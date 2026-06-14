@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/jiji-core", "crates/jiji-forge", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "FSL-1.1-MIT"
+authors = ["lauf"]
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures = "0.3"
+insta = { version = "1", features = ["json"] }
+jj-lib = "0.39.0"
+log = "0.4"
+notify = "8"
+pollster = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-store = "2"
+tauri-plugin-updater = "2"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
+url = "2"
+whoami = "1"

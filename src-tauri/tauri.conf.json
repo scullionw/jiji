@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "jiji",
+  "productName": "Jiji",
   "version": "0.1.0",
   "identifier": "com.lauf.jiji",
   "build": {
@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "jiji",
-        "width": 800,
-        "height": 600
+        "title": "Jiji",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 640,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#0e0e11"
       }
     ],
     "security": {
@@ -24,6 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -31,5 +37,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM2OEQ2QkI3QTIwNTQ0NkUKUldSdVJBV2l0MnVOTmtEeVgvVVFOdEhvM0JUWVdlNHpMd0V0Tm1uKzdhQXMrTE9UTGFGYndtelEK",
+      "endpoints": [
+        "https://github.com/scullionw/jiji/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

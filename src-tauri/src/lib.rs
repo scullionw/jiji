@@ -1,14 +1,43 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod commands;
+
+use commands::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::open_repo,
+            commands::refresh_snapshot,
+            commands::current_snapshot,
+            commands::change_detail,
+            commands::change_diff,
+            commands::compare_diff,
+            commands::describe_change,
+            commands::new_change,
+            commands::edit_change,
+            commands::abandon_change,
+            commands::squash_change,
+            commands::rebase_change,
+            commands::move_change,
+            commands::create_bookmark,
+            commands::move_bookmark,
+            commands::rename_bookmark,
+            commands::delete_bookmark,
+            commands::revert_operation,
+            commands::restore_operation
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

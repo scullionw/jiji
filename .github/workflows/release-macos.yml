@@ -1,0 +1,70 @@
+name: release-macos
+
+on:
+  push:
+    tags:
+      - "app-v*"
+
+jobs:
+  release-macos:
+    permissions:
+      contents: write
+
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: check tag matches app version
+        run: |
+          APP_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          TAG_VERSION="${GITHUB_REF_NAME#app-v}"
+          test "$APP_VERSION" = "$TAG_VERSION"
+
+      - name: prepare App Store Connect key
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
+
+      - uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+
+        with:
+          tauriScript: bun tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "Jiji v__VERSION__"
+          releaseBody: |
+            Initial alpha macOS release for Jiji.
+
+            Download the DMG below. This release also includes signed updater artifacts for existing installs.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          assetNamePattern: "[name]_[platform]_[arch][ext]"
+          args: "--target universal-apple-darwin --bundles app,dmg"

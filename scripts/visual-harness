@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Visual-verification harness: run the built SPA without Tauri by stubbing
+# the IPC surface with captured snapshot JSON, then screenshot scenarios
+# with headless Chrome. The browser-side stub/driver (query params, element
+# selectors) lives in scripts/harness/harness.js.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="${JIJI_HARNESS_DIR:-${TMPDIR:-/tmp}/jiji-visual-harness}"
+PID_FILE="$WORK/server.pid"
+PORT_FILE="$WORK/server.port"
+
+usage() {
+  cat <<'EOF'
+visual-harness — build, stub, serve, and screenshot the SPA without Tauri
+
+Usage:
+  scripts/visual-harness setup [--repo PATH] [--diff CHANGE_ID]... [--compare FROM:TO]... [--no-build] [--port N]
+  scripts/visual-harness shot OUT.png 'QUERY' [--size WxH] [--scale N]
+  scripts/visual-harness stop
+
+setup   Builds the SPA, captures the mock snapshot (plus content diffs for
+        every mock change) and a real snapshot of --repo (default: this
+        repo; real diffs only for ids passed via --diff, real comparisons
+        only for pairs passed via --compare FROM:TO), stages the site
+        with the IPC stubs injected, and serves it (default port 8123).
+shot    Screenshots one scenario. QUERY is the page query string, e.g.
+        'snap=mock&section=operations&expand=1' or
+        'snap=real&click=ktpqsmxw&layout=split&scroll=600'.
+        --size defaults to 1440x900; --scale 2 for detail crops.
+stop    Stops the server.
+
+Scenario params (full list in scripts/harness/harness.js):
+  snap=mock|real, theme=light|dark|system, pane=<px>, layout=split, section=<name>,
+  click=<changeId>, open=files|body|describe|squash|abandon|bookmark|rebase|compare,
+  describe=<text>, action=new|edit, confirm=1, bookmark=<name>, movebm=<name>,
+  manage=<name>, rename=<text>, delete=1, obmrename=<name>, obmdelete=<name>,
+  mode=stack|single, dest=<changeId>, compare=parent|trunk|base|<changeId>,
+  oprevert=<opId>, oprestore=<opId>, undo=1,
+  expand=1, scroll=<px>, scrollx=<px>
+EOF
+}
+
+find_chrome() {
+  if [[ -n "${CHROME:-}" ]]; then echo "$CHROME"; return; fi
+  local mac="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  if [[ -x "$mac" ]]; then echo "$mac"; return; fi
+  local candidate
+  for candidate in google-chrome chromium chromium-browser; do
+    if command -v "$candidate" >/dev/null; then echo "$candidate"; return; fi
+  done
+  echo "error: no Chrome/Chromium found; set CHROME=/path/to/chrome" >&2
+  exit 1
+}
+
+cmd_setup() {
+  local repo="$ROOT" port=8123 build=1
+  local diff_ids=() compare_pairs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --diff) diff_ids+=("$2"); shift 2 ;;
+      --compare) compare_pairs+=("$2"); shift 2 ;;
+      --no-build) build=0; shift ;;
+      --port) port="$2"; shift 2 ;;
+      *) echo "unknown setup flag: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  cmd_stop >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+  mkdir -p "$WORK/diffs-mock" "$WORK/diffs-real" "$WORK/compares-mock" "$WORK/compares-real"
+
+  if [[ $build -eq 1 ]]; then
+    echo "building the SPA..."
+    (cd "$ROOT" && bun run build >/dev/null)
+  fi
+
+  echo "capturing snapshots..."
+  (cd "$ROOT" && cargo build -q -p jiji-core --example snapshot)
+  local snap_bin="$ROOT/target/debug/examples/snapshot"
+  JIJI_MOCK_BACKEND=1 "$snap_bin" "$repo" > "$WORK/mock.json"
+  "$snap_bin" "$repo" > "$WORK/real.json"
+
+  # Every mock change has a fabricated diff; capture them all so &click=
+  # works out of the box. Real diffs are heavier — only what was asked for.
+  local id
+  for id in $(python3 -c "import json; [print(n['id']) for n in json.load(open('$WORK/mock.json'))['nodes']]"); do
+    JIJI_MOCK_BACKEND=1 "$snap_bin" "$repo" "$id" --diff > "$WORK/diffs-mock/$id.json"
+  done
+  for id in ${diff_ids[@]+"${diff_ids[@]}"}; do
+    "$snap_bin" "$repo" "$id" --diff > "$WORK/diffs-real/$id.json"
+  done
+  # Real commit-to-commit comparisons (mock ones come from the stub's
+  # per-change-diff union, mirroring the Rust mock backend).
+  local pair
+  for pair in ${compare_pairs[@]+"${compare_pairs[@]}"}; do
+    "$snap_bin" "$repo" "${pair#*:}" --compare "${pair%%:*}" \
+      > "$WORK/compares-real/${pair%%:*}..${pair#*:}.json"
+  done
+
+  echo "staging the site..."
+  cp -R "$ROOT/build" "$WORK/site"
+  cp "$ROOT/scripts/harness/harness.js" "$WORK/site/harness.js"
+  python3 - "$WORK" <<'EOF'
+import json, pathlib, sys
+
+work = pathlib.Path(sys.argv[1])
+data = {}
+for name in ("mock", "real"):
+    snap = work / f"{name}.json"
+    if not snap.exists():
+        continue
+    diffs = {p.stem: json.loads(p.read_text()) for p in (work / f"diffs-{name}").glob("*.json")}
+    compares = {p.stem: json.loads(p.read_text()) for p in (work / f"compares-{name}").glob("*.json")}
+    data[name] = {"snapshot": json.loads(snap.read_text()), "diffs": diffs, "compares": compares}
+(work / "site" / "snapshots.js").write_text(
+    "window.__HARNESS_DATA__ = " + json.dumps(data) + ";\n"
+)
+
+index = work / "site" / "index.html"
+html = index.read_text()
+assert "<head>" in html, "index.html has no <head> to inject into"
+tag = '<script src="/snapshots.js"></script><script src="/harness.js"></script>'
+index.write_text(html.replace("<head>", "<head>\n\t\t" + tag, 1))
+EOF
+
+  python3 -m http.server "$port" -d "$WORK/site" >/dev/null 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "$port" > "$PORT_FILE"
+  echo "serving on http://localhost:$port (pid $(cat "$PID_FILE"))"
+  echo "next: scripts/visual-harness shot /tmp/out.png 'snap=mock&section=operations'"
+}
+
+cmd_shot() {
+  if [[ $# -lt 2 ]]; then usage; exit 1; fi
+  local out="$1" query="$2"
+  shift 2
+  local size="1440,900" scale=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --size) size="${2//x/,}"; shift 2 ;;
+      --scale) scale="$2"; shift 2 ;;
+      *) echo "unknown shot flag: $1" >&2; exit 1 ;;
+    esac
+  done
+  if [[ ! -f "$PORT_FILE" ]]; then
+    echo "error: no server running — run setup first" >&2
+    exit 1
+  fi
+  local port chrome
+  port="$(cat "$PORT_FILE")"
+  chrome="$(find_chrome)"
+  local args=(
+    --headless=new --disable-gpu
+    "--window-size=$size"
+    --virtual-time-budget=8000
+    "--screenshot=$out"
+  )
+  [[ -n "$scale" ]] && args+=("--force-device-scale-factor=$scale")
+  "$chrome" "${args[@]}" "http://localhost:$port/?$query" 2>/dev/null
+  echo "wrote $out"
+}
+
+cmd_stop() {
+  if [[ -f "$PID_FILE" ]]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE" "$PORT_FILE"
+    echo "server stopped"
+  else
+    echo "no server running"
+  fi
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  shot) shift; cmd_shot "$@" ;;
+  stop) shift; cmd_stop ;;
+  *) usage; exit 1 ;;
+esac
