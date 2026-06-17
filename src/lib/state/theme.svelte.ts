@@ -8,8 +8,12 @@
 //
 // Persistence is localStorage rather than the Tauri store: the boot script
 // needs a synchronous read, and double-bookkeeping two stores isn't worth it.
+//
+// Themes are a supporter perk: an unregistered copy is pinned to the default
+// light palette and the picker is locked (see $lib/license/state.svelte.ts).
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { license } from "$lib/license/state.svelte";
 
 export type ThemeMode = "system" | "light" | "dark";
 export type ThemeScheme = "light" | "dark";
@@ -65,7 +69,13 @@ export function resolvedScheme(): ThemeScheme {
 }
 
 function apply(animate: boolean): void {
-  theme.resolved = resolvedScheme() === "light" ? theme.light : theme.dark;
+  // Unregistered copies are pinned to the default light palette; registered
+  // users get their full chosen preference.
+  theme.resolved = license.registered
+    ? resolvedScheme() === "light"
+      ? theme.light
+      : theme.dark
+    : DEFAULT_LIGHT;
   const root = document.documentElement;
   const swap = () => {
     root.dataset.theme = theme.resolved;
@@ -88,7 +98,13 @@ function apply(animate: boolean): void {
   // No-op outside Tauri (vite dev in a plain browser).
   try {
     getCurrentWindow()
-      .setTheme(theme.mode === "system" ? null : theme.mode)
+      .setTheme(
+        license.registered
+          ? theme.mode === "system"
+            ? null
+            : theme.mode
+          : "light",
+      )
       .catch(() => {});
   } catch {
     /* not running under Tauri */
@@ -130,12 +146,14 @@ export function initTheme(): void {
 }
 
 export function setMode(mode: ThemeMode): void {
+  if (!license.registered) return;
   theme.mode = mode;
   persist();
   apply(true);
 }
 
 export function selectTheme(id: string): void {
+  if (!license.registered) return;
   const def = themeById(id);
   if (!def) return;
   theme[def.scheme] = id;
@@ -143,5 +161,10 @@ export function selectTheme(id: string): void {
   // follow it with the mode when the schemes differ.
   if (resolvedScheme() !== def.scheme) theme.mode = def.scheme;
   persist();
+  apply(true);
+}
+
+/** Re-apply the active theme — called when registration status flips. */
+export function refreshTheme(): void {
   apply(true);
 }

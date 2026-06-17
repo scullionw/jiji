@@ -7,6 +7,7 @@
     selectTheme,
     type ThemeMode,
   } from "$lib/state/theme.svelte";
+  import { license, openRegistration } from "$lib/license/state.svelte";
 
   let open = $state(false);
   let anchor: HTMLDivElement | undefined = $state();
@@ -61,36 +62,56 @@
 
   {#if open}
     <div class="panel" role="dialog" aria-label="Theme">
-      <div class="modes">
-        {#each modes as mode (mode.id)}
-          <button
-            class="mode"
-            class:selected={theme.mode === mode.id}
-            onclick={() => setMode(mode.id)}
-          >
-            {mode.label}
-          </button>
-        {/each}
-      </div>
-
-      {#each groups as group (group.label)}
-        <div class="group-label">{group.label}</div>
-        <div class="swatches">
-          {#each group.list as t (t.id)}
+      {#if license.registered}
+        <div class="modes">
+          {#each modes as mode (mode.id)}
             <button
-              class="swatch-item"
-              class:selected={group.current === t.id}
-              title={t.label}
-              onclick={() => selectTheme(t.id)}
+              class="mode"
+              class:selected={theme.mode === mode.id}
+              onclick={() => setMode(mode.id)}
             >
-              <span class="swatch" style:background={t.swatch.bg}>
-                <span class="dot" style:background={t.swatch.accent}></span>
-              </span>
-              <span class="swatch-name truncate">{t.label}</span>
+              {mode.label}
             </button>
           {/each}
         </div>
-      {/each}
+
+        {#each groups as group (group.label)}
+          <div class="group-label">{group.label}</div>
+          <div class="swatches">
+            {#each group.list as t (t.id)}
+              <button
+                class="swatch-item"
+                class:selected={group.current === t.id}
+                title={t.label}
+                onclick={() => selectTheme(t.id)}
+              >
+                <span class="swatch" style:background={t.swatch.bg}>
+                  <span class="dot" style:background={t.swatch.accent}></span>
+                </span>
+                <span class="swatch-name truncate">{t.label}</span>
+              </button>
+            {/each}
+          </div>
+        {/each}
+      {:else}
+        <div class="locked">
+          <span class="locked-icon"><Icon name="sparkles" size={20} /></span>
+          <p class="locked-title">Themes are a supporter perk</p>
+          <p class="locked-copy">
+            Jiji ships in ten palettes. A one-time license unlocks them all and
+            keeps development going.
+          </p>
+          <button
+            class="unlock"
+            onclick={() => {
+              open = false;
+              openRegistration();
+            }}
+          >
+            Unlock themes
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -228,5 +249,47 @@
   .swatch-item.selected .swatch-name {
     color: var(--clr-text-1);
     font-weight: 500;
+  }
+
+  .locked {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  }
+
+  .locked-icon {
+    color: var(--clr-accent);
+    margin-bottom: var(--sp-2);
+  }
+
+  .locked-title {
+    font-size: var(--text-m);
+    font-weight: 600;
+    color: var(--clr-text-1);
+  }
+
+  .locked-copy {
+    margin-top: 4px;
+    font-size: var(--text-s);
+    line-height: 1.5;
+    color: var(--clr-text-3);
+  }
+
+  .unlock {
+    margin-top: var(--sp-3);
+    width: 100%;
+    height: 32px;
+    border-radius: var(--radius-m);
+    background: var(--clr-accent);
+    color: var(--clr-accent-contrast);
+    font-size: var(--text-m);
+    font-weight: 500;
+    transition: background var(--t-fast) var(--ease-out);
+  }
+
+  .unlock:hover {
+    background: var(--clr-accent-strong);
   }
 </style>

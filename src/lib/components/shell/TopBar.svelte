@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from "$lib/components/ui/Icon.svelte";
   import ThemeMenu from "./ThemeMenu.svelte";
+  import LicenseBadge from "./LicenseBadge.svelte";
   import { app } from "$lib/state/app.svelte";
   import { chooseRepo, refreshSnapshot } from "$lib/state/actions";
 
@@ -52,6 +53,7 @@
       <Icon name="refresh" size={15} />
     </button>
   {/if}
+  <LicenseBadge />
   <ThemeMenu />
   <button
     class="icon-btn"

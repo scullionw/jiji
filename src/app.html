@@ -60,14 +60,24 @@
             mode = raw; // legacy bare-mode format
           }
         } catch {}
+        // Themes are a supporter perk: an unregistered copy boots to the
+        // default light palette. `jiji-registered` mirrors the cached license
+        // (the full record lives in license.json) so this stays synchronous.
+        let registered = false;
+        try {
+          registered = localStorage.getItem("jiji-registered") === "1";
+        } catch {}
         const scheme =
           mode === "system"
             ? matchMedia("(prefers-color-scheme: light)").matches
               ? "light"
               : "dark"
             : mode;
-        document.documentElement.dataset.theme =
-          scheme === "light" ? light : dark;
+        document.documentElement.dataset.theme = registered
+          ? scheme === "light"
+            ? light
+            : dark
+          : "paper";
       })();
     </script>
     %sveltekit.head%
