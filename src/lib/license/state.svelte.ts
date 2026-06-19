@@ -24,11 +24,41 @@ export type Plan = "solo" | "personal" | "unknown";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// `registered` is seeded synchronously from the localStorage mirror, so it is
-// already correct on first paint (matching app.html). loadLicenseState() then
-// confirms it from license.json and revalidates.
+// ── Development ergonomics ──────────────────────────────────────────────
+// In `vite dev` / `tauri dev`, everyday work shouldn't be stuck behind the
+// license gate (which pins the app to the light theme). `import.meta.env.DEV`
+// compiles to `false` for a production `tauri build`, so none of this ships.
+//
+// Simulate a state from devtools (the window.jiji helpers below do this):
+//   localStorage.setItem("jiji-dev-license", "unregistered") // exercise the gate
+//   localStorage.setItem("jiji-dev-license", "real")         // hit real Polar
+//   localStorage.removeItem("jiji-dev-license")              // default: unlocked
+type DevMode = "registered" | "unregistered" | "real";
+const DEV_KEY = "jiji-dev-license";
+
+function devMode(): DevMode | null {
+  if (!import.meta.env.DEV) return null;
+  try {
+    const v = localStorage.getItem(DEV_KEY);
+    if (v === "unregistered") return "unregistered";
+    if (v === "real") return "real";
+  } catch {
+    /* ignore */
+  }
+  return "registered"; // default in dev: themes unlocked, no real key needed
+}
+
+function initialRegistered(): boolean {
+  const mode = devMode();
+  if (mode === "registered") return true;
+  if (mode === "unregistered") return false;
+  return readRegisteredMirror();
+}
+
+// `registered` is seeded synchronously so it's correct on first paint (matching
+// app.html's boot script). loadLicenseState() then confirms it.
 export const license = $state({
-  registered: readRegisteredMirror(),
+  registered: initialRegistered(),
   loaded: false,
   plan: "unknown" as Plan,
   displayKey: "",
@@ -96,6 +126,20 @@ function recordFrom(
 
 /** Load cached state at startup and revalidate opportunistically (≤ 1×/day). */
 export async function loadLicenseState(): Promise<void> {
+  const mode = devMode();
+  if (mode === "registered" || mode === "unregistered") {
+    // Simulated dev state — never touch the store or Polar.
+    if (mode === "registered") {
+      license.registered = true;
+      license.plan = "personal";
+      license.displayKey = "dev-mode";
+      setRegisteredMirror(true);
+    } else {
+      drop();
+    }
+    license.loaded = true;
+    return;
+  }
   try {
     const record = await loadRecord();
     if (record) {
@@ -204,4 +248,28 @@ function activationError(err: unknown): Error {
     }
   }
   return new Error("Something went wrong activating your license. Try again.");
+}
+
+// Dev-only console helpers (compiled out of production builds). Flip the
+// simulated license state without a real key, then the page reloads:
+//   window.jiji.unregister()  → exercise the unregistered/gated UI
+//   window.jiji.register()    → unlocked (the dev default)
+//   window.jiji.real()        → use the real cached license + Polar
+//   window.jiji.reset()       → clear the override
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  const set = (mode: string | null) => {
+    try {
+      if (mode) localStorage.setItem(DEV_KEY, mode);
+      else localStorage.removeItem(DEV_KEY);
+    } catch {
+      /* ignore */
+    }
+    location.reload();
+  };
+  (window as unknown as Record<string, unknown>).jiji = {
+    register: () => set("registered"),
+    unregister: () => set("unregistered"),
+    real: () => set("real"),
+    reset: () => set(null),
+  };
 }
