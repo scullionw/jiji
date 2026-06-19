@@ -158,7 +158,7 @@
               onclick={() => openUrl(PERSONAL_CHECKOUT_URL)}
             >
               <span>Buy Personal</span>
-              <span class="price">{PERSONAL_PRICE} · 2 devices</span>
+              <span class="price">{PERSONAL_PRICE} · 5 devices</span>
             </button>
           </div>
           <p class="fine">Secure checkout via Polar. Your key arrives by email.</p>

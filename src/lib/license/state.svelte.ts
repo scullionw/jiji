@@ -52,7 +52,7 @@ let cached: LicenseRecord | null = null;
 
 function planFromLimit(limit: number | null): Plan {
   if (limit === 1) return "solo";
-  if (limit === 2) return "personal";
+  if (typeof limit === "number" && limit > 1) return "personal";
   return "unknown";
 }
 
@@ -194,7 +194,7 @@ function activationError(err: unknown): Error {
     }
     if (err.status === 403) {
       return new Error(
-        "This license has reached its device limit. Solo covers 1 device; Personal covers 2.",
+        "This license is already active on its maximum number of devices.",
       );
     }
     if (err.status === 0) {
