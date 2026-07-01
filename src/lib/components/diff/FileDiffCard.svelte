@@ -15,6 +15,7 @@
     type DiffLayout,
     type SplitCell,
   } from "./diff";
+  import { fileHighlighter } from "./highlight";
 
   let {
     file,
@@ -55,6 +56,11 @@
   const text = $derived(file.content.kind === "text" ? file.content : null);
   const digits = $derived(text ? gutterDigits(text.hunks) : 2);
   const cols = $derived(text ? maxLineCols(text.hunks) : 0);
+
+  // Syntax spans are computed lazily per hunk as blocks mount and cached
+  // by segments-array identity, so both layouts share one computation and
+  // repeated renders of a mounted block are lookups (see highlight.ts).
+  const hl = $derived(fileHighlighter(file.path, text?.hunks ?? []));
 
   // Lazy per-layout: only the active layout's rows are ever computed.
   const uniBlocks = $derived(
@@ -138,8 +144,9 @@
     <span class="no {side} {cell.kind}">{cell.no}</span><span
       class="code selectable {side} {cell.kind}"
       class:intraline={cell.intraline}
-    >{#each cell.segments as segment}{#if segment.changed}<mark
-        >{segment.text}</mark>{:else}{segment.text}{/if}{/each}</span>
+    >{#each hl(cell.segments) as span}{#if span.changed}<mark
+        class={span.cls}>{span.text}</mark>{:else if span.cls}<span
+        class={span.cls}>{span.text}</span>{:else}{span.text}{/if}{/each}</span>
   {:else}
     <span class="no {side} absent"></span><span class="code {side} absent"></span>
   {/if}
@@ -243,8 +250,9 @@
                   <div class="line {row.kind}" class:intraline={row.intraline}>
                     <span class="no">{row.oldNo ?? ""}</span><span class="no"
                     >{row.newNo ?? ""}</span><span class="code selectable"
-                    >{#each row.segments as segment}{#if segment.changed}<mark
-                        >{segment.text}</mark>{:else}{segment.text}{/if}{/each}</span>
+                    >{#each hl(row.segments) as span}{#if span.changed}<mark
+                        class={span.cls}>{span.text}</mark>{:else if span.cls}<span
+                        class={span.cls}>{span.text}</span>{:else}{span.text}{/if}{/each}</span>
                   </div>
                 {/if}
               {/each}
@@ -462,6 +470,59 @@
     background: transparent;
     color: inherit;
     border-radius: 2px;
+  }
+
+  /* Syntax classes from highlight.ts — color only, so the add/remove
+     tints and intraline mark backgrounds stay the layer underneath.
+     :global() because the classes arrive from data, not static markup. */
+  .code :global(.syn-kw) {
+    color: var(--syn-kw);
+  }
+
+  .code :global(.syn-str) {
+    color: var(--syn-str);
+  }
+
+  .code :global(.syn-const) {
+    color: var(--syn-const);
+  }
+
+  .code :global(.syn-type) {
+    color: var(--syn-type);
+  }
+
+  .code :global(.syn-fn) {
+    color: var(--syn-fn);
+  }
+
+  .code :global(.syn-prop) {
+    color: var(--syn-prop);
+  }
+
+  .code :global(.syn-comment) {
+    color: var(--syn-comment);
+    font-style: italic;
+  }
+
+  .code :global(.syn-meta) {
+    color: var(--syn-meta);
+  }
+
+  /* Markdown structure: weight and slant, not new hues. */
+  .code :global(.syn-heading) {
+    font-weight: 600;
+  }
+
+  .code :global(.syn-link) {
+    color: var(--syn-fn);
+  }
+
+  .code :global(.syn-em) {
+    font-style: italic;
+  }
+
+  .code :global(.syn-strong) {
+    font-weight: 600;
   }
 
   .line.added {

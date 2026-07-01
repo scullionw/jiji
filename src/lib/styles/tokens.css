@@ -49,6 +49,21 @@
   --clr-warn: #d9a04c;
   --clr-danger: #e0605c;
 
+  /* Syntax (code) — one restrained set per scheme, shared by every theme:
+     the diff should read calmer than the shell, so hues mark scan anchors
+     (keywords, strings, types) and everything else stays plain text. The
+     dark set lives here; the light set is the :where() group after the
+     light themes (kept low-specificity so a theme block can override any
+     --syn-* token individually). */
+  --syn-kw: #b98fd0;
+  --syn-str: #99b87a;
+  --syn-const: #d2a266;
+  --syn-type: #6fb9c9;
+  --syn-fn: #7fa9e0;
+  --syn-prop: #92aed1;
+  --syn-comment: var(--clr-text-3);
+  --syn-meta: #c49a76;
+
   /* Scrollbars */
   --clr-scrollbar: rgb(255 255 255 / 0.12);
   --clr-scrollbar-hover: rgb(255 255 255 / 0.2);
@@ -411,4 +426,24 @@
   --shadow-1: 0 1px 2px rgb(80 35 55 / 0.08);
   --shadow-2: 0 4px 16px rgb(80 35 55 / 0.12);
   --shadow-edge: 0 1px 0 rgb(80 35 55 / 0.05);
+}
+
+/* Syntax palette, light schemes: the same hues deepened to hold contrast
+   on paper. :where() keeps specificity at bare :root, so a later
+   :root[data-theme="…"] block can retune any single token. */
+:root:where(
+    [data-theme="paper"],
+    [data-theme="linen"],
+    [data-theme="glacier"],
+    [data-theme="meadow"],
+    [data-theme="dawn"]
+  ) {
+  --syn-kw: #7c3fa5;
+  --syn-str: #4f7d22;
+  --syn-const: #9c6410;
+  --syn-type: #17697f;
+  --syn-fn: #2f5fb8;
+  --syn-prop: #4a648c;
+  --syn-comment: var(--clr-text-3);
+  --syn-meta: #96632a;
 }
