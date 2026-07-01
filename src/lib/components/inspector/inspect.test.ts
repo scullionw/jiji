@@ -5,11 +5,13 @@ import type { NodeKind } from "$lib/bindings/NodeKind";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { WorkstreamSummary } from "$lib/bindings/WorkstreamSummary";
 import {
+  actionAvailability,
   bookmarksAt,
   childrenOf,
   combinedDescription,
   descendantsOf,
   divergentSiblings,
+  findNode,
   isAncestor,
   moveDirection,
   rebaseDestinations,
@@ -339,5 +341,53 @@ describe("splitPath", () => {
 
   it("handles root-level files", () => {
     expect(splitPath("README.md")).toEqual({ dir: "", name: "README.md" });
+  });
+});
+
+describe("actionAvailability", () => {
+  const snap = snapshot([
+    node("wc", "workingCopy", ["mid"]),
+    node("mid", "mutable", ["bottom"]),
+    node("bottom", "mutable", ["base"]),
+    node("merge", "mutable", ["mid", "bottom"]),
+    node("base", "immutable"),
+  ]);
+  const at = (id: string) => actionAvailability(snap, findNode(snap, id)!);
+
+  it("offers everything on a mutable change with a mutable parent", () => {
+    expect(at("mid")).toEqual({
+      describe: true,
+      newChild: true,
+      edit: true,
+      bookmark: true,
+      rebase: true,
+      squash: true,
+      abandon: true,
+    });
+  });
+
+  it("offers only the non-rewriting pair on immutable changes", () => {
+    expect(at("base")).toEqual({
+      describe: false,
+      newChild: true,
+      edit: false,
+      bookmark: true,
+      rebase: false,
+      squash: false,
+      abandon: false,
+    });
+  });
+
+  it("withholds squash without a single mutable parent", () => {
+    // Immutable parent.
+    expect(at("bottom").squash).toBe(false);
+    // Merge: two parents.
+    expect(at("merge").squash).toBe(false);
+  });
+
+  it("withholds edit on the working copy itself", () => {
+    const wc = at("wc");
+    expect(wc.edit).toBe(false);
+    expect(wc.describe).toBe(true);
   });
 });

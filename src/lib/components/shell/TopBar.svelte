@@ -3,7 +3,7 @@
   import ThemeMenu from "./ThemeMenu.svelte";
   import LicenseBadge from "./LicenseBadge.svelte";
   import { app } from "$lib/state/app.svelte";
-  import { chooseRepo, refreshSnapshot } from "$lib/state/actions";
+  import { chooseRepo, refreshSnapshot, togglePalette } from "$lib/state/actions";
 
   const snapshot = $derived(app.snapshot);
   const trunk = $derived(snapshot?.bookmarks.find((b) => b.isTrunk));
@@ -54,6 +54,15 @@
     </button>
   {/if}
   <LicenseBadge />
+  <button
+    class="icon-btn"
+    title="Command palette (⌘K)"
+    aria-label="Command palette"
+    data-action="palette"
+    onclick={togglePalette}
+  >
+    <Icon name="command" size={14} />
+  </button>
   <ThemeMenu />
   <button
     class="icon-btn"

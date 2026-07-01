@@ -8,8 +8,14 @@
   import WorkbenchView from "$lib/components/views/WorkbenchView.svelte";
   import PlaceholderView from "$lib/components/views/PlaceholderView.svelte";
   import OperationsView from "$lib/components/ops/OperationsView.svelte";
+  import CommandPalette from "$lib/components/palette/CommandPalette.svelte";
   import { app, type Section } from "$lib/state/app.svelte";
-  import { bootstrap, chooseRepo, refreshSnapshot } from "$lib/state/actions";
+  import {
+    bootstrap,
+    chooseRepo,
+    refreshSnapshot,
+    togglePalette,
+  } from "$lib/state/actions";
   import { checkForAppUpdate } from "$lib/update";
 
   const sectionOrder: Section[] = [
@@ -29,6 +35,10 @@
     void checkForAppUpdate();
 
     return tinykeys(window, {
+      "$mod+KeyK": (event) => {
+        event.preventDefault();
+        togglePalette();
+      },
       "$mod+KeyO": (event) => {
         event.preventDefault();
         chooseRepo();
@@ -63,6 +73,9 @@
     </div>
     <StatusBar />
   </div>
+  {#if app.paletteOpen}
+    <CommandPalette />
+  {/if}
 </div>
 
 <style>

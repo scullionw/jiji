@@ -10,6 +10,8 @@
     resolveCompareFrom,
     type CompareMode,
   } from "$lib/components/inspector/inspect";
+  import { app } from "$lib/state/app.svelte";
+  import { consumeIntent } from "$lib/state/actions";
   import ChangeHeader from "./ChangeHeader.svelte";
   import FileDiffCard from "./FileDiffCard.svelte";
   import type { DiffLayout } from "./diff";
@@ -88,6 +90,15 @@
     layout = next;
     localStorage.setItem(LAYOUT_KEY, next);
   }
+
+  // The command palette's layout commands land here.
+  $effect(() => {
+    const intent = app.intent;
+    if (intent?.kind === "layout") {
+      setLayout(intent.layout);
+      consumeIntent();
+    }
+  });
 
   let scroller: HTMLDivElement | undefined;
 

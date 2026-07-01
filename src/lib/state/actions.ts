@@ -5,7 +5,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as api from "$lib/api";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import { stackPosition } from "$lib/components/inspector/inspect";
-import { app } from "./app.svelte";
+import { app, type Section, type UiIntent } from "./app.svelte";
 import { loadRecentRepos, rememberRepo } from "./recent";
 
 export async function bootstrap(): Promise<void> {
@@ -182,4 +182,51 @@ export function dismissBreadcrumb(): void {
 
 export function showOperations(): void {
   app.section = "operations";
+}
+
+export function goToSection(section: Section): void {
+  if (app.snapshot) app.section = section;
+}
+
+// ── Command palette ──
+
+export function togglePalette(): void {
+  app.paletteOpen = !app.paletteOpen;
+}
+
+export function closePalette(): void {
+  app.paletteOpen = false;
+}
+
+// Every intent targets a workbench surface, so the section switches along;
+// the owning surface mounts (if it wasn't) and consumes the intent.
+export function sendIntent(intent: UiIntent): void {
+  app.section = "workbench";
+  app.intent = intent;
+}
+
+export function consumeIntent(): void {
+  app.intent = null;
+}
+
+// Move the workbench selection to a change (the palette's "go to"),
+// focusing its workstream like a graph-row click would.
+export function jumpToChange(id: string): void {
+  if (!app.snapshot?.nodes.some((n) => n.id === id)) return;
+  app.section = "workbench";
+  app.selectedNodeId = id;
+  const owner = stackPosition(app.snapshot, id)?.workstream;
+  if (owner) app.focusedWorkstreamId = owner.id;
+}
+
+// Palette-launched mutations have no panel to render errors inline, so
+// failures land in the status bar's error slot (like the breadcrumb Undo).
+export async function runQuiet(
+  call: () => Promise<MutationOutcome>,
+): Promise<void> {
+  try {
+    await call();
+  } catch (error) {
+    app.error = api.errorMessage(error);
+  }
 }

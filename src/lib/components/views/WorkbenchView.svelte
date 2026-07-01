@@ -19,6 +19,7 @@
   import { findNode, stackPosition } from "$lib/components/inspector/inspect";
   import Inspector from "$lib/components/views/Inspector.svelte";
   import { app } from "$lib/state/app.svelte";
+  import { consumeIntent } from "$lib/state/actions";
 
   // Parent only renders this view when a snapshot exists.
   const snapshot = $derived(app.snapshot!);
@@ -43,6 +44,15 @@
     view = next;
     localStorage.setItem(VIEW_KEY, next);
   }
+
+  // The command palette's view-mode commands land here.
+  $effect(() => {
+    const intent = app.intent;
+    if (intent?.kind === "view") {
+      setView(intent.view);
+      consumeIntent();
+    }
+  });
 
   const focused = $derived(
     resolveFocusedWorkstream(snapshot, app.focusedWorkstreamId),
@@ -126,7 +136,7 @@
   }
 
   function moveSelection(event: KeyboardEvent, delta: number) {
-    if (isEditable(event.target)) return;
+    if (app.paletteOpen || isEditable(event.target)) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (ids.length === 0) return;
     event.preventDefault();
@@ -141,7 +151,7 @@
   }
 
   function switchView(event: KeyboardEvent, next: WorkbenchViewMode) {
-    if (isEditable(event.target)) return;
+    if (app.paletteOpen || isEditable(event.target)) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     event.preventDefault();
     setView(next);
@@ -156,7 +166,9 @@
       KeyG: (event) => switchView(event, "graph"),
       KeyW: (event) => switchView(event, "focus"),
       Escape: (event) => {
-        if (!isEditable(event.target)) app.selectedNodeId = null;
+        if (!app.paletteOpen && !isEditable(event.target)) {
+          app.selectedNodeId = null;
+        }
       },
     }),
   );

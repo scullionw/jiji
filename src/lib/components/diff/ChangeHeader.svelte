@@ -21,6 +21,7 @@
   } from "$lib/state/actions";
   import { fromNow } from "$lib/time";
   import {
+    actionAvailability,
     bookmarksAt,
     childrenOf,
     combinedDescription,
@@ -35,6 +36,8 @@
     SYNC_LABEL,
     type CompareMode,
   } from "$lib/components/inspector/inspect";
+  import { app } from "$lib/state/app.svelte";
+  import { consumeIntent } from "$lib/state/actions";
   import { fileStats, totalStats, type DiffLayout } from "./diff";
 
   let {
@@ -98,9 +101,12 @@
     compareFilter = "";
   });
 
+  // Which actions this selection offers — the shared affordance rule, also
+  // what the command palette consults (the backend re-checks everything).
+  const avail = $derived(actionAvailability(snapshot, node));
+
   // The describe editor: the first mutation surface. Immutable changes get
   // no affordance; the backend refuses them anyway.
-  const canDescribe = $derived(node.kind !== "immutable");
   let editing = $state(false);
   let draft = $state("");
   let saving = $state(false);
@@ -139,18 +145,10 @@
     }
   }
 
-  // Mutation actions on the selection. Immutable changes only get "New
-  // child" — everything else would rewrite them, so the affordances hide,
-  // matching the describe button. Squash also needs a single mutable parent.
-  const isImmutable = $derived(node.kind === "immutable");
+  // The squash panel needs the parent itself, not just the availability.
   const parentNode = $derived(
     node.parents.length === 1 ? findNode(snapshot, node.parents[0]) : undefined,
   );
-  const canEdit = $derived(node.kind === "mutable");
-  const canSquash = $derived(
-    !isImmutable && parentNode !== undefined && parentNode.kind !== "immutable",
-  );
-  const canAbandon = $derived(!isImmutable);
 
   // Squash and abandon restructure the graph, so they get the spec's
   // explicit plan step: an inline panel stating the consequences (computed
@@ -331,7 +329,6 @@
   // graph's own changes, choose whether descendants come along, read the
   // consequences, then confirm. Drag-and-drop arrives in M3 — this is the
   // explicit-action form.
-  const canRebase = $derived(!isImmutable);
   let rebaseOpen = $state(false);
   // false = jj rebase -s (descendants follow); true = jj rebase -r (the
   // change moves alone and descendants reparent onto its parents).
@@ -405,12 +402,44 @@
     );
   }
 
+  // Arrow keys pick the destination without leaving the filter input, so
+  // the whole rebase runs from the keyboard: filter → ↑/↓ → ↵.
+  function moveRebaseDest(delta: number) {
+    const list = visibleDestinations;
+    if (list.length === 0) return;
+    const index = list.findIndex((candidate) => candidate.id === rebaseDest);
+    const next =
+      index === -1
+        ? delta > 0
+          ? 0
+          : list.length - 1
+        : Math.min(list.length - 1, Math.max(0, index + delta));
+    rebaseDest = list[next].id;
+    tick().then(() =>
+      rebasePanelEl
+        ?.querySelector(`[data-dest="${CSS.escape(list[next].id)}"]`)
+        ?.scrollIntoView({ block: "nearest" }),
+    );
+  }
+
   function onRebaseKeydown(event: KeyboardEvent) {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
       rebaseOpen = false;
-    } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveRebaseDest(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Enter") {
+      // Plain Enter on a focused button still activates that button
+      // (Tab-and-Enter picking); anywhere else it confirms.
+      const el = event.target as HTMLElement | null;
+      if (
+        el?.tagName === "BUTTON" &&
+        !(event.metaKey || event.ctrlKey)
+      ) {
+        return;
+      }
       event.preventDefault();
       submitRebase();
     }
@@ -493,6 +522,40 @@
     }
   }
 
+  // The command palette routes here: an intent names the panel to open (or
+  // the compare mode to apply) on the current selection, so the palette
+  // reuses these plan/confirm surfaces instead of duplicating them. An
+  // intent whose action this selection doesn't offer is dropped; intents
+  // owned by other surfaces (view, layout) are left alone.
+  $effect(() => {
+    const intent = app.intent;
+    if (!intent) return;
+    switch (intent.kind) {
+      case "describe":
+        if (avail.describe && !editing) openEditor();
+        break;
+      case "bookmark":
+        if (!bookmarkOpen) toggleBookmarkPanel();
+        break;
+      case "rebase":
+        if (avail.rebase && !rebaseOpen) toggleRebase();
+        break;
+      case "squash":
+        if (avail.squash && confirm !== "squash") toggleConfirm("squash");
+        break;
+      case "abandon":
+        if (avail.abandon && confirm !== "abandon") toggleConfirm("abandon");
+        break;
+      case "compare":
+        if (intent.mode) oncompare(intent.mode);
+        else if (!compareOpen) toggleCompare();
+        break;
+      default:
+        return;
+    }
+    consumeIntent();
+  });
+
   const KIND_GLYPH = { workingCopy: "@", mutable: "○", immutable: "◆" } as const;
 
   function relationTitle(id: string, role: string): string {
@@ -550,7 +613,7 @@
           <Icon name="chevronRight" size={12} />
         </button>
       {/if}
-      {#if canDescribe && !editing}
+      {#if avail.describe && !editing}
         <button class="edit" title="Edit description" onclick={openEditor}>
           <Icon name="edit" size={11} />
         </button>
@@ -558,7 +621,7 @@
     {:else}
       <span class="undescribed">
         No description yet
-        {#if canDescribe}
+        {#if avail.describe}
           <button class="describe-button" onclick={openEditor}>
             <Icon name="edit" size={10} />
             Describe
@@ -781,7 +844,7 @@
         <Icon name="plus" size={11} />
         New child
       </button>
-      {#if canEdit}
+      {#if avail.edit}
         <button
           class="action"
           data-action="edit"
@@ -804,7 +867,7 @@
         <Icon name="bookmark" size={11} />
         Bookmark
       </button>
-      {#if canRebase}
+      {#if avail.rebase}
         <button
           class="action"
           class:armed={rebaseOpen}
@@ -817,7 +880,7 @@
           Rebase
         </button>
       {/if}
-      {#if canSquash}
+      {#if avail.squash}
         <button
           class="action"
           class:armed={confirm === "squash"}
@@ -830,7 +893,7 @@
           Squash into parent
         </button>
       {/if}
-      {#if canAbandon}
+      {#if avail.abandon}
         <button
           class="action danger"
           class:armed={confirm === "abandon"}
@@ -1206,7 +1269,9 @@
         {/if}
         <div class="confirm-row">
           <span class="editor-hint">
-            {destNode ? "⌘↵ to confirm" : "Pick the destination this change moves onto"}
+            {destNode
+              ? "↵ to confirm"
+              : "Pick the destination this change moves onto — ↑↓ or click"}
           </span>
           {#if rebaseError}
             <span class="editor-error truncate" title={rebaseError}>{rebaseError}</span>

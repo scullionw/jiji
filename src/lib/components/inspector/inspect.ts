@@ -103,6 +103,39 @@ export function moveDirection(
   return "sideways";
 }
 
+// Which actions the workbench offers on one change — shared by the change
+// header's actions row and the command palette so the two routes never
+// disagree. Immutable changes get only the non-rewriting pair (new child,
+// bookmark); squash also needs a single mutable parent. The backend
+// re-checks everything; this is the affordance rule, not the enforcement.
+export interface ChangeActions {
+  describe: boolean;
+  newChild: boolean;
+  edit: boolean;
+  bookmark: boolean;
+  rebase: boolean;
+  squash: boolean;
+  abandon: boolean;
+}
+
+export function actionAvailability(
+  snapshot: RepoSnapshot,
+  node: GraphNode,
+): ChangeActions {
+  const immutable = node.kind === "immutable";
+  const parent =
+    node.parents.length === 1 ? findNode(snapshot, node.parents[0]) : undefined;
+  return {
+    describe: !immutable,
+    newChild: true,
+    edit: node.kind === "mutable",
+    bookmark: true,
+    rebase: !immutable,
+    squash: !immutable && parent !== undefined && parent.kind !== "immutable",
+    abandon: !immutable,
+  };
+}
+
 // Candidate destinations for rebasing one change, in the snapshot's graph
 // order. Excluded: the change itself; its descendants when they come along
 // (a cycle — but a lone move onto a descendant is how adjacent changes swap

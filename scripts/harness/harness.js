@@ -39,6 +39,12 @@
 //   &open=theme          open the theme menu in the top bar
 //   &swatch=<label>      switch theme through the menu (e.g. Ember): runs
 //                        the live selectTheme path, not the pre-boot preset
+//   &palette=1           open the command palette (top-bar ⌘K button)
+//   &pq=<text>           type into the open palette's input
+//   &prun=<commandId>    click that palette row (data-command, e.g.
+//                        change.rebase or goto.<id>) and wait for the
+//                        palette to close; panel params (&dest, &confirm,
+//                        &describe, …) then drive the opened panel
 //   &describe=<text>     type into the open editor and save (stubbed
 //                        describe_change mutates the captured snapshot)
 //   &action=new|edit     run that action on the selection (stubbed mutation)
@@ -751,6 +757,24 @@
   if (open === "bookmark") steps.push(() => click('[data-action="bookmark"]'));
   if (open === "rebase") steps.push(() => click('[data-action="rebase"]'));
   if (open === "compare") steps.push(() => click('[data-action="compare"]'));
+  if (params.get("palette")) {
+    steps.push(() => click('[data-action="palette"]'));
+  }
+  const paletteQuery = params.get("pq");
+  if (paletteQuery) {
+    steps.push(() => {
+      const input = document.querySelector(".palette-input");
+      if (!input) return false;
+      input.value = paletteQuery;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
+  }
+  const paletteRun = params.get("prun");
+  if (paletteRun) {
+    steps.push(() => click(`.palette-row[data-command="${paletteRun}"]`));
+    steps.push(() => !document.querySelector(".palette-input"));
+  }
   const compareTo = params.get("compare");
   if (compareTo) {
     const selector = ["parent", "trunk", "base"].includes(compareTo)

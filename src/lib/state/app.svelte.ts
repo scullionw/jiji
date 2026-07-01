@@ -2,6 +2,8 @@
 
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
+import type { DiffLayout } from "$lib/components/diff/diff";
+import type { CompareMode } from "$lib/components/inspector/inspect";
 
 // The breadcrumb after a mutation: what happened and which operation
 // recorded it, so the status bar can deep-link into the timeline.
@@ -9,6 +11,23 @@ export interface MutationBreadcrumb {
   outcome: MutationOutcome;
   at: number;
 }
+
+// A one-shot request from the command palette to the surface that owns the
+// matching UI: ChangeHeader opens its plan/confirm panels (so the palette
+// never duplicates them), DiffView owns the layout, WorkbenchView the view
+// mode. The owner calls `consumeIntent` after acting; intents it does not
+// own it leaves alone.
+export type UiIntent =
+  | { kind: "describe" }
+  | { kind: "bookmark" }
+  | { kind: "rebase" }
+  | { kind: "squash" }
+  | { kind: "abandon" }
+  // With a mode the comparison applies directly; without one the compare
+  // panel opens for picking.
+  | { kind: "compare"; mode?: CompareMode }
+  | { kind: "layout"; layout: DiffLayout }
+  | { kind: "view"; view: "graph" | "focus" };
 
 export type Section =
   | "workbench"
@@ -36,4 +55,8 @@ export const app = $state({
   focusedWorkstreamId: null as string | null,
   // Breadcrumb for the most recent mutation; the status bar surfaces it.
   lastMutation: null as MutationBreadcrumb | null,
+  // Command palette (⌘K), the keyboard route to every action.
+  paletteOpen: false,
+  // Pending palette request for another surface; see UiIntent.
+  intent: null as UiIntent | null,
 });
