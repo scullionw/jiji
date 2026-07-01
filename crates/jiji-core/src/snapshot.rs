@@ -59,8 +59,15 @@ pub struct WorkstreamSummary {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct GraphNode {
-    /// JJ change id (stable across rewrites).
+    /// Unique node id — what selection and every backend request use. The
+    /// short change id (stable across rewrites) normally; for a divergent
+    /// change (several visible commits share one change id) each commit
+    /// keys by its short *commit* id instead, jj's own addressing rule for
+    /// divergence. The two namespaces never collide: jj renders change ids
+    /// in reverse hex (k–z) and commit ids in forward hex (0–9a–f).
     pub id: String,
+    /// Short change id, for display. Equals `id` except on divergent nodes.
+    pub change_id: String,
     pub commit_id: String,
     /// Empty string when the change has no description yet.
     pub description: String,
@@ -78,6 +85,10 @@ pub struct GraphNode {
     pub bookmarks: Vec<String>,
     pub is_empty: bool,
     pub has_conflict: bool,
+    /// jj's `??` state: other visible commit(s) share this change id, so
+    /// the change id no longer names one commit. Rendered first-class; the
+    /// usual resolution is abandoning or rewriting the copies not wanted.
+    pub is_divergent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

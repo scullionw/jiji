@@ -9,6 +9,7 @@ import {
   childrenOf,
   combinedDescription,
   descendantsOf,
+  divergentSiblings,
   isAncestor,
   moveDirection,
   rebaseDestinations,
@@ -21,6 +22,7 @@ import {
 function node(id: string, kind: NodeKind, parents: string[] = []): GraphNode {
   return {
     id,
+    changeId: id,
     commitId: `c-${id}`,
     description: `change ${id}`,
     author: "test",
@@ -31,6 +33,7 @@ function node(id: string, kind: NodeKind, parents: string[] = []): GraphNode {
     bookmarks: [],
     isEmpty: false,
     hasConflict: false,
+    isDivergent: false,
   };
 }
 
@@ -294,6 +297,35 @@ describe("stackBaseOf and resolveCompareFrom", () => {
     // No trunk bookmark at all.
     const trunkless = snapshot([node("top", "workingCopy")]);
     expect(resolveCompareFrom(trunkless, "top", { kind: "trunk" })).toBeNull();
+  });
+});
+
+describe("divergentSiblings", () => {
+  // Divergent copies share changeId but key by commit id.
+  const copyA = {
+    ...node("b41c77d0", "mutable", ["trunk"]),
+    changeId: "rzvqnkom",
+    isDivergent: true,
+  };
+  const copyB = {
+    ...node("e93d5a12", "mutable", ["trunk"]),
+    changeId: "rzvqnkom",
+    isDivergent: true,
+  };
+  const plain = node("side", "mutable", ["trunk"]);
+  const snap = snapshot([copyA, copyB, plain, node("trunk", "immutable")]);
+
+  it("finds the other visible copies of a divergent change", () => {
+    expect(divergentSiblings(snap, copyA).map((n) => n.id)).toEqual([
+      "e93d5a12",
+    ]);
+    expect(divergentSiblings(snap, copyB).map((n) => n.id)).toEqual([
+      "b41c77d0",
+    ]);
+  });
+
+  it("returns nothing for non-divergent nodes", () => {
+    expect(divergentSiblings(snap, plain)).toEqual([]);
   });
 });
 

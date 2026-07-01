@@ -23,6 +23,7 @@ function node(
 ): GraphNode {
   return {
     id,
+    changeId: id,
     commitId: `c-${id}`,
     description: `change ${id}`,
     author: "test",
@@ -33,6 +34,7 @@ function node(
     bookmarks: [],
     isEmpty: false,
     hasConflict: false,
+    isDivergent: false,
   };
 }
 

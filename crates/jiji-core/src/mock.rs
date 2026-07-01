@@ -22,6 +22,7 @@ fn node(
 ) -> GraphNode {
     GraphNode {
         id: id.into(),
+        change_id: id.into(),
         commit_id: commit_id.into(),
         description: description.into(),
         author: author.into(),
@@ -32,6 +33,33 @@ fn node(
         bookmarks: bookmarks.iter().map(|b| b.to_string()).collect(),
         is_empty: false,
         has_conflict: false,
+        is_divergent: false,
+    }
+}
+
+/// One visible commit of a divergent change: keyed by its commit id (like
+/// the real backend), sharing `change_id` with its sibling copies.
+fn divergent_node(
+    change_id: &str,
+    commit_id: &str,
+    description: &str,
+    timestamp: &str,
+    parents: &[&str],
+) -> GraphNode {
+    GraphNode {
+        id: commit_id.into(),
+        change_id: change_id.into(),
+        is_divergent: true,
+        ..node(
+            change_id,
+            commit_id,
+            description,
+            "lauf",
+            timestamp,
+            NodeKind::Mutable,
+            parents,
+            &[],
+        )
     }
 }
 
@@ -845,6 +873,7 @@ fn spawn_working_copy(snapshot: &mut RepoSnapshot, parent: &str, index: usize) -
         0,
         GraphNode {
             id: new_id.clone(),
+            change_id: new_id.clone(),
             commit_id: format!("0e{index:02}4af9"),
             description: String::new(),
             author: "lauf".into(),
@@ -855,6 +884,7 @@ fn spawn_working_copy(snapshot: &mut RepoSnapshot, parent: &str, index: usize) -
             bookmarks: Vec::new(),
             is_empty: true,
             has_conflict: false,
+            is_divergent: false,
         },
     );
     set_working_copy(snapshot, &new_id);
@@ -886,7 +916,18 @@ fn spawn_working_copy(snapshot: &mut RepoSnapshot, parent: &str, index: usize) -
 
 fn remove_node(snapshot: &mut RepoSnapshot, id: &str) -> Option<GraphNode> {
     let position = snapshot.nodes.iter().position(|n| n.id == id)?;
-    Some(snapshot.nodes.remove(position))
+    let removed = snapshot.nodes.remove(position);
+    // Removing one copy of a divergent change can resolve the divergence.
+    // Mock approximation: the surviving copy keeps its commit-id-based `id`
+    // (the real backend re-keys it by change id on the next snapshot).
+    let mut siblings = snapshot
+        .nodes
+        .iter_mut()
+        .filter(|n| n.change_id == removed.change_id);
+    if let (Some(last), None) = (siblings.next(), siblings.next()) {
+        last.is_divergent = false;
+    }
+    Some(removed)
 }
 
 /// Children of a removed node adopt its parents in place.
@@ -991,6 +1032,23 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             &["uvkmrtpz"],
             &[],
         ),
+        // One change rewritten two ways (jj's `??` state): the same fix
+        // described from two terminals, both copies still visible. Nodes
+        // key by commit id; the change id is shared.
+        divergent_node(
+            "rzvqnkom",
+            "b41c77d0",
+            "fix: debounce watcher restarts",
+            "2026-06-09T18:26:00Z",
+            &["uvkmrtpz"],
+        ),
+        divergent_node(
+            "rzvqnkom",
+            "e93d5a12",
+            "fix: debounce watcher restarts (simpler timer)",
+            "2026-06-09T18:31:00Z",
+            &["uvkmrtpz"],
+        ),
         node(
             "uvkmrtpz",
             "e7c41a9f",
@@ -1051,6 +1109,24 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             bookmark: Some("conflict-inbox".into()),
             is_active: false,
             behind_trunk: 4,
+        },
+        // Each copy of the divergent change is its own head, so the
+        // first-mutable-parent walk yields one workstream per copy.
+        WorkstreamSummary {
+            id: "ws-e93d5a12".into(),
+            title: "fix: debounce watcher restarts (simpler timer)".into(),
+            node_ids: vec!["e93d5a12".into()],
+            bookmark: None,
+            is_active: false,
+            behind_trunk: 0,
+        },
+        WorkstreamSummary {
+            id: "ws-b41c77d0".into(),
+            title: "fix: debounce watcher restarts".into(),
+            node_ids: vec!["b41c77d0".into()],
+            bookmark: None,
+            is_active: false,
+            behind_trunk: 0,
         },
     ];
 
@@ -1185,6 +1261,7 @@ pub fn mock_change_detail(change_id: &str) -> Option<ChangeDetail> {
             ("src/lib/components/conflicts/ConflictList.svelte", Added),
             ("src/lib/components/conflicts/ConflictRow.svelte", Added),
         ],
+        "b41c77d0" | "e93d5a12" => &[("src/lib/state/watcher.ts", Modified)],
         "uvkmrtpz" => &[("CHANGELOG.md", Modified), ("package.json", Modified)],
         _ => return None,
     };
@@ -1567,6 +1644,46 @@ pub fn mock_change_diff(change_id: &str) -> Option<ChangeDiff> {
                 ]),
             ),
         ],
+        // The two copies of the divergent change: the same fix, written two
+        // ways — comparing them side by side is how a user picks a winner.
+        "b41c77d0" => vec![file(
+            "src/lib/state/watcher.ts",
+            FileStatus::Modified,
+            text(vec![hunk(
+                21,
+                21,
+                vec![
+                    line(Context, "export function scheduleRefresh(repo: string) {"),
+                    intraline(
+                        Removed,
+                        &[("  refresh(repo)", true), (";", false)],
+                    ),
+                    intraline(
+                        Added,
+                        &[("  debounce(() => refresh(repo), 400)", true), (";", false)],
+                    ),
+                    line(Context, "}"),
+                ],
+            )]),
+        )],
+        "e93d5a12" => vec![file(
+            "src/lib/state/watcher.ts",
+            FileStatus::Modified,
+            text(vec![hunk(
+                21,
+                21,
+                vec![
+                    line(Context, "export function scheduleRefresh(repo: string) {"),
+                    intraline(
+                        Removed,
+                        &[("  refresh(repo)", true), (";", false)],
+                    ),
+                    line(Added, "  clearTimeout(timer);"),
+                    line(Added, "  timer = setTimeout(() => refresh(repo), 400);"),
+                    line(Context, "}"),
+                ],
+            )]),
+        )],
         "uvkmrtpz" => vec![
             file(
                 "CHANGELOG.md",

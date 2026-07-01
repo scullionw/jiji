@@ -177,7 +177,19 @@ impl JjBackend {
                 target_change: Some(change_id.to_owned()),
             });
         }
+        // The change follows its rewritten commit: for a divergent change
+        // the node id is the commit id, which the rebase just replaced.
+        let target_change = match stats.rebased_commits.get(commit.id()) {
+            Some(jj_lib::rewrite::RebasedCommit::Rewritten(new_commit)) => {
+                Some(new_commit.clone())
+            }
+            _ => None,
+        };
         let new_repo = finish_mutation(&mut workspace, &repo, tx, op_description)?;
+        let target_change = match target_change {
+            Some(new_commit) => display_id(new_repo.as_ref(), &new_commit),
+            None => change_id.to_owned(),
+        };
 
         // In `Roots` scope every moved commit counts as a target, so the
         // descendant count is whatever moved beyond the change itself. In
@@ -208,7 +220,7 @@ impl JjBackend {
         Ok(MutationOutcome {
             operation_id: Some(short_operation_id(new_repo.op_id())),
             summary,
-            target_change: Some(change_id.to_owned()),
+            target_change: Some(target_change),
         })
     }
 }
@@ -303,7 +315,7 @@ impl RepoBackend for JjBackend {
         }
 
         let mut tx = repo.start_transaction();
-        pollster::block_on(
+        let new_commit = pollster::block_on(
             tx.repo_mut()
                 .rewrite_commit(&commit)
                 .set_description(&new_description)
@@ -319,7 +331,9 @@ impl RepoBackend for JjBackend {
         Ok(MutationOutcome {
             operation_id: Some(short_operation_id(new_repo.op_id())),
             summary: format!("Described {change_id}"),
-            target_change: Some(change_id.to_owned()),
+            // Recomputed rather than echoed: rewriting one side of a
+            // divergent change gives that node a fresh commit-id-based id.
+            target_change: Some(display_id(new_repo.as_ref(), &new_commit)),
         })
     }
 
@@ -389,7 +403,7 @@ impl RepoBackend for JjBackend {
             .store()
             .get_commit(&commit.parent_ids()[0])
             .map_err(snapshot_err)?;
-        let parent_id = short_change_id(repo.as_ref(), &parent);
+        let parent_id = display_id(repo.as_ref(), &parent);
 
         let mut tx = repo.start_transaction();
         tx.repo_mut().record_abandoned_commit(&commit);
@@ -432,7 +446,7 @@ impl RepoBackend for JjBackend {
             }
         };
         let parent = repo.store().get_commit(&parent_id).map_err(snapshot_err)?;
-        let parent_display = short_change_id(repo.as_ref(), &parent);
+        let parent_display = display_id(repo.as_ref(), &parent);
         check_mutable(&workspace, repo.as_ref(), &parent, &parent_display)?;
 
         let combined = combined_description(parent.description(), commit.description());
@@ -442,7 +456,7 @@ impl RepoBackend for JjBackend {
         // combined description; the child is abandoned, and descendants and
         // bookmarks follow through the shared rebase (bookmarks on the
         // squashed change land on the rewritten parent).
-        pollster::block_on(
+        let new_parent = pollster::block_on(
             tx.repo_mut()
                 .rewrite_commit(&parent)
                 .set_tree(commit.tree())
@@ -460,7 +474,9 @@ impl RepoBackend for JjBackend {
         Ok(MutationOutcome {
             operation_id: Some(short_operation_id(new_repo.op_id())),
             summary: format!("Squashed {change_id} into {parent_display}"),
-            target_change: Some(parent_display),
+            // The parent was rewritten; recompute its id in case its change
+            // is divergent (commit-id-keyed nodes move with the rewrite).
+            target_change: Some(display_id(new_repo.as_ref(), &new_parent)),
         })
     }
 
@@ -594,7 +610,7 @@ impl RepoBackend for JjBackend {
         let target_change = target
             .added_ids()
             .next()
-            .map(|id| short_change_id_of(repo.as_ref(), id))
+            .map(|id| display_id_of(repo.as_ref(), id))
             .transpose()?;
         if new_name == old_name {
             return Ok(MutationOutcome {
@@ -641,7 +657,7 @@ impl RepoBackend for JjBackend {
         let target_change = target
             .added_ids()
             .next()
-            .map(|id| short_change_id_of(repo.as_ref(), id))
+            .map(|id| display_id_of(repo.as_ref(), id))
             .transpose()?;
         let mut tx = repo.start_transaction();
         tx.repo_mut()
@@ -810,7 +826,7 @@ fn working_copy_change(
 ) -> Result<Option<String>, BackendError> {
     repo.view()
         .get_wc_commit_id(workspace.workspace_name())
-        .map(|id| short_change_id_of(repo.as_ref(), id))
+        .map(|id| display_id_of(repo.as_ref(), id))
         .transpose()
 }
 
@@ -892,10 +908,18 @@ fn build_snapshot(
         .map(|id| store.get_commit(id).map_err(snapshot_err))
         .collect::<Result<_, _>>()?;
 
-    // Short display ids, computed once per commit.
+    // Short display ids, computed once per commit. Commits of a divergent
+    // change key by commit id so every node id stays unique (`GraphNode::id`).
     let mut change_ids: HashMap<CommitId, String> = HashMap::new();
+    let mut divergent: HashSet<CommitId> = HashSet::new();
     for commit in mutable_commits.iter().chain(&base_commits) {
-        change_ids.insert(commit.id().clone(), short_change_id(repo_ref, commit));
+        let id = if is_divergent(repo_ref, commit) {
+            divergent.insert(commit.id().clone());
+            short_commit_id(repo_ref, commit.id())
+        } else {
+            short_change_id(repo_ref, commit)
+        };
+        change_ids.insert(commit.id().clone(), id);
     }
 
     let elided_links = elided_base_links(repo_ref, &base_commits, &change_ids);
@@ -911,7 +935,16 @@ fn build_snapshot(
             (commit, kind)
         }))
         .map(|(commit, kind)| {
-            graph_node(repo_ref, view, commit, kind, &trunk, &change_ids, &elided_links)
+            graph_node(
+                repo_ref,
+                view,
+                commit,
+                kind,
+                &trunk,
+                &change_ids,
+                &divergent,
+                &elided_links,
+            )
         })
         .collect();
 
@@ -966,54 +999,111 @@ fn build_snapshot(
     })
 }
 
-/// Snapshot node ids are shortened reverse-hex change ids; resolve the
-/// prefix back to a commit. A divergent change has several visible
-/// commits — taking the first is fine for read-only inspection.
+/// Snapshot node ids are shortened reverse-hex change ids — except for
+/// divergent changes, whose nodes key by forward-hex commit ids (see
+/// `GraphNode::id`). The alphabets are disjoint (k–z vs 0–9a–f), so an id
+/// string is unambiguously one or the other. The read path serves either:
+/// a divergent change id resolves to its first visible commit, which is
+/// fine for inspection the UI no longer relies on (divergent nodes always
+/// arrive here as commit ids).
 fn resolve_change_commit(
     repo: &Arc<ReadonlyRepo>,
     change_id: &str,
 ) -> Result<Commit, BackendError> {
     let missing = || BackendError::ChangeMissing(change_id.to_owned());
-    let prefix = HexPrefix::try_from_reverse_hex(change_id).ok_or_else(missing)?;
-    let commit_id = match repo
-        .as_ref()
-        .resolve_change_id_prefix(&prefix)
-        .map_err(snapshot_err)?
-    {
-        PrefixResolution::SingleMatch(targets) => targets
-            .visible_with_offsets()
-            .next()
-            .map(|(_, id)| id.clone()),
-        _ => None,
+    if let Some(prefix) = change_id_prefix(change_id) {
+        let commit_id = match repo
+            .as_ref()
+            .resolve_change_id_prefix(&prefix)
+            .map_err(snapshot_err)?
+        {
+            PrefixResolution::SingleMatch(targets) => targets
+                .visible_with_offsets()
+                .next()
+                .map(|(_, id)| id.clone()),
+            _ => None,
+        }
+        .ok_or_else(missing)?;
+        return repo.store().get_commit(&commit_id).map_err(snapshot_err);
     }
-    .ok_or_else(missing)?;
+    let commit_id = resolve_commit_id(repo, change_id)?.ok_or_else(missing)?;
     repo.store().get_commit(&commit_id).map_err(snapshot_err)
 }
 
-/// Like `resolve_change_commit`, but refuses divergent changes: rewriting
-/// one arbitrary side of a divergence would silently pick a winner.
+/// Like `resolve_change_commit`, but with the mutation rules: a change id
+/// that is divergent is refused (rewriting one arbitrary side would
+/// silently pick a winner), while an explicit commit id picks one side of
+/// a divergence deliberately — exactly how the CLI operates on divergent
+/// changes, and how they are resolved (abandon or rewrite one copy). One
+/// curated deviation: a commit id that is no longer visible (a stale
+/// snapshot's node after a rewrite) is refused, where the CLI would rewrite
+/// the hidden commit and *create* divergence — surprising from a GUI click.
 fn resolve_change_commit_for_mutation(
     repo: &Arc<ReadonlyRepo>,
     change_id: &str,
 ) -> Result<Commit, BackendError> {
     let missing = || BackendError::ChangeMissing(change_id.to_owned());
-    let prefix = HexPrefix::try_from_reverse_hex(change_id).ok_or_else(missing)?;
-    let targets = match repo
+    if let Some(prefix) = change_id_prefix(change_id) {
+        let targets = match repo
+            .as_ref()
+            .resolve_change_id_prefix(&prefix)
+            .map_err(snapshot_err)?
+        {
+            PrefixResolution::SingleMatch(targets) => targets,
+            _ => return Err(missing()),
+        };
+        let mut visible = targets.visible_with_offsets();
+        let commit_id = visible.next().map(|(_, id)| id.clone()).ok_or_else(missing)?;
+        if visible.next().is_some() {
+            return Err(BackendError::MutationFailed(format!(
+                "change {change_id} is divergent; pick one of its commits"
+            )));
+        }
+        return repo.store().get_commit(&commit_id).map_err(snapshot_err);
+    }
+    let commit_id = resolve_commit_id(repo, change_id)?.ok_or_else(missing)?;
+    let commit = repo.store().get_commit(&commit_id).map_err(snapshot_err)?;
+    let visible = repo
         .as_ref()
-        .resolve_change_id_prefix(&prefix)
+        .resolve_change_id(commit.change_id())
         .map_err(snapshot_err)?
-    {
-        PrefixResolution::SingleMatch(targets) => targets,
-        _ => return Err(missing()),
-    };
-    let mut visible = targets.visible_with_offsets();
-    let commit_id = visible.next().map(|(_, id)| id.clone()).ok_or_else(missing)?;
-    if visible.next().is_some() {
+        .is_some_and(|targets| targets.has_visible(commit.id()));
+    if !visible {
         return Err(BackendError::MutationFailed(format!(
-            "change {change_id} has divergent commits; resolve the divergence first"
+            "commit {change_id} has been rewritten; refresh and try again"
         )));
     }
-    repo.store().get_commit(&commit_id).map_err(snapshot_err)
+    Ok(commit)
+}
+
+/// Parses an id string as a reverse-hex change-id prefix. Returns `None`
+/// for forward-hex commit ids (and anything else), which resolve through
+/// `resolve_commit_id` instead. Empty strings parse as an empty prefix and
+/// resolve as ambiguous, so they fail cleanly either way.
+fn change_id_prefix(id: &str) -> Option<HexPrefix> {
+    if id.is_empty() {
+        return None;
+    }
+    HexPrefix::try_from_reverse_hex(id)
+}
+
+/// Resolves a forward-hex commit-id prefix, hidden commits included (like
+/// jj, which lets you inspect rewritten-away commits by id).
+fn resolve_commit_id(
+    repo: &Arc<ReadonlyRepo>,
+    id: &str,
+) -> Result<Option<CommitId>, BackendError> {
+    let Some(prefix) = (!id.is_empty()).then(|| HexPrefix::try_from_hex(id)).flatten() else {
+        return Ok(None);
+    };
+    match repo
+        .index()
+        .resolve_commit_id_prefix(&prefix)
+        .map_err(snapshot_err)?
+    {
+        PrefixResolution::SingleMatch(commit_id) => Ok(Some(commit_id)),
+        _ => Ok(None),
+    }
 }
 
 /// Parses and resolves the user's `immutable_heads()` revset alias. This is
@@ -1825,6 +1915,7 @@ fn graph_node(
     kind: NodeKind,
     trunk: &Option<TrunkRef>,
     change_ids: &HashMap<CommitId, String>,
+    divergent: &HashSet<CommitId>,
     elided_links: &HashMap<CommitId, Vec<String>>,
 ) -> GraphNode {
     let mut bookmarks: Vec<String> = view
@@ -1859,7 +1950,8 @@ fn graph_node(
         id: change_ids
             .get(commit.id())
             .cloned()
-            .unwrap_or_else(|| short_change_id(repo, commit)),
+            .unwrap_or_else(|| display_id(repo, commit)),
+        change_id: short_change_id(repo, commit),
         commit_id: short_commit_id(repo, commit.id()),
         description: commit.description().trim().to_owned(),
         author: author_name,
@@ -1870,6 +1962,7 @@ fn graph_node(
         bookmarks,
         is_empty,
         has_conflict: commit.has_conflict(),
+        is_divergent: divergent.contains(commit.id()),
     }
 }
 
@@ -2074,7 +2167,7 @@ fn build_bookmarks(
 
         bookmarks.push(BookmarkState {
             name: name.as_str().to_owned(),
-            target: short_change_id_for(repo, local_id, change_ids)?,
+            target: display_id_for(repo, local_id, change_ids)?,
             remote,
             sync,
             is_trunk: Some(name.as_str()) == trunk_name,
@@ -2088,7 +2181,7 @@ fn build_bookmarks(
         if !bookmarks.iter().any(|b| b.is_trunk) {
             bookmarks.push(BookmarkState {
                 name: trunk.name.clone(),
-                target: short_change_id_for(repo, &trunk.target, change_ids)?,
+                target: display_id_for(repo, &trunk.target, change_ids)?,
                 remote: trunk.remote.clone(),
                 sync: SyncState::Synced,
                 is_trunk: true,
@@ -2323,7 +2416,29 @@ fn short_change_id(repo: &dyn Repo, commit: &Commit) -> String {
     full[..len.min(full.len())].to_owned()
 }
 
-fn short_change_id_for(
+/// jj's `??` state: several visible commits share this commit's change id.
+/// Index errors report as not-divergent — anything genuinely broken fails
+/// the surrounding revset evaluation first.
+fn is_divergent(repo: &dyn Repo, commit: &Commit) -> bool {
+    repo.resolve_change_id(commit.change_id())
+        .ok()
+        .flatten()
+        .is_some_and(|targets| targets.is_divergent())
+}
+
+/// The id the UI addresses this commit by (`GraphNode::id`): its short
+/// change id, or its short commit id when the change is divergent — a
+/// divergent change id names several commits, so like the CLI Jiji falls
+/// back to commit ids for the individual copies.
+fn display_id(repo: &dyn Repo, commit: &Commit) -> String {
+    if is_divergent(repo, commit) {
+        short_commit_id(repo, commit.id())
+    } else {
+        short_change_id(repo, commit)
+    }
+}
+
+fn display_id_for(
     repo: &dyn Repo,
     commit_id: &CommitId,
     change_ids: &mut HashMap<CommitId, String>,
@@ -2332,16 +2447,16 @@ fn short_change_id_for(
         return Ok(existing.clone());
     }
     let commit = repo.store().get_commit(commit_id).map_err(snapshot_err)?;
-    let short = short_change_id(repo, &commit);
+    let short = display_id(repo, &commit);
     change_ids.insert(commit_id.clone(), short.clone());
     Ok(short)
 }
 
-/// Short change id for a commit id outside the snapshot's cache (bookmark
-/// targets resolved during a mutation).
-fn short_change_id_of(repo: &dyn Repo, commit_id: &CommitId) -> Result<String, BackendError> {
+/// Display id for a commit id outside the snapshot's cache (bookmark
+/// targets or the working copy resolved during a mutation).
+fn display_id_of(repo: &dyn Repo, commit_id: &CommitId) -> Result<String, BackendError> {
     let commit = repo.store().get_commit(commit_id).map_err(snapshot_err)?;
-    Ok(short_change_id(repo, &commit))
+    Ok(display_id(repo, &commit))
 }
 
 fn short_commit_id(repo: &dyn Repo, commit_id: &CommitId) -> String {
@@ -3882,6 +3997,106 @@ mod tests {
             err.to_string().contains("merges concurrent operations"),
             "got {err:?}"
         );
+    }
+
+    /// Rewrites the side commit in two concurrent operations — the classic
+    /// way divergence happens (two clients rewriting the same change) — and
+    /// returns the shared change id the copies display.
+    fn diverge_side_commit(root: &Path) -> String {
+        let settings = test_settings();
+        let workspace = Workspace::load(
+            &settings,
+            root,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head()).unwrap();
+        let snapshot = test_backend().open(root).unwrap();
+        let side_id = node_by_description(&snapshot, "wip: side experiment").id.clone();
+        let side = resolve_change_commit(&repo, &side_id).unwrap();
+
+        for (text, op) in [
+            ("wip: side experiment (tuned)", "describe side one way"),
+            ("wip: side experiment (rewritten)", "describe side the other way"),
+        ] {
+            let mut tx = repo.start_transaction();
+            pollster::block_on(
+                tx.repo_mut().rewrite_commit(&side).set_description(text).write(),
+            )
+            .unwrap();
+            pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+            pollster::block_on(tx.commit(op)).unwrap();
+        }
+        side_id
+    }
+
+    #[test]
+    fn divergent_change_surfaces_and_is_addressed_by_commit_id() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+        let change_id = diverge_side_commit(dir.path());
+
+        // Both visible copies render, sharing the change id but each keyed
+        // by its own forward-hex commit id, so every node id stays unique.
+        let snapshot = backend.open(dir.path()).unwrap();
+        let copies: Vec<&GraphNode> = snapshot.nodes.iter().filter(|n| n.is_divergent).collect();
+        assert_eq!(copies.len(), 2, "both copies drawn");
+        let (a, b) = (copies[0], copies[1]);
+        assert_eq!(a.change_id, change_id);
+        assert_eq!(b.change_id, change_id);
+        assert_ne!(a.id, b.id);
+        for copy in &copies {
+            assert_eq!(copy.id, copy.commit_id, "divergent nodes key by commit id");
+            assert!(copy.id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Everything else keeps the change-id key.
+        let wc = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.id == snapshot.working_copy)
+            .unwrap();
+        assert!(!wc.is_divergent);
+        assert_eq!(wc.id, wc.change_id);
+
+        // Each copy is separately inspectable through its commit id.
+        let diff = backend.change_diff(dir.path(), &a.id).unwrap();
+        assert_eq!(diff.id, a.id);
+
+        // Mutating by change id is ambiguous and refused; an explicit
+        // commit id picks one side, and the outcome follows the rewritten
+        // copy (its node id changed with the rewrite).
+        let err = backend.describe(dir.path(), &change_id, "pick me").unwrap_err();
+        assert!(err.to_string().contains("divergent"), "got {err:?}");
+        let outcome = backend
+            .describe(dir.path(), &a.id, "wip: side experiment (kept)")
+            .unwrap();
+        let after = backend.open(dir.path()).unwrap();
+        let target = outcome.target_change.unwrap();
+        let kept = after
+            .nodes
+            .iter()
+            .find(|n| n.id == target)
+            .expect("selection follows the rewritten copy");
+        assert!(kept.is_divergent, "still two visible copies");
+        assert_eq!(kept.description, "wip: side experiment (kept)");
+
+        // The rewritten-away commit id refuses mutations (a stale click
+        // must not resurrect a hidden commit and widen the divergence),
+        // while the read path still serves it, like `jj show`.
+        let err = backend.describe(dir.path(), &a.id, "too late").unwrap_err();
+        assert!(err.to_string().contains("rewritten"), "got {err:?}");
+        assert!(backend.change_diff(dir.path(), &a.id).is_ok());
+
+        // Abandoning the copy not wanted resolves the divergence: one
+        // visible commit again, keyed by its change id.
+        backend.abandon_change(dir.path(), &b.id).unwrap();
+        let resolved = backend.open(dir.path()).unwrap();
+        assert!(!resolved.nodes.iter().any(|n| n.is_divergent));
+        let survivor = node_by_description(&resolved, "wip: side experiment (kept)");
+        assert_eq!(survivor.id, change_id);
+        assert_eq!(survivor.change_id, change_id);
     }
 
     #[test]

@@ -604,6 +604,35 @@ mod tests {
     }
 
     #[test]
+    fn mock_divergent_pair_renders_and_resolves_by_abandon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+
+        let snapshot = backend.open(dir.path()).unwrap();
+        let copies: Vec<_> = snapshot.nodes.iter().filter(|n| n.is_divergent).collect();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].change_id, copies[1].change_id);
+        assert_ne!(copies[0].id, copies[1].id);
+        for copy in &copies {
+            assert_eq!(copy.id, copy.commit_id, "divergent nodes key by commit id");
+            assert!(
+                backend.change_diff(dir.path(), &copy.id).is_ok(),
+                "each copy is separately inspectable"
+            );
+        }
+
+        // Abandoning one copy settles the survivor's flag (its id stays
+        // commit-keyed — a documented mock approximation).
+        let (kept, dropped) = (copies[0].id.clone(), copies[1].id.clone());
+        backend.abandon_change(dir.path(), &dropped).unwrap();
+        let after = backend.open(dir.path()).unwrap();
+        assert!(!after.nodes.iter().any(|n| n.id == dropped));
+        let survivor = after.nodes.iter().find(|n| n.id == kept).unwrap();
+        assert!(!survivor.is_divergent);
+    }
+
+    #[test]
     fn compare_diff_combines_the_mock_span() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".jj")).unwrap();

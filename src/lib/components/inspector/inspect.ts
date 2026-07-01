@@ -174,6 +174,19 @@ export function resolveCompareFrom(
   }
 }
 
+// The other visible commit(s) of a divergent change, drawn-snapshot only.
+// Divergent nodes share `changeId` but key by commit id, so equality on the
+// change id finds the sibling copies.
+export function divergentSiblings(
+  snapshot: RepoSnapshot,
+  node: GraphNode,
+): GraphNode[] {
+  if (!node.isDivergent) return [];
+  return snapshot.nodes.filter(
+    (n) => n.changeId === node.changeId && n.id !== node.id,
+  );
+}
+
 // Bookmark states pointing at this node, trunk first. Richer than
 // `node.bookmarks`, which is names only.
 export function bookmarksAt(

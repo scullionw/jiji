@@ -76,7 +76,12 @@
     } else if (lightThemes.includes(themePref)) {
       pref = { mode: "light", dark: darkThemes[0], light: themePref };
     }
-    if (pref) localStorage.setItem("jiji-theme", JSON.stringify(pref));
+    if (pref) {
+      localStorage.setItem("jiji-theme", JSON.stringify(pref));
+      // Themes are a supporter perk; an unregistered copy boots to the
+      // default light palette, so presetting a theme implies registration.
+      localStorage.setItem("jiji-registered", "1");
+    }
   }
   const pane = params.get("pane");
   if (pane) localStorage.setItem("jiji.pane.graph", pane);
@@ -127,6 +132,7 @@
     spawnedIds.add(id);
     snap.nodes.unshift({
       id,
+      changeId: id,
       commitId: `0e${String(mutationIndex).padStart(2, "0")}4af9`,
       description: "",
       author: "harness",
@@ -137,6 +143,7 @@
       bookmarks: [],
       isEmpty: true,
       hasConflict: false,
+      isDivergent: false,
     });
     setWorkingCopy(snap, id);
     snap.workstreams.forEach((ws) => (ws.isActive = false));
@@ -195,6 +202,9 @@
           .filter((p, i, all) => all.indexOf(p) === i);
       }
     });
+    // Removing one copy of a divergent change can settle the survivor.
+    const copies = snap.nodes.filter((n) => n.changeId === node.changeId);
+    if (copies.length === 1) copies[0].isDivergent = false;
     snap.workstreams.forEach((ws) => {
       ws.nodeIds = ws.nodeIds.filter((n) => n !== id);
     });
@@ -667,7 +677,30 @@
         }
         case "plugin:event|listen":
           return Promise.resolve(0);
+        case "plugin:store|load":
+          // The path doubles as the resource id so gets can tell the
+          // license store from the recent-repos store.
+          return Promise.resolve(args?.path);
         case "plugin:store|get":
+          // The built site runs without dev-mode license simulation, so
+          // answer the license read like a registered copy — matching the
+          // dev default (themes unlocked) instead of the unregistered gate.
+          if (args?.rid === "license.json" && args?.key === "state") {
+            return Promise.resolve([
+              {
+                key: "JIJI-HARNESS",
+                activationId: "harness",
+                deviceId: "harness",
+                status: "granted",
+                plan: "personal",
+                limitActivations: null,
+                expiresAt: null,
+                registeredAt: 1765000000000,
+                lastValidatedAt: Date.now(),
+              },
+              true,
+            ]);
+          }
           return Promise.resolve([null, false]);
         default:
           return Promise.resolve(null);

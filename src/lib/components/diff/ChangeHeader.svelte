@@ -25,6 +25,7 @@
     childrenOf,
     combinedDescription,
     descendantsOf,
+    divergentSiblings,
     findNode,
     moveDirection,
     rebaseDestinations,
@@ -230,6 +231,11 @@
   const children = $derived(childrenOf(snapshot, node.id));
   const position = $derived(stackPosition(snapshot, node.id));
   const stats = $derived(files ? totalStats(files) : null);
+
+  // jj's ?? state: the other visible copies of this divergent change, for
+  // the callout's jump chips. Abandoning or rewriting the copies not wanted
+  // is how divergence resolves.
+  const siblings = $derived(divergentSiblings(snapshot, node));
 
   // Bookmark management: the Bookmark action opens a panel that creates a
   // new bookmark on the selection or moves an existing one here; clicking a
@@ -517,9 +523,20 @@
 <!-- The selection's details, docked compactly so the diff keeps the pane. -->
 <header class="change-header">
   <div class="row top">
-    <span class="ids mono selectable">
-      <b>{node.id.slice(0, 2)}</b>{node.id.slice(2)}
-    </span>
+    {#if node.isDivergent}
+      <span
+        class="ids mono selectable divergent"
+        title="Divergent change: several visible commits share this change id"
+        >{node.changeId}<b class="qq">??</b></span
+      >
+      <span class="ids mono selectable commit" title="This copy's commit id">
+        {node.commitId}
+      </span>
+    {:else}
+      <span class="ids mono selectable">
+        <b>{node.id.slice(0, 2)}</b>{node.id.slice(2)}
+      </span>
+    {/if}
     <span class="kind {node.kind}">{kindLabel}</span>
     {#if title}
       <h3 class="title truncate selectable" {title}>{title}</h3>
@@ -727,6 +744,26 @@
       </button>
     </div>
   </div>
+
+  {#if node.isDivergent}
+    <div class="divergence-note" role="note">
+      <span class="note-text">
+        Divergent change — {siblings.length + 1} visible commits share
+        <span class="mono">{node.changeId}</span>, so each copy goes by its
+        commit id. Keep one and abandon the
+        other{siblings.length === 1 ? "" : "s"} to resolve.
+      </span>
+      {#each siblings as sibling (sibling.id)}
+        <button
+          class="sibling-chip mono"
+          title={relationTitle(sibling.id, "copy")}
+          onclick={() => onjump(sibling.id)}
+        >
+          {sibling.commitId.slice(0, 8)}
+        </button>
+      {/each}
+    </div>
+  {/if}
 
   {#if compareNote}
     <p class="compare-note">{compareNote}</p>
@@ -1021,6 +1058,18 @@
             <li>The working copy restarts as a new empty change on its parent.</li>
           {:else if isWcOrAbove}
             <li>The working copy follows the rebase.</li>
+          {/if}
+          {#if siblings.length === 1}
+            <li>
+              Only commit <span class="mono">{siblings[0].commitId.slice(0, 8)}</span>
+              remains for <span class="mono">{node.changeId}</span> — the
+              divergence resolves.
+            </li>
+          {:else if siblings.length > 1}
+            <li>
+              {siblings.length} other copies of
+              <span class="mono">{node.changeId}</span> stay divergent.
+            </li>
           {/if}
         </ul>
         <div class="confirm-row">
@@ -1337,6 +1386,17 @@
 
   .ids b {
     color: var(--clr-accent-strong);
+    font-weight: 600;
+  }
+
+  /* jj's ?? state: the change id no longer names one commit, so it reads
+     alarmed and the commit id carries the identity. */
+  .ids.divergent,
+  .ids.divergent .qq {
+    color: var(--clr-danger);
+  }
+
+  .ids.divergent .qq {
     font-weight: 600;
   }
 
@@ -2139,6 +2199,41 @@
     font-size: var(--text-xs);
     color: var(--clr-text-3);
     font-style: italic;
+  }
+
+  /* The divergence callout: what happened, and jump chips to the other
+     visible copies of the change. */
+  .divergence-note {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    font-size: var(--text-s);
+    border-radius: var(--radius-m);
+    background: color-mix(in srgb, var(--clr-danger) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--clr-danger) 22%, transparent);
+    color: var(--clr-text-2);
+  }
+
+  .divergence-note .note-text .mono {
+    color: var(--clr-danger);
+  }
+
+  .sibling-chip {
+    flex-shrink: 0;
+    height: 18px;
+    padding: 0 8px;
+    font-size: var(--text-xs);
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--clr-danger) 30%, transparent);
+    color: var(--clr-danger);
+    transition: background var(--t-fast) var(--ease-out);
+  }
+
+  .sibling-chip:hover {
+    background: color-mix(in srgb, var(--clr-danger) 12%, transparent);
   }
 
   .preset-list {

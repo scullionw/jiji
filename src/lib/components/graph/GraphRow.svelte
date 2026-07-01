@@ -117,7 +117,18 @@
     </svg>
   </span>
 
-  <span class="id mono"><b>{node.id.slice(0, 2)}</b>{node.id.slice(2, 8)}</span>
+  {#if node.isDivergent}
+    <!-- jj's ?? state: the change id names several commits, so it renders
+         alarmed and the commit id becomes the row's real identity. -->
+    <span
+      class="id mono divergent"
+      title="Divergent change: several visible commits share {node.changeId} — this copy is commit {node.commitId}"
+      >{node.changeId.slice(0, 8)}<b class="qq">??</b></span
+    >
+    <span class="divergent-commit mono">{node.commitId.slice(0, 8)}</span>
+  {:else}
+    <span class="id mono"><b>{node.id.slice(0, 2)}</b>{node.id.slice(2, 8)}</span>
+  {/if}
 
   <span class="desc truncate" class:undescribed={!title}>
     {title || "No description yet"}
@@ -275,6 +286,23 @@
 
   .base .id b {
     color: var(--clr-text-2);
+  }
+
+  /* jj colors divergent change ids like an error: the id no longer names
+     one commit. */
+  .id.divergent,
+  .id.divergent .qq {
+    color: var(--clr-danger);
+  }
+
+  .id.divergent .qq {
+    font-weight: 600;
+  }
+
+  .divergent-commit {
+    flex-shrink: 0;
+    font-size: var(--text-s);
+    color: var(--clr-text-3);
   }
 
   .desc {
