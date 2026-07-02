@@ -71,6 +71,7 @@ function snapshot(
     bookmarks,
     conflicts: [],
     operations: [],
+    resolveTool: null,
   };
 }
 

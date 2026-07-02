@@ -11,7 +11,11 @@
     type CompareMode,
   } from "$lib/components/inspector/inspect";
   import { app } from "$lib/state/app.svelte";
-  import { consumeIntent } from "$lib/state/actions";
+  import { consumeIntent, resolveConflict } from "$lib/state/actions";
+  import {
+    canResolve,
+    mergeToolLabel,
+  } from "$lib/components/conflicts/conflicts";
   import ChangeHeader from "./ChangeHeader.svelte";
   import FileDiffCard from "./FileDiffCard.svelte";
   import type { DiffLayout } from "./diff";
@@ -125,6 +129,31 @@
     rewindowCards();
   }
 
+  // Resolve on conflicted file headers: hands the file to the external
+  // merge tool, same flow and waiting state as the conflict inbox. Only on
+  // the change's own diff — a comparison span can mark files conflicted at
+  // its endpoints, but the action rewrites the selection.
+  const resolveTool = $derived(
+    compareFrom === null && snapshot.resolveTool && canResolve(snapshot, node.id)
+      ? mergeToolLabel(snapshot.resolveTool)
+      : null,
+  );
+  let resolveError = $state<string | null>(null);
+
+  $effect(() => {
+    void node.id;
+    untrack(() => (resolveError = null));
+  });
+
+  async function resolveFile(path: string) {
+    resolveError = null;
+    try {
+      await resolveConflict(node.id, path);
+    } catch (error) {
+      resolveError = api.errorMessage(error);
+    }
+  }
+
   async function jumpToFile(index: number) {
     const path = current?.files[index]?.path;
     if (path && collapsedFiles.delete(path)) await tick();
@@ -151,6 +180,9 @@
     onjumpfile={jumpToFile}
     {onclose}
   />
+  {#if resolveError}
+    <p class="resolve-error" role="alert">{resolveError}</p>
+  {/if}
   <div class="scroller" bind:this={scroller} class:stale={slow && current}>
     {#if current}
       {#if current.files.length === 0}
@@ -173,6 +205,16 @@
             {layout}
             collapsed={collapsedFiles.has(file.path)}
             ontoggle={() => toggleFile(file.path)}
+            resolve={file.hasConflict && resolveTool
+              ? {
+                  tool: resolveTool,
+                  waiting:
+                    app.resolvingConflict?.changeId === node.id &&
+                    app.resolvingConflict?.path === file.path,
+                  disabled: app.resolvingConflict !== null,
+                }
+              : null}
+            onresolve={() => resolveFile(file.path)}
           />
         {/each}
         {#if current.truncated}
@@ -228,6 +270,15 @@
     padding: var(--sp-4);
     font-size: var(--text-s);
     color: var(--clr-warn);
+  }
+
+  .resolve-error {
+    flex-shrink: 0;
+    padding: var(--sp-2) var(--sp-4);
+    font-size: var(--text-s);
+    color: var(--clr-danger);
+    background: color-mix(in srgb, var(--clr-danger) 8%, transparent);
+    border-bottom: 1px solid var(--clr-border-2);
   }
 
   .skeleton {

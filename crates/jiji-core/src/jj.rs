@@ -14,8 +14,10 @@ use futures::StreamExt as _;
 use jj_lib::backend::{CommitId, Timestamp};
 use jj_lib::commit::Commit;
 use jj_lib::conflicts::{
-    materialized_diff_stream, ConflictMarkerStyle, ConflictMaterializeOptions,
-    MaterializedTreeValue,
+    choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
+    materialized_diff_stream, try_materialize_file_conflict_value, update_from_content,
+    ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue,
+    MIN_CONFLICT_MARKER_LEN,
 };
 use jj_lib::copies::{CopiesTreeDiffEntryPath, CopyOperation, CopyRecords};
 use jj_lib::diff_presentation::unified::{git_diff_part, unified_diff_hunks, DiffLineType};
@@ -25,7 +27,8 @@ use jj_lib::git::{self, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
 use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
 use jj_lib::hex_util;
 use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
-use jj_lib::merge::Diff as MergeDiff;
+use jj_lib::merge::{Diff as MergeDiff, Merge};
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
 use jj_lib::op_store::{OperationId, RefTarget, RemoteRefState, ViewId};
 use jj_lib::op_walk;
@@ -768,6 +771,202 @@ impl RepoBackend for JjBackend {
             target_change: working_copy_change(&workspace, &new_repo)?,
         })
     }
+
+    fn resolve_conflict(
+        &self,
+        path: &Path,
+        change_id: &str,
+        file_path: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        // Phase 1 — materialize the conflict, exactly like `jj resolve`
+        // starting up: sync, resolve the change, refuse immutable targets,
+        // and extract the conflict's sides.
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+        check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+        let tool = crate::merge_tool::resolve_merge_tool(workspace.settings())?;
+
+        let repo_path = RepoPath::from_internal_string(file_path).map_err(|err| {
+            BackendError::MutationFailed(format!("not a valid repository path: {err}"))
+        })?;
+        let tree = commit.tree();
+        let conflict = match tree.path_value(repo_path).map_err(snapshot_err)?.into_resolved() {
+            Err(conflict) => conflict,
+            Ok(Some(_)) => {
+                return Err(BackendError::MutationFailed(format!(
+                    "{file_path} has no conflict in {change_id}"
+                )))
+            }
+            Ok(None) => {
+                return Err(BackendError::MutationFailed(format!(
+                    "{file_path} does not exist in {change_id}"
+                )))
+            }
+        };
+        let file = pollster::block_on(try_materialize_file_conflict_value(
+            repo.store(),
+            repo_path,
+            &conflict,
+            tree.labels(),
+        ))
+        .map_err(snapshot_err)?
+        .ok_or_else(|| {
+            BackendError::MutationFailed(format!(
+                "the conflict in {file_path} involves something other than normal files \
+                 (a symlink or a deleted directory); resolve it from the CLI"
+            ))
+        })?;
+        // External tools present exactly one base and two sides.
+        if file.ids.num_sides() > 2 {
+            return Err(BackendError::MutationFailed(format!(
+                "the conflict in {file_path} has {} sides; external tools support at most 2 \
+                 — resolve it in steps from the CLI",
+                file.ids.num_sides()
+            )));
+        }
+        let Some(executable) = file.executable else {
+            return Err(BackendError::MutationFailed(format!(
+                "{file_path} has a conflict in its executable bit; resolve it from the CLI"
+            )));
+        };
+
+        // Marker length and the pre-populated output, mirroring the CLI:
+        // markers only for tools that edit them in place; the tool's marker
+        // style overrides `ui.conflict-marker-style`.
+        let uses_marker_length = tool.merge_args.iter().any(|arg| arg.contains("$marker_length"));
+        let marker_len = if tool.edits_conflict_markers || uses_marker_length {
+            choose_materialized_conflict_marker_len(&file.contents)
+        } else {
+            MIN_CONFLICT_MARKER_LEN
+        };
+        let initial_output = if tool.edits_conflict_markers {
+            let style = match tool.marker_style {
+                Some(style) => style,
+                None => workspace
+                    .settings()
+                    .get::<ConflictMarkerStyle>("ui.conflict-marker-style")
+                    .map_err(|err| {
+                        BackendError::ConfigInvalid(format!("ui.conflict-marker-style: {err}"))
+                    })?,
+            };
+            let options = ConflictMaterializeOptions {
+                marker_style: style,
+                marker_len: Some(marker_len),
+                merge: repo.store().merge_options().clone(),
+            };
+            materialize_merge_result_to_bytes(&file.contents, &file.labels, &options).into()
+        } else {
+            Vec::new()
+        };
+
+        // Phase 2 — hand off to the tool and wait. No transaction is open;
+        // the merge window can stay up for as long as the user needs.
+        let file_name = repo_path
+            .components()
+            .next_back()
+            .map(|name| name.as_internal_str().to_owned())
+            .unwrap_or_default();
+        let output = crate::merge_tool::run_merge_tool(
+            &tool,
+            &crate::merge_tool::MergeInput {
+                base: file.contents.get_remove(0).map(|c| c.as_slice()).unwrap_or_default(),
+                left: file.contents.get_add(0).map(|c| c.as_slice()).unwrap_or_default(),
+                right: file.contents.get_add(1).map(|c| c.as_slice()).unwrap_or_default(),
+                initial_output: &initial_output,
+                file_name: &file_name,
+                repo_path: file_path,
+                marker_len,
+            },
+        )?;
+
+        // Phase 3 — record the result. The repo may have moved while the
+        // merge window was open (the CLI blindly rewrites; Jiji re-reads):
+        // reload at the current head, follow the change id to its current
+        // commit, and refuse if the file itself changed underneath the tool.
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let commit = resolve_change_commit_for_mutation(&repo, change_id).map_err(|err| match err {
+            BackendError::ChangeMissing(id) => BackendError::MutationFailed(format!(
+                "{id} disappeared while the merge tool was open; nothing was recorded"
+            )),
+            err => err,
+        })?;
+        check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+        let tree = commit.tree();
+        let current_value = tree.path_value(repo_path).map_err(snapshot_err)?;
+        if current_value != conflict {
+            return Err(BackendError::MutationFailed(format!(
+                "{file_path} in {change_id} changed while the merge tool was open; \
+                 nothing was recorded — resolve it again"
+            )));
+        }
+
+        let store = repo.store().clone();
+        let new_file_ids = if tool.edits_conflict_markers || output.exit_implies_conflict {
+            // Remaining conflict markers parse back into a (possibly
+            // partially resolved) conflict.
+            pollster::block_on(update_from_content(
+                &file.unsimplified_ids,
+                &store,
+                repo_path,
+                &output.content,
+                marker_len,
+            ))
+            .map_err(mutation_err)?
+        } else {
+            let file_id =
+                pollster::block_on(store.write_file(repo_path, &mut output.content.as_slice()))
+                    .map_err(mutation_err)?;
+            Merge::normal(file_id)
+        };
+        // An exit code that promised conflict markers, but none parsed:
+        // most likely broken markers — treating it as resolved would lie.
+        if output.exit_implies_conflict && new_file_ids.is_resolved() {
+            return Err(BackendError::MutationFailed(format!(
+                "\u{201c}{}\u{201d} reported unresolved conflicts but left no valid conflict \
+                 markers in {file_path}; nothing was recorded",
+                tool.name
+            )));
+        }
+        let fully_resolved = new_file_ids.is_resolved();
+
+        let new_value = match new_file_ids.into_resolved() {
+            Ok(file_id) => Merge::resolved(file_id.map(|id| jj_lib::backend::TreeValue::File {
+                id,
+                executable,
+                copy_id: jj_lib::backend::CopyId::placeholder(),
+            })),
+            // Still conflicted: update the file ids, keep the rest of the
+            // conflict's shape (executable bits and such) as it was.
+            Err(file_ids) => conflict.with_new_file_ids(&file_ids),
+        };
+        let mut tree_builder = MergedTreeBuilder::new(tree);
+        tree_builder.set_or_remove(repo_path.to_owned(), new_value);
+        let new_tree = pollster::block_on(tree_builder.write_tree()).map_err(mutation_err)?;
+
+        let mut tx = repo.start_transaction();
+        let new_commit = pollster::block_on(
+            tx.repo_mut().rewrite_commit(&commit).set_tree(new_tree).write(),
+        )
+        .map_err(mutation_err)?;
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("Resolve conflicts in commit {}", commit.id().hex()),
+        )?;
+        let summary = if fully_resolved {
+            format!("Resolved {file_path} in {change_id}")
+        } else {
+            format!("Partially resolved {file_path} in {change_id} — conflicts remain")
+        };
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary,
+            target_change: Some(display_id(new_repo.as_ref(), &new_commit)),
+        })
+    }
 }
 
 /// Resolves an operation-id hex prefix — what `OperationItem.id` and
@@ -996,6 +1195,7 @@ fn build_snapshot(
         bookmarks,
         conflicts,
         operations,
+        resolve_tool: crate::merge_tool::available_tool_name(workspace.settings()),
     })
 }
 
@@ -4558,5 +4758,333 @@ mod tests {
         assert!(snapshot.operations[0].description.starts_with("describe commit"));
         assert_eq!(snapshot.operations[1].description, "import git refs");
         assert!(snapshot.bookmarks.iter().any(|b| b.name == "topic"));
+    }
+
+    /// A repo whose stack carries a real rebase conflict: `theirs` rebased
+    /// onto `ours` after both rewrote notes.txt, with a child on top that
+    /// never touched the file (it inherits the conflict). Returns
+    /// (ours, theirs, child) node ids.
+    fn build_conflicted_repo(root: &Path, backend: &JjBackend) -> (String, String, String) {
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, root)).unwrap();
+        let store = repo.store().clone();
+        let root_commit_id = store.root_commit_id().clone();
+        let mut tx = repo.start_transaction();
+        let base = write_commit_with_tree(
+            &mut tx,
+            vec![root_commit_id],
+            "base: shared notes",
+            file_tree(&store, &[("notes.txt", "base\n")]),
+        );
+        tx.repo_mut()
+            .set_local_bookmark_target(RefName::new("main"), RefTarget::normal(base.id().clone()));
+        let ours = write_commit_with_tree(
+            &mut tx,
+            vec![base.id().clone()],
+            "feat: ours",
+            file_tree(&store, &[("notes.txt", "ours\n")]),
+        );
+        let theirs = write_commit_with_tree(
+            &mut tx,
+            vec![base.id().clone()],
+            "feat: theirs",
+            file_tree(&store, &[("notes.txt", "theirs\n")]),
+        );
+        write_commit_with_tree(
+            &mut tx,
+            vec![theirs.id().clone()],
+            "docs: readme only",
+            file_tree(&store, &[("notes.txt", "theirs\n"), ("README.md", "hi\n")]),
+        );
+        pollster::block_on(tx.commit("set up conflicting siblings")).unwrap();
+
+        let before = backend.open(root).unwrap();
+        let ours_id = node_by_description(&before, "feat: ours").id.clone();
+        let theirs_id = node_by_description(&before, "feat: theirs").id.clone();
+        let child_id = node_by_description(&before, "docs: readme only").id.clone();
+        backend.rebase_change(root, &theirs_id, &ours_id).unwrap();
+        (ours_id, theirs_id, child_id)
+    }
+
+    /// Points the repo's `ui.merge-editor` at a fake tool: a shell script
+    /// with `body` (temp files arrive as `$1`=base `$2`=left `$3`=right
+    /// `$4`=output). The script lives outside the workspace so running it
+    /// never dirties the working copy. `tool_config` appends extra
+    /// `[merge-tools.fake]` keys.
+    fn install_fake_merge_tool(root: &Path, scratch: &Path, body: &str, tool_config: &str) {
+        let script = scratch.join("fake-merge-tool.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write_repo_config(
+            root,
+            &format!(
+                "ui.merge-editor = \"fake\"\n[merge-tools.fake]\nprogram = \"{}\"\n\
+                 merge-args = [\"$base\", \"$left\", \"$right\", \"$output\"]\n{tool_config}",
+                script.display()
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_conflict_records_the_tools_output_and_rebases_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let (_ours_id, theirs_id, child_id) = build_conflicted_repo(dir.path(), &backend);
+        // The tool sees all three sides read-only and saves a merge; the
+        // capture files pin what the temp files actually contained.
+        install_fake_merge_tool(
+            dir.path(),
+            scratch.path(),
+            &format!(
+                "cp \"$1\" {s}/got_base; cp \"$2\" {s}/got_left; cp \"$3\" {s}/got_right\n\
+                 printf 'merged\\n' > \"$4\"",
+                s = scratch.path().display()
+            ),
+            "",
+        );
+        let before = backend.open(dir.path()).unwrap();
+        assert_eq!(before.resolve_tool.as_deref(), Some("fake"));
+        assert_eq!(before.conflicts.len(), 2, "theirs and its child are conflicted");
+        let theirs_commit = node_by_description(&before, "feat: theirs").commit_id.clone();
+
+        let outcome = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, format!("Resolved notes.txt in {theirs_id}"));
+        assert_eq!(outcome.target_change.as_deref(), Some(theirs_id.as_str()));
+
+        // The tool got the real sides: the shared base and the two rewrites.
+        let read = |name: &str| std::fs::read_to_string(scratch.path().join(name)).unwrap();
+        assert_eq!(read("got_base"), "base\n");
+        let sides = [read("got_left"), read("got_right")];
+        assert!(sides.contains(&"ours\n".to_owned()), "sides: {sides:?}");
+        assert!(sides.contains(&"theirs\n".to_owned()), "sides: {sides:?}");
+
+        // The conflict is gone — and the child, which carried the inherited
+        // conflict in a file it never touched, auto-resolved through the
+        // descendant rebase (its side never diverged from the parent's).
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after.conflicts.is_empty(), "got {:?}", after.conflicts);
+        for id in [&theirs_id, &child_id] {
+            assert!(!after.nodes.iter().find(|n| &n.id == id).unwrap().has_conflict);
+        }
+        assert_eq!(
+            after.operations[0].description,
+            format!("Resolve conflicts in commit {}", full_commit_hex(&after, &theirs_commit)),
+        );
+        // The rewritten change now diffs as plain resolved content.
+        let diff = backend.change_diff(dir.path(), &theirs_id).unwrap();
+        let file = diff.files.iter().find(|f| f.path == "notes.txt").unwrap();
+        assert!(!file.has_conflict);
+        let FileDiffContent::Text { hunks, .. } = &file.content else {
+            panic!("expected text content");
+        };
+        let added: Vec<String> = hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind == DiffLineKind::Added)
+            .map(|l| l.segments.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        assert_eq!(added, vec!["merged"]);
+    }
+
+    /// The full commit hex for an operation-description assertion: the
+    /// snapshot only carries the short id, so match by prefix against the
+    /// recorded description.
+    fn full_commit_hex(snapshot: &RepoSnapshot, short_commit_id: &str) -> String {
+        let op = &snapshot.operations[0];
+        let hex = op
+            .description
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            hex.starts_with(short_commit_id),
+            "operation \u{201c}{}\u{201d} does not name commit {short_commit_id}",
+            op.description
+        );
+        hex
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_conflict_on_the_working_copy_updates_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let (_ours_id, theirs_id, _child_id) = build_conflicted_repo(dir.path(), &backend);
+        install_fake_merge_tool(dir.path(), scratch.path(), "printf 'merged\\n' > \"$4\"", "");
+
+        // Make the conflicted change the working copy: the conflict
+        // materializes into the file on disk as marker lines.
+        backend.edit_change(dir.path(), &theirs_id).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join("notes.txt")).unwrap();
+        assert!(on_disk.contains("<<<<<<<"), "markers materialized, got: {on_disk}");
+
+        let outcome = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+
+        // The rewritten working copy checked out: the disk has the merge.
+        let on_disk = std::fs::read_to_string(dir.path().join("notes.txt")).unwrap();
+        assert_eq!(on_disk, "merged\n");
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after.conflicts.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_conflict_parses_markers_left_by_editing_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let (_ours_id, theirs_id, _child_id) = build_conflicted_repo(dir.path(), &backend);
+        // A tool that edits conflict markers in place: `$output` arrives
+        // pre-populated with the materialized conflict; the tool appends a
+        // line and leaves the markers, i.e. resolves nothing but changes
+        // the file — a partial resolution.
+        install_fake_merge_tool(
+            dir.path(),
+            scratch.path(),
+            &format!(
+                "cp \"$4\" {s}/got_output; printf 'trailer\\n' >> \"$4\"",
+                s = scratch.path().display()
+            ),
+            "merge-tool-edits-conflict-markers = true\n",
+        );
+
+        let outcome = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(
+            outcome.summary,
+            format!("Partially resolved notes.txt in {theirs_id} — conflicts remain")
+        );
+
+        // The output really was pre-populated with markers, and the change
+        // still renders as conflicted afterwards.
+        let got = std::fs::read_to_string(scratch.path().join("got_output")).unwrap();
+        assert!(got.contains("<<<<<<<"), "pre-populated output, got: {got}");
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after
+            .conflicts
+            .iter()
+            .any(|c| c.node_id.as_deref() == Some(theirs_id.as_str())
+                && c.paths == vec!["notes.txt"]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_conflict_refusals_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let (ours_id, theirs_id, _child_id) = build_conflicted_repo(dir.path(), &backend);
+        let ops_before = backend.open(dir.path()).unwrap().operations.len();
+
+        // The tool was closed without completing (nonzero exit).
+        install_fake_merge_tool(dir.path(), scratch.path(), "exit 1", "");
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("closed without completing"), "got {err}");
+
+        // The tool exited fine but never wrote the output file.
+        install_fake_merge_tool(dir.path(), scratch.path(), "exit 0", "");
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("without saving"), "got {err}");
+
+        // Not a conflict / not a file / immutable target — refused before
+        // any tool launches.
+        install_fake_merge_tool(dir.path(), scratch.path(), "printf 'x\\n' > \"$4\"", "");
+        let err = backend
+            .resolve_conflict(dir.path(), &ours_id, "notes.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("has no conflict"), "got {err}");
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "missing.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got {err}");
+        let snapshot = backend.open(dir.path()).unwrap();
+        let base_id = node_by_description(&snapshot, "base: shared notes").id.clone();
+        let err = backend
+            .resolve_conflict(dir.path(), &base_id, "notes.txt")
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ImmutableChange(_)), "got {err:?}");
+
+        // Config that cannot run: a bare unknown tool name, and the CLI's
+        // builtin TUI editor Jiji cannot host. Both refuse without spawning.
+        write_repo_config(dir.path(), "ui.merge-editor = \"sometool\"\n");
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("merge-args"), "got {err}");
+        write_repo_config(dir.path(), "ui.merge-editor = \":builtin\"\n");
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap_err();
+        assert!(err.to_string().contains("Jiji cannot run"), "got {err}");
+        // A broken tool config also hides the snapshot's Resolve affordance
+        // instead of failing the snapshot.
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(snapshot.resolve_tool, None);
+
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(after.operations.len(), ops_before, "no operation recorded");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_conflict_refuses_when_the_file_changed_under_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let (_ours_id, theirs_id, _child_id) = build_conflicted_repo(dir.path(), &backend);
+        backend.edit_change(dir.path(), &theirs_id).unwrap();
+
+        // While the merge window is "open", the user also edits the
+        // conflicted file on disk. The post-tool sync snapshots that edit,
+        // so the conflict the tool resolved is no longer what the change
+        // holds — recording the tool's output would silently discard the
+        // manual edit. The CLI would clobber it; Jiji refuses.
+        install_fake_merge_tool(
+            dir.path(),
+            scratch.path(),
+            &format!(
+                "printf 'merged\\n' > \"$4\"\nprintf 'sneaky edit\\n' >> \"{}\"",
+                dir.path().join("notes.txt").display()
+            ),
+            "",
+        );
+        let err = backend
+            .resolve_conflict(dir.path(), &theirs_id, "notes.txt")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed while the merge tool was open"),
+            "got {err}"
+        );
+
+        // The manual edit survived — on disk and snapshotted into `@`.
+        let on_disk = std::fs::read_to_string(dir.path().join("notes.txt")).unwrap();
+        assert!(on_disk.contains("sneaky edit"));
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after.operations[0].is_snapshot, "the sneaky edit was snapshotted");
+        assert!(
+            after.conflicts.iter().any(|c| c.node_id.as_deref() == Some(theirs_id.as_str())),
+            "the conflict is still recorded"
+        );
     }
 }

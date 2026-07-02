@@ -113,6 +113,15 @@ export function restoreOperation(opId: string): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("restore_operation", { opId });
 }
 
+// Launches the external merge tool for one conflicted file and resolves
+// when the tool's window closes — this call can stay pending for minutes.
+export function resolveConflict(
+  changeId: string,
+  filePath: string,
+): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("resolve_conflict", { changeId, filePath });
+}
+
 export function onSnapshotUpdated(
   callback: (snapshot: RepoSnapshot) => void,
 ): Promise<UnlistenFn> {

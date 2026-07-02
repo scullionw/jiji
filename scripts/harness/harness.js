@@ -16,6 +16,11 @@
 //   &section=<name>      click a sidebar section (e.g. operations)
 //   &cgo=<conflictId>    click a conflict-inbox item (jump to its change)
 //   &ctarget=<changeId>  click a conflicted bookmark's candidate chip
+//   &resolve=<path>      click a Resolve button by conflicted path (inbox
+//                        card with section=conflicts, or diff file header
+//                        after click=<id>) and wait for the breadcrumb
+//   &resolvewait=1       the stubbed merge tool never returns: the click
+//                        settles into the "Waiting for …" state instead
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -689,6 +694,46 @@
             targetChange: snap.workingCopy,
           });
         }
+        case "resolve_conflict": {
+          // `resolvewait=1` keeps the call pending forever: the real command
+          // blocks while the external merge tool's window is open, and this
+          // is how the waiting state gets screenshotted.
+          if (params.get("resolvewait")) return new Promise(() => {});
+          const node = requireNode(snap, args?.changeId);
+          if (!node)
+            return reject(
+              "change_missing",
+              `Change ${args?.changeId} is not in the repository anymore`,
+            );
+          const path = args?.filePath;
+          const item = (snap.conflicts || []).find(
+            (c) =>
+              c.kind === "file" &&
+              c.nodeId === node.id &&
+              (c.paths || []).includes(path),
+          );
+          if (!item)
+            return reject(
+              "mutation_failed",
+              `${path} has no conflict in ${node.id}`,
+            );
+          // Mirror the Rust mock: the path leaves its item; an emptied item
+          // is done and its node stops rendering as conflicted.
+          item.paths = item.paths.filter((p) => p !== path);
+          if (item.paths.length === 0 && !item.morePaths) {
+            snap.conflicts = snap.conflicts.filter((c) => c !== item);
+            node.hasConflict = false;
+          }
+          const opId = pushOp(
+            snap,
+            `Resolve conflicts in commit ${node.commitId}`,
+          );
+          return Promise.resolve({
+            operationId: opId,
+            summary: `Resolved ${path} in ${node.id}`,
+            targetChange: node.id,
+          });
+        }
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -754,7 +799,27 @@
   if (collapse !== null) {
     steps.push(() => !document.querySelector(".diff-view .skeleton"));
     steps.push(() =>
-      click(`.diff-view .file[data-file-index="${collapse}"] .file-head`),
+      click(`.diff-view .file[data-file-index="${collapse}"] .head-toggle`),
+    );
+  }
+  // Resolve flows: click a Resolve button by its conflicted path — the
+  // inbox card's (section=conflicts) or the diff file header's (click=<id>
+  // first). Waits for the stubbed mutation's breadcrumb, or for the waiting
+  // state when resolvewait=1 keeps the fake tool open.
+  const resolvePath = params.get("resolve");
+  if (resolvePath) {
+    steps.push(() => {
+      const button = document.querySelector(
+        `.resolve[data-resolve-path="${resolvePath}"]`,
+      );
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    });
+    steps.push(() =>
+      params.get("resolvewait")
+        ? document.querySelector(".resolve.waiting") !== null
+        : document.querySelector(".breadcrumb") !== null,
     );
   }
   const open = params.get("open");

@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod jj;
+pub(crate) mod merge_tool;
 pub mod mock;
 pub mod settings;
 pub mod snapshot;

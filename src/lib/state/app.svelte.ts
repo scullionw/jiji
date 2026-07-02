@@ -55,6 +55,11 @@ export const app = $state({
   focusedWorkstreamId: null as string | null,
   // Breadcrumb for the most recent mutation; the status bar surfaces it.
   lastMutation: null as MutationBreadcrumb | null,
+  // The conflict currently handed to the external merge tool. Set for the
+  // whole time the tool's window is open, so every Resolve affordance (the
+  // inbox card and the diff header alike) shows the same waiting state and
+  // no second tool launches meanwhile.
+  resolvingConflict: null as { changeId: string; path: string } | null,
   // Command palette (⌘K), the keyboard route to every action.
   paletteOpen: false,
   // Pending palette request for another surface; see UiIntent.

@@ -377,3 +377,19 @@ pub fn restore_operation(
         backend.restore_operation(path, &op_id)
     })
 }
+
+/// Launches the external merge tool and blocks until its window closes —
+/// minutes, not milliseconds. `async` moves it off the main thread so the
+/// UI keeps rendering (and auto-refresh keeps running) while the merge
+/// window is open; every other command stays main-thread like before.
+#[tauri::command(async)]
+pub fn resolve_conflict(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    change_id: String,
+    file_path: String,
+) -> Result<MutationOutcome, CommandError> {
+    state.mutate(&app, |backend, path| {
+        backend.resolve_conflict(path, &change_id, &file_path)
+    })
+}

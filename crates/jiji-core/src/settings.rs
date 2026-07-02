@@ -37,7 +37,7 @@ pub enum UserConfigSource {
 /// settings from `misc.toml`. One curated deviation: `trunk()` falls back to
 /// a local main/master/trunk bookmark before `root()`, matching Jiji's
 /// display trunk on repos with no remotes. User layers override any of these.
-const DEFAULT_CONFIG: &str = r#"
+pub(crate) const DEFAULT_CONFIG: &str = r#"
 [revset-aliases]
 'trunk()' = '''
 latest(
@@ -67,6 +67,36 @@ latest(
 [snapshot]
 auto-track = 'all()'
 max-new-file-size = '1MiB'
+
+# 3-way merge tools for conflict resolution, mirroring the merge-relevant
+# entries of the jj CLI's merge_tools.toml (CLI-owned config jj-lib ships no
+# defaults for; pinned against jj 0.41). Only the fields the resolve flow
+# reads are included. User layers extend or override these per user or per
+# repo, exactly like the CLI; `ui.merge-editor` picks which one runs.
+[merge-tools.kdiff3]
+merge-args = ["$base", "$left", "$right", "-o", "$output", "--auto"]
+[merge-tools.meld]
+merge-args = ["$left", "$base", "$right", "-o", "$output", "--auto-merge"]
+[merge-tools.mergiraf]
+merge-args = ["merge", "$base", "$left", "$right", "-o", "$output", "-l", "$marker_length", "-p", "$path", "--fast"]
+merge-conflict-exit-codes = [1]
+[merge-tools.smerge]
+merge-args = ["mergetool", "$base", "$left", "$right", "-o", "$output"]
+conflict-marker-style = "git"
+[merge-tools.vimdiff]
+program = "vim"
+merge-args = ["-f", "-d", "$output", "-M", "$left", "$base", "$right", "-c", "wincmd J", "-c", "set modifiable", "-c", "set write", "-c", "/<<<<<</+2"]
+merge-tool-edits-conflict-markers = true
+[merge-tools.vscode]
+program = "code"
+merge-args = ["--wait", "--merge", "$left", "$right", "$base", "$output"]
+merge-tool-edits-conflict-markers = true
+conflict-marker-style = "git"
+[merge-tools.vscodium]
+program = "codium"
+merge-args = ["--wait", "--merge", "$left", "$right", "$base", "$output"]
+merge-tool-edits-conflict-markers = true
+conflict-marker-style = "git"
 "#;
 
 fn config_err(err: impl std::fmt::Display) -> BackendError {

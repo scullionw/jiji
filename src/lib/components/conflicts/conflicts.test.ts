@@ -3,7 +3,7 @@ import type { ConflictItem } from "$lib/bindings/ConflictItem";
 import type { GraphNode } from "$lib/bindings/GraphNode";
 import type { NodeKind } from "$lib/bindings/NodeKind";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
-import { groupConflicts } from "./conflicts";
+import { canResolve, groupConflicts, mergeToolLabel } from "./conflicts";
 
 function node(id: string, kind: NodeKind = "mutable"): GraphNode {
   return {
@@ -39,6 +39,7 @@ function snapshot(
   conflicts: ConflictItem[],
   nodes: GraphNode[] = [],
   workingCopy = "wc",
+  resolveTool: string | null = "smerge",
 ): RepoSnapshot {
   return {
     repoPath: "/tmp/repo",
@@ -52,6 +53,7 @@ function snapshot(
     bookmarks: [],
     conflicts,
     operations: [],
+    resolveTool,
   };
 }
 
@@ -101,5 +103,33 @@ describe("groupConflicts", () => {
 
   it("returns nothing for a conflict-free snapshot", () => {
     expect(groupConflicts(snapshot([]))).toEqual([]);
+  });
+});
+
+describe("mergeToolLabel", () => {
+  it("prettifies known tools and echoes unknown ones", () => {
+    expect(mergeToolLabel("smerge")).toBe("Sublime Merge");
+    expect(mergeToolLabel("vscode")).toBe("VS Code");
+    expect(mergeToolLabel("meld")).toBe("Meld");
+    expect(mergeToolLabel("my-house-tool")).toBe("my-house-tool");
+  });
+});
+
+describe("canResolve", () => {
+  it("requires a tool, a drawn node, and mutability", () => {
+    const nodes = [
+      node("wc", "workingCopy"),
+      node("mut"),
+      node("trunk", "immutable"),
+    ];
+    const snap = snapshot([], nodes);
+    expect(canResolve(snap, "wc")).toBe(true);
+    expect(canResolve(snap, "mut")).toBe(true);
+    expect(canResolve(snap, "trunk")).toBe(false);
+    expect(canResolve(snap, "gone")).toBe(false);
+    expect(canResolve(snap, null)).toBe(false);
+    // No usable merge tool configured: every affordance hides.
+    const untooled = snapshot([], nodes, "wc", null);
+    expect(canResolve(untooled, "mut")).toBe(false);
   });
 });

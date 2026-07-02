@@ -16,7 +16,11 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <name> --delete-bookmark
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --revert-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --restore-op
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --resolve <file-path>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo --watch
+//!
+//! `--resolve` launches the configured external merge tool (like the app's
+//! Resolve action) and blocks until it exits.
 //!
 //! `--watch` syncs (working-copy snapshot + git import), then keeps watching
 //! the repo and prints one line per auto-refresh until interrupted — the
@@ -119,6 +123,12 @@ fn main() {
         (Some(op_id), Some("--restore-op")) => backend
             .restore_operation(path, &op_id)
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),
+        (Some(change_id), Some("--resolve")) => {
+            let file = std::env::args().nth(4).expect("--resolve needs the file path");
+            backend
+                .resolve_conflict(path, &change_id, &file)
+                .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap())
+        }
         (Some(change_id), _) => backend
             .change_detail(path, &change_id)
             .map(|detail| serde_json::to_string_pretty(&detail).unwrap()),

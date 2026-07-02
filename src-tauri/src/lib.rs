@@ -36,7 +36,8 @@ pub fn run() {
             commands::rename_bookmark,
             commands::delete_bookmark,
             commands::revert_operation,
-            commands::restore_operation
+            commands::restore_operation,
+            commands::resolve_conflict
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

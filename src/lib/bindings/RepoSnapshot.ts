@@ -19,4 +19,11 @@ workingCopy: string, workspaces: Array<WorkspaceSummary>, workstreams: Array<Wor
 /**
  * Newest first.
  */
-operations: Array<OperationItem>, };
+operations: Array<OperationItem>, 
+/**
+ * The external merge tool a Resolve action would launch, by its
+ * configured name ("smerge", "meld", …): the user's `ui.merge-editor`,
+ * or Sublime Merge when nothing is configured and it is installed.
+ * `None` hides Resolve affordances — no usable tool is configured.
+ */
+resolveTool: string | null, };

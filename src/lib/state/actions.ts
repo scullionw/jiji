@@ -154,6 +154,22 @@ export function deleteBookmark(name: string): Promise<MutationOutcome> {
   return runMutation(() => api.deleteBookmark(name));
 }
 
+// Hands one conflicted file to the external merge tool and waits for the
+// tool's window to close. `app.resolvingConflict` stays set the whole time
+// so every Resolve affordance shows the waiting state; errors propagate to
+// the initiating surface like every other mutation.
+export async function resolveConflict(
+  changeId: string,
+  path: string,
+): Promise<MutationOutcome> {
+  app.resolvingConflict = { changeId, path };
+  try {
+    return await runMutation(() => api.resolveConflict(changeId, path));
+  } finally {
+    app.resolvingConflict = null;
+  }
+}
+
 export function revertOperation(opId: string): Promise<MutationOutcome> {
   return runMutation(() => api.revertOperation(opId));
 }

@@ -240,6 +240,25 @@ pub trait RepoBackend: Send + Sync {
     /// `revert_operation`.
     fn restore_operation(&self, path: &Path, op_id: &str)
         -> Result<MutationOutcome, BackendError>;
+
+    /// Resolve one conflicted file by launching the configured external
+    /// 3-way merge tool and waiting for it to exit (`jj resolve <path> -r
+    /// <rev>` with `ui.merge-editor` semantics; Sublime Merge is the
+    /// default when nothing is configured and it is installed —
+    /// `RepoSnapshot::resolve_tool` names what will run). The tool's saved
+    /// output rewrites the change through the shared mutation plumbing;
+    /// descendants rebase and a rewritten working copy is checked out, so
+    /// resolving `@` updates the file on disk. Blocks for as long as the
+    /// merge window stays open. One curated deviation from the CLI: the
+    /// conflict is re-read after the tool exits, and if the change moved or
+    /// the file changed underneath the open tool the resolution is refused
+    /// ("resolve again") instead of rewriting stale state.
+    fn resolve_conflict(
+        &self,
+        path: &Path,
+        change_id: &str,
+        file_path: &str,
+    ) -> Result<MutationOutcome, BackendError>;
 }
 
 /// Deterministic mock backend, kept for UI development against stable data
@@ -508,6 +527,21 @@ impl RepoBackend for MockBackend {
             },
         )
     }
+
+    fn resolve_conflict(
+        &self,
+        path: &Path,
+        change_id: &str,
+        file_path: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::Resolve {
+                id: change_id.to_owned(),
+                path: file_path.to_owned(),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +664,44 @@ mod tests {
         assert!(!after.nodes.iter().any(|n| n.id == dropped));
         let survivor = after.nodes.iter().find(|n| n.id == kept).unwrap();
         assert!(!survivor.is_divergent);
+    }
+
+    #[test]
+    fn mock_resolve_settles_one_conflict_item_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+        assert_eq!(before.resolve_tool.as_deref(), Some("smerge"));
+        let path = "src/lib/components/conflicts/ConflictList.svelte";
+
+        // Wrong paths and clean changes refuse like the real backend.
+        let err = backend
+            .resolve_conflict(dir.path(), "pmwzqkvt", "nope.txt")
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+
+        let outcome = backend.resolve_conflict(dir.path(), "pmwzqkvt", path).unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, format!("Resolved {path} in pmwzqkvt"));
+
+        // The parent's item settled and its node reads clean; the child
+        // still carries its inherited copy until resolved itself.
+        let after = backend.open(dir.path()).unwrap();
+        assert!(!after
+            .conflicts
+            .iter()
+            .any(|c| c.node_id.as_deref() == Some("pmwzqkvt")));
+        assert!(!after.nodes.iter().find(|n| n.id == "pmwzqkvt").unwrap().has_conflict);
+        assert!(after
+            .conflicts
+            .iter()
+            .any(|c| c.node_id.as_deref() == Some("qvlxnsry") && c.kind == crate::snapshot::ConflictKind::File));
+        assert!(after.operations[0].description.starts_with("Resolve conflicts in commit"));
+
+        // Resolving the already-settled path now refuses.
+        let err = backend.resolve_conflict(dir.path(), "pmwzqkvt", path).unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
     }
 
     #[test]

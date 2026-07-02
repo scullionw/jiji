@@ -79,6 +79,7 @@ pub enum MockMutation {
     DeleteBookmark { name: String },
     RevertOp { op_id: String },
     RestoreOp { op_id: String },
+    Resolve { id: String, path: String },
 }
 
 impl MockMutation {
@@ -379,6 +380,21 @@ pub fn mutation_outcome(
                 summary: format!("Restored to {}", op_label(op)),
                 target_change: None,
             })
+        }
+        MockMutation::Resolve { id, path } => {
+            let node = find(id)?;
+            require_mutable(node)?;
+            let listed = snapshot.conflicts.iter().any(|item| {
+                item.kind == ConflictKind::File
+                    && item.node_id.as_deref() == Some(id.as_str())
+                    && item.paths.iter().any(|p| p == path)
+            });
+            if !listed {
+                return Err(BackendError::MutationFailed(format!(
+                    "{path} has no conflict in {id}"
+                )));
+            }
+            Ok(recorded(format!("Resolved {path} in {id}"), id))
         }
     }
 }
@@ -767,6 +783,44 @@ pub fn apply_mutation(
                 }],
             );
         }
+        MockMutation::Resolve { id, path } => {
+            // The resolved path leaves its inbox item; an item with no paths
+            // left is done, and its node stops rendering as conflicted. Only
+            // the targeted item settles — an ancestor's copy of the same
+            // conflict stays until resolved itself, like the real backend.
+            // (Fixture diffs still show the old marker content — a documented
+            // mock approximation, they are static fixtures.)
+            let commit = snapshot
+                .nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .map(|n| n.commit_id.clone())
+                .unwrap_or_default();
+            let mut settled = false;
+            snapshot.conflicts.retain_mut(|item| {
+                if item.kind != ConflictKind::File || item.node_id.as_deref() != Some(id.as_str())
+                {
+                    return true;
+                }
+                item.paths.retain(|p| p != path);
+                if item.paths.is_empty() && item.more_paths == 0 {
+                    settled = true;
+                    return false;
+                }
+                true
+            });
+            if settled {
+                if let Some(node) = snapshot.nodes.iter_mut().find(|n| n.id == *id) {
+                    node.has_conflict = false;
+                }
+            }
+            push_op(
+                snapshot,
+                index,
+                format!("Resolve conflicts in commit {commit}"),
+                vec![],
+            );
+        }
     }
 }
 
@@ -816,6 +870,9 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
         MockMutation::DeleteBookmark { name } => format!("delete bookmark {name}"),
         MockMutation::RevertOp { op_id } => format!("revert operation {op_id}"),
         MockMutation::RestoreOp { op_id } => format!("restore to operation {op_id}"),
+        MockMutation::Resolve { id, .. } => {
+            format!("Resolve conflicts in commit {}", commit_of(id))
+        }
     }
 }
 
@@ -1273,6 +1330,9 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         bookmarks,
         conflicts: mock_conflicts(),
         operations,
+        // The fabricated machine has Sublime Merge installed, so every
+        // Resolve affordance renders (the stub/harness replay the mutation).
+        resolve_tool: Some("smerge".into()),
     }
 }
 

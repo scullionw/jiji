@@ -23,12 +23,19 @@
     layout = "unified",
     collapsed = false,
     ontoggle,
+    resolve = null,
+    onresolve,
   }: {
     file: FileDiff;
     index: number;
     layout?: DiffLayout;
     collapsed?: boolean;
     ontoggle?: () => void;
+    /// Renders the Resolve action on a conflicted file's header: which
+    /// external tool will open, whether this file is the one the tool is
+    /// currently holding, and whether launching another is blocked.
+    resolve?: { tool: string; waiting: boolean; disabled: boolean } | null;
+    onresolve?: () => void;
   } = $props();
 
   const STATUS_GLYPH: Record<FileStatus, string> = {
@@ -156,37 +163,52 @@
      change header while the file's lines scroll by, and doubles as the
      collapse toggle for the file's body. -->
 <section class="file" data-file-index={index} data-path={file.path}>
-  <button
-    type="button"
-    class="file-head"
-    aria-expanded={!collapsed}
-    onclick={ontoggle}
-  >
-    <span class="chev" class:open={!collapsed}>
-      <Icon name="chevronRight" size={12} />
-    </span>
-    <span class="status {file.status}">{STATUS_GLYPH[file.status]}</span>
-    <span
-      class="path mono"
-      title={file.renamedFrom ? `${file.renamedFrom} → ${file.path}` : file.path}
+  <div class="file-head">
+    <button
+      type="button"
+      class="head-toggle"
+      aria-expanded={!collapsed}
+      onclick={ontoggle}
     >
-      {#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<span
-        class="fname"
-        class:gone={file.status === "removed"}>{parts.name}</span>
-    </span>
-    {#if file.renamedFrom}
-      <span class="from mono truncate">← {file.renamedFrom}</span>
-    {/if}
-    {#if file.hasConflict}
-      <span class="conflict-chip">conflict</span>
-    {/if}
-    {#if stats.added > 0 || stats.removed > 0}
-      <span class="stats mono">
-        {#if stats.added > 0}<span class="add">+{stats.added}</span>{/if}
-        {#if stats.removed > 0}<span class="del">−{stats.removed}</span>{/if}
+      <span class="chev" class:open={!collapsed}>
+        <Icon name="chevronRight" size={12} />
       </span>
+      <span class="status {file.status}">{STATUS_GLYPH[file.status]}</span>
+      <span
+        class="path mono"
+        title={file.renamedFrom ? `${file.renamedFrom} → ${file.path}` : file.path}
+      >
+        {#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<span
+          class="fname"
+          class:gone={file.status === "removed"}>{parts.name}</span>
+      </span>
+      {#if file.renamedFrom}
+        <span class="from mono truncate">← {file.renamedFrom}</span>
+      {/if}
+      {#if file.hasConflict}
+        <span class="conflict-chip">conflict</span>
+      {/if}
+      {#if stats.added > 0 || stats.removed > 0}
+        <span class="stats mono">
+          {#if stats.added > 0}<span class="add">+{stats.added}</span>{/if}
+          {#if stats.removed > 0}<span class="del">−{stats.removed}</span>{/if}
+        </span>
+      {/if}
+    </button>
+    {#if file.hasConflict && resolve}
+      <button
+        type="button"
+        class="resolve"
+        class:waiting={resolve.waiting}
+        disabled={resolve.disabled}
+        data-resolve-path={file.path}
+        title="Open the 3-way merge in {resolve.tool} and record the saved result"
+        onclick={onresolve}
+      >
+        {resolve.waiting ? `Waiting for ${resolve.tool}…` : `Resolve in ${resolve.tool}`}
+      </button>
     {/if}
-  </button>
+  </div>
 
   {#if !collapsed}
     {#if text}
@@ -295,15 +317,58 @@
     gap: var(--sp-2);
     width: 100%;
     min-width: 0;
-    padding: 5px var(--sp-4) 5px var(--sp-3);
+    padding-right: var(--sp-4);
     background: var(--clr-bg-1);
     border-bottom: 1px solid var(--clr-border-2);
     box-shadow: var(--shadow-edge);
+  }
+
+  /* The whole left run of the header stays the collapse toggle; actions
+     like Resolve sit beside it rather than nesting buttons. */
+  .head-toggle {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
+    padding: 5px 0 5px var(--sp-3);
     text-align: left;
   }
 
   .file-head:hover {
     background: var(--clr-bg-2);
+  }
+
+  .resolve {
+    flex-shrink: 0;
+    font-size: var(--text-xs);
+    font-family: var(--font-ui);
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--clr-border-2);
+    background: var(--clr-bg-3);
+    color: var(--clr-text-2);
+    transition:
+      background var(--t-fast) var(--ease-out),
+      border-color var(--t-fast) var(--ease-out),
+      color var(--t-fast) var(--ease-out);
+  }
+
+  .resolve:hover:not(:disabled) {
+    background: var(--clr-accent-dim);
+    border-color: color-mix(in srgb, var(--clr-accent) 40%, transparent);
+    color: var(--clr-accent-strong);
+  }
+
+  .resolve:disabled {
+    opacity: 0.55;
+  }
+
+  .resolve.waiting {
+    opacity: 1;
+    color: var(--clr-accent-strong);
+    border-color: color-mix(in srgb, var(--clr-accent) 40%, transparent);
+    background: var(--clr-accent-dim);
   }
 
   .chev {

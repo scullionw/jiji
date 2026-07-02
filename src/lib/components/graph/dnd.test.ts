@@ -35,6 +35,7 @@ function snapshot(nodes: GraphNode[], workingCopy = ""): RepoSnapshot {
     bookmarks: [],
     conflicts: [],
     operations: [],
+    resolveTool: null,
   };
 }
 

@@ -86,3 +86,33 @@ export function groupConflicts(snapshot: RepoSnapshot): ConflictGroup[] {
     .filter((key) => buckets.has(key))
     .map((key) => ({ key, ...GROUP_COPY[key], items: buckets.get(key)! }));
 }
+
+// Display names for the merge tools whose configs ship embedded (plus the
+// obvious spellings users configure themselves); anything unknown shows its
+// configured name verbatim, which is what the user typed into their config.
+const TOOL_LABELS: Record<string, string> = {
+  smerge: "Sublime Merge",
+  meld: "Meld",
+  kdiff3: "KDiff3",
+  mergiraf: "Mergiraf",
+  vimdiff: "Vim",
+  vscode: "VS Code",
+  vscodium: "VSCodium",
+};
+
+export function mergeToolLabel(tool: string): string {
+  return TOOL_LABELS[tool] ?? tool;
+}
+
+// Whether a Resolve affordance should render for a conflicted file in this
+// change: a usable merge tool exists and the change is drawn and mutable
+// (resolving rewrites the change, so immutable conflicts get no button —
+// same rule the actions row applies to rewrites).
+export function canResolve(
+  snapshot: RepoSnapshot,
+  nodeId: string | null,
+): boolean {
+  if (!snapshot.resolveTool || !nodeId) return false;
+  const node = snapshot.nodes.find((n) => n.id === nodeId);
+  return node !== undefined && node.kind !== "immutable";
+}
