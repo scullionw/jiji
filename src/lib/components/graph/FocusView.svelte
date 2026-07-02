@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { flip } from "svelte/animate";
+  import { cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
   import GraphRow from "./GraphRow.svelte";
@@ -65,18 +67,22 @@
     </header>
 
     <div class="rows">
+      <!-- Keyed by change id like the graph view, so an applied reorder
+           slides rows to their new place. -->
       {#each chainRows as row (row.type === "node" ? row.node.id : row.id)}
-        {#if row.type === "node"}
-          <GraphRow
-            {row}
-            columnCount={model.graph.columnCount}
-            emphasized={workstream.id}
-            selected={selectedId === row.node.id}
-            onselect={() => onselect(row.node.id)}
-          />
-        {:else}
-          <ElisionRow {row} columnCount={model.graph.columnCount} emphasized={workstream.id} />
-        {/if}
+        <div animate:flip={{ duration: 220, easing: cubicOut }}>
+          {#if row.type === "node"}
+            <GraphRow
+              {row}
+              columnCount={model.graph.columnCount}
+              emphasized={workstream.id}
+              selected={selectedId === row.node.id}
+              onselect={() => onselect(row.node.id)}
+            />
+          {:else}
+            <ElisionRow {row} columnCount={model.graph.columnCount} emphasized={workstream.id} />
+          {/if}
+        </div>
       {/each}
     </div>
 

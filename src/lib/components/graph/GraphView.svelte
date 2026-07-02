@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { flip } from "svelte/animate";
+  import { cubicOut } from "svelte/easing";
   import GraphRow from "./GraphRow.svelte";
   import ElisionRow from "./ElisionRow.svelte";
   import type { GraphModel } from "./graph";
@@ -17,19 +19,23 @@
   } = $props();
 </script>
 
+<!-- Change ids survive rewrites, so keyed rows carry over a rebase and the
+     flip shows work sliding to its new place instead of teleporting. -->
 <div class="graph" role="listbox" aria-label="Change graph">
   {#each model.rows as row (row.type === "node" ? row.node.id : row.id)}
-    {#if row.type === "node"}
-      <GraphRow
-        {row}
-        columnCount={model.columnCount}
-        {emphasized}
-        selected={selectedId === row.node.id}
-        onselect={() => onselect(row.node.id)}
-      />
-    {:else}
-      <ElisionRow {row} columnCount={model.columnCount} {emphasized} />
-    {/if}
+    <div animate:flip={{ duration: 220, easing: cubicOut }}>
+      {#if row.type === "node"}
+        <GraphRow
+          {row}
+          columnCount={model.columnCount}
+          {emphasized}
+          selected={selectedId === row.node.id}
+          onselect={() => onselect(row.node.id)}
+        />
+      {:else}
+        <ElisionRow {row} columnCount={model.columnCount} {emphasized} />
+      {/if}
+    </div>
   {/each}
 </div>
 

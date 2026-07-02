@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from "$lib/components/ui/Icon.svelte";
   import { shortAge } from "$lib/time";
+  import { drag } from "./dnd.svelte";
   import {
     gutterWidth,
     railX,
@@ -62,12 +63,23 @@
   // Immutable bases keep history below them; a dashed stub hands the rail
   // off to the elision row underneath.
   const stubBelow = $derived(isBase && row.edgesOut.length === 0);
+
+  // Drag-and-drop reads the shared session directly, so the same states
+  // light up wherever this row renders (graph or focus view): the row in
+  // hand dims, the row under the pointer answers as the prospective new
+  // parent — or as a refused target.
+  const isDragSource = $derived(drag.active && drag.sourceId === node.id);
+  const isDropTarget = $derived(drag.active && drag.targetId === node.id);
+  const dropOk = $derived(isDropTarget && drag.plan?.allowed === true);
 </script>
 
 <button
   class="row {tone}"
   class:selected
   class:base={isBase}
+  class:drag-source={isDragSource}
+  class:drop-ok={dropOk}
+  class:drop-no={isDropTarget && !dropOk}
   data-node-id={node.id}
   data-kind={node.kind}
   data-stream={row.stream}
@@ -193,6 +205,26 @@
   .row.selected {
     background: color-mix(in srgb, var(--clr-accent) 9%, transparent);
     box-shadow: inset 2px 0 0 var(--clr-accent);
+  }
+
+  /* Mutable rows are objects you can pick up. */
+  .row:not(.base) {
+    cursor: grab;
+  }
+
+  .row.drag-source {
+    opacity: 0.4;
+  }
+
+  /* The prospective new parent under the pointer. */
+  .row.drop-ok {
+    background: color-mix(in srgb, var(--clr-accent) 13%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--clr-accent) 60%, transparent);
+  }
+
+  .row.drop-no {
+    background: color-mix(in srgb, var(--clr-danger) 7%, transparent);
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--clr-danger) 32%, transparent);
   }
 
   .gutter {

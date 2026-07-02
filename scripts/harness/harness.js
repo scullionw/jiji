@@ -57,6 +57,12 @@
 //                        the deterministic ids ad00…, ad01…)
 //   &undo=1              click the breadcrumb's Undo and wait for the
 //                        revert breadcrumb to land
+//   &drag=<changeId>     press that graph row and start dragging it
+//   &dragto=<changeId>   drag over that row (plan card + target ring show)
+//   &dragalt=1           hold ⌥ through the drag (move-alone scope)
+//   &drop=1              release over the dragto row and wait for the
+//                        stubbed rebase/move breadcrumb (omit for refused
+//                        targets — they record nothing)
 //   &expand=1            open the first collapsed snapshot run (operations)
 //   &scroll=<px>         scroll the main content scroller vertically
 //   &scrollx=<px>        scroll diff code horizontally (every file)
@@ -852,6 +858,50 @@
     // Wait for the stubbed mutation round-trip: the breadcrumb appears in
     // the status bar once the refreshed snapshot lands.
     steps.push(() => document.querySelector(".breadcrumb") !== null);
+  }
+  // Row drag-and-drop, driven with synthetic PointerEvents: the controller
+  // reads coordinates (elementFromPoint), not event targets, so dispatching
+  // pointermove/up on window with real clientX/Y behaves like a real drag.
+  const dragId = params.get("drag");
+  const dragTo = params.get("dragto");
+  if (dragId && dragTo) {
+    const alt = params.get("dragalt") === "1";
+    const center = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    };
+    const pev = (type, target, pos) =>
+      target.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          pointerId: 1,
+          isPrimary: true,
+          button: 0,
+          buttons: type === "pointerup" ? 0 : 1,
+          clientX: pos.x,
+          clientY: pos.y,
+          altKey: alt,
+        }),
+      );
+    steps.push(() => {
+      const source = document.querySelector(`[data-node-id="${dragId}"]`);
+      const target = document.querySelector(`[data-node-id="${dragTo}"]`);
+      if (!source || !target) return false;
+      pev("pointerdown", source, center(source));
+      pev("pointermove", window, center(target));
+      return true;
+    });
+    // The plan card confirms the drag session is live before any release.
+    steps.push(() => document.querySelector(".drag-card") !== null);
+    if (params.get("drop")) {
+      steps.push(() => {
+        const target = document.querySelector(`[data-node-id="${dragTo}"]`);
+        if (!target) return false;
+        pev("pointerup", window, center(target));
+        return true;
+      });
+      steps.push(() => document.querySelector(".breadcrumb") !== null);
+    }
   }
   const opRevert = params.get("oprevert");
   if (opRevert) {

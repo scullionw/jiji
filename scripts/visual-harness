@@ -37,6 +37,7 @@ Scenario params (full list in scripts/harness/harness.js):
   manage=<name>, rename=<text>, delete=1, obmrename=<name>, obmdelete=<name>,
   mode=stack|single, dest=<changeId>, compare=parent|trunk|base|<changeId>,
   oprevert=<opId>, oprestore=<opId>, undo=1,
+  drag=<changeId>, dragto=<changeId>, dragalt=1, drop=1,
   expand=1, scroll=<px>, scrollx=<px>
 EOF
 }

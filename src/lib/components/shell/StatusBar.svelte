@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { drag } from "$lib/components/graph/dnd.svelte";
   import { app } from "$lib/state/app.svelte";
   import {
     dismissBreadcrumb,
@@ -35,7 +36,21 @@
 </script>
 
 <footer class="statusbar">
-  {#if app.error}
+  {#if drag.active}
+    <!-- The live meaning of the drag gesture, mirroring the plan card. -->
+    {#if drag.plan?.allowed}
+      <span class="dot accent"></span>
+      <span class="msg truncate">{drag.plan.summary} — release to apply</span>
+    {:else if drag.plan}
+      <span class="dot danger"></span>
+      <span class="msg danger-text truncate">{drag.plan.reason}</span>
+    {:else}
+      <span class="dot"></span>
+      <span class="msg truncate">
+        Drag onto the change that becomes the new parent — ⌥ moves it alone, Esc cancels
+      </span>
+    {/if}
+  {:else if app.error}
     <span class="dot danger"></span>
     <span class="msg danger-text truncate">{app.error}</span>
   {:else if breadcrumb}
@@ -73,7 +88,7 @@
   <div class="fill"></div>
 
   <span class="meta mono">backend: {snapshot?.backend ?? "—"}</span>
-  <span class="meta mono">milestone 2</span>
+  <span class="meta mono">milestone 3</span>
 </footer>
 
 <style>

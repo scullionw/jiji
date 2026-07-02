@@ -7,6 +7,8 @@
   import Icon from "$lib/components/ui/Icon.svelte";
   import GraphView from "$lib/components/graph/GraphView.svelte";
   import FocusView from "$lib/components/graph/FocusView.svelte";
+  import DragOverlay from "$lib/components/graph/DragOverlay.svelte";
+  import { attachRowDnd, drag } from "$lib/components/graph/dnd.svelte";
   import {
     buildFocusModel,
     buildGraphModel,
@@ -81,7 +83,16 @@
     app.selectedNodeId = id;
   }
 
-  let container: HTMLDivElement | undefined;
+  let container = $state<HTMLDivElement | undefined>();
+
+  // Row drag-and-drop: one delegated controller on the pane's scroller
+  // covers both view modes, since every row carries data-node-id. The
+  // snapshot is read lazily at gesture time, so the controller survives
+  // refreshes without rewiring.
+  $effect(() => {
+    if (!container) return;
+    return attachRowDnd(container, () => app.snapshot);
+  });
 
   // Snapshots refresh underneath the UI; drop selection/focus that no
   // longer resolves instead of rendering ghosts.
@@ -166,7 +177,8 @@
       KeyG: (event) => switchView(event, "graph"),
       KeyW: (event) => switchView(event, "focus"),
       Escape: (event) => {
-        if (!app.paletteOpen && !isEditable(event.target)) {
+        // An active drag owns Esc: it cancels the gesture, not the selection.
+        if (!app.paletteOpen && !isEditable(event.target) && !drag.active) {
           app.selectedNodeId = null;
         }
       },
@@ -270,6 +282,9 @@
     {/if}
   {/snippet}
 </SplitPane>
+
+<!-- The pointer-following plan card while a row is in hand. -->
+<DragOverlay {snapshot} />
 
 <style>
   .diff-pane {
