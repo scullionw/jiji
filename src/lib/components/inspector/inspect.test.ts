@@ -362,6 +362,7 @@ describe("actionAvailability", () => {
       edit: true,
       bookmark: true,
       rebase: true,
+      split: true,
       squash: true,
       abandon: true,
     });
@@ -374,9 +375,20 @@ describe("actionAvailability", () => {
       edit: false,
       bookmark: true,
       rebase: false,
+      split: false,
       squash: false,
       abandon: false,
     });
+  });
+
+  it("withholds split on empty changes", () => {
+    const empty = snapshot([
+      { ...node("wc", "workingCopy", ["base"]), isEmpty: true },
+      node("base", "immutable"),
+    ]);
+    expect(
+      actionAvailability(empty, findNode(empty, "wc")!).split,
+    ).toBe(false);
   });
 
   it("withholds squash without a single mutable parent", () => {

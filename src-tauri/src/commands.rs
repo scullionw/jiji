@@ -290,6 +290,19 @@ pub fn squash_change(
 }
 
 #[tauri::command]
+pub fn split_change(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    change_id: String,
+    paths: Vec<String>,
+    description: String,
+) -> Result<MutationOutcome, CommandError> {
+    state.mutate(&app, |backend, path| {
+        backend.split_change(path, &change_id, &paths, &description)
+    })
+}
+
+#[tauri::command]
 pub fn rebase_change(
     app: AppHandle,
     state: State<'_, AppState>,

@@ -32,6 +32,8 @@ export const icons = {
     '<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/>',
   squash:
     '<path d="M12 3v8"/><path d="m8 7 4 4 4-4"/><path d="M5 15h14"/><path d="M5 19h14"/>',
+  split:
+    '<path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3"/><path d="m15 9 6-6"/>',
   rebase:
     '<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>',
   compare:

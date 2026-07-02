@@ -34,6 +34,12 @@
 //   &open=squash|abandon open that action's confirm panel on the selection
 //   &open=bookmark       open the bookmark panel on the selection
 //   &open=rebase         open the rebase panel on the selection
+//   &open=split          open the split panel on the selection
+//   &sfiles=<p1,p2>      check those file rows in the open split panel
+//   &sdesc=<text>        type the carved change's description in the open
+//                        split panel (confirm via &confirm=1; the stubbed
+//                        split_change partitions the captured diff between
+//                        the two halves)
 //   &open=compare        open the compare panel on the selection
 //   &compare=<v>         pick a row in the open compare panel: parent|trunk|
 //                        base or a change id (compare_diff is stubbed from
@@ -421,6 +427,88 @@
             operationId: opId,
             summary: `Squashed ${node.id} into ${parent.id}`,
             targetChange: parent.id,
+          });
+        }
+        case "split_change": {
+          const node = target(args?.changeId);
+          if (node instanceof Promise) return node;
+          const diff = (data.diffs || {})[node.id];
+          const all = (diff?.files || []).map((f) => f.path);
+          const paths = args?.paths || [];
+          const selected = all.filter((p) => paths.includes(p));
+          if (selected.length === 0)
+            return reject(
+              "mutation_failed",
+              `none of the selected files change anything in ${node.id}`,
+            );
+          if (selected.length === all.length)
+            return reject(
+              "mutation_failed",
+              `the selection covers every change in ${node.id}; there would be nothing left to split off`,
+            );
+          // jj's split rule: the checked files stay in the change (same id,
+          // new description); a new change on top takes everything else and
+          // inherits bookmarks, children, and working-copy status.
+          const newId = `wn${String(mutationIndex).padStart(2, "0")}pqzu`;
+          spawnedIds.add(newId);
+          const remainder = {
+            id: newId,
+            changeId: newId,
+            commitId: `e5${String(mutationIndex).padStart(2, "0")}9b2c`,
+            description: node.description,
+            author: node.author,
+            timestamp: node.timestamp,
+            kind: node.kind,
+            parents: [node.id],
+            elidedParents: [],
+            bookmarks: node.bookmarks,
+            isEmpty: false,
+            hasConflict: false,
+            isDivergent: false,
+          };
+          node.description = (args?.description ?? "").trim();
+          node.bookmarks = [];
+          if (node.kind === "workingCopy") node.kind = "mutable";
+          snap.nodes.forEach((n) => {
+            if (n !== node && n.parents.includes(node.id)) {
+              n.parents = n.parents.map((p) => (p === node.id ? newId : p));
+            }
+          });
+          const effects = snap.bookmarks
+            .filter((b) => b.target === node.id)
+            .map((b) => ({ kind: "bookmark", label: `${b.name} moved` }));
+          snap.bookmarks.forEach((b) => {
+            if (b.target === node.id) b.target = newId;
+          });
+          snap.nodes.splice(snap.nodes.indexOf(node), 0, remainder);
+          if (snap.workingCopy === node.id) {
+            setWorkingCopy(snap, newId);
+            effects.push(wcMoved);
+          }
+          snap.workstreams.forEach((ws) => {
+            const at = ws.nodeIds.indexOf(node.id);
+            if (at !== -1) ws.nodeIds.splice(at, 0, newId);
+          });
+          // Partition the captured diff so each half renders its own files.
+          if (diff) {
+            data.diffs[newId] = {
+              id: newId,
+              from: null,
+              files: diff.files.filter((f) => !paths.includes(f.path)),
+              truncated: false,
+            };
+            data.diffs[node.id] = {
+              ...diff,
+              files: diff.files.filter((f) => paths.includes(f.path)),
+            };
+          }
+          const opId = pushOp(snap, `split commit ${node.commitId}`, effects);
+          return Promise.resolve({
+            operationId: opId,
+            summary: `Split ${node.id}: kept ${selected.length} file${
+              selected.length === 1 ? "" : "s"
+            }, the rest moved to ${newId}`,
+            targetChange: node.id,
           });
         }
         case "rebase_change":
@@ -876,6 +964,7 @@
   }
   if (open === "bookmark") steps.push(() => click('[data-action="bookmark"]'));
   if (open === "rebase") steps.push(() => click('[data-action="rebase"]'));
+  if (open === "split") steps.push(() => click('[data-action="split"]'));
   if (open === "compare") steps.push(() => click('[data-action="compare"]'));
   if (params.get("palette")) {
     steps.push(() => click('[data-action="palette"]'));
@@ -913,6 +1002,23 @@
   const rebaseMode = params.get("mode");
   if (rebaseMode) {
     steps.push(() => click(`.mode-toggle [data-mode="${rebaseMode}"]`));
+  }
+  // Split panel: check file rows, then type the carved change's description.
+  const splitFiles = params.get("sfiles");
+  if (splitFiles) {
+    for (const path of splitFiles.split(",")) {
+      steps.push(() => click(`.dest-row[data-splitfile="${path}"]`));
+    }
+  }
+  const splitDesc = params.get("sdesc");
+  if (splitDesc) {
+    steps.push(() => {
+      const textarea = document.querySelector(".split-desc");
+      if (!textarea) return false;
+      textarea.value = splitDesc;
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
   }
   const rebaseDest = params.get("dest");
   if (rebaseDest) {

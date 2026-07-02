@@ -72,6 +72,7 @@ pub enum MockMutation {
     Edit { id: String },
     Abandon { id: String },
     Squash { id: String },
+    Split { id: String, paths: Vec<String>, description: String },
     Rebase { id: String, destination: String, with_descendants: bool },
     CreateBookmark { name: String, target: String },
     MoveBookmark { name: String, target: String },
@@ -233,6 +234,37 @@ pub fn mutation_outcome(
             let parent = find(parent_id)?;
             require_mutable(parent)?;
             Ok(recorded(format!("Squashed {id} into {parent_id}"), parent_id))
+        }
+        MockMutation::Split { id, paths, .. } => {
+            let node = find(id)?;
+            require_mutable(node)?;
+            // The change's own diff decides what a selection can cover.
+            // Mutation-created nodes have no fixture files, so they refuse
+            // as "nothing selected" — same as the real backend on an empty
+            // change.
+            let files: Vec<String> = mock_change_detail(id)
+                .map(|detail| detail.files.into_iter().map(|f| f.path).collect())
+                .unwrap_or_default();
+            let selected = files.iter().filter(|f| paths.contains(f)).count();
+            if selected == 0 {
+                return Err(BackendError::MutationFailed(format!(
+                    "none of the selected files change anything in {id}"
+                )));
+            }
+            if selected == files.len() {
+                return Err(BackendError::MutationFailed(format!(
+                    "the selection covers every change in {id}; \
+                     there would be nothing left to split off"
+                )));
+            }
+            let new_id = mock_new_change_id(index);
+            Ok(recorded(
+                format!(
+                    "Split {id}: kept {selected} file{}, the rest moved to {new_id}",
+                    if selected == 1 { "" } else { "s" }
+                ),
+                id,
+            ))
         }
         MockMutation::Rebase {
             id,
@@ -616,6 +648,65 @@ pub fn apply_mutation(
                 effects,
             );
         }
+        MockMutation::Split { id, description, .. } => {
+            // The split change keeps the selected files and takes the new
+            // description; a new change directly on top inherits the
+            // original description, bookmarks, children, and working-copy
+            // status — jj's split rule. Fixture diffs stay static, so both
+            // halves keep showing the original file list (a documented mock
+            // approximation, like resolve's marker content).
+            let Some(position) = snapshot.nodes.iter().position(|n| n.id == *id) else {
+                return;
+            };
+            let new_id = mock_new_change_id(index);
+            let (commit, remainder) = {
+                let node = &mut snapshot.nodes[position];
+                let remainder = GraphNode {
+                    id: new_id.clone(),
+                    change_id: new_id.clone(),
+                    commit_id: format!("e5{index:02}9b2c"),
+                    description: std::mem::replace(&mut node.description, description.clone()),
+                    author: node.author.clone(),
+                    timestamp: node.timestamp.clone(),
+                    kind: node.kind,
+                    parents: vec![id.clone()],
+                    elided_parents: Vec::new(),
+                    bookmarks: std::mem::take(&mut node.bookmarks),
+                    is_empty: false,
+                    has_conflict: false,
+                    is_divergent: false,
+                };
+                if node.kind == NodeKind::WorkingCopy {
+                    node.kind = NodeKind::Mutable;
+                }
+                (node.commit_id.clone(), remainder)
+            };
+            reparent_children(snapshot, id, std::slice::from_ref(&new_id));
+            let mut effects: Vec<OpEffect> = Vec::new();
+            for bookmark in &mut snapshot.bookmarks {
+                if bookmark.target == *id {
+                    bookmark.target = new_id.clone();
+                    effects.push(OpEffect {
+                        kind: OpEffectKind::Bookmark,
+                        label: format!("{} moved", bookmark.name),
+                    });
+                }
+            }
+            let was_working_copy = snapshot.working_copy == *id;
+            snapshot.nodes.insert(position, remainder);
+            if was_working_copy {
+                set_working_copy(snapshot, &new_id);
+                effects.push(wc_moved_effect());
+            }
+            // The remainder slots into the same workstream, directly above
+            // the split change (node_ids are top-first).
+            for ws in &mut snapshot.workstreams {
+                if let Some(at) = ws.node_ids.iter().position(|n| n == id) {
+                    ws.node_ids.insert(at, new_id.clone());
+                }
+            }
+            push_op(snapshot, index, format!("split commit {commit}"), effects);
+        }
         MockMutation::Rebase {
             id,
             destination,
@@ -851,6 +942,7 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
                 .unwrap_or_default();
             format!("squash commits into {}", commit_of(&parent))
         }
+        MockMutation::Split { id, .. } => format!("split commit {}", commit_of(id)),
         MockMutation::Rebase {
             id,
             with_descendants,

@@ -141,6 +141,16 @@ function buildItems(ctx: PaletteContext): PaletteItem[] {
         action: { type: "intent", intent: { kind: "rebase" } },
       });
     }
+    if (avail.split) {
+      change({
+        id: "change.split",
+        title: "Split change…",
+        hint: at,
+        keywords: "carve separate divide files jj split",
+        icon: "split",
+        action: { type: "intent", intent: { kind: "split" } },
+      });
+    }
     if (avail.squash) {
       change({
         id: "change.squash",

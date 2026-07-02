@@ -159,6 +159,25 @@ pub trait RepoBackend: Send + Sync {
     fn squash_change(&self, path: &Path, change_id: &str)
         -> Result<MutationOutcome, BackendError>;
 
+    /// Split a change in two by file (`jj split <paths> -r <rev>`): the
+    /// selected paths stay in the change itself — same change id, new
+    /// `description` — and every other change moves into a new change
+    /// inserted directly on top, which keeps the original description and
+    /// author. Like the CLI, bookmarks, descendants, and (when splitting
+    /// `@`) the working copy all follow the remainder, so "split" reads as
+    /// carving the selected files off the bottom while work continues on
+    /// top. One curated deviation, both ways the same: a selection that
+    /// changes nothing or covers every change is refused — the CLI warns
+    /// and proceeds, leaving an empty half behind, but from a plan panel
+    /// that is always a mistake.
+    fn split_change(
+        &self,
+        path: &Path,
+        change_id: &str,
+        paths: &[String],
+        description: &str,
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Rebase a change and all its descendants onto a new parent
     /// (`jj rebase -s <rev> -d <dest>`). The change must be mutable; the
     /// destination may be immutable — rebasing onto trunk is the canonical
@@ -431,6 +450,23 @@ impl RepoBackend for MockBackend {
             path,
             crate::mock::MockMutation::Squash {
                 id: change_id.to_owned(),
+            },
+        )
+    }
+
+    fn split_change(
+        &self,
+        path: &Path,
+        change_id: &str,
+        paths: &[String],
+        description: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::Split {
+                id: change_id.to_owned(),
+                paths: paths.to_vec(),
+                description: description.trim().to_owned(),
             },
         )
     }
@@ -729,6 +765,65 @@ mod tests {
         // Resolving the already-settled path now refuses.
         let err = backend.resolve_conflict(dir.path(), "pmwzqkvt", path).unwrap_err();
         assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mock_split_carves_a_new_change_above() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+        let wc_id = before.working_copy.clone();
+        let wc_parents = before
+            .nodes
+            .iter()
+            .find(|n| n.id == wc_id)
+            .unwrap()
+            .parents
+            .clone();
+        let files = backend.change_detail(dir.path(), &wc_id).unwrap().files;
+        assert!(files.len() >= 2, "fixture working copy has files to split");
+
+        // Degenerate selections refuse like the real backend.
+        let err = backend
+            .split_change(dir.path(), &wc_id, &["nope.txt".to_owned()], "x")
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+        let all: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        let err = backend.split_change(dir.path(), &wc_id, &all, "x").unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+
+        let selected = vec![files[0].path.clone()];
+        let outcome = backend
+            .split_change(dir.path(), &wc_id, &selected, "carved: first file")
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.target_change.as_deref(), Some(wc_id.as_str()));
+
+        // The carved half keeps the change id, its original parents, and the
+        // new description; the remainder sits directly on top with the old
+        // description and the working-copy status.
+        let after = backend.open(dir.path()).unwrap();
+        let carved = after.nodes.iter().find(|n| n.id == wc_id).unwrap();
+        assert_eq!(carved.description, "carved: first file");
+        assert_eq!(carved.parents, wc_parents);
+        assert_ne!(after.working_copy, wc_id);
+        let remainder = after
+            .nodes
+            .iter()
+            .find(|n| n.id == after.working_copy)
+            .unwrap();
+        assert_eq!(remainder.parents, vec![wc_id.clone()]);
+        assert_eq!(
+            remainder.description,
+            before.nodes.iter().find(|n| n.id == wc_id).unwrap().description
+        );
+        assert!(after.operations[0].description.starts_with("split commit "));
+        // The active workstream gained the remainder right above the carved
+        // change.
+        let active = after.workstreams.iter().find(|w| w.is_active).unwrap();
+        let remainder_at = active.node_ids.iter().position(|n| *n == remainder.id).unwrap();
+        assert_eq!(active.node_ids.get(remainder_at + 1), Some(&wc_id));
     }
 
     #[test]

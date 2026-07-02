@@ -27,7 +27,7 @@ use jj_lib::fileset::{self, FilesetAliasesMap, FilesetDiagnostics, FilesetParseC
 use jj_lib::git::{self, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
 use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
 use jj_lib::hex_util;
-use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher, NothingMatcher};
 use jj_lib::merge::{Diff as MergeDiff, Merge};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
@@ -36,13 +36,14 @@ use jj_lib::op_walk;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
-use jj_lib::repo_path::{RepoPath, RepoPathUiConverter};
+use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter};
 use jj_lib::revset::{
     self, ResolvedRevsetExpression, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
     RevsetParseContext, RevsetWorkspaceContext, SymbolResolver,
 };
 use jj_lib::rewrite::{
-    move_commits, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, RewriteRefsOptions,
+    move_commits, restore_tree, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions,
+    RewriteRefsOptions,
 };
 use jj_lib::settings::HumanByteSize;
 use jj_lib::store::Store;
@@ -481,6 +482,114 @@ impl RepoBackend for JjBackend {
             // The parent was rewritten; recompute its id in case its change
             // is divergent (commit-id-keyed nodes move with the rewrite).
             target_change: Some(display_id(new_repo.as_ref(), &new_parent)),
+        })
+    }
+
+    fn split_change(
+        &self,
+        path: &Path,
+        change_id: &str,
+        paths: &[String],
+        description: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+        check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+
+        let mut repo_paths = Vec::with_capacity(paths.len());
+        for file_path in paths {
+            repo_paths.push(RepoPathBuf::from_internal_string(file_path.as_str()).map_err(
+                |err| BackendError::MutationFailed(format!("not a valid repository path: {err}")),
+            )?);
+        }
+        let matcher = FilesMatcher::new(&repo_paths);
+
+        // Partition the change's own diff by the selection before building
+        // trees: both degenerate splits are refused up front (the curated
+        // deviation documented on the trait — the CLI warns and leaves an
+        // empty half), and the selected count feeds the summary.
+        let commit_tree = commit.tree();
+        let parent_tree =
+            pollster::block_on(commit.parent_tree(repo.as_ref())).map_err(snapshot_err)?;
+        let (mut selected_files, mut remaining_files) = (0usize, 0usize);
+        pollster::block_on(async {
+            let mut stream = parent_tree.diff_stream(&commit_tree, &EverythingMatcher);
+            while let Some(entry) = stream.next().await {
+                if matcher.matches(&entry.path) {
+                    selected_files += 1;
+                } else {
+                    remaining_files += 1;
+                }
+            }
+        });
+        if selected_files == 0 {
+            return Err(BackendError::MutationFailed(format!(
+                "none of the selected files change anything in {change_id}"
+            )));
+        }
+        if remaining_files == 0 {
+            return Err(BackendError::MutationFailed(format!(
+                "the selection covers every change in {change_id}; \
+                 there would be nothing left to split off"
+            )));
+        }
+
+        // The selected half's tree: the parent tree with the selected paths
+        // restored from the change's tree.
+        let selected_tree = pollster::block_on(restore_tree(
+            &commit_tree,
+            &parent_tree,
+            format!("commit {}", commit.id().hex()),
+            "parents".to_owned(),
+            &matcher,
+        ))
+        .map_err(mutation_err)?;
+
+        let mut tx = repo.start_transaction();
+        // The selected files stay in the change itself: same change id, the
+        // new description.
+        let first = pollster::block_on(
+            tx.repo_mut()
+                .rewrite_commit(&commit)
+                .set_tree(selected_tree)
+                .set_description(complete_newline(description.trim_end()))
+                .write(),
+        )
+        .map_err(mutation_err)?;
+        // The remainder is a new change directly on top with the original
+        // tree, description, and author. Recording it as *the* rewrite of
+        // the split commit is what routes bookmarks, descendants, and the
+        // working copy to it — jj's split rule.
+        let second = pollster::block_on(
+            tx.repo_mut()
+                .rewrite_commit(&commit)
+                .set_parents(vec![first.id().clone()])
+                .set_tree(commit_tree)
+                .generate_new_change_id()
+                .write(),
+        )
+        .map_err(mutation_err)?;
+        tx.repo_mut()
+            .set_rewritten_commit(commit.id().clone(), second.id().clone());
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("split commit {}", commit.id().hex()),
+        )?;
+        let first_id = display_id_of(new_repo.as_ref(), first.id())?;
+        let second_id = display_id_of(new_repo.as_ref(), second.id())?;
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary: format!(
+                "Split {change_id}: kept {selected_files} file{}, the rest moved to {second_id}",
+                if selected_files == 1 { "" } else { "s" }
+            ),
+            // Selection stays on the carved-out half — the change the user
+            // just described, which keeps the change id (recomputed in case
+            // the rewrite left it divergent).
+            target_change: Some(first_id),
         })
     }
 
@@ -3924,6 +4033,206 @@ mod tests {
         // Nothing was recorded in either repo.
         let after = backend.open(merge_dir.path()).unwrap();
         assert_eq!(after.operations[0].description, "set up merge");
+    }
+
+    #[test]
+    fn split_working_copy_carves_selected_files_off_the_bottom() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+
+        let base_tree = file_tree(&store, &[("a.txt", "one\n")]);
+        let base = write_commit_with_tree(&mut tx, vec![root_commit_id], "feat: base", base_tree);
+        let mixed_tree = file_tree(
+            &store,
+            &[("a.txt", "two\n"), ("b.txt", "bee\n"), ("c.txt", "sea\n")],
+        );
+        let mixed =
+            write_commit_with_tree(&mut tx, vec![base.id().clone()], "mixed work", mixed_tree);
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new("topic"),
+            RefTarget::normal(mixed.id().clone()),
+        );
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &mixed)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up split fixture")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let mixed_id = before.working_copy.clone();
+        let base_id = node_by_description(&before, "feat: base").id.clone();
+
+        let outcome = backend
+            .split_change(
+                dir.path(),
+                &mixed_id,
+                &["a.txt".to_owned(), "c.txt".to_owned()],
+                "refactor: carve a and c",
+            )
+            .unwrap();
+        // Selection stays on the carved half, which keeps the change id.
+        assert_eq!(outcome.target_change.as_deref(), Some(mixed_id.as_str()));
+
+        let after = backend.open(dir.path()).unwrap();
+        // The carved half: same change id, the new description, only the
+        // selected files, sitting on the original parent.
+        let carved = after.nodes.iter().find(|n| n.id == mixed_id).unwrap();
+        assert_eq!(carved.description, "refactor: carve a and c");
+        assert_eq!(carved.parents, vec![base_id]);
+        assert_eq!(carved.kind, NodeKind::Mutable);
+        let carved_files = backend.change_detail(dir.path(), &mixed_id).unwrap();
+        let paths: Vec<&str> = carved_files.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "c.txt"]);
+
+        // The remainder: a new change directly on top with the original
+        // description, the unselected file, the bookmark, and the working
+        // copy — jj's split rule.
+        let remainder = node_by_description(&after, "mixed work");
+        assert_ne!(remainder.id, mixed_id);
+        assert_eq!(remainder.parents, vec![mixed_id.clone()]);
+        assert_eq!(remainder.kind, NodeKind::WorkingCopy);
+        assert_eq!(after.working_copy, remainder.id);
+        assert!(remainder.bookmarks.contains(&"topic".to_owned()));
+        let remainder_files = backend.change_detail(dir.path(), &remainder.id).unwrap();
+        let paths: Vec<&str> = remainder_files.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["b.txt"]);
+
+        assert_eq!(
+            outcome.summary,
+            format!("Split {mixed_id}: kept 2 files, the rest moved to {}", remainder.id)
+        );
+        assert!(after.operations[0].description.starts_with("split commit "));
+        // Splitting @ leaves the same files on disk (the remainder's tree is
+        // the original tree), recorded fresh at the new operation.
+        assert!(dir.path().join("a.txt").exists());
+        assert!(dir.path().join("b.txt").exists());
+        assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn split_mid_stack_rebases_descendants_onto_the_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+
+        let middle_tree = file_tree(&store, &[("a.txt", "aaa\n"), ("b.txt", "bbb\n")]);
+        let middle =
+            write_commit_with_tree(&mut tx, vec![root_commit_id], "mixed middle", middle_tree);
+        let child_tree = file_tree(
+            &store,
+            &[("a.txt", "aaa\n"), ("b.txt", "bbb\n"), ("d.txt", "ddd\n")],
+        );
+        let child =
+            write_commit_with_tree(&mut tx, vec![middle.id().clone()], "child work", child_tree);
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &child)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up mid-stack split")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let middle_id = node_by_description(&before, "mixed middle").id.clone();
+        let child_id = before.working_copy.clone();
+
+        let outcome = backend
+            .split_change(dir.path(), &middle_id, &["b.txt".to_owned()], "fix: only b")
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!(
+                "Split {middle_id}: kept 1 file, the rest moved to {}",
+                node_by_description(&backend.open(dir.path()).unwrap(), "mixed middle").id
+            )
+        );
+
+        let after = backend.open(dir.path()).unwrap();
+        let carved = after.nodes.iter().find(|n| n.id == middle_id).unwrap();
+        assert_eq!(carved.description, "fix: only b");
+        let remainder = node_by_description(&after, "mixed middle");
+        assert_eq!(remainder.parents, vec![middle_id.clone()]);
+        // The descendant rebased onto the remainder, and the working copy
+        // followed it; its content is untouched.
+        let child_node = after.nodes.iter().find(|n| n.id == child_id).unwrap();
+        assert_eq!(child_node.parents, vec![remainder.id.clone()]);
+        assert_eq!(after.working_copy, child_id);
+        let child_files = backend.change_detail(dir.path(), &child_id).unwrap();
+        let paths: Vec<&str> = child_files.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["d.txt"]);
+        assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn split_refusals_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+        let tree = file_tree(&store, &[("a.txt", "aaa\n"), ("b.txt", "bbb\n")]);
+        let mixed = write_commit_with_tree(&mut tx, vec![root_commit_id], "mixed", tree);
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &mixed)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up split refusals")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let snapshot = backend.open(dir.path()).unwrap();
+        let mixed_id = snapshot.working_copy.clone();
+
+        // A selection that changes nothing (unknown path, or no paths at
+        // all) and one that covers every change are both refused — the
+        // curated deviation from the CLI's warn-and-proceed.
+        let err = backend
+            .split_change(dir.path(), &mixed_id, &["zz.txt".to_owned()], "x")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("none of the selected files"),
+            "got {err}"
+        );
+        let err = backend.split_change(dir.path(), &mixed_id, &[], "x").unwrap_err();
+        assert!(
+            err.to_string().contains("none of the selected files"),
+            "got {err}"
+        );
+        let err = backend
+            .split_change(
+                dir.path(),
+                &mixed_id,
+                &["a.txt".to_owned(), "b.txt".to_owned()],
+                "x",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("covers every change"), "got {err}");
+
+        // Immutable targets refuse like every mutation.
+        let root_id = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Immutable)
+            .unwrap()
+            .id
+            .clone();
+        let err = backend
+            .split_change(dir.path(), &root_id, &["a.txt".to_owned()], "x")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BackendError::ImmutableChange(_) | BackendError::MutationFailed(_)
+        ));
+
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(after.operations[0].description, "set up split refusals");
     }
 
     #[test]

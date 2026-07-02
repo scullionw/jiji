@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
   import Icon from "$lib/components/ui/Icon.svelte";
   import type { FileDiff } from "$lib/bindings/FileDiff";
   import type { FileStatus } from "$lib/bindings/FileStatus";
@@ -17,6 +18,7 @@
     newChange,
     rebaseChange,
     renameBookmark,
+    splitChange,
     squashChange,
   } from "$lib/state/actions";
   import { fromNow } from "$lib/time";
@@ -97,6 +99,10 @@
     rebaseDest = null;
     rebaseFilter = "";
     rebaseError = null;
+    splitOpen = false;
+    splitSelected.clear();
+    splitDraft = "";
+    splitError = null;
     compareOpen = false;
     compareFilter = "";
   });
@@ -177,6 +183,7 @@
     bookmarkOpen = false;
     manage = null;
     rebaseOpen = false;
+    splitOpen = false;
     compareOpen = false;
     if (confirm) tick().then(() => confirmEl?.focus());
   }
@@ -260,6 +267,7 @@
     confirm = null;
     manage = null;
     rebaseOpen = false;
+    splitOpen = false;
     compareOpen = false;
     bookmarkName = "";
     bookmarkError = null;
@@ -271,6 +279,7 @@
     confirm = null;
     bookmarkOpen = false;
     rebaseOpen = false;
+    splitOpen = false;
     compareOpen = false;
     renameDraft = name;
     manageError = null;
@@ -367,6 +376,7 @@
     confirm = null;
     bookmarkOpen = false;
     manage = null;
+    splitOpen = false;
     compareOpen = false;
     rebaseAlone = false;
     rebaseDest = null;
@@ -445,6 +455,73 @@
     }
   }
 
+  // Split: the plan step for carving a mixed change apart by file. The
+  // checked files become the first change — it keeps this change's id and
+  // takes the description entered here — and the unchecked files move to a
+  // new change directly on top, which inherits the original description,
+  // bookmarks, descendants, and (splitting @) the working copy: jj's split
+  // rule, so peeling described commits off the bottom of the working copy
+  // is a repeatable loop. File list comes from the loaded diff, so opening
+  // the panel drops an active comparison back to the parent diff.
+  let splitOpen = $state(false);
+  const splitSelected = new SvelteSet<string>();
+  let splitDraft = $state("");
+  let splitError = $state<string | null>(null);
+  let splitPanelEl = $state<HTMLDivElement | undefined>();
+  let splitDescEl = $state<HTMLTextAreaElement | undefined>();
+
+  // Stale checks (a refetch can drop files) count only via the loaded list.
+  const splitChecked = $derived(
+    files ? files.filter((f) => splitSelected.has(f.path)).length : 0,
+  );
+  const splitValid = $derived(
+    files !== null && splitChecked > 0 && splitChecked < files.length,
+  );
+
+  function toggleSplit() {
+    splitOpen = !splitOpen;
+    confirm = null;
+    bookmarkOpen = false;
+    manage = null;
+    rebaseOpen = false;
+    compareOpen = false;
+    splitSelected.clear();
+    splitDraft = "";
+    splitError = null;
+    if (splitOpen) {
+      // The checklist is this change's own files, not a comparison span's.
+      if (compareFrom !== null) oncompare({ kind: "parent" });
+      tick().then(() => splitPanelEl?.focus());
+    }
+  }
+
+  function toggleSplitFile(path: string) {
+    if (!splitSelected.delete(path)) splitSelected.add(path);
+  }
+
+  function submitSplit() {
+    if (!splitValid || !files) return;
+    const paths = files
+      .filter((f) => splitSelected.has(f.path))
+      .map((f) => f.path);
+    runPanel(
+      () => splitChange(node.id, paths, splitDraft),
+      (message) => (splitError = message),
+      () => (splitOpen = false),
+    );
+  }
+
+  function onSplitKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      splitOpen = false;
+    } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      submitSplit();
+    }
+  }
+
   // Compare: what the diff is measured against. Read-only — picking a row
   // applies immediately, no plan/confirm step. Presets stay relative
   // (trunk, stack base) so walking the stack keeps the comparison; the
@@ -503,6 +580,7 @@
     bookmarkOpen = false;
     manage = null;
     rebaseOpen = false;
+    splitOpen = false;
     compareFilter = "";
     if (compareOpen) {
       tick().then(() => (compareFilterEl ?? comparePanelEl)?.focus());
@@ -539,6 +617,9 @@
         break;
       case "rebase":
         if (avail.rebase && !rebaseOpen) toggleRebase();
+        break;
+      case "split":
+        if (avail.split && !splitOpen) toggleSplit();
         break;
       case "squash":
         if (avail.squash && confirm !== "squash") toggleConfirm("squash");
@@ -878,6 +959,19 @@
         >
           <Icon name="rebase" size={11} />
           Rebase
+        </button>
+      {/if}
+      {#if avail.split}
+        <button
+          class="action"
+          class:armed={splitOpen}
+          data-action="split"
+          disabled={acting}
+          title="Split this change in two by file (jj split)"
+          onclick={toggleSplit}
+        >
+          <Icon name="split" size={11} />
+          Split
         </button>
       {/if}
       {#if avail.squash}
@@ -1285,6 +1379,130 @@
             disabled={acting || !destNode}
           >
             {acting ? "Rebasing…" : rebaseAlone ? "Move here" : "Rebase here"}
+          </button>
+        </div>
+      </div>
+    {/if}
+
+    {#if splitOpen}
+      <div
+        class="confirm-panel split-panel"
+        role="dialog"
+        aria-label="Split this change"
+        tabindex="-1"
+        bind:this={splitPanelEl}
+        onkeydown={onSplitKeydown}
+      >
+        <p class="confirm-title">
+          Split <b class="mono">{node.id.slice(0, 4)}</b>
+          <span class="confirm-context truncate">“{title || "no description"}”</span>
+        </p>
+        {#if files === null}
+          <span class="dest-empty">Loading the file list…</span>
+        {:else if files.length < 2}
+          <span class="dest-empty">
+            This change touches {files.length === 1 ? "only one file" : "no files"}
+            — there is nothing to split apart.
+          </span>
+        {:else}
+          <span class="result-label dest-label">
+            Check the files to carve off into their own change
+          </span>
+          <div class="dest-list" role="listbox" aria-multiselectable="true" aria-label="Files for the split-off change">
+            {#each files as file (file.path)}
+              {@const parts = splitPath(file.path)}
+              {@const checked = splitSelected.has(file.path)}
+              <button
+                class="dest-row"
+                class:selected={checked}
+                role="option"
+                aria-selected={checked}
+                data-splitfile={file.path}
+                disabled={acting}
+                title={file.renamedFrom
+                  ? `${file.renamedFrom} → ${file.path}`
+                  : file.path}
+                onclick={() => toggleSplitFile(file.path)}
+              >
+                <span class="check mono" class:on={checked}>{checked ? "✓" : ""}</span>
+                <span class="status {file.status} mono">{STATUS_GLYPH[file.status]}</span>
+                <span class="path mono truncate">
+                  {#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<span
+                    class="fname">{parts.name}</span>
+                </span>
+              </button>
+            {/each}
+          </div>
+          <span class="result-label">Description for the split-off change</span>
+          <textarea
+            bind:this={splitDescEl}
+            bind:value={splitDraft}
+            class="split-desc mono"
+            rows="2"
+            placeholder={"Summary line for the carved-out change"}
+            spellcheck="false"
+            disabled={acting}
+          ></textarea>
+          {#if splitChecked > 0}
+            <ul class="consequences">
+              <li>
+                The {splitChecked} checked file{splitChecked === 1 ? "" : "s"}
+                become{splitChecked === 1 ? "s" : ""} the first change — it keeps
+                the id <b class="mono">{node.id.slice(0, 4)}</b> and the
+                description above.
+              </li>
+              {#if splitChecked < files.length}
+                <li>
+                  The other {files.length - splitChecked} file{files.length - splitChecked === 1
+                    ? " moves"
+                    : "s move"} to a new change directly on top, keeping
+                  <span class="quiet">“{title || "no description"}”</span>.
+                </li>
+              {:else}
+                <li class="blocked">
+                  Every file is checked — leave at least one for the new change
+                  on top.
+                </li>
+              {/if}
+              {#if marks.length > 0}
+                <li>
+                  Bookmark{marks.length === 1 ? "" : "s"}
+                  {marks.map((m) => m.name).join(", ")}
+                  follow{marks.length === 1 ? "s" : ""} the new top change.
+                </li>
+              {/if}
+              {#if node.id === snapshot.workingCopy}
+                <li>
+                  The working copy follows the new top change — nothing moves on
+                  disk.
+                </li>
+              {:else if isWcOrAbove}
+                <li>The working copy follows the rebase.</li>
+              {/if}
+              {#if descendants.length > 0}
+                <li>
+                  {descendants.length} descendant change{descendants.length === 1
+                    ? " rebases"
+                    : "s rebase"} onto the new top change.
+                </li>
+              {/if}
+            </ul>
+          {/if}
+        {/if}
+        <div class="confirm-row">
+          <span class="editor-hint">
+            {splitValid
+              ? "⌘↵ to confirm"
+              : "Check the files for the first change — at least one on each side"}
+          </span>
+          {#if splitError}
+            <span class="editor-error truncate" title={splitError}>{splitError}</span>
+          {/if}
+          <button class="editor-cancel" onclick={() => (splitOpen = false)} disabled={acting}>
+            Cancel
+          </button>
+          <button class="confirm-go" onclick={submitSplit} disabled={acting || !splitValid}>
+            {acting ? "Splitting…" : "Split"}
           </button>
         </div>
       </div>
@@ -2204,6 +2422,54 @@
 
   .quiet {
     color: var(--clr-text-3);
+  }
+
+  /* Split panel: checkbox glyphs on file rows, and the description box for
+     the carved-out change. */
+  .check {
+    flex-shrink: 0;
+    width: 13px;
+    height: 13px;
+    line-height: 11px;
+    text-align: center;
+    font-size: var(--text-xs);
+    border: 1px solid var(--clr-border-1);
+    border-radius: 3px;
+    color: transparent;
+    background: var(--clr-bg-2);
+    transition: all var(--t-fast) var(--ease-out);
+  }
+
+  .check.on {
+    background: var(--clr-accent);
+    border-color: var(--clr-accent);
+    color: var(--clr-bg-1);
+  }
+
+  .split-desc {
+    width: 100%;
+    margin-top: 2px;
+    padding: var(--sp-2);
+    font-size: var(--text-s);
+    line-height: 1.45;
+    color: var(--clr-text-1);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-1);
+    border-radius: var(--radius-s);
+    resize: vertical;
+  }
+
+  .split-desc:focus {
+    outline: none;
+    border-color: var(--clr-accent);
+  }
+
+  .split-desc:disabled {
+    opacity: 0.6;
+  }
+
+  .consequences li.blocked {
+    color: var(--clr-warn);
   }
 
   /* The diff-surface controls cluster right: comparison, files, layout.

@@ -64,6 +64,22 @@ export function squashChange(changeId: string): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("squash_change", { changeId });
 }
 
+// Split a change in two by file (`jj split`): the selected paths stay in
+// the change itself with the new description; the rest moves to a new
+// change on top, which inherits bookmarks, descendants, and working-copy
+// status.
+export function splitChange(
+  changeId: string,
+  paths: string[],
+  description: string,
+): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("split_change", {
+    changeId,
+    paths,
+    description,
+  });
+}
+
 export function rebaseChange(
   changeId: string,
   destinationId: string,

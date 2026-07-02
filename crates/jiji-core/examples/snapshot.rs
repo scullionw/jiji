@@ -8,6 +8,7 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --compare <from-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --describe "text"
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --new|--edit|--abandon|--squash
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --split "description" <path>...
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --rebase <dest-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --move <dest-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --bookmark <name>
@@ -95,6 +96,13 @@ fn main() {
         (Some(change_id), Some("--squash")) => backend
             .squash_change(path, &change_id)
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),
+        (Some(change_id), Some("--split")) => {
+            let description = std::env::args().nth(4).expect("--split needs the description");
+            let paths: Vec<String> = std::env::args().skip(5).collect();
+            backend
+                .split_change(path, &change_id, &paths, &description)
+                .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap())
+        }
         (Some(change_id), Some("--rebase")) => {
             let dest = std::env::args().nth(4).expect("--rebase needs the destination");
             backend

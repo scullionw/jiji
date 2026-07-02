@@ -122,6 +122,7 @@ describe("paletteResults availability", () => {
       "change.edit",
       "change.bookmark",
       "change.rebase",
+      "change.split",
       "change.squash",
       "change.abandon",
       "compare.parent",
@@ -150,6 +151,7 @@ describe("paletteResults availability", () => {
       "change.describe",
       "change.edit",
       "change.rebase",
+      "change.split",
       "change.squash",
       "change.abandon",
     ]) {

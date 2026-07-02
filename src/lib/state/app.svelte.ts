@@ -21,6 +21,7 @@ export type UiIntent =
   | { kind: "describe" }
   | { kind: "bookmark" }
   | { kind: "rebase" }
+  | { kind: "split" }
   | { kind: "squash" }
   | { kind: "abandon" }
   // With a mode the comparison applies directly; without one the compare

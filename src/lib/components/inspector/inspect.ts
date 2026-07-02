@@ -114,6 +114,7 @@ export interface ChangeActions {
   edit: boolean;
   bookmark: boolean;
   rebase: boolean;
+  split: boolean;
   squash: boolean;
   abandon: boolean;
 }
@@ -131,6 +132,9 @@ export function actionAvailability(
     edit: node.kind === "mutable",
     bookmark: true,
     rebase: !immutable,
+    // An empty change has no files to split apart; the panel additionally
+    // needs the loaded file list to know a one-file change cannot split.
+    split: !immutable && !node.isEmpty,
     squash: !immutable && parent !== undefined && parent.kind !== "immutable",
     abandon: !immutable,
   };

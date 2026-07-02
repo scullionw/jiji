@@ -115,6 +115,14 @@ export function squashChange(changeId: string): Promise<MutationOutcome> {
   return runMutation(() => api.squashChange(changeId));
 }
 
+export function splitChange(
+  changeId: string,
+  paths: string[],
+  description: string,
+): Promise<MutationOutcome> {
+  return runMutation(() => api.splitChange(changeId, paths, description));
+}
+
 export function rebaseChange(
   changeId: string,
   destinationId: string,
