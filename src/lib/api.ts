@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
+import type { SplitSelection } from "$lib/bindings/SplitSelection";
 
 export interface CommandError {
   code: string;
@@ -64,18 +65,18 @@ export function squashChange(changeId: string): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("squash_change", { changeId });
 }
 
-// Split a change in two by file (`jj split`): the selected paths stay in
-// the change itself with the new description; the rest moves to a new
-// change on top, which inherits bookmarks, descendants, and working-copy
-// status.
+// Split a change in two (`jj split`): the selected content — whole files,
+// or just the chosen hunks of a file — stays in the change itself with the
+// new description; the rest moves to a new change on top, which inherits
+// bookmarks, descendants, and working-copy status.
 export function splitChange(
   changeId: string,
-  paths: string[],
+  selection: SplitSelection[],
   description: string,
 ): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("split_change", {
     changeId,
-    paths,
+    selection,
     description,
   });
 }

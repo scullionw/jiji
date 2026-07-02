@@ -4,6 +4,7 @@
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import * as api from "$lib/api";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
+import type { SplitSelection } from "$lib/bindings/SplitSelection";
 import { stackPosition } from "$lib/components/inspector/inspect";
 import { app, type Section, type UiIntent } from "./app.svelte";
 import { loadRecentRepos, rememberRepo } from "./recent";
@@ -117,10 +118,10 @@ export function squashChange(changeId: string): Promise<MutationOutcome> {
 
 export function splitChange(
   changeId: string,
-  paths: string[],
+  selection: SplitSelection[],
   description: string,
 ): Promise<MutationOutcome> {
-  return runMutation(() => api.splitChange(changeId, paths, description));
+  return runMutation(() => api.splitChange(changeId, selection, description));
 }
 
 export function rebaseChange(

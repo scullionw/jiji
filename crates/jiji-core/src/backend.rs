@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::snapshot::{ChangeDetail, ChangeDiff, MutationOutcome, RepoSnapshot};
+use crate::snapshot::{ChangeDetail, ChangeDiff, MutationOutcome, RepoSnapshot, SplitSelection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -159,22 +159,36 @@ pub trait RepoBackend: Send + Sync {
     fn squash_change(&self, path: &Path, change_id: &str)
         -> Result<MutationOutcome, BackendError>;
 
-    /// Split a change in two by file (`jj split <paths> -r <rev>`): the
-    /// selected paths stay in the change itself — same change id, new
-    /// `description` — and every other change moves into a new change
-    /// inserted directly on top, which keeps the original description and
-    /// author. Like the CLI, bookmarks, descendants, and (when splitting
-    /// `@`) the working copy all follow the remainder, so "split" reads as
-    /// carving the selected files off the bottom while work continues on
-    /// top. One curated deviation, both ways the same: a selection that
-    /// changes nothing or covers every change is refused — the CLI warns
-    /// and proceeds, leaving an empty half behind, but from a plan panel
-    /// that is always a mistake.
+    /// Split a change in two (`jj split <paths> -r <rev>`, or `jj split -i`
+    /// when a selection names hunks): the selected content stays in the
+    /// change itself — same change id, new `description` — and everything
+    /// else moves into a new change inserted directly on top, which keeps
+    /// the original description and author. Like the CLI, bookmarks,
+    /// descendants, and (when splitting `@`) the working copy all follow
+    /// the remainder, so "split" reads as carving the selection off the
+    /// bottom while work continues on top.
+    ///
+    /// Whole-file entries (`hunks: None`) are the fast path. An entry with
+    /// hunks takes only those hunks of the file's diff — the carved half
+    /// gets the parent's file content with the selected hunks applied, the
+    /// rest of the file stays with the remainder. Hunk-level entries must
+    /// be regular non-conflicted text files; the hunk coordinates are
+    /// re-derived from the trees at mutation time and refused when they no
+    /// longer match what the panel rendered (the change moved underneath —
+    /// refresh and try again), the same never-clobber posture as
+    /// `resolve_conflict`. A partial file keeps the parent side's
+    /// executable bit in the carved half; a mode-only flip rides the
+    /// remainder.
+    ///
+    /// One curated deviation, both ways the same: a selection that changes
+    /// nothing or covers every change is refused — the CLI warns and
+    /// proceeds, leaving an empty half behind, but from a plan panel that
+    /// is always a mistake.
     fn split_change(
         &self,
         path: &Path,
         change_id: &str,
-        paths: &[String],
+        selection: &[SplitSelection],
         description: &str,
     ) -> Result<MutationOutcome, BackendError>;
 
@@ -458,14 +472,14 @@ impl RepoBackend for MockBackend {
         &self,
         path: &Path,
         change_id: &str,
-        paths: &[String],
+        selection: &[SplitSelection],
         description: &str,
     ) -> Result<MutationOutcome, BackendError> {
         self.mutate(
             path,
             crate::mock::MockMutation::Split {
                 id: change_id.to_owned(),
-                paths: paths.to_vec(),
+                selection: selection.to_vec(),
                 description: description.trim().to_owned(),
             },
         )
@@ -610,6 +624,7 @@ impl RepoBackend for MockBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::SplitHunk;
 
     #[test]
     fn open_rejects_missing_paths() {
@@ -786,19 +801,48 @@ mod tests {
 
         // Degenerate selections refuse like the real backend.
         let err = backend
-            .split_change(dir.path(), &wc_id, &["nope.txt".to_owned()], "x")
+            .split_change(dir.path(), &wc_id, &[SplitSelection::whole("nope.txt")], "x")
             .unwrap_err();
         assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
-        let all: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        let all: Vec<SplitSelection> = files
+            .iter()
+            .map(|f| SplitSelection::whole(f.path.clone()))
+            .collect();
         let err = backend.split_change(dir.path(), &wc_id, &all, "x").unwrap_err();
         assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
 
-        let selected = vec![files[0].path.clone()];
+        // A hunk entry counts as partially kept, so covering every file is
+        // fine as long as one of them is partial (its unchosen hunks stay
+        // with the remainder; the mock does not validate coordinates —
+        // fixture diffs are static).
+        let mut selected: Vec<SplitSelection> = files
+            .iter()
+            .take(files.len() - 1)
+            .map(|f| SplitSelection::whole(f.path.clone()))
+            .collect();
+        selected.push(SplitSelection {
+            path: files[files.len() - 1].path.clone(),
+            hunks: Some(vec![SplitHunk {
+                old_start: 1,
+                new_start: 1,
+                old_lines: 1,
+                new_lines: 1,
+            }]),
+        });
         let outcome = backend
             .split_change(dir.path(), &wc_id, &selected, "carved: first file")
             .unwrap();
         assert!(outcome.operation_id.is_some());
         assert_eq!(outcome.target_change.as_deref(), Some(wc_id.as_str()));
+        assert!(
+            outcome.summary.contains(&format!(
+                "kept {} file{} and parts of 1 more",
+                files.len() - 1,
+                if files.len() - 1 == 1 { "" } else { "s" }
+            )),
+            "got {}",
+            outcome.summary
+        );
 
         // The carved half keeps the change id, its original parents, and the
         // new description; the remainder sits directly on top with the old

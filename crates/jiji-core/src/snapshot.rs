@@ -300,6 +300,45 @@ pub struct DiffSegment {
     pub changed: bool,
 }
 
+/// One file's part in a split: either the whole file (the fast path) or a
+/// subset of its diff hunks. What the split panel sends per checked row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SplitSelection {
+    /// Repo-relative path, `/`-separated.
+    pub path: String,
+    /// `None` — the whole file moves into the carved-off change. `Some` —
+    /// only these hunks of the file's current diff do; the rest of the file
+    /// stays with the remainder. Hunks are identified by their unified-diff
+    /// coordinates so the backend can verify them against a freshly
+    /// computed diff and refuse when the change moved underneath the panel.
+    pub hunks: Option<Vec<SplitHunk>>,
+}
+
+impl SplitSelection {
+    /// A whole-file selection — the fast path.
+    pub fn whole(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            hunks: None,
+        }
+    }
+}
+
+/// Coordinates of one selected unified hunk, as the diff surface rendered
+/// it: 1-based start lines plus the per-side line counts (context lines
+/// included). A hunk that no longer matches these exactly is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SplitHunk {
+    pub old_start: u32,
+    pub new_start: u32,
+    pub old_lines: u32,
+    pub new_lines: u32,
+}
+
 /// What a mutation did, surfaced as the operation breadcrumb after the
 /// snapshot refreshes. Every write action returns one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

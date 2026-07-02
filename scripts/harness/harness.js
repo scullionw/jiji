@@ -36,10 +36,15 @@
 //   &open=rebase         open the rebase panel on the selection
 //   &open=split          open the split panel on the selection
 //   &sfiles=<p1,p2>      check those file rows in the open split panel
+//   &shunks=<p@0.2,p2@1> open those files' hunk lists in the split panel
+//                        and check the dot-separated hunk indices (a bare
+//                        `p@` only opens the list; composes with sfiles —
+//                        e.g. check the file, then untick one hunk)
 //   &sdesc=<text>        type the carved change's description in the open
 //                        split panel (confirm via &confirm=1; the stubbed
 //                        split_change partitions the captured diff between
-//                        the two halves)
+//                        the two halves, at hunk granularity for hunk
+//                        selections)
 //   &open=compare        open the compare panel on the selection
 //   &compare=<v>         pick a row in the open compare panel: parent|trunk|
 //                        base or a change id (compare_diff is stubbed from
@@ -434,14 +439,19 @@
           if (node instanceof Promise) return node;
           const diff = (data.diffs || {})[node.id];
           const all = (diff?.files || []).map((f) => f.path);
-          const paths = args?.paths || [];
-          const selected = all.filter((p) => paths.includes(p));
-          if (selected.length === 0)
+          const selection = args?.selection || [];
+          const wholePaths = selection.filter((s) => !s.hunks).map((s) => s.path);
+          const partial = selection.filter((s) => s.hunks);
+          const whole = all.filter((p) => wholePaths.includes(p));
+          const partialSelected = all.filter((p) =>
+            partial.some((s) => s.path === p),
+          );
+          if (whole.length + partialSelected.length === 0)
             return reject(
               "mutation_failed",
               `none of the selected files change anything in ${node.id}`,
             );
-          if (selected.length === all.length)
+          if (whole.length === all.length)
             return reject(
               "mutation_failed",
               `the selection covers every change in ${node.id}; there would be nothing left to split off`,
@@ -489,25 +499,66 @@
             const at = ws.nodeIds.indexOf(node.id);
             if (at !== -1) ws.nodeIds.splice(at, 0, newId);
           });
-          // Partition the captured diff so each half renders its own files.
+          // Partition the captured diff so each half renders its own
+          // files — at hunk granularity for hunk selections, matched by
+          // the same coordinates the backend verifies.
           if (diff) {
+            const coords = (h) => ({
+              oldStart: h.oldStart,
+              newStart: h.newStart,
+              oldLines: h.lines.filter((l) => l.kind !== "added").length,
+              newLines: h.lines.filter((l) => l.kind !== "removed").length,
+            });
+            const matches = (h, want) => {
+              const c = coords(h);
+              return (
+                c.oldStart === want.oldStart &&
+                c.newStart === want.newStart &&
+                c.oldLines === want.oldLines &&
+                c.newLines === want.newLines
+              );
+            };
+            const carved = [];
+            const rest = [];
+            for (const f of diff.files) {
+              const sel = partial.find((s) => s.path === f.path);
+              if (wholePaths.includes(f.path)) {
+                carved.push(f);
+              } else if (sel && f.content?.kind === "text") {
+                const chosen = f.content.hunks.filter((h) =>
+                  sel.hunks.some((want) => matches(h, want)),
+                );
+                const left = f.content.hunks.filter((h) => !chosen.includes(h));
+                if (chosen.length)
+                  carved.push({ ...f, content: { ...f.content, hunks: chosen } });
+                if (left.length || !chosen.length)
+                  rest.push({ ...f, content: { ...f.content, hunks: left } });
+              } else {
+                rest.push(f);
+              }
+            }
             data.diffs[newId] = {
               id: newId,
               from: null,
-              files: diff.files.filter((f) => !paths.includes(f.path)),
+              files: rest,
               truncated: false,
             };
-            data.diffs[node.id] = {
-              ...diff,
-              files: diff.files.filter((f) => paths.includes(f.path)),
-            };
+            data.diffs[node.id] = { ...diff, files: carved };
           }
+          const kept =
+            partialSelected.length === 0
+              ? `${whole.length} file${whole.length === 1 ? "" : "s"}`
+              : whole.length === 0
+                ? `parts of ${partialSelected.length} file${
+                    partialSelected.length === 1 ? "" : "s"
+                  }`
+                : `${whole.length} file${
+                    whole.length === 1 ? "" : "s"
+                  } and parts of ${partialSelected.length} more`;
           const opId = pushOp(snap, `split commit ${node.commitId}`, effects);
           return Promise.resolve({
             operationId: opId,
-            summary: `Split ${node.id}: kept ${selected.length} file${
-              selected.length === 1 ? "" : "s"
-            }, the rest moved to ${newId}`,
+            summary: `Split ${node.id}: kept ${kept}, the rest moved to ${newId}`,
             targetChange: node.id,
           });
         }
@@ -1003,11 +1054,22 @@
   if (rebaseMode) {
     steps.push(() => click(`.mode-toggle [data-mode="${rebaseMode}"]`));
   }
-  // Split panel: check file rows, then type the carved change's description.
+  // Split panel: check file rows and hunk rows, then type the carved
+  // change's description.
   const splitFiles = params.get("sfiles");
   if (splitFiles) {
     for (const path of splitFiles.split(",")) {
       steps.push(() => click(`.dest-row[data-splitfile="${path}"]`));
+    }
+  }
+  const splitHunks = params.get("shunks");
+  if (splitHunks) {
+    for (const entry of splitHunks.split(",")) {
+      const [path, indices] = entry.split("@");
+      steps.push(() => click(`.hunk-toggle[data-splitexpand="${path}"]`));
+      for (const index of (indices || "").split(".").filter(Boolean)) {
+        steps.push(() => click(`.dest-row[data-splithunk="${path}@${index}"]`));
+      }
     }
   }
   const splitDesc = params.get("sdesc");

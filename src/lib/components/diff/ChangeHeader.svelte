@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import Icon from "$lib/components/ui/Icon.svelte";
   import type { FileDiff } from "$lib/bindings/FileDiff";
   import type { FileStatus } from "$lib/bindings/FileStatus";
@@ -41,6 +41,19 @@
   import { app } from "$lib/state/app.svelte";
   import { consumeIntent } from "$lib/state/actions";
   import { fileStats, totalStats, type DiffLayout } from "./diff";
+  import {
+    canSelectHunks,
+    fileHunks,
+    hunkLabel,
+    hunkPreview,
+    hunkStats,
+    splitPayload,
+    splitSummary,
+    splittable,
+    toggleFilePick,
+    toggleHunkPick,
+    type SplitPick,
+  } from "./split";
 
   let {
     snapshot,
@@ -101,6 +114,7 @@
     rebaseError = null;
     splitOpen = false;
     splitSelected.clear();
+    splitHunksOpen.clear();
     splitDraft = "";
     splitError = null;
     compareOpen = false;
@@ -455,27 +469,41 @@
     }
   }
 
-  // Split: the plan step for carving a mixed change apart by file. The
-  // checked files become the first change — it keeps this change's id and
-  // takes the description entered here — and the unchecked files move to a
-  // new change directly on top, which inherits the original description,
-  // bookmarks, descendants, and (splitting @) the working copy: jj's split
-  // rule, so peeling described commits off the bottom of the working copy
-  // is a repeatable loop. File list comes from the loaded diff, so opening
-  // the panel drops an active comparison back to the parent diff.
+  // Split: the plan step for carving a mixed change apart. Checked files —
+  // or just the checked hunks of a file — become the first change: it
+  // keeps this change's id and takes the description entered here, while
+  // everything unchecked moves to a new change directly on top, which
+  // inherits the original description, bookmarks, descendants, and
+  // (splitting @) the working copy: jj's split rule, so peeling described
+  // commits off the bottom of the working copy is a repeatable loop. The
+  // checklist comes from the loaded diff, so opening the panel drops an
+  // active comparison back to the parent diff; the backend re-derives and
+  // verifies hunk coordinates, refusing when the change moved meanwhile.
   let splitOpen = $state(false);
-  const splitSelected = new SvelteSet<string>();
+  const splitSelected = new SvelteMap<string, SplitPick>();
+  const splitHunksOpen = new SvelteSet<string>();
   let splitDraft = $state("");
   let splitError = $state<string | null>(null);
   let splitPanelEl = $state<HTMLDivElement | undefined>();
   let splitDescEl = $state<HTMLTextAreaElement | undefined>();
 
   // Stale checks (a refetch can drop files) count only via the loaded list.
-  const splitChecked = $derived(
-    files ? files.filter((f) => splitSelected.has(f.path)).length : 0,
-  );
-  const splitValid = $derived(
-    files !== null && splitChecked > 0 && splitChecked < files.length,
+  const splitInfo = $derived(splitSummary(files, splitSelected));
+  const splitValid = $derived(splitInfo.valid);
+  // The checked-selection subject line: "2 files", "3 hunks across 1
+  // file", or "1 file plus 2 hunks from 1 more".
+  const splitKept = $derived.by(() => {
+    const { whole, partial, hunks } = splitInfo;
+    const n = (count: number, word: string) =>
+      `${count} ${word}${count === 1 ? "" : "s"}`;
+    if (partial === 0) return n(whole, "checked file");
+    if (whole === 0) return `${n(hunks, "checked hunk")} across ${n(partial, "file")}`;
+    return `${n(whole, "checked file")} plus ${n(hunks, "hunk")} from ${n(partial, "more")}`;
+  });
+  const splitKeptSingular = $derived(
+    splitInfo.partial === 0
+      ? splitInfo.whole === 1
+      : splitInfo.whole === 0 && splitInfo.hunks === 1,
   );
 
   function toggleSplit() {
@@ -486,6 +514,7 @@
     rebaseOpen = false;
     compareOpen = false;
     splitSelected.clear();
+    splitHunksOpen.clear();
     splitDraft = "";
     splitError = null;
     if (splitOpen) {
@@ -496,16 +525,26 @@
   }
 
   function toggleSplitFile(path: string) {
-    if (!splitSelected.delete(path)) splitSelected.add(path);
+    const next = toggleFilePick(splitSelected.get(path));
+    if (next === undefined) splitSelected.delete(path);
+    else splitSelected.set(path, next);
+  }
+
+  function toggleSplitHunk(path: string, index: number, count: number) {
+    const next = toggleHunkPick(splitSelected.get(path), index, count);
+    if (next === undefined) splitSelected.delete(path);
+    else splitSelected.set(path, next);
+  }
+
+  function toggleSplitHunksOpen(path: string) {
+    if (!splitHunksOpen.delete(path)) splitHunksOpen.add(path);
   }
 
   function submitSplit() {
     if (!splitValid || !files) return;
-    const paths = files
-      .filter((f) => splitSelected.has(f.path))
-      .map((f) => f.path);
+    const selection = splitPayload(files, splitSelected);
     runPanel(
-      () => splitChange(node.id, paths, splitDraft),
+      () => splitChange(node.id, selection, splitDraft),
       (message) => (splitError = message),
       () => (splitOpen = false),
     );
@@ -1399,38 +1438,86 @@
         </p>
         {#if files === null}
           <span class="dest-empty">Loading the file list…</span>
-        {:else if files.length < 2}
+        {:else if !splittable(files)}
           <span class="dest-empty">
-            This change touches {files.length === 1 ? "only one file" : "no files"}
-            — there is nothing to split apart.
+            This change touches {files.length === 1
+              ? "only one file, and its diff offers nothing to carve apart"
+              : "no files"} — there is nothing to split.
           </span>
         {:else}
           <span class="result-label dest-label">
-            Check the files to carve off into their own change
+            Check the files — or single hunks — to carve off into their own change
           </span>
-          <div class="dest-list" role="listbox" aria-multiselectable="true" aria-label="Files for the split-off change">
+          <div class="dest-list" role="listbox" aria-multiselectable="true" aria-label="Files and hunks for the split-off change">
             {#each files as file (file.path)}
               {@const parts = splitPath(file.path)}
-              {@const checked = splitSelected.has(file.path)}
-              <button
-                class="dest-row"
-                class:selected={checked}
-                role="option"
-                aria-selected={checked}
-                data-splitfile={file.path}
-                disabled={acting}
-                title={file.renamedFrom
-                  ? `${file.renamedFrom} → ${file.path}`
-                  : file.path}
-                onclick={() => toggleSplitFile(file.path)}
-              >
-                <span class="check mono" class:on={checked}>{checked ? "✓" : ""}</span>
-                <span class="status {file.status} mono">{STATUS_GLYPH[file.status]}</span>
-                <span class="path mono truncate">
-                  {#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<span
-                    class="fname">{parts.name}</span>
-                </span>
-              </button>
+              {@const pick = splitSelected.get(file.path)}
+              {@const checked = pick === "all"}
+              {@const partial = pick !== undefined && pick !== "all"}
+              {@const hunky = canSelectHunks(file)}
+              {@const hunksOpen = hunky && splitHunksOpen.has(file.path)}
+              <div class="split-file">
+                <button
+                  class="dest-row"
+                  class:selected={checked}
+                  class:partial
+                  role="option"
+                  aria-selected={checked || partial}
+                  data-splitfile={file.path}
+                  disabled={acting}
+                  title={file.renamedFrom
+                    ? `${file.renamedFrom} → ${file.path}`
+                    : file.path}
+                  onclick={() => toggleSplitFile(file.path)}
+                >
+                  <span class="check mono" class:on={checked} class:half={partial}>
+                    {checked ? "✓" : partial ? "–" : ""}
+                  </span>
+                  <span class="status {file.status} mono">{STATUS_GLYPH[file.status]}</span>
+                  <span class="path mono truncate">
+                    {#if parts.dir}<span class="dir">{parts.dir}</span>{/if}<span
+                      class="fname">{parts.name}</span>
+                  </span>
+                </button>
+                {#if hunky}
+                  <button
+                    class="hunk-toggle mono"
+                    class:open={hunksOpen}
+                    data-splitexpand={file.path}
+                    disabled={acting}
+                    title={hunksOpen
+                      ? "Hide this file's hunks"
+                      : "Pick single hunks of this file"}
+                    onclick={() => toggleSplitHunksOpen(file.path)}
+                  >
+                    {fileHunks(file).length} hunks
+                    <span class="chevron" class:open={hunksOpen}>›</span>
+                  </button>
+                {/if}
+              </div>
+              {#if hunksOpen}
+                {#each fileHunks(file) as h, i (i)}
+                  {@const on = checked || (partial && pick.has(i))}
+                  {@const stats = hunkStats(h)}
+                  <button
+                    class="dest-row hunk-row"
+                    class:selected={on}
+                    role="option"
+                    aria-selected={on}
+                    data-splithunk={`${file.path}@${i}`}
+                    disabled={acting}
+                    onclick={() => toggleSplitHunk(file.path, i, fileHunks(file).length)}
+                  >
+                    <span class="check mono" class:on>{on ? "✓" : ""}</span>
+                    <span class="hunk-label mono">{hunkLabel(h)}</span>
+                    <span class="hunk-stats mono">
+                      {#if stats.added > 0}<span class="add">+{stats.added}</span>{/if}
+                      {#if stats.removed > 0}<span class="del">−{stats.removed}</span>{/if}
+                    </span>
+                    <span class="hunk-preview mono truncate">{hunkPreview(h)}</span>
+                  </button>
+                {/each}
+              {/if}
             {/each}
           </div>
           <span class="result-label">Description for the split-off change</span>
@@ -1443,25 +1530,25 @@
             spellcheck="false"
             disabled={acting}
           ></textarea>
-          {#if splitChecked > 0}
+          {#if splitInfo.whole + splitInfo.partial > 0}
             <ul class="consequences">
               <li>
-                The {splitChecked} checked file{splitChecked === 1 ? "" : "s"}
-                become{splitChecked === 1 ? "s" : ""} the first change — it keeps
+                The {splitKept}
+                become{splitKeptSingular ? "s" : ""} the first change — it keeps
                 the id <b class="mono">{node.id.slice(0, 4)}</b> and the
                 description above.
               </li>
-              {#if splitChecked < files.length}
+              {#if !splitInfo.allCovered}
                 <li>
-                  The other {files.length - splitChecked} file{files.length - splitChecked === 1
-                    ? " moves"
-                    : "s move"} to a new change directly on top, keeping
+                  Everything unchecked{splitInfo.partial > 0
+                    ? " — including the other hunks of partially checked files —"
+                    : ""} moves to a new change directly on top, keeping
                   <span class="quiet">“{title || "no description"}”</span>.
                 </li>
               {:else}
                 <li class="blocked">
-                  Every file is checked — leave at least one for the new change
-                  on top.
+                  Every file is fully checked — leave a file or a hunk for the
+                  new change on top.
                 </li>
               {/if}
               {#if marks.length > 0}
@@ -1493,7 +1580,7 @@
           <span class="editor-hint">
             {splitValid
               ? "⌘↵ to confirm"
-              : "Check the files for the first change — at least one on each side"}
+              : "Check files or hunks for the first change — leaving something on each side"}
           </span>
           {#if splitError}
             <span class="editor-error truncate" title={splitError}>{splitError}</span>
@@ -2444,6 +2531,86 @@
     background: var(--clr-accent);
     border-color: var(--clr-accent);
     color: var(--clr-bg-1);
+  }
+
+  /* Partially checked file: some hunks ride along, the rest stay. */
+  .check.half {
+    border-color: var(--clr-accent);
+    color: var(--clr-accent-strong);
+    font-weight: 700;
+  }
+
+  .split-file {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+    min-width: 0;
+  }
+
+  .split-file > .dest-row {
+    flex: 1;
+  }
+
+  .hunk-toggle {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px var(--sp-2);
+    border-radius: 999px;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+    transition: all var(--t-fast) var(--ease-out);
+  }
+
+  .hunk-toggle:hover:not(:disabled),
+  .hunk-toggle.open {
+    background: var(--clr-bg-hover);
+    color: var(--clr-text-1);
+  }
+
+  .hunk-toggle:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+
+  .hunk-toggle .chevron {
+    display: inline-block;
+    transition: transform var(--t-fast) var(--ease-out);
+  }
+
+  .hunk-toggle .chevron.open {
+    transform: rotate(90deg);
+  }
+
+  /* Hunk rows sit indented under their file row, labeled by their unified
+     header with a first-changed-line hint. */
+  .hunk-row {
+    padding-left: calc(var(--sp-2) + 19px);
+  }
+
+  .hunk-label {
+    flex-shrink: 0;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .dest-row.selected .hunk-label {
+    color: var(--clr-text-2);
+  }
+
+  .hunk-stats {
+    flex-shrink: 0;
+    display: inline-flex;
+    gap: 4px;
+    font-size: var(--text-xs);
+  }
+
+  .hunk-preview {
+    min-width: 0;
+    flex: 1;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
   }
 
   .split-desc {

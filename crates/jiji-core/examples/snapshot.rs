@@ -8,7 +8,7 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --compare <from-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --describe "text"
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --new|--edit|--abandon|--squash
-//!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --split "description" <path>...
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --split "description" <path|path@hunk,hunk>...
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --rebase <dest-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --move <dest-change-id>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --bookmark <name>
@@ -34,6 +34,7 @@
 //! Set `JIJI_MOCK_BACKEND=1` to print the mock backend's data instead
 //! (the path still has to be a `.jj` repo).
 
+use jiji_core::snapshot::{DiffLineKind, FileDiffContent, SplitHunk, SplitSelection};
 use jiji_core::{JjBackend, MockBackend, RepoBackend};
 
 fn main() {
@@ -98,9 +99,69 @@ fn main() {
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),
         (Some(change_id), Some("--split")) => {
             let description = std::env::args().nth(4).expect("--split needs the description");
-            let paths: Vec<String> = std::env::args().skip(5).collect();
+            // Each selection arg is a bare path (whole file), or
+            // `path@0,2` to carve only those hunks — 0-based indices into
+            // the file's current diff as `--diff` prints it, mapped to the
+            // hunk coordinates the backend verifies.
+            let args: Vec<String> = std::env::args().skip(5).collect();
+            let diff = if args.iter().any(|a| a.contains('@')) {
+                Some(
+                    backend
+                        .change_diff(path, &change_id)
+                        .expect("hunk selection needs the change diff"),
+                )
+            } else {
+                None
+            };
+            let mut selection = Vec::new();
+            for arg in &args {
+                match arg.split_once('@') {
+                    None => selection.push(SplitSelection {
+                        path: arg.clone(),
+                        hunks: None,
+                    }),
+                    Some((file, indices)) => {
+                        let file_diff = diff
+                            .as_ref()
+                            .unwrap()
+                            .files
+                            .iter()
+                            .find(|f| f.path == file)
+                            .unwrap_or_else(|| panic!("{file} is not in the diff"));
+                        let FileDiffContent::Text { hunks, .. } = &file_diff.content else {
+                            panic!("{file} has no text hunks");
+                        };
+                        let chosen = indices
+                            .split(',')
+                            .map(|idx| {
+                                let hunk = &hunks[idx.parse::<usize>().expect("hunk index")];
+                                SplitHunk {
+                                    old_start: hunk.old_start,
+                                    new_start: hunk.new_start,
+                                    old_lines: hunk
+                                        .lines
+                                        .iter()
+                                        .filter(|l| !matches!(l.kind, DiffLineKind::Added))
+                                        .count()
+                                        as u32,
+                                    new_lines: hunk
+                                        .lines
+                                        .iter()
+                                        .filter(|l| !matches!(l.kind, DiffLineKind::Removed))
+                                        .count()
+                                        as u32,
+                                }
+                            })
+                            .collect();
+                        selection.push(SplitSelection {
+                            path: file.to_owned(),
+                            hunks: Some(chosen),
+                        });
+                    }
+                }
+            }
             backend
-                .split_change(path, &change_id, &paths, &description)
+                .split_change(path, &change_id, &selection, &description)
                 .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap())
         }
         (Some(change_id), Some("--rebase")) => {

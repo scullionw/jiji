@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use jiji_core::snapshot::{ChangeDetail, ChangeDiff, MutationOutcome};
+use jiji_core::snapshot::{ChangeDetail, ChangeDiff, MutationOutcome, SplitSelection};
 use jiji_core::{BackendError, JjBackend, MockBackend, RepoBackend, RepoSnapshot, RepoWatcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager as _, State};
@@ -294,11 +294,11 @@ pub fn split_change(
     app: AppHandle,
     state: State<'_, AppState>,
     change_id: String,
-    paths: Vec<String>,
+    selection: Vec<SplitSelection>,
     description: String,
 ) -> Result<MutationOutcome, CommandError> {
     state.mutate(&app, |backend, path| {
-        backend.split_change(path, &change_id, &paths, &description)
+        backend.split_change(path, &change_id, &selection, &description)
     })
 }
 

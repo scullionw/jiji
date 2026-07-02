@@ -72,7 +72,7 @@ pub enum MockMutation {
     Edit { id: String },
     Abandon { id: String },
     Squash { id: String },
-    Split { id: String, paths: Vec<String>, description: String },
+    Split { id: String, selection: Vec<SplitSelection>, description: String },
     Rebase { id: String, destination: String, with_descendants: bool },
     CreateBookmark { name: String, target: String },
     MoveBookmark { name: String, target: String },
@@ -235,34 +235,57 @@ pub fn mutation_outcome(
             require_mutable(parent)?;
             Ok(recorded(format!("Squashed {id} into {parent_id}"), parent_id))
         }
-        MockMutation::Split { id, paths, .. } => {
+        MockMutation::Split { id, selection, .. } => {
             let node = find(id)?;
             require_mutable(node)?;
             // The change's own diff decides what a selection can cover.
             // Mutation-created nodes have no fixture files, so they refuse
             // as "nothing selected" — same as the real backend on an empty
-            // change.
+            // change. Hunk entries count as partially kept: their file
+            // still leaves its unchosen hunks with the remainder, so only
+            // an all-whole-files selection can cover everything (the hunk
+            // coordinates themselves are not validated — fixture diffs are
+            // static, a documented mock approximation).
             let files: Vec<String> = mock_change_detail(id)
                 .map(|detail| detail.files.into_iter().map(|f| f.path).collect())
                 .unwrap_or_default();
-            let selected = files.iter().filter(|f| paths.contains(f)).count();
-            if selected == 0 {
+            let whole = files
+                .iter()
+                .filter(|f| {
+                    selection
+                        .iter()
+                        .any(|s| s.path == **f && s.hunks.is_none())
+                })
+                .count();
+            let partial = files
+                .iter()
+                .filter(|f| {
+                    selection
+                        .iter()
+                        .any(|s| s.path == **f && s.hunks.is_some())
+                })
+                .count();
+            if whole + partial == 0 {
                 return Err(BackendError::MutationFailed(format!(
                     "none of the selected files change anything in {id}"
                 )));
             }
-            if selected == files.len() {
+            if whole == files.len() {
                 return Err(BackendError::MutationFailed(format!(
                     "the selection covers every change in {id}; \
                      there would be nothing left to split off"
                 )));
             }
+            let kept = match (whole, partial) {
+                (w, 0) => format!("{w} file{}", if w == 1 { "" } else { "s" }),
+                (0, p) => format!("parts of {p} file{}", if p == 1 { "" } else { "s" }),
+                (w, p) => {
+                    format!("{w} file{} and parts of {p} more", if w == 1 { "" } else { "s" })
+                }
+            };
             let new_id = mock_new_change_id(index);
             Ok(recorded(
-                format!(
-                    "Split {id}: kept {selected} file{}, the rest moved to {new_id}",
-                    if selected == 1 { "" } else { "s" }
-                ),
+                format!("Split {id}: kept {kept}, the rest moved to {new_id}"),
                 id,
             ))
         }
