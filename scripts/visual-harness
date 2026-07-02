@@ -16,7 +16,7 @@ visual-harness — build, stub, serve, and screenshot the SPA without Tauri
 
 Usage:
   scripts/visual-harness setup [--repo PATH] [--diff CHANGE_ID]... [--compare FROM:TO]... [--no-build] [--port N]
-  scripts/visual-harness shot OUT.png 'QUERY' [--size WxH] [--scale N]
+  scripts/visual-harness shot OUT.png 'QUERY' [--size WxH] [--scale N] [--motion]
   scripts/visual-harness stop
 
 setup   Builds the SPA, captures the mock snapshot (plus content diffs for
@@ -28,6 +28,9 @@ shot    Screenshots one scenario. QUERY is the page query string, e.g.
         'snap=mock&section=operations&expand=1' or
         'snap=real&click=ktpqsmxw&layout=split&scroll=600'.
         --size defaults to 1440x900; --scale 2 for detail crops.
+        Shots force prefers-reduced-motion so every animation settles
+        instantly (Svelte outros never finish under virtual time);
+        --motion turns that off to observe mid-flight motion states.
 stop    Stops the server.
 
 Scenario params (full list in scripts/harness/harness.js):
@@ -35,7 +38,8 @@ Scenario params (full list in scripts/harness/harness.js):
   click=<changeId>, open=files|body|describe|squash|abandon|bookmark|rebase|compare,
   describe=<text>, action=new|edit, confirm=1, bookmark=<name>, movebm=<name>,
   manage=<name>, rename=<text>, delete=1, obmrename=<name>, obmdelete=<name>,
-  mode=stack|single, dest=<changeId>, compare=parent|trunk|base|<changeId>,
+  mode=stack|single, dest=<changeId>, desthover=<changeId>,
+  compare=parent|trunk|base|<changeId>,
   oprevert=<opId>, oprestore=<opId>, undo=1,
   drag=<changeId>, dragto=<changeId>, dragalt=1, drop=1,
   expand=1, scroll=<px>, scrollx=<px>
@@ -137,11 +141,12 @@ cmd_shot() {
   if [[ $# -lt 2 ]]; then usage; exit 1; fi
   local out="$1" query="$2"
   shift 2
-  local size="1440,900" scale=""
+  local size="1440,900" scale="" motion=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --size) size="${2//x/,}"; shift 2 ;;
       --scale) scale="$2"; shift 2 ;;
+      --motion) motion=1; shift ;;
       *) echo "unknown shot flag: $1" >&2; exit 1 ;;
     esac
   done
@@ -158,6 +163,7 @@ cmd_shot() {
     --virtual-time-budget=8000
     "--screenshot=$out"
   )
+  [[ $motion -eq 0 ]] && args+=(--force-prefers-reduced-motion)
   [[ -n "$scale" ]] && args+=("--force-device-scale-factor=$scale")
   "$chrome" "${args[@]}" "http://localhost:$port/?$query" 2>/dev/null
   echo "wrote $out"

@@ -40,6 +40,11 @@
     SYNC_LABEL,
     type CompareMode,
   } from "$lib/components/inspector/inspect";
+  import { drag } from "$lib/components/graph/dnd.svelte";
+  import {
+    clearRewritePreview,
+    setRewritePreview,
+  } from "$lib/components/graph/preview.svelte";
   import { app } from "$lib/state/app.svelte";
   import { consumeIntent } from "$lib/state/actions";
   import { fileStats, totalStats, type DiffLayout } from "./diff";
@@ -364,6 +369,9 @@
   // change moves alone and descendants reparent onto its parents).
   let rebaseAlone = $state(false);
   let rebaseDest = $state<string | null>(null);
+  // Destination row under the pointer: scrubs the graph preview without
+  // committing the pick.
+  let rebaseHover = $state<string | null>(null);
   let rebaseFilter = $state("");
   let rebaseError = $state<string | null>(null);
   let rebaseFilterEl = $state<HTMLInputElement | undefined>();
@@ -401,6 +409,7 @@
     compareOpen = false;
     rebaseAlone = false;
     rebaseDest = null;
+    rebaseHover = null;
     rebaseFilter = "";
     rebaseError = null;
     if (rebaseOpen) {
@@ -498,6 +507,8 @@
   // true = move into an existing change; false = carve into a new one.
   let splitInto = $state(false);
   let splitDest = $state<string | null>(null);
+  // Destination row under the pointer, like the rebase panel's scrub.
+  let splitDestHover = $state<string | null>(null);
   let splitDestFilter = $state("");
   let splitPanelEl = $state<HTMLDivElement | undefined>();
   let splitDescEl = $state<HTMLTextAreaElement | undefined>();
@@ -560,6 +571,7 @@
     splitError = null;
     splitInto = into;
     splitDest = null;
+    splitDestHover = null;
     splitDestFilter = "";
     if (splitOpen) {
       // The checklist is this change's own files, not a comparison span's.
@@ -646,6 +658,49 @@
       submitSplit();
     }
   }
+
+  // The graph's hover-scrub: while a plan panel is open, the rows its
+  // rewrite would touch light up in the tree, and a picked destination
+  // wears the same ring a drag target does — so scrubbing the destination
+  // list (hover, click, or ↑/↓) moves the preview live in the graph. A
+  // drag owns the preview for its duration; reading `drag.active` re-runs
+  // this when the drag ends, so the panel's set comes back on its own.
+  $effect(() => {
+    if (drag.active) return;
+    if (rebaseOpen) {
+      const moving = rebaseAlone
+        ? [node.id]
+        : [node.id, ...descendants.map((d) => d.id)];
+      setRewritePreview("panel", moving, rebaseHover ?? rebaseDest);
+    } else if (confirm === "squash" && parentNode) {
+      // The parent takes the fold and everything under it rebases.
+      setRewritePreview("panel", [
+        parentNode.id,
+        ...descendantsOf(snapshot, parentNode.id).map((d) => d.id),
+      ]);
+    } else if (confirm === "abandon") {
+      setRewritePreview("panel", [
+        node.id,
+        ...descendants.map((d) => d.id),
+      ]);
+    } else if (splitOpen) {
+      const ids = [node.id, ...descendants.map((d) => d.id)];
+      const dest = splitInto ? (splitDestHover ?? splitDest) : null;
+      if (dest !== null) {
+        // Content lands in the destination, so it and its descendants
+        // rewrite too.
+        ids.push(dest, ...descendantsOf(snapshot, dest).map((d) => d.id));
+      }
+      setRewritePreview("panel", ids, dest);
+    } else {
+      clearRewritePreview("panel");
+    }
+  });
+
+  // Leaving the selection (or unmounting entirely) takes the preview along.
+  $effect(() => {
+    return () => clearRewritePreview("panel");
+  });
 
   // Compare: what the diff is measured against. Read-only — picking a row
   // applies immediately, no plan/confirm step. Presets stay relative
@@ -1415,7 +1470,13 @@
           {/if}
         </div>
         <span class="result-label dest-label">Destination — the new parent</span>
-        <div class="dest-list" role="listbox" aria-label="Rebase destination">
+        <div
+          class="dest-list"
+          role="listbox"
+          aria-label="Rebase destination"
+          tabindex="-1"
+          onpointerleave={() => (rebaseHover = null)}
+        >
           {#each visibleDestinations as candidate (candidate.id)}
             <button
               class="dest-row"
@@ -1425,6 +1486,7 @@
               data-dest={candidate.id}
               disabled={acting}
               onclick={() => (rebaseDest = candidate.id)}
+              onpointerenter={() => (rebaseHover = candidate.id)}
             >
               <span class="dest-glyph mono {candidate.kind}">{KIND_GLYPH[candidate.kind]}</span>
               <span class="dest-id mono"><b>{candidate.id.slice(0, 2)}</b>{candidate.id.slice(2, 4)}</span>
@@ -1701,7 +1763,13 @@
           {/if}
           {:else}
           <span class="result-label dest-label">Destination — the change the selection moves into</span>
-          <div class="dest-list" role="listbox" aria-label="Move destination">
+          <div
+            class="dest-list"
+            role="listbox"
+            aria-label="Move destination"
+            tabindex="-1"
+            onpointerleave={() => (splitDestHover = null)}
+          >
             {#each visibleSplitDests as candidate (candidate.id)}
               <button
                 class="dest-row"
@@ -1711,6 +1779,7 @@
                 data-splitdest={candidate.id}
                 disabled={acting}
                 onclick={() => (splitDest = candidate.id)}
+                onpointerenter={() => (splitDestHover = candidate.id)}
               >
                 <span class="dest-glyph mono {candidate.kind}">{KIND_GLYPH[candidate.kind]}</span>
                 <span class="dest-id mono"><b>{candidate.id.slice(0, 2)}</b>{candidate.id.slice(2, 4)}</span>

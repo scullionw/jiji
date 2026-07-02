@@ -1,6 +1,11 @@
 <script lang="ts">
+  import { cubicOut } from "svelte/easing";
+  import { Tween } from "svelte/motion";
+  import { SvelteMap } from "svelte/reactivity";
+  import { GRAPH_MOTION_MS, motionMs } from "$lib/motion";
   import {
     gutterWidth,
+    keyedElisionRails,
     railX,
     ELISION_ROW_HEIGHT,
     type ElisionRow,
@@ -13,6 +18,7 @@
     emphasized,
   }: {
     row: ElisionRow;
+    /** May be fractional mid-morph — the view tweens it. */
     columnCount: number;
     emphasized: string | null;
   } = $props();
@@ -20,6 +26,29 @@
   const H = ELISION_ROW_HEIGHT;
   const CY = H / 2;
   const gw = $derived(gutterWidth(columnCount));
+
+  // Same morph as GraphRow: rails and `~` marks keyed by role + stream
+  // tween sideways when a rewrite shifts their columns.
+  const rails = $derived(keyedElisionRails(row));
+  const railXs = new SvelteMap<string, Tween<number>>();
+  $effect(() => {
+    for (const { key, rail } of rails) {
+      const target = railX(rail.col);
+      const existing = railXs.get(key);
+      if (!existing) {
+        railXs.set(key, new Tween(target, { easing: cubicOut }));
+      } else if (existing.target !== target) {
+        existing.set(target, { duration: motionMs(GRAPH_MOTION_MS) });
+      }
+    }
+    for (const key of railXs.keys()) {
+      if (!rails.some((kr) => kr.key === key)) railXs.delete(key);
+    }
+  });
+
+  function xOf(key: string, rail: Rail): number {
+    return railXs.get(key)?.current ?? railX(rail.col);
+  }
 
   function railTone(rail: Rail): string {
     if (rail.stream === null) return "base";
@@ -31,17 +60,18 @@
 <div class="elision" title="History between these commits is not shown">
   <span class="gutter" style:width="{gw}px">
     <svg width={gw} height={H} viewBox="0 0 {gw} {H}" aria-hidden="true">
-      {#each row.passThrough as rail (rail.col)}
-        <path class="rail {railTone(rail)}" d="M {railX(rail.col)} 0 V {H}" />
-      {/each}
-      {#each row.marks as rail (rail.col)}
-        {#if row.continues}
-          <path
-            class="rail {railTone(rail)}"
-            d="M {railX(rail.col)} {CY + 6} V {H}"
-          />
+      {#each rails as kr (kr.key)}
+        {#if kr.role === "pass"}
+          <path class="rail {railTone(kr.rail)}" d="M {xOf(kr.key, kr.rail)} 0 V {H}" />
+        {:else}
+          {#if row.continues}
+            <path
+              class="rail {railTone(kr.rail)}"
+              d="M {xOf(kr.key, kr.rail)} {CY + 6} V {H}"
+            />
+          {/if}
+          <text class="tilde" x={xOf(kr.key, kr.rail)} y={CY + 1}>~</text>
         {/if}
-        <text class="tilde" x={railX(rail.col)} y={CY + 1}>~</text>
       {/each}
     </svg>
   </span>

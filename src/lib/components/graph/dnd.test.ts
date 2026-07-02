@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { GraphNode } from "$lib/bindings/GraphNode";
 import type { NodeKind } from "$lib/bindings/NodeKind";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
-import { canDrag, planDrop } from "./dnd";
+import { canDrag, dragAffectedIds, planDrop } from "./dnd";
 
 function node(id: string, kind: NodeKind, parents: string[] = []): GraphNode {
   return {
@@ -176,5 +176,23 @@ describe("planDrop", () => {
       allowed: false,
       reason: "That change left the snapshot",
     });
+  });
+});
+
+describe("dragAffectedIds", () => {
+  it("includes the source and every descendant for a stack move", () => {
+    expect(dragAffectedIds(stacked, "low", false)).toEqual([
+      "low",
+      "mid",
+      "top",
+    ]);
+  });
+
+  it("shrinks to the source alone for a lone move", () => {
+    expect(dragAffectedIds(stacked, "low", true)).toEqual(["low"]);
+  });
+
+  it("is just the source when nothing sits on top", () => {
+    expect(dragAffectedIds(stacked, "top", false)).toEqual(["top"]);
   });
 });

@@ -1,12 +1,21 @@
 <script lang="ts">
+  import { cubicOut } from "svelte/easing";
+  import { Tween } from "svelte/motion";
+  import { SvelteMap } from "svelte/reactivity";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { GRAPH_MOTION_MS, motionMs } from "$lib/motion";
   import { shortAge } from "$lib/time";
   import { drag } from "./dnd.svelte";
+  import { rewritePreview } from "./preview.svelte";
   import {
     gutterWidth,
+    keyedRails,
+    railInPath,
+    railOutPath,
     railX,
     NODE_ROW_HEIGHT,
     SYNC_GLYPH,
+    type KeyedRail,
     type NodeRow,
     type Rail,
   } from "./graph";
@@ -19,6 +28,7 @@
     onselect,
   }: {
     row: NodeRow;
+    /** May be fractional mid-morph — the view tweens it. */
     columnCount: number;
     /** Workstream id rendered hot; other streams render calm. */
     emphasized: string | null;
@@ -35,29 +45,50 @@
 
   const H = NODE_ROW_HEIGHT;
   const CY = H / 2;
-  const CR = 6; // rail corner radius
   const gw = $derived(gutterWidth(columnCount));
-  const nx = $derived(railX(row.column));
   // Clearance around the marker so rails do not pierce hollow glyphs.
   const clear = $derived(row.isWorkingCopy ? 7 : 6);
+
+  // The gutter morphs instead of swapping: rows survive rewrites (keyed by
+  // change id), so the node marker and each rail (keyed by role + stream,
+  // not column) tween sideways to their new columns and the layout change
+  // reads as movement. Rails are drawn from the tweened positions every
+  // frame; a brand-new rail starts at its target (nothing to slide from).
+  // svelte-ignore state_referenced_locally — the initial value is meant to
+  // be captured once; the effect below tweens every later change.
+  const nxT = new Tween(railX(row.column), { easing: cubicOut });
+  $effect(() => {
+    nxT.set(railX(row.column), { duration: motionMs(GRAPH_MOTION_MS) });
+  });
+  const nx = $derived(nxT.current);
+
+  const rails = $derived(keyedRails(row));
+  const railXs = new SvelteMap<string, Tween<number>>();
+  $effect(() => {
+    for (const { key, rail } of rails) {
+      const target = railX(rail.col);
+      const existing = railXs.get(key);
+      if (!existing) {
+        railXs.set(key, new Tween(target, { easing: cubicOut }));
+      } else if (existing.target !== target) {
+        existing.set(target, { duration: motionMs(GRAPH_MOTION_MS) });
+      }
+    }
+    for (const key of railXs.keys()) {
+      if (!rails.some((kr) => kr.key === key)) railXs.delete(key);
+    }
+  });
+
+  function railD(kr: KeyedRail): string {
+    const x = railXs.get(kr.key)?.current ?? railX(kr.rail.col);
+    if (kr.role === "in") return railInPath(x, nx, H, clear);
+    if (kr.role === "out") return railOutPath(x, nx, H, clear);
+    return `M ${x} 0 V ${H}`;
+  }
 
   function railTone(rail: Rail): string {
     if (rail.stream === null) return "base";
     return rail.stream === emphasized ? "hot" : "calm";
-  }
-
-  function inPath(rail: Rail): string {
-    const x = railX(rail.col);
-    if (rail.col === row.column) return `M ${x} 0 V ${CY - clear}`;
-    const s = x > nx ? -1 : 1; // direction of travel toward the node
-    return `M ${x} 0 V ${CY - CR} Q ${x} ${CY} ${x + s * CR} ${CY} H ${nx - s * clear}`;
-  }
-
-  function outPath(rail: Rail): string {
-    const x = railX(rail.col);
-    if (rail.col === row.column) return `M ${x} ${CY + clear} V ${H}`;
-    const s = x > nx ? 1 : -1; // direction of travel away from the node
-    return `M ${nx + s * clear} ${CY} H ${x - s * CR} Q ${x} ${CY} ${x} ${CY + CR} V ${H}`;
   }
 
   // Immutable bases keep history below them; a dashed stub hands the rail
@@ -71,6 +102,17 @@
   const isDragSource = $derived(drag.active && drag.sourceId === node.id);
   const isDropTarget = $derived(drag.active && drag.targetId === node.id);
   const dropOk = $derived(isDropTarget && drag.plan?.allowed === true);
+
+  // The hover-scrub: rows the pending rewrite would touch light up while a
+  // drag or plan panel is scrubbing destinations. The row in hand already
+  // dims, so it stays out; a picked panel destination wears the same ring
+  // a drag target does.
+  const planDest = $derived(
+    !drag.active && rewritePreview.destination === node.id,
+  );
+  const affected = $derived(
+    rewritePreview.ids.has(node.id) && !isDragSource && !planDest,
+  );
 </script>
 
 <button
@@ -78,8 +120,9 @@
   class:selected
   class:base={isBase}
   class:drag-source={isDragSource}
-  class:drop-ok={dropOk}
+  class:drop-ok={dropOk || planDest}
   class:drop-no={isDropTarget && !dropOk}
+  class:affected
   data-node-id={node.id}
   data-kind={node.kind}
   data-stream={row.stream}
@@ -88,17 +131,11 @@
 >
   <span class="gutter" style:width="{gw}px">
     <svg width={gw} height={H} viewBox="0 0 {gw} {H}" aria-hidden="true">
-      {#each row.passThrough as rail (rail.col)}
-        <path class="rail {railTone(rail)}" d="M {railX(rail.col)} 0 V {H}" />
-      {/each}
-      {#each row.edgesIn as rail (rail.col)}
-        <path class="rail {railTone(rail)}" d={inPath(rail)} />
-      {/each}
-      {#each row.edgesOut as rail (rail.col)}
+      {#each rails as kr (kr.key)}
         <path
-          class="rail {railTone(rail)}"
-          class:elided={rail.elided}
-          d={outPath(rail)}
+          class="rail {railTone(kr.rail)}"
+          class:elided={kr.rail.elided}
+          d={railD(kr)}
         />
       {/each}
       {#if stubBelow}
@@ -225,6 +262,17 @@
   .row.drop-no {
     background: color-mix(in srgb, var(--clr-danger) 7%, transparent);
     box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--clr-danger) 32%, transparent);
+  }
+
+  /* The hover-scrub wash: this row would be rewritten by the plan being
+     scrubbed. Warm and quiet — informative, not alarming. The selection
+     keeps its accent rail; unselected rows get a warn tick instead. */
+  .row.affected {
+    background: color-mix(in srgb, var(--clr-warn) 8%, transparent);
+  }
+
+  .row.affected:not(.selected) {
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--clr-warn) 55%, transparent);
   }
 
   .gutter {

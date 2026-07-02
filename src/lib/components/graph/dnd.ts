@@ -44,6 +44,18 @@ function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
 
+/** The changes a drop would rewrite: the source, plus its descendants when
+ * they come along. The graph renders this set as the live scrub highlight
+ * while a row is in hand — the spec's hover-scrub of affected descendants. */
+export function dragAffectedIds(
+  snapshot: RepoSnapshot,
+  sourceId: string,
+  movesAlone: boolean,
+): string[] {
+  if (movesAlone) return [sourceId];
+  return [sourceId, ...descendantsOf(snapshot, sourceId).map((n) => n.id)];
+}
+
 export function planDrop(
   snapshot: RepoSnapshot,
   sourceId: string,

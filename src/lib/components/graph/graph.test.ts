@@ -8,9 +8,14 @@ import {
   buildFocusModel,
   buildGraphModel,
   emphasizedStreamId,
+  keyedElisionRails,
+  keyedRails,
+  railInPath,
+  railOutPath,
   resolveFocusedWorkstream,
   selectableIds,
   streamOfNode,
+  type ElisionRow,
   type NodeRow,
 } from "./graph";
 
@@ -518,5 +523,95 @@ describe("selection helpers", () => {
     expect(resolveFocusedWorkstream(snap, "ws-b")?.id).toBe("ws-b");
     expect(resolveFocusedWorkstream(snap, "missing")?.id).toBe("ws-a");
     expect(resolveFocusedWorkstream(snap, null)?.id).toBe("ws-a");
+  });
+});
+
+describe("rail morphing helpers", () => {
+  // A stack on column 1 crossing a trunk spine on column 0: enough shape
+  // to exercise every role.
+  const snap = snapshot(
+    [
+      node("wc", "workingCopy", ["a"], "2026-06-10T12:00:00Z"),
+      node("a", "mutable", ["trunk"], "2026-06-10T11:00:00Z"),
+      node("b1", "mutable", ["old"], "2026-06-09T12:00:00Z"),
+      node("trunk", "immutable", ["old"], "2026-06-08T12:00:00Z"),
+      node("old", "immutable", [], "2026-06-07T12:00:00Z"),
+    ],
+    [
+      workstream("ws-a", ["wc", "a"], { isActive: true }),
+      workstream("ws-b", ["b1"]),
+    ],
+    [bookmark("main", "trunk", { isTrunk: true })],
+  );
+  const model = buildGraphModel(snap);
+  const rowOf = (id: string): NodeRow =>
+    model.rows.find(
+      (row): row is NodeRow => row.type === "node" && row.node.id === id,
+    )!;
+
+  it("keys rails by role and stream, not by column", () => {
+    // Both lines converge on `old`: the unowned trunk spine and the ws-b
+    // stream arrive as `in` rails with stream-scoped keys — no column
+    // numbers anywhere in the identity, so a column shift keeps the key.
+    const keyed = keyedRails(rowOf("old"));
+    const inKeys = keyed.filter((k) => k.role === "in").map((k) => k.key);
+    expect(inKeys).toContain("in:·:0");
+    expect(inKeys).toContain("in:ws-b:0");
+  });
+
+  it("gives every rail in a row a unique key", () => {
+    for (const id of ["wc", "a", "b1", "trunk", "old"]) {
+      const keys = keyedRails(rowOf(id)).map((k) => k.key);
+      expect(new Set(keys).size).toBe(keys.length);
+    }
+  });
+
+  it("keeps the paint order: pass, then in, then out", () => {
+    // The trunk row carries all three roles: ws-b passing by, the stack
+    // arriving, the spine continuing down.
+    const roles = keyedRails(rowOf("trunk")).map((k) => k.role);
+    expect(roles).toEqual(["pass", "in", "out"]);
+  });
+
+  it("keys elision rails including marks", () => {
+    const elision = model.rows.find(
+      (row): row is ElisionRow => row.type === "elision",
+    );
+    expect(elision).toBeDefined();
+    const keyed = keyedElisionRails(elision!);
+    expect(keyed.some((k) => k.role === "mark")).toBe(true);
+    const keys = keyed.map((k) => k.key);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("railInPath matches the classic shapes at integral columns", () => {
+    // Straight drop onto its own column.
+    expect(railInPath(12, 12, 26, 6)).toBe("M 12 0 V 7");
+    // One column to the right of the node, curving left into it.
+    expect(railInPath(25, 12, 26, 6)).toBe("M 25 0 V 7 Q 25 13 19 13 H 18");
+    // One column to the left, curving right.
+    expect(railInPath(12, 25, 26, 6)).toBe("M 12 0 V 7 Q 12 13 18 13 H 19");
+    // Working-copy clearance (7) leaves a zero-length H, like before.
+    expect(railInPath(25, 12, 26, 7)).toBe("M 25 0 V 7 Q 25 13 19 13 H 19");
+  });
+
+  it("railOutPath matches the classic shapes at integral columns", () => {
+    expect(railOutPath(12, 12, 26, 6)).toBe("M 12 19 V 26");
+    expect(railOutPath(25, 12, 26, 6)).toBe("M 18 13 H 19 Q 25 13 25 19 V 26");
+    expect(railOutPath(12, 25, 26, 6)).toBe("M 19 13 H 18 Q 12 13 12 19 V 26");
+  });
+
+  it("clamps mid-tween geometry instead of overshooting", () => {
+    // 3px from the node: the corner shrinks to the gap and the horizontal
+    // reach collapses to zero — never a backwards H segment.
+    expect(railInPath(15, 12, 26, 6)).toBe("M 15 0 V 10 Q 15 13 12 13 H 12");
+    expect(railOutPath(15, 12, 26, 6)).toBe("M 12 13 H 12 Q 15 13 15 16 V 26");
+    // Sub-pixel from the node reads as arrived.
+    expect(railInPath(12.2, 12, 26, 6)).toBe("M 12.2 0 V 7");
+    // No NaNs anywhere across a sweep of fractional positions.
+    for (let x = 0; x <= 38; x += 0.7) {
+      expect(railInPath(x, 12, 26, 6)).not.toMatch(/NaN/);
+      expect(railOutPath(x, 12, 26, 6)).not.toMatch(/NaN/);
+    }
   });
 });

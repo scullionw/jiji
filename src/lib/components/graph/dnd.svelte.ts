@@ -11,7 +11,8 @@
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import { findNode } from "$lib/components/inspector/inspect";
 import { moveChange, rebaseChange, runQuiet } from "$lib/state/actions";
-import { canDrag, planDrop, type DropPlan } from "./dnd";
+import { canDrag, dragAffectedIds, planDrop, type DropPlan } from "./dnd";
+import { clearRewritePreview, setRewritePreview } from "./preview.svelte";
 
 export const drag = $state({
   active: false,
@@ -44,9 +45,25 @@ export function attachRowDnd(
     drag.active = false;
     drag.targetId = null;
     drag.plan = null;
+    clearRewritePreview("drag");
     document.body.classList.remove("row-dragging");
     if (raf) cancelAnimationFrame(raf);
     raf = 0;
+  }
+
+  // The hover-scrub while a row is in hand: the rows this drop would
+  // rewrite light up in the graph. Plan-aware, because the plan decides
+  // the scope — a target inside the dragged stack degrades to the lone
+  // move, shrinking the set to the held change.
+  function publishPreview() {
+    const snapshot = getSnapshot();
+    if (!snapshot || !drag.active) return;
+    const movesAlone =
+      drag.plan?.allowed === true ? drag.plan.op === "move" : drag.alone;
+    setRewritePreview(
+      "drag",
+      dragAffectedIds(snapshot, drag.sourceId, movesAlone),
+    );
   }
 
   function replan() {
@@ -55,6 +72,7 @@ export function attachRowDnd(
       snapshot && drag.targetId
         ? planDrop(snapshot, drag.sourceId, drag.targetId, drag.alone)
         : null;
+    publishPreview();
   }
 
   function setAlone(alone: boolean) {
@@ -145,6 +163,7 @@ export function attachRowDnd(
       drag.alone = event.altKey;
       drag.targetId = null;
       drag.plan = null;
+      publishPreview();
       document.body.classList.add("row-dragging");
       raf = requestAnimationFrame(loop);
     }

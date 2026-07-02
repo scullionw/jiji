@@ -1,8 +1,10 @@
 <script lang="ts">
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
+  import { Tween } from "svelte/motion";
   import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { growIn, motionMs, shrinkOut, GRAPH_MOTION_MS } from "$lib/motion";
   import GraphRow from "./GraphRow.svelte";
   import ElisionRow from "./ElisionRow.svelte";
   import SiblingLane from "./SiblingLane.svelte";
@@ -40,7 +42,15 @@
     splitAt === -1 ? [] : model.graph.rows.slice(splitAt),
   );
 
-  const gw = $derived(gutterWidth(model.graph.columnCount));
+  // Same width morph as the graph view when a rewrite changes the lane's
+  // column needs.
+  // svelte-ignore state_referenced_locally — initial width is meant to be
+  // captured once; the effect tweens every later change.
+  const cols = new Tween(model.graph.columnCount, { easing: cubicOut });
+  $effect(() => {
+    cols.set(model.graph.columnCount, { duration: motionMs(GRAPH_MOTION_MS) });
+  });
+  const gw = $derived(gutterWidth(cols.current));
 
   function plural(n: number, word: string): string {
     return `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -68,19 +78,24 @@
 
     <div class="rows">
       <!-- Keyed by change id like the graph view, so an applied reorder
-           slides rows to their new place. -->
+           slides rows to their new place, new rows grow in, and removed
+           rows fold closed. -->
       {#each chainRows as row (row.type === "node" ? row.node.id : row.id)}
-        <div animate:flip={{ duration: 220, easing: cubicOut }}>
+        <div
+          animate:flip={{ duration: motionMs(GRAPH_MOTION_MS), easing: cubicOut }}
+          in:growIn
+          out:shrinkOut
+        >
           {#if row.type === "node"}
             <GraphRow
               {row}
-              columnCount={model.graph.columnCount}
+              columnCount={cols.current}
               emphasized={workstream.id}
               selected={selectedId === row.node.id}
               onselect={() => onselect(row.node.id)}
             />
           {:else}
-            <ElisionRow {row} columnCount={model.graph.columnCount} emphasized={workstream.id} />
+            <ElisionRow {row} columnCount={cols.current} emphasized={workstream.id} />
           {/if}
         </div>
       {/each}
@@ -97,17 +112,23 @@
           </span>
         </div>
         {#each baseRows as row (row.type === "node" ? row.node.id : row.id)}
-          {#if row.type === "node"}
-            <GraphRow
-              {row}
-              columnCount={model.graph.columnCount}
-              emphasized={workstream.id}
-              selected={selectedId === row.node.id}
-              onselect={() => onselect(row.node.id)}
-            />
-          {:else}
-            <ElisionRow {row} columnCount={model.graph.columnCount} emphasized={workstream.id} />
-          {/if}
+          <div
+            animate:flip={{ duration: motionMs(GRAPH_MOTION_MS), easing: cubicOut }}
+            in:growIn
+            out:shrinkOut
+          >
+            {#if row.type === "node"}
+              <GraphRow
+                {row}
+                columnCount={cols.current}
+                emphasized={workstream.id}
+                selected={selectedId === row.node.id}
+                onselect={() => onselect(row.node.id)}
+              />
+            {:else}
+              <ElisionRow {row} columnCount={cols.current} emphasized={workstream.id} />
+            {/if}
+          </div>
         {/each}
         {#if model.behindTrunk > 0 && model.trunkName}
           <p class="behind-foot">

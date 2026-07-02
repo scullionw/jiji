@@ -390,6 +390,8 @@ export const SYNC_GLYPH: Record<
 export const COL_WIDTH = 13;
 export const NODE_ROW_HEIGHT = 26;
 export const ELISION_ROW_HEIGHT = 18;
+/** Corner radius where an edge bends into or out of a node. */
+export const RAIL_CORNER = 6;
 
 export function railX(col: number): number {
   return COL_WIDTH * col + 12;
@@ -397,4 +399,83 @@ export function railX(col: number): number {
 
 export function gutterWidth(columnCount: number): number {
   return railX(Math.max(columnCount - 1, 0)) + 12;
+}
+
+/** A rail's job within its row. `pass` crosses without touching the node,
+ * `in`/`out` end at or leave the node, `mark` carries an elision row's `~`. */
+export type RailRole = "pass" | "in" | "out" | "mark";
+
+export interface KeyedRail {
+  key: string;
+  role: RailRole;
+  rail: Rail;
+}
+
+/** Rails keyed by what they are (role + owning stream), not where they sit.
+ * Columns are exactly what a rewrite changes, so a column-keyed rail would
+ * be destroyed and recreated on every layout shift; keyed this way the same
+ * element survives and its x position can tween sideways — the morph that
+ * explains the rewrite. Streams owning several rails in one role are
+ * disambiguated by their order in the row (column-ascending), which is
+ * stable across rebuilds. */
+export function keyedRails(row: NodeRow): KeyedRail[] {
+  return keyRails([
+    ...row.passThrough.map((rail) => ({ role: "pass" as const, rail })),
+    ...row.edgesIn.map((rail) => ({ role: "in" as const, rail })),
+    ...row.edgesOut.map((rail) => ({ role: "out" as const, rail })),
+  ]);
+}
+
+/** Same identity scheme for an elision row's rails and `~` marks. */
+export function keyedElisionRails(row: ElisionRow): KeyedRail[] {
+  return keyRails([
+    ...row.passThrough.map((rail) => ({ role: "pass" as const, rail })),
+    ...row.marks.map((rail) => ({ role: "mark" as const, rail })),
+  ]);
+}
+
+function keyRails(entries: { role: RailRole; rail: Rail }[]): KeyedRail[] {
+  const seen = new Map<string, number>();
+  return entries.map(({ role, rail }) => {
+    const base = `${role}:${rail.stream ?? "·"}`;
+    const occurrence = seen.get(base) ?? 0;
+    seen.set(base, occurrence + 1);
+    return { key: `${base}:${occurrence}`, role, rail };
+  });
+}
+
+/** An edge entering its node from above. Written against continuous x
+ * positions so a rail mid-tween still draws sanely: the corner radius and
+ * the horizontal reach both clamp to the shrinking gap, and a rail that
+ * has (nearly) arrived at the node column degrades to the straight drop.
+ * At rest — integral columns — the output is exactly the classic shape. */
+export function railInPath(
+  x: number,
+  nx: number,
+  height: number,
+  clear: number,
+): string {
+  const cy = height / 2;
+  const dx = nx - x;
+  if (Math.abs(dx) < 0.5) return `M ${x} 0 V ${cy - clear}`;
+  const s = dx > 0 ? 1 : -1; // direction of travel toward the node
+  const r = Math.min(RAIL_CORNER, Math.abs(dx));
+  const reach = Math.min(clear, Math.abs(dx) - r);
+  return `M ${x} 0 V ${cy - r} Q ${x} ${cy} ${x + s * r} ${cy} H ${nx - s * reach}`;
+}
+
+/** An edge leaving its node toward the row below; same clamping rules. */
+export function railOutPath(
+  x: number,
+  nx: number,
+  height: number,
+  clear: number,
+): string {
+  const cy = height / 2;
+  const dx = x - nx;
+  if (Math.abs(dx) < 0.5) return `M ${x} ${cy + clear} V ${height}`;
+  const s = dx > 0 ? 1 : -1; // direction of travel away from the node
+  const r = Math.min(RAIL_CORNER, Math.abs(dx));
+  const reach = Math.min(clear, Math.abs(dx) - r);
+  return `M ${nx + s * reach} ${cy} H ${x - s * r} Q ${x} ${cy} ${x} ${cy + r} V ${height}`;
 }

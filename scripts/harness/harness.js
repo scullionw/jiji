@@ -59,6 +59,9 @@
 //                        captured comparisons, else a per-change-diff union)
 //   &mode=stack|single   pick the rebase scope in the open rebase panel
 //   &dest=<changeId>     pick that destination row in the open rebase panel
+//   &desthover=<changeId> hover a destination row (rebase or split-into
+//                        list) without picking it: the graph's rewrite
+//                        preview scrubs to it
 //   &bookmark=<name>     type a name into the open bookmark panel and create
 //   &movebm=<name>       move that bookmark onto the selection (panel row)
 //   &manage=<name>       open a bookmark chip's rename/delete panel
@@ -1234,6 +1237,20 @@
   const rebaseDest = params.get("dest");
   if (rebaseDest) {
     steps.push(() => click(`.dest-row[data-dest="${rebaseDest}"]`));
+  }
+  // Hover a destination row without picking it: the graph's rewrite
+  // preview scrubs to it live (pointerenter drives the panel's hover
+  // state; works for both the rebase and the split-into lists).
+  const destHover = params.get("desthover");
+  if (destHover) {
+    steps.push(() => {
+      const row =
+        document.querySelector(`.dest-row[data-dest="${destHover}"]`) ||
+        document.querySelector(`.dest-row[data-splitdest="${destHover}"]`);
+      if (!row) return false;
+      row.dispatchEvent(new PointerEvent("pointerenter"));
+      return true;
+    });
   }
   const manageName = params.get("manage");
   if (manageName) {
