@@ -927,6 +927,17 @@ fn remove_node(snapshot: &mut RepoSnapshot, id: &str) -> Option<GraphNode> {
     if let (Some(last), None) = (siblings.next(), siblings.next()) {
         last.is_divergent = false;
     }
+    // Conflict items follow the graph: a removed change takes its inbox
+    // entries along, and a removed bookmark-conflict candidate leaves the
+    // list (mock approximation: with one candidate left the conflict reads
+    // as resolved, where the real backend re-derives ref state).
+    snapshot.conflicts.retain(|c| c.node_id.as_deref() != Some(id));
+    for conflict in &mut snapshot.conflicts {
+        conflict.targets.retain(|t| t != id);
+    }
+    snapshot
+        .conflicts
+        .retain(|c| c.kind != ConflictKind::Bookmark || c.targets.len() > 1);
     Some(removed)
 }
 
@@ -1012,36 +1023,51 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             &["uvkmrtpz"],
             &[],
         ),
-        node(
-            "qvlxnsry",
-            "d2a6f4e8",
-            "feat: conflict inbox empty states",
-            "lauf",
-            "2026-06-08T17:30:00Z",
-            NodeKind::Mutable,
-            &["pmwzqkvt"],
-            &["conflict-inbox"],
-        ),
-        node(
-            "pmwzqkvt",
-            "77be0c13",
-            "wip: conflict inbox list skeleton",
-            "lauf",
-            "2026-06-08T15:02:00Z",
-            NodeKind::Mutable,
-            &["uvkmrtpz"],
-            &[],
-        ),
+        // The rebase onto 0.41 (see the ops list) left this stack
+        // conflicted: the wip change collided in ConflictList.svelte, and
+        // its child carries the unresolved conflict until someone fixes it.
+        GraphNode {
+            has_conflict: true,
+            ..node(
+                "qvlxnsry",
+                "d2a6f4e8",
+                "feat: conflict inbox empty states",
+                "lauf",
+                "2026-06-08T17:30:00Z",
+                NodeKind::Mutable,
+                &["pmwzqkvt"],
+                &["conflict-inbox"],
+            )
+        },
+        GraphNode {
+            has_conflict: true,
+            ..node(
+                "pmwzqkvt",
+                "77be0c13",
+                "wip: conflict inbox list skeleton",
+                "lauf",
+                "2026-06-08T15:02:00Z",
+                NodeKind::Mutable,
+                &["uvkmrtpz"],
+                &[],
+            )
+        },
         // One change rewritten two ways (jj's `??` state): the same fix
         // described from two terminals, both copies still visible. Nodes
         // key by commit id; the change id is shared.
-        divergent_node(
-            "rzvqnkom",
-            "b41c77d0",
-            "fix: debounce watcher restarts",
-            "2026-06-09T18:26:00Z",
-            &["uvkmrtpz"],
-        ),
+        // Each terminal also pointed `watcher-fix` at its own copy, so the
+        // bookmark resolved to multiple targets (the chip renders on the
+        // first candidate, like the real backend's bookmark state).
+        GraphNode {
+            bookmarks: vec!["watcher-fix".into()],
+            ..divergent_node(
+                "rzvqnkom",
+                "b41c77d0",
+                "fix: debounce watcher restarts",
+                "2026-06-09T18:26:00Z",
+                &["uvkmrtpz"],
+            )
+        },
         divergent_node(
             "rzvqnkom",
             "e93d5a12",
@@ -1083,6 +1109,17 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             target: "qvlxnsry".into(),
             remote: Some("origin".into()),
             sync: SyncState::Ahead,
+            is_trunk: false,
+            is_local: true,
+        },
+        // Conflicted: points at the first candidate, like the real
+        // backend's state for a bookmark whose ref resolved to multiple
+        // targets (the conflict item below carries all candidates).
+        BookmarkState {
+            name: "watcher-fix".into(),
+            target: "b41c77d0".into(),
+            remote: None,
+            sync: SyncState::LocalOnly,
             is_trunk: false,
             is_local: true,
         },
@@ -1213,18 +1250,86 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         backend: "mock".into(),
         trunk_bookmark: "main".into(),
         working_copy: "ktpqsmxw".into(),
-        workspaces: vec![WorkspaceSummary {
-            name: "default".into(),
-            is_default: true,
-            is_stale: false,
-            working_copy_node: Some("ktpqsmxw".into()),
-        }],
+        workspaces: vec![
+            WorkspaceSummary {
+                name: "default".into(),
+                is_default: true,
+                is_stale: false,
+                working_copy_node: Some("ktpqsmxw".into()),
+            },
+            // Mock-only preview of staleness: the real backend still reports
+            // every workspace fresh (see the JjBackend gap note). A second
+            // workspace parked on the conflict-inbox head went stale when
+            // the rebase moved the repo underneath it.
+            WorkspaceSummary {
+                name: "review".into(),
+                is_default: false,
+                is_stale: true,
+                working_copy_node: Some("qvlxnsry".into()),
+            },
+        ],
         workstreams,
         nodes,
         bookmarks,
-        conflicts: vec![],
+        conflicts: mock_conflicts(),
         operations,
     }
+}
+
+/// The inbox items matching the fabricated graph: the rebase-conflicted
+/// stack (the child inherits the parent's unresolved file), the bookmark
+/// that resolved to both copies of the divergent change, and the stale
+/// `review` workspace (mock-only until the real backend detects staleness).
+fn mock_conflicts() -> Vec<ConflictItem> {
+    let file_item = |id: &str, summary: &str, node: &str, paths: &[&str]| ConflictItem {
+        id: format!("file-{id}"),
+        kind: ConflictKind::File,
+        summary: summary.into(),
+        node_id: Some(node.into()),
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        more_paths: 0,
+        targets: Vec::new(),
+    };
+    vec![
+        file_item(
+            "qvlxnsry",
+            "\u{201c}feat: conflict inbox empty states\u{201d} has unresolved file conflicts",
+            "qvlxnsry",
+            &["src/lib/components/conflicts/ConflictList.svelte"],
+        ),
+        file_item(
+            "pmwzqkvt",
+            "\u{201c}wip: conflict inbox list skeleton\u{201d} has unresolved file conflicts",
+            "pmwzqkvt",
+            &["src/lib/components/conflicts/ConflictList.svelte"],
+        ),
+        ConflictItem {
+            id: "bookmark-watcher-fix".into(),
+            kind: ConflictKind::Bookmark,
+            summary: "Bookmark \u{201c}watcher-fix\u{201d} resolved to multiple targets and needs to be repointed".into(),
+            node_id: None,
+            paths: Vec::new(),
+            more_paths: 0,
+            targets: vec!["b41c77d0".into(), "e93d5a12".into()],
+        },
+        ConflictItem {
+            id: "workspace-review".into(),
+            kind: ConflictKind::StaleWorkspace,
+            summary: "Workspace \u{201c}review\u{201d} is stale: the repo has moved since its working copy was last updated".into(),
+            node_id: Some("qvlxnsry".into()),
+            paths: Vec::new(),
+            more_paths: 0,
+            targets: Vec::new(),
+        },
+    ]
+}
+
+/// The one conflicted path in the fabricated graph (see `mock_conflicts`):
+/// the wip change collided here when the stack was rebased onto 0.41. Its
+/// child inherits the conflict without touching the file, so only the
+/// parent's own diff shows it — exactly like the real backend.
+fn is_mock_conflicted(change_id: &str, path: &str) -> bool {
+    change_id == "pmwzqkvt" && path == "src/lib/components/conflicts/ConflictList.svelte"
 }
 
 /// Changed-file lists matching the mock graph, keyed by change id. `None`
@@ -1273,7 +1378,7 @@ pub fn mock_change_detail(change_id: &str) -> Option<ChangeDetail> {
                 path: (*path).to_owned(),
                 status: *status,
                 renamed_from: None,
-                has_conflict: false,
+                has_conflict: is_mock_conflicted(change_id, path),
             })
             .collect(),
         truncated: false,
@@ -1618,20 +1723,37 @@ pub fn mock_change_diff(change_id: &str) -> Option<ChangeDiff> {
             ),
         ],
         "pmwzqkvt" => vec![
-            file(
-                "src/lib/components/conflicts/ConflictList.svelte",
-                FileStatus::Added,
-                added_file(&[
-                    "<script lang=\"ts\">",
-                    "  import ConflictRow from \"./ConflictRow.svelte\";",
-                    "  let { items } = $props();",
-                    "</script>",
-                    "",
-                    "{#each items as item (item.id)}",
-                    "  <ConflictRow {item} />",
-                    "{/each}",
-                ]),
-            ),
+            // Conflicted: both sides of the rebase added this component, so
+            // the content arrives with jj's materialized markers, exactly
+            // like the real backend renders an unresolved file.
+            FileDiff {
+                has_conflict: true,
+                ..file(
+                    "src/lib/components/conflicts/ConflictList.svelte",
+                    FileStatus::Added,
+                    added_file(&[
+                        "<<<<<<< Conflict 1 of 1",
+                        "%%%%%%% Changes from base to side #1",
+                        "+<script lang=\"ts\">",
+                        "+  import ConflictRow from \"./ConflictRow.svelte\";",
+                        "+  let { items } = $props();",
+                        "+</script>",
+                        "+",
+                        "+{#each items as item (item.id)}",
+                        "+  <ConflictRow {item} />",
+                        "+{/each}",
+                        "+++++++ Contents of side #2",
+                        "<script lang=\"ts\">",
+                        "  let { conflicts } = $props();",
+                        "</script>",
+                        "",
+                        "{#each conflicts as conflict}",
+                        "  <p class=\"row\">{conflict.summary}</p>",
+                        "{/each}",
+                        ">>>>>>> Conflict 1 of 1 ends",
+                    ]),
+                )
+            },
             file(
                 "src/lib/components/conflicts/ConflictRow.svelte",
                 FileStatus::Added,

@@ -5,4 +5,25 @@ export type ConflictItem = { id: string, kind: ConflictKind,
 /**
  * Plain-language explanation of what happened.
  */
-summary: string, nodeId: string | null, path: string | null, };
+summary: string, 
+/**
+ * The change the conflict lives in (file conflicts) or the stale
+ * workspace's working copy, when that change is drawn in the snapshot.
+ */
+nodeId: string | null, 
+/**
+ * Conflicted file paths, repo-relative (file conflicts only). Lists
+ * the tree's own unresolved entries — what `jj resolve --list` shows —
+ * so a conflict inherited from a parent appears even though the
+ * parent-relative diff would not mention the file.
+ */
+paths: Array<string>, 
+/**
+ * Count of conflicted paths dropped past the per-item cap.
+ */
+morePaths: number, 
+/**
+ * Change ids a conflicted bookmark resolved to (bookmark conflicts
+ * only): the candidates the user can repoint it at.
+ */
+targets: Array<string>, };

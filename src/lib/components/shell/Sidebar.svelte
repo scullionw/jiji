@@ -12,6 +12,9 @@
   ];
 
   const hasRepo = $derived(app.snapshot !== null);
+  // The inbox count rides the nav item so conflict state is never hidden
+  // behind a section switch.
+  const conflictCount = $derived(app.snapshot?.conflicts.length ?? 0);
 </script>
 
 <nav class="sidebar" data-tauri-drag-region>
@@ -29,6 +32,11 @@
         onclick={() => (app.section = item.id)}
       >
         <Icon name={item.icon} size={17} />
+        {#if item.id === "conflicts" && hasRepo && conflictCount > 0}
+          <span class="badge mono">
+            {conflictCount > 9 ? "9+" : conflictCount}
+          </span>
+        {/if}
       </button>
     {/each}
   </div>
@@ -73,6 +81,7 @@
   }
 
   .nav-item {
+    position: relative;
     width: 38px;
     height: 38px;
     display: grid;
@@ -82,6 +91,23 @@
     transition:
       background var(--t-fast) var(--ease-out),
       color var(--t-fast) var(--ease-out);
+  }
+
+  .badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 14px;
+    height: 14px;
+    display: grid;
+    place-items: center;
+    padding: 0 3px;
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 1;
+    border-radius: 999px;
+    background: var(--clr-danger);
+    color: var(--clr-bg-0);
   }
 
   .nav-item:hover:not(:disabled) {

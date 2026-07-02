@@ -9,12 +9,6 @@
     string,
     { icon: IconName; title: string; body: string; hint: string }
   > = {
-    conflicts: {
-      icon: "conflicts",
-      title: "Conflict inbox",
-      body: "File conflicts, bookmark conflicts, and stale workspaces will be triaged here, in plain language.",
-      hint: "arrives in milestone 3",
-    },
     publish: {
       icon: "publish",
       title: "Publish & review",

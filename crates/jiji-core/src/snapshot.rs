@@ -134,8 +134,19 @@ pub struct ConflictItem {
     pub kind: ConflictKind,
     /// Plain-language explanation of what happened.
     pub summary: String,
+    /// The change the conflict lives in (file conflicts) or the stale
+    /// workspace's working copy, when that change is drawn in the snapshot.
     pub node_id: Option<String>,
-    pub path: Option<String>,
+    /// Conflicted file paths, repo-relative (file conflicts only). Lists
+    /// the tree's own unresolved entries — what `jj resolve --list` shows —
+    /// so a conflict inherited from a parent appears even though the
+    /// parent-relative diff would not mention the file.
+    pub paths: Vec<String>,
+    /// Count of conflicted paths dropped past the per-item cap.
+    pub more_paths: u32,
+    /// Change ids a conflicted bookmark resolved to (bookmark conflicts
+    /// only): the candidates the user can repoint it at.
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

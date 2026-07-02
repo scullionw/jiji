@@ -2081,6 +2081,9 @@ fn title_from_bookmark(name: &str) -> String {
     }
 }
 
+/// Conflicted paths listed per item, capped like `OperationItem` effects.
+const MAX_CONFLICT_PATHS: usize = 20;
+
 fn file_conflicts(
     mutable_commits: &[Commit],
     wc_commit_id: &Option<CommitId>,
@@ -2105,12 +2108,26 @@ fn file_conflicts(
                     format!("\u{201c}{label}\u{201d} has unresolved file conflicts")
                 }
             };
+            // The tree's own unresolved entries (`jj resolve --list`), not
+            // the parent-relative diff: a child inherits its parent's
+            // conflict in files the child never touched.
+            let mut paths = Vec::new();
+            let mut more_paths = 0u32;
+            for (path, _value) in commit.tree().conflicts() {
+                if paths.len() < MAX_CONFLICT_PATHS {
+                    paths.push(path.as_internal_file_string().to_owned());
+                } else {
+                    more_paths += 1;
+                }
+            }
             ConflictItem {
                 id: format!("file-{}", short_id.as_deref().unwrap_or("?")),
                 kind: ConflictKind::File,
                 summary,
                 node_id: short_id,
-                path: None,
+                paths,
+                more_paths,
+                targets: Vec::new(),
             }
         })
         .collect()
@@ -2132,6 +2149,10 @@ fn build_bookmarks(
             continue;
         }
         if local_target.has_conflict() {
+            let targets = local_target
+                .added_ids()
+                .map(|id| display_id_for(repo, id, change_ids))
+                .collect::<Result<Vec<_>, _>>()?;
             conflicts.push(ConflictItem {
                 id: format!("bookmark-{}", name.as_str()),
                 kind: ConflictKind::Bookmark,
@@ -2140,7 +2161,9 @@ fn build_bookmarks(
                     name.as_str()
                 ),
                 node_id: None,
-                path: None,
+                paths: Vec::new(),
+                more_paths: 0,
+                targets,
             });
         }
         let Some(local_id) = local_target.added_ids().next() else {
@@ -4097,6 +4120,133 @@ mod tests {
         let survivor = node_by_description(&resolved, "wip: side experiment (kept)");
         assert_eq!(survivor.id, change_id);
         assert_eq!(survivor.change_id, change_id);
+    }
+
+    /// Conflicts carry their file paths: the conflicted change lists the
+    /// tree's unresolved entries, and a child that never touched the file
+    /// inherits the same path even though its own diff has nothing to show.
+    #[test]
+    fn conflicted_changes_list_their_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let store = repo.store().clone();
+        let root_commit_id = store.root_commit_id().clone();
+        let mut tx = repo.start_transaction();
+        let base = write_commit_with_tree(
+            &mut tx,
+            vec![root_commit_id],
+            "base: shared notes",
+            file_tree(&store, &[("notes.txt", "base\n")]),
+        );
+        tx.repo_mut()
+            .set_local_bookmark_target(RefName::new("main"), RefTarget::normal(base.id().clone()));
+        let ours = write_commit_with_tree(
+            &mut tx,
+            vec![base.id().clone()],
+            "feat: ours",
+            file_tree(&store, &[("notes.txt", "ours\n")]),
+        );
+        let theirs = write_commit_with_tree(
+            &mut tx,
+            vec![base.id().clone()],
+            "feat: theirs",
+            file_tree(&store, &[("notes.txt", "theirs\n")]),
+        );
+        write_commit_with_tree(
+            &mut tx,
+            vec![theirs.id().clone()],
+            "docs: readme only",
+            file_tree(&store, &[("notes.txt", "theirs\n"), ("README.md", "hi\n")]),
+        );
+        pollster::block_on(tx.commit("set up conflicting siblings")).unwrap();
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        assert!(before.conflicts.is_empty());
+        let ours_id = node_by_description(&before, "feat: ours").id.clone();
+        let theirs_id = node_by_description(&before, "feat: theirs").id.clone();
+        let child_id = node_by_description(&before, "docs: readme only").id.clone();
+
+        // Both sides rewrote notes.txt, so rebasing one onto the other
+        // records the conflict first-class instead of blocking.
+        backend.rebase_change(dir.path(), &theirs_id, &ours_id).unwrap();
+
+        let after = backend.open(dir.path()).unwrap();
+        let by_node = |id: &str| {
+            after
+                .conflicts
+                .iter()
+                .find(|c| c.node_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("conflict item for {id}"))
+        };
+        let theirs_item = by_node(&theirs_id);
+        assert_eq!(theirs_item.kind, ConflictKind::File);
+        assert_eq!(theirs_item.paths, vec!["notes.txt"]);
+        assert_eq!(theirs_item.more_paths, 0);
+        assert!(theirs_item.summary.contains("feat: theirs"), "got {}", theirs_item.summary);
+
+        // The child never touched notes.txt — its parent-relative diff has
+        // no entry for it — but its tree carries the unresolved conflict.
+        let child_item = by_node(&child_id);
+        assert_eq!(child_item.paths, vec!["notes.txt"]);
+        let child_diff = backend.change_diff(dir.path(), &child_id).unwrap();
+        assert!(child_diff.files.iter().all(|f| f.path != "notes.txt"));
+        for id in [&theirs_id, &child_id] {
+            assert!(after.nodes.iter().find(|n| &n.id == id).unwrap().has_conflict);
+        }
+        assert!(!after.nodes.iter().find(|n| n.id == ours_id).unwrap().has_conflict);
+    }
+
+    /// A bookmark moved to different targets in concurrent operations
+    /// resolves to multiple candidates; the inbox item names them all and
+    /// the bookmark list keeps an entry parked on the first.
+    #[test]
+    fn conflicted_bookmark_lists_its_candidate_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let feature_id = node_by_description(&before, "feat: first change").id.clone();
+        let side_id = node_by_description(&before, "wip: side experiment").id.clone();
+
+        let settings = test_settings();
+        let workspace = Workspace::load(
+            &settings,
+            dir.path(),
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head()).unwrap();
+        let feature = resolve_change_commit(&repo, &feature_id).unwrap();
+        let side = resolve_change_commit(&repo, &side_id).unwrap();
+        for (commit, op) in [(&feature, "point release at feature"), (&side, "point release at side")]
+        {
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("release"),
+                RefTarget::normal(commit.id().clone()),
+            );
+            pollster::block_on(tx.commit(op)).unwrap();
+        }
+
+        let merged = backend.open(dir.path()).unwrap();
+        let item = merged
+            .conflicts
+            .iter()
+            .find(|c| c.kind == ConflictKind::Bookmark)
+            .expect("bookmark conflict surfaced");
+        assert_eq!(item.id, "bookmark-release");
+        assert!(item.summary.contains("release"), "got {}", item.summary);
+        let mut targets = item.targets.clone();
+        targets.sort();
+        let mut expected = vec![feature_id, side_id];
+        expected.sort();
+        assert_eq!(targets, expected);
+        let bookmark = merged.bookmarks.iter().find(|b| b.name == "release").unwrap();
+        assert!(item.targets.contains(&bookmark.target));
     }
 
     #[test]

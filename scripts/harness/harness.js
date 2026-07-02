@@ -14,6 +14,8 @@
 //   &layout=split        preset the diff layout (localStorage, pre-boot)
 //   &view=graph|focus    preset the workbench view mode (localStorage, pre-boot)
 //   &section=<name>      click a sidebar section (e.g. operations)
+//   &cgo=<conflictId>    click a conflict-inbox item (jump to its change)
+//   &ctarget=<changeId>  click a conflicted bookmark's candidate chip
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -738,6 +740,16 @@
   }
   const row = params.get("click");
   if (row) steps.push(() => click(`[data-node-id="${row}"]`));
+  // Conflict-inbox flows: click a jumpable item card, or one candidate
+  // chip of a conflicted bookmark (combine with section=conflicts).
+  const conflictGo = params.get("cgo");
+  if (conflictGo) {
+    steps.push(() => click(`button[data-conflict-id="${conflictGo}"]`));
+  }
+  const conflictTarget = params.get("ctarget");
+  if (conflictTarget) {
+    steps.push(() => click(`[data-conflict-target="${conflictTarget}"]`));
+  }
   const collapse = params.get("collapse");
   if (collapse !== null) {
     steps.push(() => !document.querySelector(".diff-view .skeleton"));
