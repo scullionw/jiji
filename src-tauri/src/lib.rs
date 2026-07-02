@@ -1,6 +1,8 @@
 mod commands;
+mod forge;
 
 use commands::AppState;
+use forge::ForgeState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,6 +19,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(AppState::new())
+        .manage(ForgeState::new())
         .invoke_handler(tauri::generate_handler![
             commands::open_repo,
             commands::refresh_snapshot,
@@ -40,7 +43,12 @@ pub fn run() {
             commands::revert_operation,
             commands::restore_operation,
             commands::resolve_conflict,
-            commands::update_stale_workspace
+            commands::update_stale_workspace,
+            forge::forge_status,
+            forge::forge_verify,
+            forge::forge_login,
+            forge::forge_logout,
+            forge::forge_prs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

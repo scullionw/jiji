@@ -25,6 +25,24 @@
 //                        button (section=conflicts; the captured snapshot
 //                        must carry a stale current workspace) and wait for
 //                        the item to settle
+//   &forge=keychain|env|gh preset the GitHub connection's token source
+//                        (default: none — the Publish section's connect
+//                        state); the stubbed repo detection reads the
+//                        captured snapshot's gitRemotes
+//   &fuser=<login>       the login the stubbed token verifies as
+//                        (default jiji-dev)
+//   &fwait=1             the stubbed forge_verify never resolves,
+//                        capturing the "Verifying the token…" state
+//   &ftoken=<text>       type into the Publish section's token input
+//                        (the literal token "bad" is refused like an
+//                        invalid PAT)
+//   &fconnect=1          submit the token and wait for the connected card
+//                        (or the inline error when the token was "bad")
+//   &fafter=env|gh       which fallback token remains after disconnect
+//                        (default: none)
+//   &fdisconnect=1       click Disconnect on the connected card and wait
+//                        for the connect state (or the managed-outside
+//                        note when a fallback token remains)
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -256,6 +274,45 @@
     snap.workstreams = snap.workstreams.filter((ws) => ws.nodeIds.length > 0);
     return node;
   };
+
+  // Forge connection stub state: which token source is active and who it
+  // verifies as. Mirrors ForgeState + the keychain, not the snapshot — the
+  // real connection also lives outside repo state.
+  const forgeSourceByParam = { keychain: "keychain", env: "environment", gh: "ghCli" };
+  const forge = {
+    source: forgeSourceByParam[params.get("forge")] || null,
+    login: params.get("fuser") || "jiji-dev",
+  };
+  // A JS twin of the backend's GitHub detection, just enough for shots:
+  // github.com HTTPS/SSH forms, origin > upstream > name order.
+  const forgeRepoOf = (snap) => {
+    const rank = (name) =>
+      name === "origin" ? 0 : name === "upstream" ? 1 : 2;
+    const remotes = [...(snap?.gitRemotes || [])].sort(
+      (a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name),
+    );
+    for (const remote of remotes) {
+      const match =
+        /^(?:https?:\/\/|git@|ssh:\/\/git@)((?:[\w-]+\.)?github\.com)[/:]([^/]+)\/([^/]+?)(?:\.git)?(?:\/.*)?$/.exec(
+          remote.url,
+        );
+      if (match)
+        return {
+          provider: "gitHub",
+          remote: remote.name,
+          host: match[1],
+          owner: match[2],
+          name: match[3],
+        };
+    }
+    return null;
+  };
+  const forgeStatusOf = (snap, login) => ({
+    repo: forgeRepoOf(snap),
+    auth: forge.source
+      ? { source: forge.source, login }
+      : { source: null, login: null },
+  });
 
   window.__TAURI_INTERNALS__ = {
     transformCallback: () => 0,
@@ -1047,6 +1104,37 @@
             targetChange: snap.workingCopy,
           });
         }
+        // The forge connection (Publish section): repo detection mirrors
+        // the backend's GitHub-URL parse over the captured gitRemotes;
+        // auth state lives in `forge`, preset via &forge= and mutated by
+        // the stubbed login/logout like the real keychain.
+        case "forge_status":
+        case "forge_verify": {
+          if (cmd === "forge_verify" && params.get("fwait"))
+            return new Promise(() => {});
+          // With fwait, status answers no login so the UI proceeds into
+          // the hanging verify; otherwise the login arrives pre-verified.
+          const login =
+            cmd === "forge_status" && params.get("fwait") ? null : forge.login;
+          return Promise.resolve(forgeStatusOf(snap, login));
+        }
+        case "forge_login": {
+          const token = (args?.token || "").trim();
+          if (!token) return reject("auth_failed", "no token was entered");
+          if (token === "bad")
+            return reject(
+              "auth_failed",
+              "GitHub rejected the token: Bad credentials",
+            );
+          forge.source = "keychain";
+          return Promise.resolve(forgeStatusOf(snap, forge.login));
+        }
+        case "forge_logout": {
+          const after = params.get("fafter");
+          forge.source =
+            after === "env" ? "environment" : after === "gh" ? "ghCli" : null;
+          return Promise.resolve(forgeStatusOf(snap, forge.login));
+        }
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -1145,6 +1233,41 @@
       return true;
     });
     steps.push(() => !document.querySelector("[data-update-workspace]"));
+  }
+  // Forge connection flows (section=publish): type a token, connect,
+  // disconnect. The connect wait lands on the connected card, or on the
+  // inline error when the token was the refused "bad".
+  const forgeToken = params.get("ftoken");
+  if (forgeToken) {
+    steps.push(() => {
+      const input = document.querySelector("[data-forge-token]");
+      if (!input || input.disabled) return false;
+      input.value = forgeToken;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
+  }
+  if (params.get("fconnect")) {
+    steps.push(() =>
+      click('[data-forge-state="disconnected"] .btn.primary:not(:disabled)'),
+    );
+    steps.push(() =>
+      forgeToken === "bad"
+        ? document.querySelector("[data-forge-error]") !== null
+        : document.querySelector('[data-forge-state="connected"]') !== null,
+    );
+  }
+  if (params.get("fdisconnect")) {
+    steps.push(() =>
+      click('[data-forge-state="connected"] .btn.secondary:not(:disabled)'),
+    );
+    // Either the connect state returns (no fallback token) or the fallback
+    // source's managed-outside note replaces the Disconnect button.
+    steps.push(
+      () =>
+        document.querySelector('[data-forge-state="disconnected"]') !== null ||
+        document.querySelector(".managed") !== null,
+    );
   }
   const open = params.get("open");
   if (open === "files") steps.push(() => click(".files-button"));

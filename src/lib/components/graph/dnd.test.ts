@@ -33,6 +33,7 @@ function snapshot(nodes: GraphNode[], workingCopy = ""): RepoSnapshot {
     workstreams: [],
     nodes,
     bookmarks: [],
+    gitRemotes: [],
     conflicts: [],
     operations: [],
     resolveTool: null,

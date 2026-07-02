@@ -9,12 +9,6 @@
     string,
     { icon: IconName; title: string; body: string; hint: string }
   > = {
-    publish: {
-      icon: "publish",
-      title: "Publish & review",
-      body: "Stack submission, PR state, landing plans, and direct-to-trunk shipping will live here.",
-      hint: "arrives in milestone 4",
-    },
     workspaces: {
       icon: "workspaces",
       title: "Workspaces",

@@ -57,6 +57,7 @@ function snapshot(
     workstreams: [],
     nodes,
     bookmarks: [],
+    gitRemotes: [],
     conflicts,
     operations: [],
     resolveTool,

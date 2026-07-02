@@ -24,6 +24,10 @@ pub struct RepoSnapshot {
     pub workstreams: Vec<WorkstreamSummary>,
     pub nodes: Vec<GraphNode>,
     pub bookmarks: Vec<BookmarkState>,
+    /// The repo's configured git remotes (jj's hidden colocated `git`
+    /// remote excluded). Forge detection — which GitHub project does this
+    /// repo publish to — reads these; `jiji-core` itself only reports them.
+    pub git_remotes: Vec<GitRemote>,
     pub conflicts: Vec<ConflictItem>,
     /// Newest first.
     pub operations: Vec<OperationItem>,
@@ -123,6 +127,15 @@ pub struct BookmarkState {
     /// False only for the synthetic entry a remote-only trunk gets: with no
     /// local bookmark behind it there is nothing to move, rename, or delete.
     pub is_local: bool,
+}
+
+/// One configured git remote, as `git remote -v` would list it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GitRemote {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

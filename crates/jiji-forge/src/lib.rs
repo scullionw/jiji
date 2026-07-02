@@ -1,51 +1,32 @@
 //! Shared remote workflow engine for PR stacks, landing, and auto-land.
 //!
-//! This crate should stay headless so the same logic can be hosted by the
-//! Tauri app now and a future CLI later.
+//! This crate stays headless — synchronous, no UI types, no async runtime —
+//! so the same logic can be hosted by the Tauri app now and a future CLI
+//! later. The engine's shape follows jjpr (see the jjpr inspiration note):
+//! forge facts fetched fresh through one small client, explicit
+//! plan-then-execute flows layered on top in later milestones.
+//!
+//! What lives here today:
+//! - [`remote`]: detecting the GitHub repo behind a jj repo's git remotes
+//! - [`auth`]: token storage (system keychain) and the resolution chain
+//! - [`github`]: the API client (REST for identity, one batched GraphQL
+//!   query for PR state)
+//! - [`pr`]: PR state mapped into Jiji-owned, TS-exported DTOs
 
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use ts_rs::TS;
-use url::Url;
+pub mod auth;
+pub mod error;
+pub mod github;
+pub mod pr;
+pub mod remote;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
-#[ts(export)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeProvider {
-    GitHub,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-#[serde(rename_all = "camelCase")]
-pub struct ForgeCapabilities {
-    pub provider: ForgeProvider,
-    pub supports_pr_stacks: bool,
-    pub supports_auto_land: bool,
-}
-
-pub struct GitHubForge {
-    client: Client,
-    api_base: Url,
-}
-
-impl GitHubForge {
-    pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-            api_base: Url::parse("https://api.github.com")
-                .expect("hard-coded GitHub API URL should always parse"),
-        }
-    }
-
-    pub fn capabilities(&self) -> ForgeCapabilities {
-        let _ = &self.client;
-        let _ = &self.api_base;
-
-        ForgeCapabilities {
-            provider: ForgeProvider::GitHub,
-            supports_pr_stacks: true,
-            supports_auto_land: true,
-        }
-    }
-}
+pub use auth::{
+    resolve_token, ForgeAuth, ForgeStatus, KeychainTokenStore, MemoryTokenStore, ResolvedToken,
+    TokenSource, TokenStore,
+};
+pub use error::ForgeError;
+pub use github::GitHubClient;
+pub use pr::{
+    parse_open_prs, prs_by_branch, ChecksRollup, PrState, PrStateReport, PrSummary,
+    ReviewDecision,
+};
+pub use remote::{detect_github_repo, no_github_remote, parse_github_url, ForgeProvider, ForgeRepo};

@@ -22,7 +22,7 @@ pub struct CommandError {
 }
 
 impl CommandError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -168,6 +168,17 @@ pub fn current_snapshot(state: State<'_, AppState>) -> Option<RepoSnapshot> {
 }
 
 impl AppState {
+    /// Git remotes of the open repo's latest snapshot; empty when no repo
+    /// is open. What forge detection reads.
+    pub(crate) fn current_git_remotes(&self) -> Vec<jiji_core::snapshot::GitRemote> {
+        self.current
+            .lock()
+            .expect("snapshot state lock poisoned")
+            .as_ref()
+            .map(|s| s.git_remotes.clone())
+            .unwrap_or_default()
+    }
+
     fn open_repo_path(&self) -> Result<String, CommandError> {
         self.current
             .lock()

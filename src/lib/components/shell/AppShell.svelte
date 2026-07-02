@@ -9,6 +9,7 @@
   import PlaceholderView from "$lib/components/views/PlaceholderView.svelte";
   import OperationsView from "$lib/components/ops/OperationsView.svelte";
   import ConflictsView from "$lib/components/conflicts/ConflictsView.svelte";
+  import PublishView from "$lib/components/publish/PublishView.svelte";
   import CommandPalette from "$lib/components/palette/CommandPalette.svelte";
   import { app, type Section } from "$lib/state/app.svelte";
   import {
@@ -68,6 +69,8 @@
         <WorkbenchView />
       {:else if app.section === "conflicts"}
         <ConflictsView />
+      {:else if app.section === "publish"}
+        <PublishView />
       {:else if app.section === "operations"}
         <OperationsView />
       {:else}

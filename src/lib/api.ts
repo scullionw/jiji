@@ -4,7 +4,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
+import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
+import type { PrStateReport } from "$lib/bindings/PrStateReport";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
 
@@ -158,6 +160,33 @@ export function resolveConflict(
 // guided recovery for the current workspace.
 export function updateStaleWorkspace(): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("update_stale_workspace");
+}
+
+// The forge connection (GitHub). `forgeStatus` answers without touching
+// the network; `forgeVerify` checks the resolved token against the API and
+// remembers the login for the session. Login validates before storing the
+// token in the system keychain; logout only removes Jiji's stored token —
+// tokens managed outside Jiji (environment, gh CLI) stay.
+export function forgeStatus(): Promise<ForgeStatus> {
+  return invoke<ForgeStatus>("forge_status");
+}
+
+export function forgeVerify(): Promise<ForgeStatus> {
+  return invoke<ForgeStatus>("forge_verify");
+}
+
+export function forgeLogin(token: string): Promise<ForgeStatus> {
+  return invoke<ForgeStatus>("forge_login", { token });
+}
+
+export function forgeLogout(): Promise<ForgeStatus> {
+  return invoke<ForgeStatus>("forge_logout");
+}
+
+// Open-PR state of the detected repo — what PR badges and publish flows
+// will render (one batched query on the backend).
+export function forgePrs(): Promise<PrStateReport> {
+  return invoke<PrStateReport>("forge_prs");
 }
 
 export function onSnapshotUpdated(

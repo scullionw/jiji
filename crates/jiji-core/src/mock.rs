@@ -1571,6 +1571,12 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         workstreams,
         nodes,
         bookmarks,
+        // A GitHub-shaped remote so forge detection has something to find
+        // on fabricated data (the owner/name are obviously not real).
+        git_remotes: vec![GitRemote {
+            name: "origin".into(),
+            url: "https://github.com/jiji-mock/workbench.git".into(),
+        }],
         conflicts: mock_conflicts(),
         operations,
         // The fabricated machine has Sublime Merge installed, so every

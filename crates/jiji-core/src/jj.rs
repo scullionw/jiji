@@ -1525,10 +1525,36 @@ fn build_snapshot(
         workstreams,
         nodes,
         bookmarks,
+        git_remotes: git_remotes(store),
         conflicts,
         operations,
         resolve_tool: crate::merge_tool::available_tool_name(workspace.settings()),
     })
+}
+
+/// The repo's configured git remotes, read from the git backend's config —
+/// colocated and internal git backends alike. jj's hidden `git` remote for
+/// the colocated repo is excluded, like everywhere else it is hidden.
+/// Repos without a git backend have none.
+fn git_remotes(store: &Arc<Store>) -> Vec<GitRemote> {
+    let Ok(git_backend) = git::get_git_backend(store) else {
+        return Vec::new();
+    };
+    let git_repo = git_backend.git_repo();
+    let config = git_repo.config_snapshot();
+    git_repo
+        .remote_names()
+        .iter()
+        .map(|name| name.to_string())
+        .filter(|name| name != REMOTE_NAME_FOR_LOCAL_GIT_REPO.as_str())
+        .filter_map(|name| {
+            let url = config.string(format!("remote.{name}.url").as_str())?;
+            Some(GitRemote {
+                name,
+                url: url.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Snapshot node ids are shortened reverse-hex change ids — except for
