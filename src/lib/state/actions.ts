@@ -124,6 +124,14 @@ export function splitChange(
   return runMutation(() => api.splitChange(changeId, selection, description));
 }
 
+export function squashInto(
+  changeId: string,
+  selection: SplitSelection[],
+  destinationId: string,
+): Promise<MutationOutcome> {
+  return runMutation(() => api.squashInto(changeId, selection, destinationId));
+}
+
 export function rebaseChange(
   changeId: string,
   destinationId: string,

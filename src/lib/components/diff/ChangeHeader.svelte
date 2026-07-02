@@ -20,6 +20,7 @@
     renameBookmark,
     splitChange,
     squashChange,
+    squashInto,
   } from "$lib/state/actions";
   import { fromNow } from "$lib/time";
   import {
@@ -34,6 +35,7 @@
     rebaseDestinations,
     resolveCompareFrom,
     splitPath,
+    squashDestinations,
     stackPosition,
     SYNC_LABEL,
     type CompareMode,
@@ -47,6 +49,8 @@
     hunkLabel,
     hunkPreview,
     hunkStats,
+    movable,
+    selectionReady,
     splitPayload,
     splitSummary,
     splittable,
@@ -117,6 +121,9 @@
     splitHunksOpen.clear();
     splitDraft = "";
     splitError = null;
+    splitInto = false;
+    splitDest = null;
+    splitDestFilter = "";
     compareOpen = false;
     compareFilter = "";
   });
@@ -476,20 +483,54 @@
   // inherits the original description, bookmarks, descendants, and
   // (splitting @) the working copy: jj's split rule, so peeling described
   // commits off the bottom of the working copy is a repeatable loop. The
-  // checklist comes from the loaded diff, so opening the panel drops an
-  // active comparison back to the parent diff; the backend re-derives and
-  // verifies hunk coordinates, refusing when the change moved meanwhile.
+  // panel's second mode moves the checked selection into an existing
+  // change instead (jj squash --from --into): pick a destination anywhere
+  // in the graph, and a selection covering everything abandons the emptied
+  // change. The checklist comes from the loaded diff, so opening the panel
+  // drops an active comparison back to the parent diff; the backend
+  // re-derives and verifies hunk coordinates, refusing when the change
+  // moved meanwhile.
   let splitOpen = $state(false);
   const splitSelected = new SvelteMap<string, SplitPick>();
   const splitHunksOpen = new SvelteSet<string>();
   let splitDraft = $state("");
   let splitError = $state<string | null>(null);
+  // true = move into an existing change; false = carve into a new one.
+  let splitInto = $state(false);
+  let splitDest = $state<string | null>(null);
+  let splitDestFilter = $state("");
   let splitPanelEl = $state<HTMLDivElement | undefined>();
   let splitDescEl = $state<HTMLTextAreaElement | undefined>();
+  let splitDestFilterEl = $state<HTMLInputElement | undefined>();
 
   // Stale checks (a refetch can drop files) count only via the loaded list.
   const splitInfo = $derived(splitSummary(files, splitSelected));
-  const splitValid = $derived(splitInfo.valid);
+  const splitValid = $derived(
+    selectionReady(
+      splitInfo,
+      splitInto ? { kind: "into", id: splitDest } : { kind: "new" },
+    ),
+  );
+  const splitDestCandidates = $derived(squashDestinations(snapshot, node.id));
+  const visibleSplitDests = $derived.by(() => {
+    const query = splitDestFilter.trim().toLowerCase();
+    if (!query) return splitDestCandidates;
+    return splitDestCandidates.filter(
+      (candidate) =>
+        candidate.id.toLowerCase().startsWith(query) ||
+        candidate.description.toLowerCase().includes(query) ||
+        candidate.bookmarks.some((b) => b.toLowerCase().includes(query)),
+    );
+  });
+  const splitDestNode = $derived(
+    splitDest !== null ? findNode(snapshot, splitDest) : undefined,
+  );
+  const splitDestTitle = $derived(
+    splitDestNode?.description.split("\n")[0] || "no description",
+  );
+  // Everything checked and the destination picked: the full squash, which
+  // abandons the emptied change.
+  const splitMovesAll = $derived(splitInto && splitInfo.allCovered);
   // The checked-selection subject line: "2 files", "3 hunks across 1
   // file", or "1 file plus 2 hunks from 1 more".
   const splitKept = $derived.by(() => {
@@ -506,7 +547,7 @@
       : splitInfo.whole === 0 && splitInfo.hunks === 1,
   );
 
-  function toggleSplit() {
+  function toggleSplit(into = false) {
     splitOpen = !splitOpen;
     confirm = null;
     bookmarkOpen = false;
@@ -517,11 +558,21 @@
     splitHunksOpen.clear();
     splitDraft = "";
     splitError = null;
+    splitInto = into;
+    splitDest = null;
+    splitDestFilter = "";
     if (splitOpen) {
       // The checklist is this change's own files, not a comparison span's.
       if (compareFrom !== null) oncompare({ kind: "parent" });
       tick().then(() => splitPanelEl?.focus());
     }
+  }
+
+  // Switching where the selection goes keeps the checked files; only the
+  // destination-specific state resets.
+  function setSplitInto(into: boolean) {
+    splitInto = into;
+    splitError = null;
   }
 
   function toggleSplitFile(path: string) {
@@ -543,10 +594,34 @@
   function submitSplit() {
     if (!splitValid || !files) return;
     const selection = splitPayload(files, splitSelected);
+    const dest = splitDest;
     runPanel(
-      () => splitChange(node.id, selection, splitDraft),
+      () =>
+        splitInto && dest !== null
+          ? squashInto(node.id, selection, dest)
+          : splitChange(node.id, selection, splitDraft),
       (message) => (splitError = message),
       () => (splitOpen = false),
+    );
+  }
+
+  // Arrow keys pick the destination like the rebase panel's list, so the
+  // whole move runs from the keyboard: check → ↑/↓ → ↵.
+  function moveSplitDest(delta: number) {
+    const list = visibleSplitDests;
+    if (list.length === 0) return;
+    const index = list.findIndex((candidate) => candidate.id === splitDest);
+    const next =
+      index === -1
+        ? delta > 0
+          ? 0
+          : list.length - 1
+        : Math.min(list.length - 1, Math.max(0, index + delta));
+    splitDest = list[next].id;
+    tick().then(() =>
+      splitPanelEl
+        ?.querySelector(`[data-splitdest="${CSS.escape(list[next].id)}"]`)
+        ?.scrollIntoView({ block: "nearest" }),
     );
   }
 
@@ -556,6 +631,17 @@
       event.stopPropagation();
       splitOpen = false;
     } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      submitSplit();
+    } else if (splitInto && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+      event.preventDefault();
+      moveSplitDest(event.key === "ArrowDown" ? 1 : -1);
+    } else if (splitInto && event.key === "Enter") {
+      // No description textarea in this mode, so plain Enter confirms —
+      // except on a focused button, which it still activates (the
+      // checkbox rows and destination rows are buttons).
+      const el = event.target as HTMLElement | null;
+      if (el?.tagName === "BUTTON") return;
       event.preventDefault();
       submitSplit();
     }
@@ -658,7 +744,7 @@
         if (avail.rebase && !rebaseOpen) toggleRebase();
         break;
       case "split":
-        if (avail.split && !splitOpen) toggleSplit();
+        if (avail.split && !splitOpen) toggleSplit(intent.into ?? false);
         break;
       case "squash":
         if (avail.squash && confirm !== "squash") toggleConfirm("squash");
@@ -1006,8 +1092,8 @@
           class:armed={splitOpen}
           data-action="split"
           disabled={acting}
-          title="Split this change in two by file (jj split)"
-          onclick={toggleSplit}
+          title="Split this change in two, or move files into another change (jj split / jj squash --into)"
+          onclick={() => toggleSplit()}
         >
           <Icon name="split" size={11} />
           Split
@@ -1296,7 +1382,7 @@
           Rebase <b class="mono">{node.id.slice(0, 4)}</b>
           <span class="confirm-context truncate">“{title || "no description"}”</span>
         </p>
-        <div class="rebase-controls">
+        <div class="panel-controls">
           {#if descendants.length > 0}
             <div class="mode-toggle" role="group" aria-label="Rebase scope">
               <button
@@ -1438,15 +1524,52 @@
         </p>
         {#if files === null}
           <span class="dest-empty">Loading the file list…</span>
-        {:else if !splittable(files)}
+        {:else if !movable(files)}
           <span class="dest-empty">
-            This change touches {files.length === 1
-              ? "only one file, and its diff offers nothing to carve apart"
-              : "no files"} — there is nothing to split.
+            This change touches no files — there is nothing to split or move.
           </span>
         {:else}
+          <div class="panel-controls">
+            <div class="mode-toggle" role="group" aria-label="Where the checked selection goes">
+              <button
+                class:active={!splitInto}
+                data-mode="new"
+                disabled={acting}
+                onclick={() => setSplitInto(false)}
+              >
+                Into a new change
+              </button>
+              <button
+                class:active={splitInto}
+                data-mode="into"
+                disabled={acting}
+                onclick={() => setSplitInto(true)}
+              >
+                Into an existing change
+              </button>
+            </div>
+            {#if splitInto && splitDestCandidates.length > 6}
+              <input
+                bind:this={splitDestFilterEl}
+                bind:value={splitDestFilter}
+                class="name-input mono dest-filter"
+                placeholder="filter by id, title, or bookmark"
+                spellcheck="false"
+                disabled={acting}
+              />
+            {/if}
+          </div>
+          {#if !splitInto && !splittable(files)}
+            <span class="dest-empty">
+              This change touches only one file, and its diff offers nothing
+              to carve apart — nothing to split. “Into an existing change”
+              can still move it somewhere else.
+            </span>
+          {:else}
           <span class="result-label dest-label">
-            Check the files — or single hunks — to carve off into their own change
+            Check the files — or single hunks — to {splitInto
+              ? "move into the destination"
+              : "carve off into their own change"}
           </span>
           <div class="dest-list" role="listbox" aria-multiselectable="true" aria-label="Files and hunks for the split-off change">
             {#each files as file (file.path)}
@@ -1520,6 +1643,7 @@
               {/if}
             {/each}
           </div>
+          {#if !splitInto}
           <span class="result-label">Description for the split-off change</span>
           <textarea
             bind:this={splitDescEl}
@@ -1575,12 +1699,108 @@
               {/if}
             </ul>
           {/if}
+          {:else}
+          <span class="result-label dest-label">Destination — the change the selection moves into</span>
+          <div class="dest-list" role="listbox" aria-label="Move destination">
+            {#each visibleSplitDests as candidate (candidate.id)}
+              <button
+                class="dest-row"
+                class:selected={splitDest === candidate.id}
+                role="option"
+                aria-selected={splitDest === candidate.id}
+                data-splitdest={candidate.id}
+                disabled={acting}
+                onclick={() => (splitDest = candidate.id)}
+              >
+                <span class="dest-glyph mono {candidate.kind}">{KIND_GLYPH[candidate.kind]}</span>
+                <span class="dest-id mono"><b>{candidate.id.slice(0, 2)}</b>{candidate.id.slice(2, 4)}</span>
+                <span class="dest-title truncate">
+                  {candidate.description.split("\n")[0] || "no description"}
+                </span>
+                {#each candidate.bookmarks as name (name)}
+                  <span
+                    class="dest-bookmark"
+                    class:trunk={name === snapshot.trunkBookmark}
+                  >{name}</span>
+                {/each}
+              </button>
+            {:else}
+              <span class="dest-empty">No matching destination</span>
+            {/each}
+          </div>
+          {#if splitDestNode && splitInfo.whole + splitInfo.partial > 0}
+            {@const dir = moveDirection(snapshot, node.id, splitDestNode.id)}
+            <ul class="consequences">
+              <li>
+                The {splitKept}
+                move{splitKeptSingular ? "s" : ""} into
+                <b class="mono">{splitDestNode.id.slice(0, 4)}</b>
+                <span class="quiet">“{splitDestTitle}”</span>{dir === "backwards"
+                  ? " — an earlier change beneath this one"
+                  : dir === "forward"
+                    ? " — a later change building on this one"
+                    : dir === "sideways"
+                      ? " — a change on another branch"
+                      : ""}.
+              </li>
+              {#if splitMovesAll}
+                <li>
+                  That is everything in <b class="mono">{node.id.slice(0, 4)}</b>
+                  — the emptied change is abandoned{marks.length > 0
+                    ? `, and bookmark${marks.length === 1 ? "" : "s"} ${marks
+                        .map((m) => m.name)
+                        .join(", ")} move${marks.length === 1 ? "s" : ""} to its parent`
+                    : ""}.
+                </li>
+                {#if node.id === snapshot.workingCopy}
+                  <li>
+                    The working copy respawns as a new empty change on its
+                    parent.
+                  </li>
+                {/if}
+              {:else}
+                <li>
+                  Everything unchecked{splitInfo.partial > 0
+                    ? " — including the other hunks of partially checked files —"
+                    : ""} stays here as
+                  <span class="quiet">“{title || "no description"}”</span>.
+                </li>
+                {#if node.id === snapshot.workingCopy}
+                  {#if dir === "backwards"}
+                    <li>
+                      The working copy keeps building on the moved changes —
+                      nothing moves on disk.
+                    </li>
+                  {:else}
+                    <li>The moved changes leave the working copy's files on disk.</li>
+                  {/if}
+                {/if}
+              {/if}
+              {#if splitDestNode.id === snapshot.workingCopy}
+                <li>The working copy takes the changes; its files update on disk.</li>
+              {:else if node.id !== snapshot.workingCopy && isWcOrAbove}
+                <li>The working copy follows the rebase.</li>
+              {/if}
+              <li>
+                Changes that no longer apply cleanly become conflicts instead
+                of blocking the move; the operation log can undo it.
+              </li>
+            </ul>
+          {/if}
+          {/if}
+          {/if}
         {/if}
         <div class="confirm-row">
           <span class="editor-hint">
-            {splitValid
-              ? "⌘↵ to confirm"
-              : "Check files or hunks for the first change — leaving something on each side"}
+            {splitInto
+              ? splitValid
+                ? "↵ to confirm"
+                : splitInfo.whole + splitInfo.partial === 0
+                  ? "Check the files or hunks to move"
+                  : "Pick the change they move into — ↑↓ or click"
+              : splitValid
+                ? "⌘↵ to confirm"
+                : "Check files or hunks for the first change — leaving something on each side"}
           </span>
           {#if splitError}
             <span class="editor-error truncate" title={splitError}>{splitError}</span>
@@ -1589,7 +1809,7 @@
             Cancel
           </button>
           <button class="confirm-go" onclick={submitSplit} disabled={acting || !splitValid}>
-            {acting ? "Splitting…" : "Split"}
+            {acting ? (splitInto ? "Moving…" : "Splitting…") : splitInto ? "Move here" : "Split"}
           </button>
         </div>
       </div>
@@ -2356,9 +2576,9 @@
     color: var(--clr-text-3);
   }
 
-  /* The rebase panel: scope toggle and filter above a selectable
-     destination list, consequences appearing once a destination is picked. */
-  .rebase-controls {
+  /* The rebase and split panels: a mode toggle and filter above a
+     selectable destination list, consequences appearing once picked. */
+  .panel-controls {
     display: flex;
     align-items: center;
     gap: var(--sp-2);

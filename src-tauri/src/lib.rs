@@ -30,6 +30,7 @@ pub fn run() {
             commands::abandon_change,
             commands::squash_change,
             commands::split_change,
+            commands::squash_into,
             commands::rebase_change,
             commands::move_change,
             commands::create_bookmark,

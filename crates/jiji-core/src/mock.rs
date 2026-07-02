@@ -73,6 +73,7 @@ pub enum MockMutation {
     Abandon { id: String },
     Squash { id: String },
     Split { id: String, selection: Vec<SplitSelection>, description: String },
+    SquashInto { id: String, selection: Vec<SplitSelection>, destination: String },
     Rebase { id: String, destination: String, with_descendants: bool },
     CreateBookmark { name: String, target: String },
     MoveBookmark { name: String, target: String },
@@ -288,6 +289,65 @@ pub fn mutation_outcome(
                 format!("Split {id}: kept {kept}, the rest moved to {new_id}"),
                 id,
             ))
+        }
+        MockMutation::SquashInto { id, selection, destination } => {
+            let node = find(id)?;
+            require_mutable(node)?;
+            if id == destination {
+                return Err(BackendError::MutationFailed(format!(
+                    "cannot move changes from {id} into itself"
+                )));
+            }
+            let dest = find(destination)?;
+            require_mutable(dest)?;
+            // The counting mirrors Split's: fixture files decide what a
+            // selection can cover, hunk entries count as partially moved
+            // (their unchosen hunks stay behind), and hunk coordinates go
+            // unvalidated — fixture diffs are static, the documented mock
+            // approximation.
+            let files: Vec<String> = mock_change_detail(id)
+                .map(|detail| detail.files.into_iter().map(|f| f.path).collect())
+                .unwrap_or_default();
+            let whole = files
+                .iter()
+                .filter(|f| {
+                    selection
+                        .iter()
+                        .any(|s| s.path == **f && s.hunks.is_none())
+                })
+                .count();
+            let partial = files
+                .iter()
+                .filter(|f| {
+                    selection
+                        .iter()
+                        .any(|s| s.path == **f && s.hunks.is_some())
+                })
+                .count();
+            if whole + partial == 0 {
+                return Err(BackendError::MutationFailed(format!(
+                    "none of the selected files change anything in {id}"
+                )));
+            }
+            if whole == files.len() {
+                // The full squash: the emptied source is abandoned and the
+                // selection follows the destination.
+                return Ok(recorded(
+                    format!(
+                        "Moved everything in {id} into {destination}; \
+                         the emptied change was abandoned"
+                    ),
+                    destination,
+                ));
+            }
+            let moved = match (whole, partial) {
+                (w, 0) => format!("{w} file{}", if w == 1 { "" } else { "s" }),
+                (0, p) => format!("parts of {p} file{}", if p == 1 { "" } else { "s" }),
+                (w, p) => {
+                    format!("{w} file{} and parts of {p} more", if w == 1 { "" } else { "s" })
+                }
+            };
+            Ok(recorded(format!("Moved {moved} from {id} into {destination}"), id))
         }
         MockMutation::Rebase {
             id,
@@ -730,6 +790,69 @@ pub fn apply_mutation(
             }
             push_op(snapshot, index, format!("split commit {commit}"), effects);
         }
+        MockMutation::SquashInto { id, selection, destination } => {
+            // A partial move changes only file contents, which the static
+            // fixture diffs cannot follow (the documented mock
+            // approximation); the destination stops reading as empty either
+            // way. A full move abandons the emptied source like the real
+            // backend: children reparent onto its parents, bookmarks land
+            // on its first parent, and an emptied working copy respawns.
+            let full = mock_change_detail(id).is_some_and(|detail| {
+                !detail.files.is_empty()
+                    && detail.files.iter().all(|f| {
+                        selection
+                            .iter()
+                            .any(|s| s.path == f.path && s.hunks.is_none())
+                    })
+            });
+            let dest_commit = match snapshot.nodes.iter_mut().find(|n| n.id == *destination) {
+                Some(dest) => {
+                    dest.is_empty = false;
+                    dest.commit_id.clone()
+                }
+                None => return,
+            };
+            let mut effects: Vec<OpEffect> = Vec::new();
+            if full {
+                let Some(removed) = remove_node(snapshot, id) else {
+                    return;
+                };
+                if let Some(dest) = snapshot.nodes.iter_mut().find(|n| n.id == *destination) {
+                    dest.description =
+                        combined_mock_description(&dest.description, &removed.description);
+                }
+                reparent_children(snapshot, id, &removed.parents);
+                if let Some(parent_id) = removed.parents.first() {
+                    for bookmark in &mut snapshot.bookmarks {
+                        if bookmark.target == *id {
+                            bookmark.target = parent_id.clone();
+                            effects.push(OpEffect {
+                                kind: OpEffectKind::Bookmark,
+                                label: format!("{} moved", bookmark.name),
+                            });
+                        }
+                    }
+                    if let Some(parent) =
+                        snapshot.nodes.iter_mut().find(|n| n.id == *parent_id)
+                    {
+                        parent.bookmarks.extend(removed.bookmarks.iter().cloned());
+                    }
+                }
+                prune_workstreams(snapshot, id);
+                if snapshot.working_copy == *id {
+                    if let Some(parent) = removed.parents.first() {
+                        spawn_working_copy(snapshot, &parent.clone(), index);
+                    }
+                    effects.push(wc_moved_effect());
+                }
+            }
+            push_op(
+                snapshot,
+                index,
+                format!("squash commits into {dest_commit}"),
+                effects,
+            );
+        }
         MockMutation::Rebase {
             id,
             destination,
@@ -966,6 +1089,9 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
             format!("squash commits into {}", commit_of(&parent))
         }
         MockMutation::Split { id, .. } => format!("split commit {}", commit_of(id)),
+        MockMutation::SquashInto { destination, .. } => {
+            format!("squash commits into {}", commit_of(destination))
+        }
         MockMutation::Rebase {
             id,
             with_descendants,

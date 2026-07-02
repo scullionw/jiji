@@ -21,7 +21,8 @@ export type UiIntent =
   | { kind: "describe" }
   | { kind: "bookmark" }
   | { kind: "rebase" }
-  | { kind: "split" }
+  // `into` opens the split panel in its move-into-an-existing-change mode.
+  | { kind: "split"; into?: boolean }
   | { kind: "squash" }
   | { kind: "abandon" }
   // With a mode the comparison applies directly; without one the compare

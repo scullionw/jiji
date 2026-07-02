@@ -8,6 +8,8 @@ import {
   hunkCoords,
   hunkLabel,
   hunkPreview,
+  movable,
+  selectionReady,
   splitPayload,
   splitSummary,
   splittable,
@@ -161,5 +163,44 @@ describe("splittable", () => {
     expect(splittable([textFile("a.ts", twoHunks)])).toBe(true);
     expect(splittable([textFile("a.ts", [twoHunks[0]])])).toBe(false);
     expect(splittable([])).toBe(false);
+  });
+});
+
+describe("selectionReady", () => {
+  const files = [textFile("a.ts", twoHunks), textFile("b.ts", [twoHunks[0]])];
+
+  it("a new-change split must leave a remainder", () => {
+    const some = splitSummary(files, new Map([["a.ts", "all" as SplitPick]]));
+    expect(selectionReady(some, { kind: "new" })).toBe(true);
+    expect(selectionReady(some, { kind: "into", id: null })).toBe(false);
+    expect(selectionReady(some, { kind: "into", id: "dest" })).toBe(true);
+  });
+
+  it("a move into an existing change may take everything, but not nothing", () => {
+    const all = splitSummary(
+      files,
+      new Map<string, SplitPick>([
+        ["a.ts", "all"],
+        ["b.ts", "all"],
+      ]),
+    );
+    expect(all.allCovered).toBe(true);
+    expect(selectionReady(all, { kind: "new" })).toBe(false);
+    expect(selectionReady(all, { kind: "into", id: "dest" })).toBe(true);
+    expect(selectionReady(splitSummary(files, new Map()), { kind: "into", id: "dest" })).toBe(
+      false,
+    );
+    expect(selectionReady(splitSummary(null, new Map()), { kind: "into", id: "dest" })).toBe(
+      false,
+    );
+  });
+});
+
+describe("movable", () => {
+  it("needs only one changed file, where a split needs a remainder", () => {
+    const single = [textFile("a.ts", [twoHunks[0]])];
+    expect(splittable(single)).toBe(false);
+    expect(movable(single)).toBe(true);
+    expect(movable([])).toBe(false);
   });
 });

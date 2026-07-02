@@ -29,6 +29,7 @@ use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
 use jj_lib::hex_util;
 use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher, NothingMatcher};
 use jj_lib::merge::{Diff as MergeDiff, Merge, MergedTreeValue};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
 use jj_lib::op_store::{OpStoreError, OperationId, RefTarget, RemoteRefState, ViewId};
@@ -42,8 +43,8 @@ use jj_lib::revset::{
     RevsetParseContext, RevsetWorkspaceContext, SymbolResolver,
 };
 use jj_lib::rewrite::{
-    move_commits, restore_tree, MoveCommitsLocation, MoveCommitsTarget, RebaseOptions,
-    RewriteRefsOptions,
+    move_commits, restore_tree, squash_commits, CommitWithSelection, MoveCommitsLocation,
+    MoveCommitsTarget, RebaseOptions, RebasedCommit, RewriteRefsOptions,
 };
 use jj_lib::settings::HumanByteSize;
 use jj_lib::store::Store;
@@ -497,224 +498,17 @@ impl RepoBackend for JjBackend {
         let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
         check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
 
-        // Partition the selection: whole files stay the restore_tree fast
-        // path; hunk entries rebuild their file's content below.
-        let mut whole_paths = Vec::new();
-        let mut partial: Vec<(RepoPathBuf, &[SplitHunk])> = Vec::new();
-        for entry in selection {
-            let repo_path = RepoPathBuf::from_internal_string(entry.path.as_str()).map_err(
-                |err| BackendError::MutationFailed(format!("not a valid repository path: {err}")),
-            )?;
-            match entry.hunks.as_deref() {
-                None => whole_paths.push(repo_path),
-                Some([]) => {
-                    return Err(BackendError::MutationFailed(format!(
-                        "no hunks selected in {}",
-                        entry.path
-                    )));
-                }
-                Some(hunks) => partial.push((repo_path, hunks)),
-            }
-        }
-        let whole_matcher = FilesMatcher::new(&whole_paths);
-
-        // Partition the change's own diff by the selection before building
-        // trees: both degenerate splits are refused up front (the curated
-        // deviation documented on the trait — the CLI warns and leaves an
-        // empty half), and the counts feed the summary. Hunk-selected
-        // paths are counted below, where their hunks are matched.
-        let commit_tree = commit.tree();
-        let parent_tree =
-            pollster::block_on(commit.parent_tree(repo.as_ref())).map_err(snapshot_err)?;
-        let partial_paths: HashSet<RepoPathBuf> =
-            partial.iter().map(|(p, _)| p.clone()).collect();
-        let (mut whole_files, mut remaining_files) = (0usize, 0usize);
-        pollster::block_on(async {
-            let mut stream = parent_tree.diff_stream(&commit_tree, &EverythingMatcher);
-            while let Some(entry) = stream.next().await {
-                if partial_paths.contains(&entry.path) {
-                    continue;
-                }
-                if whole_matcher.matches(&entry.path) {
-                    whole_files += 1;
-                } else {
-                    remaining_files += 1;
-                }
-            }
-        });
-
-        // Rebuild each hunk-selected file: the parent side's content with
-        // just the chosen hunks applied. Hunks are re-derived from the
-        // trees here and matched against the coordinates the panel
-        // rendered — a mismatch means the change moved since then, and
-        // rewriting it anyway could carve content the user never saw.
-        let mut partial_files = 0usize;
-        let mut matched: HashSet<RepoPathBuf> = HashSet::new();
-        let mut partial_overrides: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
-        if !partial.is_empty() {
-            let partial_repo_paths: Vec<RepoPathBuf> =
-                partial.iter().map(|(p, _)| p.clone()).collect();
-            let partial_matcher = FilesMatcher::new(&partial_repo_paths);
-            let copies = CopyRecords::default();
-            let tree_diff =
-                parent_tree.diff_stream_with_copies(&commit_tree, &partial_matcher, &copies);
-            let labels = MergeDiff::new(parent_tree.labels(), commit_tree.labels());
-            let store = repo.store();
-            let mut stream = std::pin::pin!(materialized_diff_stream(store, tree_diff, labels));
-            pollster::block_on(async {
-                while let Some(entry) = stream.next().await {
-                    let values = entry.values.map_err(snapshot_err)?;
-                    let file_path = entry.path.target().to_owned();
-                    let Some((_, wanted)) = partial.iter().find(|(p, _)| *p == file_path) else {
-                        continue;
-                    };
-                    let display = file_path.as_internal_file_string();
-                    let (before_file, before_content) =
-                        split_file_side(values.before, &file_path).await?;
-                    let (after_file, after_content) =
-                        split_file_side(values.after, &file_path).await?;
-                    if before_content.contains(&0) || after_content.contains(&0) {
-                        return Err(BackendError::MutationFailed(format!(
-                            "{display} is binary; hunks cannot be selected — \
-                             check the whole file instead"
-                        )));
-                    }
-                    if before_content.len() > MAX_DIFF_FILE_BYTES
-                        || after_content.len() > MAX_DIFF_FILE_BYTES
-                    {
-                        return Err(BackendError::MutationFailed(format!(
-                            "{display} is too large to split by hunk — \
-                             check the whole file instead"
-                        )));
-                    }
-                    let raw_hunks = unified_diff_hunks(
-                        MergeDiff::new(
-                            before_content.as_slice().into(),
-                            after_content.as_slice().into(),
-                        ),
-                        DIFF_CONTEXT_LINES,
-                        LineCompareMode::Exact,
-                    );
-                    let mut chosen = vec![false; raw_hunks.len()];
-                    for want in wanted.iter() {
-                        let found = raw_hunks.iter().position(|hunk| {
-                            hunk.left_line_range.start + 1 == want.old_start as usize
-                                && hunk.right_line_range.start + 1 == want.new_start as usize
-                                && hunk.left_line_range.len() == want.old_lines as usize
-                                && hunk.right_line_range.len() == want.new_lines as usize
-                        });
-                        let Some(found) = found else {
-                            return Err(BackendError::MutationFailed(format!(
-                                "the diff of {display} no longer matches the selected \
-                                 hunks — the change moved; refresh and try again"
-                            )));
-                        };
-                        chosen[found] = true;
-                    }
-                    partial_files += 1;
-                    matched.insert(file_path.clone());
-                    if !chosen.iter().all(|c| *c) {
-                        // Unchosen hunks of this file stay with the
-                        // remainder; an all-hunks selection leaves nothing
-                        // of it there.
-                        remaining_files += 1;
-                    }
-                    // Splice the chosen hunks into the parent content.
-                    // Left lines split \n-inclusive, matching the diff's
-                    // own line ranges, so unchanged stretches (including
-                    // unchosen hunks) copy through byte-exact.
-                    let left_lines: Vec<&[u8]> =
-                        before_content.split_inclusive(|b| *b == b'\n').collect();
-                    let mut content: Vec<u8> = Vec::with_capacity(after_content.len());
-                    let mut cursor = 0usize;
-                    for (hunk, chosen) in raw_hunks.iter().zip(&chosen) {
-                        if !*chosen {
-                            continue;
-                        }
-                        for line in &left_lines[cursor..hunk.left_line_range.start] {
-                            content.extend_from_slice(line);
-                        }
-                        for (line_type, tokens) in &hunk.lines {
-                            if !matches!(line_type, DiffLineType::Removed) {
-                                for (_, text) in tokens {
-                                    content.extend_from_slice(text);
-                                }
-                            }
-                        }
-                        cursor = hunk.left_line_range.end;
-                    }
-                    for line in &left_lines[cursor..] {
-                        content.extend_from_slice(line);
-                    }
-                    // The carved half keeps the parent side's file mode; a
-                    // mode-only flip rides the remainder (documented on
-                    // the trait).
-                    let (executable, copy_id) = match (&before_file, &after_file) {
-                        (Some((exec, copy)), _) | (None, Some((exec, copy))) => {
-                            (*exec, copy.clone())
-                        }
-                        (None, None) => {
-                            return Err(BackendError::MutationFailed(format!(
-                                "{display} does not change anything in this change"
-                            )));
-                        }
-                    };
-                    let id = store
-                        .write_file(&file_path, &mut content.as_slice())
-                        .await
-                        .map_err(mutation_err)?;
-                    partial_overrides.push((
-                        file_path,
-                        Merge::resolved(Some(TreeValue::File {
-                            id,
-                            executable,
-                            copy_id,
-                        })),
-                    ));
-                }
-                Ok::<_, BackendError>(())
-            })?;
-        }
-        for (p, _) in &partial {
-            if !matched.contains(p) {
-                return Err(BackendError::MutationFailed(format!(
-                    "{} does not change anything in {change_id}",
-                    p.as_internal_file_string()
-                )));
-            }
-        }
-        if whole_files == 0 && partial_files == 0 {
-            return Err(BackendError::MutationFailed(format!(
-                "none of the selected files change anything in {change_id}"
-            )));
-        }
-        if remaining_files == 0 {
+        let selected = select_changes(&repo, &commit, change_id, selection)?;
+        // The curated deviation documented on the trait: a split may not
+        // cover every change — the CLI warns and leaves an empty half
+        // behind, but from a plan panel that is always a mistake.
+        if selected.remaining_files == 0 {
             return Err(BackendError::MutationFailed(format!(
                 "the selection covers every change in {change_id}; \
                  there would be nothing left to split off"
             )));
         }
-
-        // The selected half's tree: the parent tree with the whole selected
-        // paths restored from the change's tree, then the hunk-selected
-        // files' rebuilt content layered on top.
-        let selected_tree = pollster::block_on(restore_tree(
-            &commit_tree,
-            &parent_tree,
-            format!("commit {}", commit.id().hex()),
-            "parents".to_owned(),
-            &whole_matcher,
-        ))
-        .map_err(mutation_err)?;
-        let selected_tree = if partial_overrides.is_empty() {
-            selected_tree
-        } else {
-            let mut builder = MergedTreeBuilder::new(selected_tree);
-            for (file_path, value) in partial_overrides {
-                builder.set_or_remove(file_path, value);
-            }
-            pollster::block_on(builder.write_tree()).map_err(mutation_err)?
-        };
+        let commit_tree = commit.tree();
 
         let mut tx = repo.start_transaction();
         // The selected files stay in the change itself: same change id, the
@@ -722,7 +516,7 @@ impl RepoBackend for JjBackend {
         let first = pollster::block_on(
             tx.repo_mut()
                 .rewrite_commit(&commit)
-                .set_tree(selected_tree)
+                .set_tree(selected.tree)
                 .set_description(complete_newline(description.trim_end()))
                 .write(),
         )
@@ -750,11 +544,7 @@ impl RepoBackend for JjBackend {
         )?;
         let first_id = display_id_of(new_repo.as_ref(), first.id())?;
         let second_id = display_id_of(new_repo.as_ref(), second.id())?;
-        let kept = match (whole_files, partial_files) {
-            (w, 0) => format!("{w} file{}", if w == 1 { "" } else { "s" }),
-            (0, p) => format!("parts of {p} file{}", if p == 1 { "" } else { "s" }),
-            (w, p) => format!("{w} file{} and parts of {p} more", if w == 1 { "" } else { "s" }),
-        };
+        let kept = files_phrase(selected.whole_files, selected.partial_files);
         Ok(MutationOutcome {
             operation_id: Some(short_operation_id(new_repo.op_id())),
             summary: format!("Split {change_id}: kept {kept}, the rest moved to {second_id}"),
@@ -762,6 +552,119 @@ impl RepoBackend for JjBackend {
             // just described, which keeps the change id (recomputed in case
             // the rewrite left it divergent).
             target_change: Some(first_id),
+        })
+    }
+
+    fn squash_into(
+        &self,
+        path: &Path,
+        change_id: &str,
+        selection: &[SplitSelection],
+        destination_id: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+        check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+        let destination = resolve_change_commit_for_mutation(&repo, destination_id)?;
+        if destination.id() == commit.id() {
+            return Err(BackendError::MutationFailed(format!(
+                "cannot move changes from {change_id} into itself"
+            )));
+        }
+        let destination_display = display_id(repo.as_ref(), &destination);
+        check_mutable(&workspace, repo.as_ref(), &destination, &destination_display)?;
+
+        let selected = select_changes(&repo, &commit, change_id, selection)?;
+        let moved = files_phrase(selected.whole_files, selected.partial_files);
+        let source = CommitWithSelection {
+            commit: commit.clone(),
+            selected_tree: selected.tree,
+            parent_tree: selected.parent_tree,
+        };
+
+        let mut tx = repo.start_transaction();
+        // jj's own squash engine: a partial selection rewrites the source
+        // with the inverse of the selected diff, a full one abandons it
+        // (bookmarks land on its parent, an emptied working copy respawns —
+        // handled by the descendant rebase below), a destination sitting
+        // above the source is rebased first, and the content arrives as a
+        // labeled tree merge so a non-applying move records a first-class
+        // conflict.
+        let squashed = pollster::block_on(squash_commits(
+            tx.repo_mut(),
+            std::slice::from_ref(&source),
+            &destination,
+            false,
+        ))
+        .map_err(mutation_err)?;
+        let Some(squashed) = squashed else {
+            // Unreachable after the changes-nothing refusal; mirror the
+            // CLI's "Nothing changed" just in case.
+            return Ok(MutationOutcome {
+                operation_id: None,
+                summary: format!("Nothing to move from {change_id}"),
+                target_change: Some(change_id.to_owned()),
+            });
+        };
+        let abandoned = !squashed.abandoned_commits.is_empty();
+        let mut builder = squashed.commit_builder;
+        if abandoned {
+            // The CLI prompts with the combined text in an editor; Jiji's
+            // curated combining (destination first, empty sides yield the
+            // other) is the same rule squash_change already applies.
+            builder = builder.set_description(combined_description(
+                destination.description(),
+                commit.description(),
+            ));
+        }
+        let new_destination = pollster::block_on(builder.write()).map_err(mutation_err)?;
+
+        // Rebase descendants here (finish_mutation's own pass then has
+        // nothing left) to learn where the rewritten source lands: a source
+        // above its destination is rewritten a second time by this pass.
+        let mut source_now = if abandoned {
+            None
+        } else {
+            tx.repo().new_parents(std::slice::from_ref(commit.id())).into_iter().next()
+        };
+        pollster::block_on(tx.repo_mut().rebase_descendants_with_options(
+            &RebaseOptions::default(),
+            |old_commit, rebased| {
+                if Some(old_commit.id()) == source_now.as_ref() {
+                    if let RebasedCommit::Rewritten(new_commit) = rebased {
+                        source_now = Some(new_commit.id().clone());
+                    }
+                }
+            },
+        ))
+        .map_err(mutation_err)?;
+
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("squash commits into {}", destination.id().hex()),
+        )?;
+        // Selection follows the destination when the source dissolved into
+        // it; a partial move stays on the rewritten source so peeling more
+        // pieces off continues where the user was.
+        let target = match source_now {
+            Some(source_id) => display_id_of(new_repo.as_ref(), &source_id)?,
+            None => display_id_of(new_repo.as_ref(), new_destination.id())?,
+        };
+        let summary = if abandoned {
+            format!(
+                "Moved everything in {change_id} into {destination_display}; \
+                 the emptied change was abandoned"
+            )
+        } else {
+            format!("Moved {moved} from {change_id} into {destination_display}")
+        };
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary,
+            target_change: Some(target),
         })
     }
 
@@ -2484,6 +2387,258 @@ fn to_segments(tokens: &[(DiffTokenType, &[u8])]) -> Vec<DiffSegment> {
         }
     }
     segments
+}
+
+/// How a `SplitSelection` partitions one change's diff, plus the tree the
+/// selected side builds. Shared by `split_change` (the selection becomes
+/// the carved-off half) and `squash_into` (the selection moves into
+/// another change).
+struct SelectedChanges {
+    /// The parent tree with the selected content applied: whole selected
+    /// files restored from the change's tree, then the chosen hunks of
+    /// partially selected files spliced in.
+    tree: MergedTree,
+    parent_tree: MergedTree,
+    /// Files selected whole.
+    whole_files: usize,
+    /// Files with a subset of their hunks selected.
+    partial_files: usize,
+    /// Diff entries the selection leaves behind — unselected files plus
+    /// partially selected files with unchosen hunks. Zero means the
+    /// selection covers every change the commit makes.
+    remaining_files: usize,
+}
+
+/// Builds the selected side of a file/hunk selection over one change's
+/// diff. Whole files are the `restore_tree` fast path; a hunk entry
+/// rebuilds its file as the parent side's content with just the chosen
+/// hunks applied, where the hunks are re-derived from the trees here and
+/// matched against the coordinates the panel rendered — a mismatch means
+/// the change moved since then, and rewriting it anyway could carve
+/// content the user never saw. Selections that change nothing are refused.
+fn select_changes(
+    repo: &Arc<ReadonlyRepo>,
+    commit: &Commit,
+    change_id: &str,
+    selection: &[SplitSelection],
+) -> Result<SelectedChanges, BackendError> {
+    // Partition the selection: whole files stay the restore_tree fast
+    // path; hunk entries rebuild their file's content below.
+    let mut whole_paths = Vec::new();
+    let mut partial: Vec<(RepoPathBuf, &[SplitHunk])> = Vec::new();
+    for entry in selection {
+        let repo_path = RepoPathBuf::from_internal_string(entry.path.as_str()).map_err(|err| {
+            BackendError::MutationFailed(format!("not a valid repository path: {err}"))
+        })?;
+        match entry.hunks.as_deref() {
+            None => whole_paths.push(repo_path),
+            Some([]) => {
+                return Err(BackendError::MutationFailed(format!(
+                    "no hunks selected in {}",
+                    entry.path
+                )));
+            }
+            Some(hunks) => partial.push((repo_path, hunks)),
+        }
+    }
+    let whole_matcher = FilesMatcher::new(&whole_paths);
+
+    // Partition the change's own diff by the selection before building
+    // trees: degenerate selections are refused up front and the counts
+    // feed the callers' summaries and policies. Hunk-selected paths are
+    // counted below, where their hunks are matched.
+    let commit_tree = commit.tree();
+    let parent_tree = pollster::block_on(commit.parent_tree(repo.as_ref())).map_err(snapshot_err)?;
+    let partial_paths: HashSet<RepoPathBuf> = partial.iter().map(|(p, _)| p.clone()).collect();
+    let (mut whole_files, mut remaining_files) = (0usize, 0usize);
+    pollster::block_on(async {
+        let mut stream = parent_tree.diff_stream(&commit_tree, &EverythingMatcher);
+        while let Some(entry) = stream.next().await {
+            if partial_paths.contains(&entry.path) {
+                continue;
+            }
+            if whole_matcher.matches(&entry.path) {
+                whole_files += 1;
+            } else {
+                remaining_files += 1;
+            }
+        }
+    });
+
+    // Rebuild each hunk-selected file.
+    let mut partial_files = 0usize;
+    let mut matched: HashSet<RepoPathBuf> = HashSet::new();
+    let mut partial_overrides: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();
+    if !partial.is_empty() {
+        let partial_repo_paths: Vec<RepoPathBuf> = partial.iter().map(|(p, _)| p.clone()).collect();
+        let partial_matcher = FilesMatcher::new(&partial_repo_paths);
+        let copies = CopyRecords::default();
+        let tree_diff =
+            parent_tree.diff_stream_with_copies(&commit_tree, &partial_matcher, &copies);
+        let labels = MergeDiff::new(parent_tree.labels(), commit_tree.labels());
+        let store = repo.store();
+        let mut stream = std::pin::pin!(materialized_diff_stream(store, tree_diff, labels));
+        pollster::block_on(async {
+            while let Some(entry) = stream.next().await {
+                let values = entry.values.map_err(snapshot_err)?;
+                let file_path = entry.path.target().to_owned();
+                let Some((_, wanted)) = partial.iter().find(|(p, _)| *p == file_path) else {
+                    continue;
+                };
+                let display = file_path.as_internal_file_string();
+                let (before_file, before_content) =
+                    split_file_side(values.before, &file_path).await?;
+                let (after_file, after_content) =
+                    split_file_side(values.after, &file_path).await?;
+                if before_content.contains(&0) || after_content.contains(&0) {
+                    return Err(BackendError::MutationFailed(format!(
+                        "{display} is binary; hunks cannot be selected — \
+                         check the whole file instead"
+                    )));
+                }
+                if before_content.len() > MAX_DIFF_FILE_BYTES
+                    || after_content.len() > MAX_DIFF_FILE_BYTES
+                {
+                    return Err(BackendError::MutationFailed(format!(
+                        "{display} is too large to split by hunk — \
+                         check the whole file instead"
+                    )));
+                }
+                let raw_hunks = unified_diff_hunks(
+                    MergeDiff::new(
+                        before_content.as_slice().into(),
+                        after_content.as_slice().into(),
+                    ),
+                    DIFF_CONTEXT_LINES,
+                    LineCompareMode::Exact,
+                );
+                let mut chosen = vec![false; raw_hunks.len()];
+                for want in wanted.iter() {
+                    let found = raw_hunks.iter().position(|hunk| {
+                        hunk.left_line_range.start + 1 == want.old_start as usize
+                            && hunk.right_line_range.start + 1 == want.new_start as usize
+                            && hunk.left_line_range.len() == want.old_lines as usize
+                            && hunk.right_line_range.len() == want.new_lines as usize
+                    });
+                    let Some(found) = found else {
+                        return Err(BackendError::MutationFailed(format!(
+                            "the diff of {display} no longer matches the selected \
+                             hunks — the change moved; refresh and try again"
+                        )));
+                    };
+                    chosen[found] = true;
+                }
+                partial_files += 1;
+                matched.insert(file_path.clone());
+                if !chosen.iter().all(|c| *c) {
+                    // Unchosen hunks of this file stay behind; an
+                    // all-hunks selection leaves nothing of it there.
+                    remaining_files += 1;
+                }
+                // Splice the chosen hunks into the parent content.
+                // Left lines split \n-inclusive, matching the diff's
+                // own line ranges, so unchanged stretches (including
+                // unchosen hunks) copy through byte-exact.
+                let left_lines: Vec<&[u8]> =
+                    before_content.split_inclusive(|b| *b == b'\n').collect();
+                let mut content: Vec<u8> = Vec::with_capacity(after_content.len());
+                let mut cursor = 0usize;
+                for (hunk, chosen) in raw_hunks.iter().zip(&chosen) {
+                    if !*chosen {
+                        continue;
+                    }
+                    for line in &left_lines[cursor..hunk.left_line_range.start] {
+                        content.extend_from_slice(line);
+                    }
+                    for (line_type, tokens) in &hunk.lines {
+                        if !matches!(line_type, DiffLineType::Removed) {
+                            for (_, text) in tokens {
+                                content.extend_from_slice(text);
+                            }
+                        }
+                    }
+                    cursor = hunk.left_line_range.end;
+                }
+                for line in &left_lines[cursor..] {
+                    content.extend_from_slice(line);
+                }
+                // The selected side keeps the parent side's file mode; a
+                // mode-only flip stays behind (documented on the trait).
+                let (executable, copy_id) = match (&before_file, &after_file) {
+                    (Some((exec, copy)), _) | (None, Some((exec, copy))) => (*exec, copy.clone()),
+                    (None, None) => {
+                        return Err(BackendError::MutationFailed(format!(
+                            "{display} does not change anything in this change"
+                        )));
+                    }
+                };
+                let id = store
+                    .write_file(&file_path, &mut content.as_slice())
+                    .await
+                    .map_err(mutation_err)?;
+                partial_overrides.push((
+                    file_path,
+                    Merge::resolved(Some(TreeValue::File {
+                        id,
+                        executable,
+                        copy_id,
+                    })),
+                ));
+            }
+            Ok::<_, BackendError>(())
+        })?;
+    }
+    for (p, _) in &partial {
+        if !matched.contains(p) {
+            return Err(BackendError::MutationFailed(format!(
+                "{} does not change anything in {change_id}",
+                p.as_internal_file_string()
+            )));
+        }
+    }
+    if whole_files == 0 && partial_files == 0 {
+        return Err(BackendError::MutationFailed(format!(
+            "none of the selected files change anything in {change_id}"
+        )));
+    }
+
+    // The selected side's tree: the parent tree with the whole selected
+    // paths restored from the change's tree, then the hunk-selected
+    // files' rebuilt content layered on top.
+    let selected_tree = pollster::block_on(restore_tree(
+        &commit_tree,
+        &parent_tree,
+        format!("commit {}", commit.id().hex()),
+        "parents".to_owned(),
+        &whole_matcher,
+    ))
+    .map_err(mutation_err)?;
+    let selected_tree = if partial_overrides.is_empty() {
+        selected_tree
+    } else {
+        let mut builder = MergedTreeBuilder::new(selected_tree);
+        for (file_path, value) in partial_overrides {
+            builder.set_or_remove(file_path, value);
+        }
+        pollster::block_on(builder.write_tree()).map_err(mutation_err)?
+    };
+    Ok(SelectedChanges {
+        tree: selected_tree,
+        parent_tree,
+        whole_files,
+        partial_files,
+        remaining_files,
+    })
+}
+
+/// How selections read in outcome summaries: "2 files", "parts of 1 file",
+/// "1 file and parts of 2 more".
+fn files_phrase(whole: usize, partial: usize) -> String {
+    match (whole, partial) {
+        (w, 0) => format!("{w} file{}", if w == 1 { "" } else { "s" }),
+        (0, p) => format!("parts of {p} file{}", if p == 1 { "" } else { "s" }),
+        (w, p) => format!("{w} file{} and parts of {p} more", if w == 1 { "" } else { "s" }),
+    }
 }
 
 /// One side of a hunk-selected file in a split: its raw bytes plus the
@@ -4710,6 +4865,313 @@ mod tests {
             new_notes
         );
         assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn squash_into_moves_selection_down_into_an_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+
+        let old_notes = "n1\nn2\nn3\nn4\nn5\nn6\nn7\nn8\nn9\nn10\nn11\nn12\n";
+        let new_notes = "n1\nsecond changed\nn3\nn4\nn5\nn6\nn7\nn8\nn9\nn10\neleventh changed\nn12\n";
+        let base_tree = file_tree(&store, &[("notes.txt", old_notes)]);
+        let base = write_commit_with_tree(&mut tx, vec![root_commit_id], "feat: base", base_tree);
+        let mixed_tree = file_tree(
+            &store,
+            &[("notes.txt", new_notes), ("b.txt", "bee\n"), ("c.txt", "sea\n")],
+        );
+        let mixed =
+            write_commit_with_tree(&mut tx, vec![base.id().clone()], "mixed work", mixed_tree);
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new("topic"),
+            RefTarget::normal(mixed.id().clone()),
+        );
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &mixed)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up squash-into fixture")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let mixed_id = before.working_copy.clone();
+        let base_id = node_by_description(&before, "feat: base").id.clone();
+        let diff = backend.change_diff(dir.path(), &mixed_id).unwrap();
+        let hunks = text_hunks(&diff, "notes.txt");
+        assert_eq!(hunks.len(), 2);
+
+        // Move b.txt whole and only the first notes.txt hunk from the
+        // working copy down into its ancestor.
+        let outcome = backend
+            .squash_into(
+                dir.path(),
+                &mixed_id,
+                &[
+                    SplitSelection::whole("b.txt"),
+                    SplitSelection {
+                        path: "notes.txt".to_owned(),
+                        hunks: Some(vec![hunk_coords(&hunks[0])]),
+                    },
+                ],
+                &base_id,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!("Moved 1 file and parts of 1 more from {mixed_id} into {base_id}")
+        );
+        // A partial move keeps the selection on the source, where the next
+        // piece gets peeled off.
+        assert_eq!(outcome.target_change.as_deref(), Some(mixed_id.as_str()));
+
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after.operations[0].description.starts_with("squash commits into "));
+        // Both descriptions and the bookmark stay put on a partial move.
+        assert_eq!(node_by_description(&after, "feat: base").id, base_id);
+        assert_eq!(node_by_description(&after, "mixed work").id, mixed_id);
+        let topic = after.bookmarks.iter().find(|b| b.name == "topic").unwrap();
+        assert_eq!(topic.target, mixed_id);
+
+        // The destination gained the file and the chosen hunk's edit.
+        let detail = backend.change_detail(dir.path(), &base_id).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["b.txt", "notes.txt"]);
+        let base_diff = backend.change_diff(dir.path(), &base_id).unwrap();
+        let base_added: Vec<String> = text_hunks(&base_diff, "notes.txt")
+            .iter()
+            .flat_map(|h| line_texts(h, DiffLineKind::Added))
+            .collect();
+        assert!(base_added.contains(&"second changed".to_owned()));
+        assert!(!base_added.contains(&"eleventh changed".to_owned()));
+
+        // The source keeps the rest; the working copy stayed on it and the
+        // files on disk are untouched — the moved content still sits below.
+        let detail = backend.change_detail(dir.path(), &mixed_id).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["c.txt", "notes.txt"]);
+        let mixed_diff = backend.change_diff(dir.path(), &mixed_id).unwrap();
+        let mixed_hunks = text_hunks(&mixed_diff, "notes.txt");
+        assert_eq!(mixed_hunks.len(), 1);
+        assert_eq!(
+            line_texts(&mixed_hunks[0], DiffLineKind::Added),
+            vec!["eleventh changed"]
+        );
+        assert_eq!(after.working_copy, mixed_id);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            new_notes
+        );
+        assert!(dir.path().join("b.txt").exists());
+        assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn squash_into_pulls_changes_forward_into_a_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+
+        let base_tree = file_tree(&store, &[("f.txt", "eff\n"), ("g.txt", "gee\n")]);
+        let base = write_commit_with_tree(&mut tx, vec![root_commit_id], "base pair", base_tree);
+        let top_tree = file_tree(
+            &store,
+            &[("f.txt", "eff\n"), ("g.txt", "gee\n"), ("t.txt", "tee\n")],
+        );
+        let top = write_commit_with_tree(&mut tx, vec![base.id().clone()], "top work", top_tree);
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &top)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up forward move")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let base_id = node_by_description(&before, "base pair").id.clone();
+        let top_id = before.working_copy.clone();
+
+        // Move f.txt up into the descendant: the destination is rebased
+        // onto the rewritten source first, then takes the content.
+        let outcome = backend
+            .squash_into(dir.path(), &base_id, &[SplitSelection::whole("f.txt")], &top_id)
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!("Moved 1 file from {base_id} into {top_id}")
+        );
+        assert_eq!(outcome.target_change.as_deref(), Some(base_id.as_str()));
+
+        let after = backend.open(dir.path()).unwrap();
+        let detail = backend.change_detail(dir.path(), &base_id).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["g.txt"]);
+        let detail = backend.change_detail(dir.path(), &top_id).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["f.txt", "t.txt"]);
+        assert_eq!(after.working_copy, top_id);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "eff\n");
+        assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn squash_into_full_selection_abandons_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+
+        // A sibling destination, so "bookmarks land on the parent" is
+        // distinguishable from "bookmarks follow the destination".
+        let base_tree = file_tree(&store, &[("x.txt", "x\n")]);
+        let base = write_commit_with_tree(&mut tx, vec![root_commit_id.clone()], "feat: base", base_tree);
+        let src_tree = file_tree(&store, &[("x.txt", "x\n"), ("y.txt", "y\n")]);
+        let src = write_commit_with_tree(&mut tx, vec![base.id().clone()], "src: adds y", src_tree);
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new("topic"),
+            RefTarget::normal(src.id().clone()),
+        );
+        let wc = write_commit_with_tree(
+            &mut tx,
+            vec![src.id().clone()],
+            "",
+            file_tree(&store, &[("x.txt", "x\n"), ("y.txt", "y\n"), ("w.txt", "w\n")]),
+        );
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &wc)).unwrap();
+        let side_tree = file_tree(&store, &[("s.txt", "s\n")]);
+        write_commit_with_tree(&mut tx, vec![root_commit_id], "side: dest", side_tree);
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up full squash-into")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let wc_id = before.working_copy.clone();
+        let base_id = node_by_description(&before, "feat: base").id.clone();
+        let src_id = node_by_description(&before, "src: adds y").id.clone();
+        let side_id = node_by_description(&before, "side: dest").id.clone();
+
+        let outcome = backend
+            .squash_into(dir.path(), &src_id, &[SplitSelection::whole("y.txt")], &side_id)
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!(
+                "Moved everything in {src_id} into {side_id}; \
+                 the emptied change was abandoned"
+            )
+        );
+        // The source is gone, so the selection follows the destination.
+        assert_eq!(outcome.target_change.as_deref(), Some(side_id.as_str()));
+
+        let after = backend.open(dir.path()).unwrap();
+        // The emptied source is abandoned: its child reparents onto the
+        // parent, and — unlike an explicit abandon, which deletes them —
+        // its bookmark moves to the parent, like the CLI.
+        assert!(!after.nodes.iter().any(|n| n.id == src_id));
+        let topic = after.bookmarks.iter().find(|b| b.name == "topic").unwrap();
+        assert_eq!(topic.target, base_id);
+        let wc_node = after.nodes.iter().find(|n| n.id == wc_id).unwrap();
+        assert_eq!(wc_node.parents, vec![base_id]);
+        assert_eq!(after.working_copy, wc_id);
+
+        // The destination took the content and the folded description,
+        // destination first — the same combining as squash_change.
+        let side = node_by_description(&after, "side: dest\n\nsrc: adds y");
+        assert_eq!(side.id, side_id);
+        let detail = backend.change_detail(dir.path(), &side_id).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["s.txt", "y.txt"]);
+
+        // The moved content left the working copy's line of history, so
+        // its files updated on disk: y.txt is gone, the wc's own file stays.
+        assert!(!dir.path().join("y.txt").exists());
+        assert!(dir.path().join("w.txt").exists());
+        assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn squash_into_refusals_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings();
+        let (_workspace, repo) =
+            pollster::block_on(Workspace::init_simple(&settings, dir.path())).unwrap();
+        let root_commit_id = repo.store().root_commit_id().clone();
+        let store = repo.store().clone();
+        let mut tx = repo.start_transaction();
+        let base_tree = file_tree(&store, &[("a.txt", "aaa\n")]);
+        let base = write_commit_with_tree(&mut tx, vec![root_commit_id], "base", base_tree);
+        let tree = file_tree(&store, &[("a.txt", "aaa\n"), ("b.txt", "bbb\n")]);
+        let mixed = write_commit_with_tree(&mut tx, vec![base.id().clone()], "mixed", tree);
+        pollster::block_on(tx.repo_mut().edit(WorkspaceName::DEFAULT.to_owned(), &mixed)).unwrap();
+        pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
+        pollster::block_on(tx.commit("set up squash-into refusals")).unwrap();
+        check_out_working_copy(dir.path());
+
+        let backend = test_backend();
+        let snapshot = backend.open(dir.path()).unwrap();
+        let mixed_id = snapshot.working_copy.clone();
+        let base_id = node_by_description(&snapshot, "base").id.clone();
+        let root_id = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Immutable)
+            .unwrap()
+            .id
+            .clone();
+
+        let err = backend
+            .squash_into(dir.path(), &mixed_id, &[SplitSelection::whole("b.txt")], &mixed_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("into itself"), "got {err}");
+        let err = backend
+            .squash_into(dir.path(), &mixed_id, &[SplitSelection::whole("zz.txt")], &base_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("none of the selected files"), "got {err}");
+        let err = backend
+            .squash_into(dir.path(), &mixed_id, &[], &base_id)
+            .unwrap_err();
+        assert!(err.to_string().contains("none of the selected files"), "got {err}");
+        // Both ends must be mutable: the destination is rewritten too.
+        let err = backend
+            .squash_into(dir.path(), &mixed_id, &[SplitSelection::whole("b.txt")], &root_id)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ImmutableChange(_)), "got {err:?}");
+        let err = backend
+            .squash_into(dir.path(), &root_id, &[SplitSelection::whole("a.txt")], &mixed_id)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ImmutableChange(_)), "got {err:?}");
+        // Stale hunk coordinates mean the change moved under the panel.
+        let err = backend
+            .squash_into(
+                dir.path(),
+                &mixed_id,
+                &[SplitSelection {
+                    path: "b.txt".to_owned(),
+                    hunks: Some(vec![SplitHunk {
+                        old_start: 999,
+                        new_start: 999,
+                        old_lines: 1,
+                        new_lines: 1,
+                    }]),
+                }],
+                &base_id,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no longer matches"), "got {err}");
+
+        assert_eq!(
+            backend.open(dir.path()).unwrap().operations[0].description,
+            "set up squash-into refusals"
+        );
     }
 
     #[test]

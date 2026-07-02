@@ -150,6 +150,14 @@ function buildItems(ctx: PaletteContext): PaletteItem[] {
         icon: "split",
         action: { type: "intent", intent: { kind: "split" } },
       });
+      change({
+        id: "change.squashInto",
+        title: "Move files into another change…",
+        hint: at,
+        keywords: "squash into amend hunks jj squash --into",
+        icon: "split",
+        action: { type: "intent", intent: { kind: "split", into: true } },
+      });
     }
     if (avail.squash) {
       change({

@@ -166,6 +166,19 @@ export function rebaseDestinations(
   return snapshot.nodes.filter((n) => !excluded.has(n.id));
 }
 
+// Candidate destinations for moving files out of one change (`jj squash
+// --from --into`), in the snapshot's graph order: any other mutable drawn
+// change — an ancestor amends work down the stack, a descendant pulls it
+// forward, a sibling moves it across stacks. Immutable changes are
+// excluded because the destination is rewritten; divergent copies stay,
+// addressed by their commit-keyed ids.
+export function squashDestinations(
+  snapshot: RepoSnapshot,
+  id: string,
+): GraphNode[] {
+  return snapshot.nodes.filter((n) => n.id !== id && n.kind !== "immutable");
+}
+
 // What the diff surface measures a selection against. The presets are
 // relative, not pinned change ids, so walking the stack with "vs trunk"
 // keeps comparing each selection against trunk.

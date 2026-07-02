@@ -17,6 +17,7 @@ import {
   rebaseDestinations,
   resolveCompareFrom,
   splitPath,
+  squashDestinations,
   stackBaseOf,
   stackPosition,
 } from "./inspect";
@@ -241,6 +242,28 @@ describe("rebaseDestinations", () => {
 
   it("returns nothing for unknown changes", () => {
     expect(rebaseDestinations(snap, "gone", true)).toEqual([]);
+  });
+});
+
+describe("squashDestinations", () => {
+  const snap = snapshot([
+    node("top", "workingCopy", ["mid"]),
+    node("mid", "mutable", ["base"]),
+    node("side", "mutable", ["base"]),
+    node("base", "immutable"),
+  ]);
+
+  it("offers every other mutable change — ancestors, descendants, and siblings", () => {
+    expect(squashDestinations(snap, "top").map((n) => n.id)).toEqual([
+      "mid",
+      "side",
+    ]);
+    // Unlike a rebase, the sole parent stays: moving files there is how
+    // work amends down the stack.
+    expect(squashDestinations(snap, "mid").map((n) => n.id)).toEqual([
+      "top",
+      "side",
+    ]);
   });
 });
 

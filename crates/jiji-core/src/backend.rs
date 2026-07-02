@@ -192,6 +192,33 @@ pub trait RepoBackend: Send + Sync {
         description: &str,
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Move part of a change into another existing change (`jj squash
+    /// --from <rev> --into <dest> <paths>`, or `jj squash -i` semantics when
+    /// a selection names hunks): the selected content leaves the change and
+    /// lands in the destination, wherever it sits — an ancestor amends work
+    /// down the stack, a descendant pulls it forward, a sibling moves it
+    /// across stacks. Both changes must be mutable and distinct; descendants
+    /// of both rebase, and content that no longer applies cleanly records a
+    /// first-class conflict rather than blocking. Selection entries follow
+    /// `split_change`'s rules exactly (whole files, or verified hunk
+    /// coordinates re-derived at mutation time and refused when the change
+    /// moved underneath the panel).
+    ///
+    /// A selection covering every change in the source is the CLI's full
+    /// squash: the emptied change is abandoned, its description folds into
+    /// the destination's (destination first, no editor — the same curated
+    /// combining as `squash_change`), bookmarks on it move to its parent,
+    /// and an emptied working copy respawns as a new empty change. One
+    /// curated deviation, same as `split_change`: a selection that changes
+    /// nothing is refused, where the CLI warns and records nothing.
+    fn squash_into(
+        &self,
+        path: &Path,
+        change_id: &str,
+        selection: &[SplitSelection],
+        destination_id: &str,
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Rebase a change and all its descendants onto a new parent
     /// (`jj rebase -s <rev> -d <dest>`). The change must be mutable; the
     /// destination may be immutable — rebasing onto trunk is the canonical
@@ -481,6 +508,23 @@ impl RepoBackend for MockBackend {
                 id: change_id.to_owned(),
                 selection: selection.to_vec(),
                 description: description.trim().to_owned(),
+            },
+        )
+    }
+
+    fn squash_into(
+        &self,
+        path: &Path,
+        change_id: &str,
+        selection: &[SplitSelection],
+        destination_id: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::SquashInto {
+                id: change_id.to_owned(),
+                selection: selection.to_vec(),
+                destination: destination_id.to_owned(),
             },
         )
     }
@@ -868,6 +912,78 @@ mod tests {
         let active = after.workstreams.iter().find(|w| w.is_active).unwrap();
         let remainder_at = active.node_ids.iter().position(|n| *n == remainder.id).unwrap();
         assert_eq!(active.node_ids.get(remainder_at + 1), Some(&wc_id));
+    }
+
+    #[test]
+    fn mock_squash_into_replays_partial_and_full_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+        let wc_id = before.working_copy.clone();
+        let wc_parent = before
+            .nodes
+            .iter()
+            .find(|n| n.id == wc_id)
+            .unwrap()
+            .parents[0]
+            .clone();
+        let files = backend.change_detail(dir.path(), &wc_id).unwrap().files;
+        assert!(files.len() >= 2, "fixture working copy has files to move");
+        let dest_id = wc_parent.clone();
+
+        // Refusals mirror the real backend: self destination, selections
+        // that change nothing.
+        let err = backend
+            .squash_into(dir.path(), &wc_id, &[SplitSelection::whole(files[0].path.clone())], &wc_id)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+        let err = backend
+            .squash_into(dir.path(), &wc_id, &[SplitSelection::whole("nope.txt")], &dest_id)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+
+        // A partial move records but leaves the graph shape alone (fixture
+        // diffs are static — the documented approximation).
+        let outcome = backend
+            .squash_into(
+                dir.path(),
+                &wc_id,
+                &[SplitSelection::whole(files[0].path.clone())],
+                &dest_id,
+            )
+            .unwrap();
+        assert_eq!(outcome.summary, format!("Moved 1 file from {wc_id} into {dest_id}"));
+        assert_eq!(outcome.target_change.as_deref(), Some(wc_id.as_str()));
+        let after = backend.open(dir.path()).unwrap();
+        assert!(after.nodes.iter().any(|n| n.id == wc_id));
+        assert!(after.operations[0].description.starts_with("squash commits into "));
+
+        // A full selection abandons the emptied source: the working copy
+        // respawns on its parent and the selection follows the destination.
+        backend.create_bookmark(dir.path(), "tmp", &wc_id).unwrap();
+        let all: Vec<SplitSelection> = files
+            .iter()
+            .map(|f| SplitSelection::whole(f.path.clone()))
+            .collect();
+        let outcome = backend.squash_into(dir.path(), &wc_id, &all, &dest_id).unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!(
+                "Moved everything in {wc_id} into {dest_id}; \
+                 the emptied change was abandoned"
+            )
+        );
+        assert_eq!(outcome.target_change.as_deref(), Some(dest_id.as_str()));
+        let after = backend.open(dir.path()).unwrap();
+        assert!(!after.nodes.iter().any(|n| n.id == wc_id));
+        assert_ne!(after.working_copy, wc_id);
+        let wc_node = after.nodes.iter().find(|n| n.id == after.working_copy).unwrap();
+        assert_eq!(wc_node.parents, vec![wc_parent.clone()]);
+        // The bookmark on the abandoned source moved to its parent — the
+        // parent happens to be the destination here, like `jj squash -r`.
+        let tmp = after.bookmarks.iter().find(|b| b.name == "tmp").unwrap();
+        assert_eq!(tmp.target, wc_parent);
     }
 
     #[test]

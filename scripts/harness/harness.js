@@ -45,6 +45,14 @@
 //                        split_change partitions the captured diff between
 //                        the two halves, at hunk granularity for hunk
 //                        selections)
+//   &mode=new|into       pick where the split panel's selection goes (the
+//                        same param drives the rebase scope toggle — only
+//                        one panel is open at a time)
+//   &sdest=<changeId>    pick that destination row in the split panel's
+//                        into-mode (the stubbed squash_into moves the
+//                        selected files/hunks into the destination's
+//                        captured diff; a full selection abandons the
+//                        emptied source like the real backend)
 //   &open=compare        open the compare panel on the selection
 //   &compare=<v>         pick a row in the open compare panel: parent|trunk|
 //                        base or a change id (compare_diff is stubbed from
@@ -250,7 +258,10 @@
     transformCallback: () => 0,
     invoke: (cmd, args) => {
       const snap = data.snapshot;
-      if (snap && (cmd.endsWith("_change") || cmd.endsWith("_bookmark"))) {
+      if (
+        snap &&
+        (cmd.endsWith("_change") || cmd.endsWith("_bookmark") || cmd === "squash_into")
+      ) {
         pendingBefore = structuredClone(snap);
       }
       const target = (id) => {
@@ -559,6 +570,140 @@
           return Promise.resolve({
             operationId: opId,
             summary: `Split ${node.id}: kept ${kept}, the rest moved to ${newId}`,
+            targetChange: node.id,
+          });
+        }
+        case "squash_into": {
+          const node = target(args?.changeId);
+          if (node instanceof Promise) return node;
+          const dest = target(args?.destinationId);
+          if (dest instanceof Promise) return dest;
+          if (dest.id === node.id)
+            return reject(
+              "mutation_failed",
+              `cannot move changes from ${node.id} into itself`,
+            );
+          const diff = (data.diffs || {})[node.id];
+          const all = (diff?.files || []).map((f) => f.path);
+          const selection = args?.selection || [];
+          const wholePaths = selection.filter((s) => !s.hunks).map((s) => s.path);
+          const partial = selection.filter((s) => s.hunks);
+          const whole = all.filter((p) => wholePaths.includes(p));
+          const partialSelected = all.filter((p) =>
+            partial.some((s) => s.path === p),
+          );
+          if (whole.length + partialSelected.length === 0)
+            return reject(
+              "mutation_failed",
+              `none of the selected files change anything in ${node.id}`,
+            );
+          const full = whole.length === all.length;
+          // Partition the source diff and hand the carved files to the
+          // destination's — same hunk matching as split_change.
+          if (diff) {
+            const coords = (h) => ({
+              oldStart: h.oldStart,
+              newStart: h.newStart,
+              oldLines: h.lines.filter((l) => l.kind !== "added").length,
+              newLines: h.lines.filter((l) => l.kind !== "removed").length,
+            });
+            const matches = (h, want) => {
+              const c = coords(h);
+              return (
+                c.oldStart === want.oldStart &&
+                c.newStart === want.newStart &&
+                c.oldLines === want.oldLines &&
+                c.newLines === want.newLines
+              );
+            };
+            const carved = [];
+            const rest = [];
+            for (const f of diff.files) {
+              const sel = partial.find((s) => s.path === f.path);
+              if (wholePaths.includes(f.path)) {
+                carved.push(f);
+              } else if (sel && f.content?.kind === "text") {
+                const chosen = f.content.hunks.filter((h) =>
+                  sel.hunks.some((want) => matches(h, want)),
+                );
+                const left = f.content.hunks.filter((h) => !chosen.includes(h));
+                if (chosen.length)
+                  carved.push({ ...f, content: { ...f.content, hunks: chosen } });
+                if (left.length || !chosen.length)
+                  rest.push({ ...f, content: { ...f.content, hunks: left } });
+              } else {
+                rest.push(f);
+              }
+            }
+            const destDiff = (data.diffs || {})[dest.id];
+            const carvedPaths = carved.map((f) => f.path);
+            data.diffs[dest.id] = {
+              id: dest.id,
+              from: null,
+              files: [
+                ...(destDiff?.files || []).filter(
+                  (f) => !carvedPaths.includes(f.path),
+                ),
+                ...carved,
+              ],
+              truncated: false,
+            };
+            data.diffs[node.id] = { ...diff, files: rest };
+          }
+          dest.isEmpty = false;
+          if (full) {
+            // The emptied source is abandoned: its description folds into
+            // the destination's, bookmarks land on its parent, an emptied
+            // working copy respawns — the real backend's full squash.
+            const destText = dest.description.trim();
+            const srcText = node.description.trim();
+            dest.description =
+              destText === ""
+                ? srcText
+                : srcText === ""
+                  ? destText
+                  : `${destText}\n\n${srcText}`;
+            const parentId = node.parents[0] ?? null;
+            const effects = snap.bookmarks
+              .filter((b) => b.target === node.id)
+              .map((b) => ({ kind: "bookmark", label: `${b.name} moved` }));
+            snap.bookmarks.forEach((b) => {
+              if (b.target === node.id && parentId) b.target = parentId;
+            });
+            if (parentId) {
+              const parent = snap.nodes.find((n) => n.id === parentId);
+              if (parent) parent.bookmarks.push(...node.bookmarks);
+            }
+            removeNode(snap, node.id, node.parents);
+            if (snap.workingCopy === node.id && parentId) {
+              spawnWorkingCopy(snap, parentId);
+              effects.push(wcMoved);
+            }
+            const opId = pushOp(
+              snap,
+              `squash commits into ${dest.commitId}`,
+              effects,
+            );
+            return Promise.resolve({
+              operationId: opId,
+              summary: `Moved everything in ${node.id} into ${dest.id}; the emptied change was abandoned`,
+              targetChange: dest.id,
+            });
+          }
+          const moved =
+            partialSelected.length === 0
+              ? `${whole.length} file${whole.length === 1 ? "" : "s"}`
+              : whole.length === 0
+                ? `parts of ${partialSelected.length} file${
+                    partialSelected.length === 1 ? "" : "s"
+                  }`
+                : `${whole.length} file${
+                    whole.length === 1 ? "" : "s"
+                  } and parts of ${partialSelected.length} more`;
+          const opId = pushOp(snap, `squash commits into ${dest.commitId}`, []);
+          return Promise.resolve({
+            operationId: opId,
+            summary: `Moved ${moved} from ${node.id} into ${dest.id}`,
             targetChange: node.id,
           });
         }
@@ -1081,6 +1226,10 @@
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
       return true;
     });
+  }
+  const splitDest = params.get("sdest");
+  if (splitDest) {
+    steps.push(() => click(`.dest-row[data-splitdest="${splitDest}"]`));
   }
   const rebaseDest = params.get("dest");
   if (rebaseDest) {

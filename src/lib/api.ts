@@ -81,6 +81,21 @@ export function splitChange(
   });
 }
 
+// Move the selected content into an existing change (`jj squash --from
+// --into <paths>`): the destination takes it wherever it sits in the graph;
+// a selection covering everything abandons the emptied source.
+export function squashInto(
+  changeId: string,
+  selection: SplitSelection[],
+  destinationId: string,
+): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("squash_into", {
+    changeId,
+    selection,
+    destinationId,
+  });
+}
+
 export function rebaseChange(
   changeId: string,
   destinationId: string,
