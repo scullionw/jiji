@@ -21,6 +21,10 @@
 //                        after click=<id>) and wait for the breadcrumb
 //   &resolvewait=1       the stubbed merge tool never returns: the click
 //                        settles into the "Waiting for …" state instead
+//   &upws=1              click the stale-workspace card's Update workspace
+//                        button (section=conflicts; the captured snapshot
+//                        must carry a stale current workspace) and wait for
+//                        the item to settle
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -734,6 +738,28 @@
             targetChange: node.id,
           });
         }
+        case "update_stale_workspace": {
+          // Mirror the real backend: only the current workspace's item can
+          // recover, the checkout records no operation, and the selection
+          // follows the fresh working copy.
+          const current = (snap?.workspaces || []).find((w) => w.isCurrent);
+          const item = (snap?.conflicts || []).find(
+            (c) => c.kind === "staleWorkspace" && c.workspace === current?.name,
+          );
+          if (!current || !item)
+            return Promise.resolve({
+              operationId: null,
+              summary: "The workspace is not stale",
+              targetChange: null,
+            });
+          current.isStale = false;
+          snap.conflicts = snap.conflicts.filter((c) => c !== item);
+          return Promise.resolve({
+            operationId: null,
+            summary: `Updated the workspace to ${snap.workingCopy}`,
+            targetChange: snap.workingCopy,
+          });
+        }
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -821,6 +847,17 @@
         ? document.querySelector(".resolve.waiting") !== null
         : document.querySelector(".breadcrumb") !== null,
     );
+  }
+  // Stale-workspace recovery: click the inbox card's Update workspace
+  // button and wait for the stubbed mutation to settle the item.
+  if (params.get("upws")) {
+    steps.push(() => {
+      const button = document.querySelector("[data-update-workspace]");
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    });
+    steps.push(() => !document.querySelector("[data-update-workspace]"));
   }
   const open = params.get("open");
   if (open === "files") steps.push(() => click(".files-button"));

@@ -170,6 +170,15 @@ export async function resolveConflict(
   }
 }
 
+// Recovers the current workspace when it went stale (`jj workspace
+// update-stale`): local edits are recorded first, then the working copy
+// catches up to where the repo moved. The checkout records no undoable
+// operation, so success usually shows as the inbox item settling and the
+// selection following the fresh working copy rather than as a breadcrumb.
+export function updateStaleWorkspace(): Promise<MutationOutcome> {
+  return runMutation(() => api.updateStaleWorkspace());
+}
+
 export function revertOperation(opId: string): Promise<MutationOutcome> {
   return runMutation(() => api.revertOperation(opId));
 }

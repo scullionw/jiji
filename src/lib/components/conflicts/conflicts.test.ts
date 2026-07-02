@@ -3,7 +3,12 @@ import type { ConflictItem } from "$lib/bindings/ConflictItem";
 import type { GraphNode } from "$lib/bindings/GraphNode";
 import type { NodeKind } from "$lib/bindings/NodeKind";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
-import { canResolve, groupConflicts, mergeToolLabel } from "./conflicts";
+import {
+  canRecoverWorkspace,
+  canResolve,
+  groupConflicts,
+  mergeToolLabel,
+} from "./conflicts";
 
 function node(id: string, kind: NodeKind = "mutable"): GraphNode {
   return {
@@ -31,6 +36,7 @@ function item(overrides: Partial<ConflictItem> & { id: string }): ConflictItem {
     paths: [],
     morePaths: 0,
     targets: [],
+    workspace: null,
     ...overrides,
   };
 }
@@ -112,6 +118,48 @@ describe("mergeToolLabel", () => {
     expect(mergeToolLabel("vscode")).toBe("VS Code");
     expect(mergeToolLabel("meld")).toBe("Meld");
     expect(mergeToolLabel("my-house-tool")).toBe("my-house-tool");
+  });
+});
+
+describe("canRecoverWorkspace", () => {
+  it("offers recovery only for the current workspace's stale item", () => {
+    const snap = snapshot([]);
+    snap.workspaces = [
+      {
+        name: "default",
+        isDefault: true,
+        isCurrent: true,
+        isStale: true,
+        workingCopyNode: "wc",
+      },
+      {
+        name: "review",
+        isDefault: false,
+        isCurrent: false,
+        isStale: true,
+        workingCopyNode: "a",
+      },
+    ];
+    const mine = item({
+      id: "workspace-default",
+      kind: "staleWorkspace",
+      workspace: "default",
+    });
+    const sibling = item({
+      id: "workspace-review",
+      kind: "staleWorkspace",
+      workspace: "review",
+    });
+    expect(canRecoverWorkspace(snap, mine)).toBe(true);
+    expect(canRecoverWorkspace(snap, sibling)).toBe(false);
+    // Non-workspace items and unnamed stale items stay inert.
+    expect(canRecoverWorkspace(snap, item({ id: "file-a" }))).toBe(false);
+    expect(
+      canRecoverWorkspace(snap, item({ id: "x", kind: "staleWorkspace" })),
+    ).toBe(false);
+    // No current workspace in the snapshot: nothing to recover from here.
+    snap.workspaces = [];
+    expect(canRecoverWorkspace(snap, mine)).toBe(false);
   });
 });
 

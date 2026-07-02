@@ -26,4 +26,10 @@ morePaths: number,
  * Change ids a conflicted bookmark resolved to (bookmark conflicts
  * only): the candidates the user can repoint it at.
  */
-targets: Array<string>, };
+targets: Array<string>, 
+/**
+ * The workspace a stale-workspace item is about. The UI offers the
+ * guided recovery only when this names the current workspace — the one
+ * `update_stale_workspace` can act on.
+ */
+workspace: string | null, };

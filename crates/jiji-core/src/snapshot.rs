@@ -40,6 +40,11 @@ pub struct RepoSnapshot {
 pub struct WorkspaceSummary {
     pub name: String,
     pub is_default: bool,
+    /// The workspace this snapshot was produced from — the one the app has
+    /// open, whose staleness is detectable and recoverable. Sibling
+    /// workspaces keep their working-copy state in their own roots, which
+    /// this workspace cannot see, so their `is_stale` stays `false`.
+    pub is_current: bool,
     pub is_stale: bool,
     pub working_copy_node: Option<String>,
 }
@@ -152,6 +157,10 @@ pub struct ConflictItem {
     /// Change ids a conflicted bookmark resolved to (bookmark conflicts
     /// only): the candidates the user can repoint it at.
     pub targets: Vec<String>,
+    /// The workspace a stale-workspace item is about. The UI offers the
+    /// guided recovery only when this names the current workspace — the one
+    /// `update_stale_workspace` can act on.
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

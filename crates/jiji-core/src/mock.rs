@@ -1311,16 +1311,18 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             WorkspaceSummary {
                 name: "default".into(),
                 is_default: true,
+                is_current: true,
                 is_stale: false,
                 working_copy_node: Some("ktpqsmxw".into()),
             },
-            // Mock-only preview of staleness: the real backend still reports
-            // every workspace fresh (see the JjBackend gap note). A second
-            // workspace parked on the conflict-inbox head went stale when
-            // the rebase moved the repo underneath it.
+            // A sibling workspace parked on the conflict-inbox head went
+            // stale when the rebase moved the repo underneath it. Its card
+            // gets no recovery action — like the real backend, only the
+            // current workspace can be updated from here.
             WorkspaceSummary {
                 name: "review".into(),
                 is_default: false,
+                is_current: false,
                 is_stale: true,
                 working_copy_node: Some("qvlxnsry".into()),
             },
@@ -1349,6 +1351,7 @@ fn mock_conflicts() -> Vec<ConflictItem> {
         paths: paths.iter().map(|p| p.to_string()).collect(),
         more_paths: 0,
         targets: Vec::new(),
+        workspace: None,
     };
     vec![
         file_item(
@@ -1371,6 +1374,7 @@ fn mock_conflicts() -> Vec<ConflictItem> {
             paths: Vec::new(),
             more_paths: 0,
             targets: vec!["b41c77d0".into(), "e93d5a12".into()],
+            workspace: None,
         },
         ConflictItem {
             id: "workspace-review".into(),
@@ -1380,6 +1384,7 @@ fn mock_conflicts() -> Vec<ConflictItem> {
             paths: Vec::new(),
             more_paths: 0,
             targets: Vec::new(),
+            workspace: Some("review".into()),
         },
     ]
 }

@@ -104,6 +104,19 @@ export function mergeToolLabel(tool: string): string {
   return TOOL_LABELS[tool] ?? tool;
 }
 
+// Whether a stale-workspace item gets the guided recovery action: only the
+// current workspace's working copy is reachable from here (a sibling
+// workspace keeps its state in its own root), so only its item can offer
+// "Update workspace".
+export function canRecoverWorkspace(
+  snapshot: RepoSnapshot,
+  item: ConflictItem,
+): boolean {
+  if (item.kind !== "staleWorkspace" || item.workspace == null) return false;
+  const current = snapshot.workspaces.find((w) => w.isCurrent);
+  return current !== undefined && current.name === item.workspace;
+}
+
 // Whether a Resolve affordance should render for a conflicted file in this
 // change: a usable merge tool exists and the change is drawn and mutable
 // (resolving rewrites the change, so immutable conflicts get no button —

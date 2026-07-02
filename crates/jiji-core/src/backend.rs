@@ -259,6 +259,21 @@ pub trait RepoBackend: Send + Sync {
         change_id: &str,
         file_path: &str,
     ) -> Result<MutationOutcome, BackendError>;
+
+    /// Update a stale working copy to the repo's current state (`jj
+    /// workspace update-stale`) — the guided recovery for the one state
+    /// where every other mutation refuses to run. Acts on the current
+    /// workspace only: sibling workspaces keep their working-copy state in
+    /// their own roots, out of reach from here. Like the CLI, on-disk edits
+    /// are first recorded on top of the working copy's *own* last
+    /// operation (so nothing is lost or misattributed), then the working
+    /// copy checks out the position the repo's view holds for it; when the
+    /// working copy's last operation is missing from the op store entirely,
+    /// its files are parked in a recovery commit instead. A workspace that
+    /// is not stale records nothing. The checkout itself records no
+    /// operation — jj's model too — so the outcome carries an operation id
+    /// only on the recovery-commit path.
+    fn update_stale_workspace(&self, path: &Path) -> Result<MutationOutcome, BackendError>;
 }
 
 /// Deterministic mock backend, kept for UI development against stable data
@@ -542,6 +557,18 @@ impl RepoBackend for MockBackend {
             },
         )
     }
+
+    fn update_stale_workspace(&self, path: &Path) -> Result<MutationOutcome, BackendError> {
+        // The mock's stale workspace (`review`) is a sibling, and recovery
+        // acts on the current workspace only — which the mock always
+        // fabricates fresh. Answer with the real backend's no-op.
+        validate_repo_path(path)?;
+        Ok(MutationOutcome {
+            operation_id: None,
+            summary: "The workspace is not stale".to_owned(),
+            target_change: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -702,6 +729,33 @@ mod tests {
         // Resolving the already-settled path now refuses.
         let err = backend.resolve_conflict(dir.path(), "pmwzqkvt", path).unwrap_err();
         assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mock_stale_workspace_is_a_sibling_preview_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let snapshot = backend.open(dir.path()).unwrap();
+
+        let current = snapshot.workspaces.iter().find(|w| w.is_current).unwrap();
+        assert!(current.is_default);
+        assert!(!current.is_stale);
+        let review = snapshot.workspaces.iter().find(|w| w.name == "review").unwrap();
+        assert!(review.is_stale);
+        assert!(!review.is_current);
+        let item = snapshot
+            .conflicts
+            .iter()
+            .find(|c| c.kind == crate::snapshot::ConflictKind::StaleWorkspace)
+            .unwrap();
+        assert_eq!(item.workspace.as_deref(), Some("review"));
+
+        // Recovery acts on the current workspace, which the mock keeps
+        // fresh — the real backend's no-op, with nothing recorded.
+        let outcome = backend.update_stale_workspace(dir.path()).unwrap();
+        assert!(outcome.operation_id.is_none());
+        assert_eq!(outcome.summary, "The workspace is not stale");
     }
 
     #[test]

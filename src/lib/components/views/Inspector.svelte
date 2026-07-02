@@ -15,7 +15,7 @@
     resolveFocusedWorkstream(snapshot, app.focusedWorkstreamId),
   );
   const workspace = $derived(
-    snapshot.workspaces.find((w) => w.isDefault) ?? snapshot.workspaces[0],
+    snapshot.workspaces.find((w) => w.isCurrent) ?? snapshot.workspaces[0],
   );
   const trunk = $derived(snapshot.bookmarks.find((b) => b.isTrunk));
 

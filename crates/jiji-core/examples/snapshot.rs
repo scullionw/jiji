@@ -17,10 +17,14 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --revert-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --restore-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --resolve <file-path>
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo --update-stale
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo --watch
 //!
 //! `--resolve` launches the configured external merge tool (like the app's
 //! Resolve action) and blocks until it exits.
+//!
+//! `--update-stale` recovers a stale working copy (`jj workspace
+//! update-stale`), like the app's inbox recovery action.
 //!
 //! `--watch` syncs (working-copy snapshot + git import), then keeps watching
 //! the repo and prints one line per auto-refresh until interrupted — the
@@ -50,6 +54,18 @@ fn main() {
     let path = std::path::Path::new(&path);
     if change_id.as_deref() == Some("--watch") {
         return watch_loop(backend.as_ref(), path);
+    }
+    if change_id.as_deref() == Some("--update-stale") {
+        match backend.update_stale_workspace(path) {
+            Ok(outcome) => {
+                println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                return;
+            }
+            Err(err) => {
+                eprintln!("error ({}): {}", err.code(), err);
+                std::process::exit(1);
+            }
+        }
     }
     let result = match (change_id, mode.as_deref()) {
         (Some(change_id), Some("--diff")) => backend

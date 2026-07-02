@@ -13,6 +13,7 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use jj_lib::backend::{CommitId, Timestamp};
 use jj_lib::commit::Commit;
+use jj_lib::dag_walk;
 use jj_lib::conflicts::{
     choose_materialized_conflict_marker_len, materialize_merge_result_to_bytes,
     materialized_diff_stream, try_materialize_file_conflict_value, update_from_content,
@@ -30,7 +31,7 @@ use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
 use jj_lib::merge::{Diff as MergeDiff, Merge};
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
-use jj_lib::op_store::{OperationId, RefTarget, RemoteRefState, ViewId};
+use jj_lib::op_store::{OpStoreError, OperationId, RefTarget, RemoteRefState, ViewId};
 use jj_lib::op_walk;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
@@ -46,7 +47,7 @@ use jj_lib::rewrite::{
 use jj_lib::settings::HumanByteSize;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
-use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::working_copy::{SnapshotOptions, WorkingCopyFreshness};
 use jj_lib::tree_merge::MergeOptions;
 use jj_lib::view::View;
 use jj_lib::workspace::{default_working_copy_factories, Workspace};
@@ -967,7 +968,127 @@ impl RepoBackend for JjBackend {
             target_change: Some(display_id(new_repo.as_ref(), &new_commit)),
         })
     }
+
+    fn update_stale_workspace(&self, path: &Path) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let ws_name = workspace.workspace_name().to_owned();
+        let wc_op_id = workspace.working_copy().operation_id().clone();
+
+        let wc_op = match pollster::block_on(repo.loader().load_operation(&wc_op_id)) {
+            Ok(op) => op,
+            Err(OpStoreError::ObjectNotFound { .. }) => {
+                // The operation the working copy was last updated at is gone
+                // (GC'd op store): nothing to replay the disk state against.
+                // Like the CLI, park a recovery commit on the workspace's
+                // recorded position — its tree, so the next snapshot records
+                // whatever is on disk as changes *in that commit* instead of
+                // guessing parents.
+                let mut locked_ws =
+                    workspace.start_working_copy_mutation().map_err(mutation_err)?;
+                let (new_repo, new_commit) =
+                    jj_lib::working_copy::create_and_check_out_recovery_commit(
+                        locked_ws.locked_wc(),
+                        &repo,
+                        ws_name,
+                        RECOVERY_COMMIT_DESCRIPTION,
+                    )
+                    .map_err(mutation_err)?;
+                locked_ws.finish(new_repo.op_id().clone()).map_err(mutation_err)?;
+                let synced = sync_workspace(&mut workspace, new_repo.clone())?;
+                return Ok(MutationOutcome {
+                    operation_id: Some(short_operation_id(new_repo.op_id())),
+                    summary: format!(
+                        "Recovered the workspace: its files were saved into new commit {}",
+                        display_id(synced.as_ref(), &new_commit)
+                    ),
+                    target_change: Some(display_id(synced.as_ref(), &new_commit)),
+                });
+            }
+            Err(err) => return Err(mutation_err(err)),
+        };
+
+        // Record what is on disk on top of the working copy's *own*
+        // operation first, exactly like the CLI: unsaved edits belong to the
+        // stale working-copy commit, not to whatever the repo moved to.
+        // Reloading at head afterwards merges that operation branch in (the
+        // fresh working-copy position wins the view merge).
+        let stale_repo =
+            pollster::block_on(workspace.repo_loader().load_at(&wc_op)).map_err(mutation_err)?;
+        let stale_repo = snapshot_working_copy(&mut workspace, stale_repo)?;
+        let stale_wc_commit = stale_repo
+            .view()
+            .get_wc_commit_id(&ws_name)
+            .map(|id| stale_repo.store().get_commit(id))
+            .transpose()
+            .map_err(mutation_err)?;
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head())
+            .map_err(mutation_err)?;
+        let Some(desired_id) = repo.view().get_wc_commit_id(&ws_name).cloned() else {
+            return Err(BackendError::MutationFailed(
+                "this workspace is no longer listed in the repo".into(),
+            ));
+        };
+        let desired = repo.store().get_commit(&desired_id).map_err(mutation_err)?;
+
+        let mut locked_ws = workspace.start_working_copy_mutation().map_err(mutation_err)?;
+        match WorkingCopyFreshness::check_stale(locked_ws.locked_wc(), &desired, &repo)
+            .map_err(mutation_err)?
+        {
+            WorkingCopyFreshness::Fresh | WorkingCopyFreshness::Updated(_) => {
+                drop(locked_ws);
+                Ok(MutationOutcome {
+                    operation_id: None,
+                    summary: "The workspace is not stale".to_owned(),
+                    target_change: Some(display_id(repo.as_ref(), &desired)),
+                })
+            }
+            WorkingCopyFreshness::WorkingCopyStale | WorkingCopyFreshness::SiblingOperation => {
+                // The same guard the CLI applies: the on-disk state must
+                // still be the one the snapshot above recorded.
+                let stale_tree_ids = stale_wc_commit.as_ref().map(|commit| commit.tree_ids());
+                if stale_tree_ids != Some(locked_ws.locked_wc().old_tree().tree_ids()) {
+                    return Err(BackendError::MutationFailed(
+                        "another client moved the working copy while it was being \
+                         recovered; try again"
+                            .into(),
+                    ));
+                }
+                pollster::block_on(locked_ws.locked_wc().check_out(&desired))
+                    .map_err(mutation_err)?;
+                locked_ws.finish(repo.op_id().clone()).map_err(mutation_err)?;
+                // Now unstale: finish like the start of any command (git
+                // imports + snapshot), exactly what the CLI does after
+                // recovery.
+                let synced = sync_workspace(&mut workspace, repo)?;
+                Ok(MutationOutcome {
+                    // The checkout records no operation of its own — jj's
+                    // model too ('jj workspace update-stale' only records
+                    // the working-copy snapshot, and there is nothing an
+                    // Undo could meaningfully revert).
+                    operation_id: None,
+                    summary: format!(
+                        "Updated the workspace to {}",
+                        display_id(synced.as_ref(), &desired)
+                    ),
+                    target_change: Some(display_id(synced.as_ref(), &desired)),
+                })
+            }
+        }
+    }
 }
+
+/// The commit description `update_stale_workspace` parks on a workspace
+/// whose last-updated operation is lost — verbatim the CLI's, so anything
+/// that recognizes `jj workspace update-stale` recovery commits recognizes
+/// Jiji's too.
+const RECOVERY_COMMIT_DESCRIPTION: &str = "RECOVERY COMMIT FROM `jj workspace update-stale`
+
+This commit contains changes that were written to the working copy by an
+operation that was subsequently lost (or was at least unavailable when you ran
+`jj workspace update-stale`). Because the operation was lost, we don't know
+what the parent commits are supposed to be. That means that the diff compared
+to the current parents may contain changes from multiple commits.
+";
 
 /// Resolves an operation-id hex prefix — what `OperationItem.id` and
 /// `MutationOutcome.operation_id` carry — against the loaded repo.
@@ -1161,14 +1282,41 @@ fn build_snapshot(
     let bookmarks = build_bookmarks(repo_ref, &trunk, &mut conflicts, &mut change_ids)?;
     let operations = build_operations(repo)?;
 
+    let current_name = workspace.workspace_name().as_str().to_owned();
+    let staleness = current_workspace_staleness(workspace, repo)?;
+    if staleness != Staleness::Fresh {
+        let summary = match staleness {
+            Staleness::OperationLost => {
+                "This workspace's working copy was last updated by an operation the repo \
+                 no longer has; recovering saves its files in a new commit"
+                    .to_owned()
+            }
+            _ => "This workspace is stale: the repo has moved since its working copy \
+                  was last updated"
+                .to_owned(),
+        };
+        conflicts.push(ConflictItem {
+            id: format!("workspace-{current_name}"),
+            kind: ConflictKind::StaleWorkspace,
+            summary,
+            node_id: wc_commit_id.as_ref().and_then(|id| change_ids.get(id).cloned()),
+            paths: Vec::new(),
+            more_paths: 0,
+            targets: Vec::new(),
+            workspace: Some(current_name.clone()),
+        });
+    }
+
     let workspaces = view
         .wc_commit_ids()
         .iter()
         .map(|(name, commit_id)| WorkspaceSummary {
             name: name.as_str().to_owned(),
             is_default: name.as_str() == "default",
-            // Staleness needs per-workspace working-copy inspection; deferred.
-            is_stale: false,
+            is_current: name.as_str() == current_name,
+            // Sibling workspaces' staleness is undetectable from here (see
+            // `current_workspace_staleness`); theirs stays `false`.
+            is_stale: name.as_str() == current_name && staleness != Staleness::Fresh,
             working_copy_node: change_ids.get(commit_id).cloned(),
         })
         .collect();
@@ -1426,6 +1574,73 @@ fn finish_mutation(
     Ok(new_repo)
 }
 
+/// Why the current workspace's on-disk working copy no longer matches the
+/// repo: another client (usually a jj command run from a different
+/// workspace) moved the repo forward without this working copy being
+/// updated, or the operation the working copy was last updated at is gone
+/// from the op store entirely (garbage-collected or corrupted).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Staleness {
+    Fresh,
+    Behind,
+    OperationLost,
+}
+
+/// Unlocked staleness check for the loaded workspace, following the CLI's
+/// `WorkingCopyFreshness::check_stale` rules: same operation (or same
+/// checked-out tree) is fresh; a working copy whose recorded operation is
+/// an ancestor of the repo's — with a different tree checked out — is
+/// stale, and so is one on a sibling operation. Reads only the recorded
+/// working-copy state, no lock, so every snapshot can afford it. Sibling
+/// workspaces keep this state in their own roots, invisible from here —
+/// only the current workspace's staleness is detectable.
+fn current_workspace_staleness(
+    workspace: &Workspace,
+    repo: &Arc<ReadonlyRepo>,
+) -> Result<Staleness, BackendError> {
+    let wc = workspace.working_copy();
+    if wc.operation_id() == repo.op_id() {
+        return Ok(Staleness::Fresh);
+    }
+    let wc_op = match pollster::block_on(repo.loader().load_operation(wc.operation_id())) {
+        Ok(op) => op,
+        Err(OpStoreError::ObjectNotFound { .. }) => return Ok(Staleness::OperationLost),
+        Err(err) => return Err(snapshot_err(err)),
+    };
+    let repo_op = repo.operation();
+    let ancestor = dag_walk::closest_common_node_ok(
+        [Ok(wc_op.clone())],
+        [Ok(repo_op.clone())],
+        |op: &Operation| op.id().clone(),
+        |op: &Operation| op.parents().collect::<Vec<_>>(),
+    )
+    .map_err(snapshot_err)?;
+    match ancestor {
+        // The working copy is *newer* than the repo we loaded; the next
+        // load-at-head catches up. Not stale.
+        Some(ancestor) if ancestor.id() == repo_op.id() => Ok(Staleness::Fresh),
+        Some(ancestor) if ancestor.id() == wc_op.id() => {
+            // The repo moved ahead of the working copy. Only an actual tree
+            // difference makes that stale — mutations that never touch `@`
+            // leave the recorded operation behind on purpose.
+            let Some(wc_commit_id) = repo.view().get_wc_commit_id(workspace.workspace_name())
+            else {
+                return Ok(Staleness::Fresh); // no longer listed; nothing to update
+            };
+            let wc_commit = repo.store().get_commit(wc_commit_id).map_err(snapshot_err)?;
+            let wc_tree = wc.tree().map_err(snapshot_err)?;
+            if wc_tree.tree_ids() == wc_commit.tree_ids() {
+                Ok(Staleness::Fresh)
+            } else {
+                Ok(Staleness::Behind)
+            }
+        }
+        // A sibling operation (or unrelated history): recovery works the
+        // same as for a working copy left behind.
+        _ => Ok(Staleness::Behind),
+    }
+}
+
 /// CLI parity for the start of every command: bring the loaded repo up to
 /// date with the world outside jj's own view. In a colocated workspace an
 /// externally-moved git HEAD imports first (so on-disk edits attribute to a
@@ -1588,8 +1803,8 @@ fn snapshot_working_copy(
         && locked_ws.locked_wc().old_tree().tree_ids() != wc_commit.tree_ids()
     {
         return Err(BackendError::StaleWorkspace(
-            "the working copy is checked out at a different operation; \
-             run a jj command in this workspace to update it first"
+            "the repo has moved since this workspace was last updated; \
+             update the workspace from the Conflicts section first"
                 .into(),
         ));
     }
@@ -2328,6 +2543,7 @@ fn file_conflicts(
                 paths,
                 more_paths,
                 targets: Vec::new(),
+                workspace: None,
             }
         })
         .collect()
@@ -2364,6 +2580,7 @@ fn build_bookmarks(
                 paths: Vec::new(),
                 more_paths: 0,
                 targets,
+                workspace: None,
             });
         }
         let Some(local_id) = local_target.added_ids().next() else {
@@ -4580,19 +4797,14 @@ mod tests {
         assert_eq!(again, snapshot);
     }
 
-    #[test]
-    fn refresh_degrades_to_read_only_when_workspace_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        build_test_repo(dir.path());
-        let backend = test_backend();
-
-        // Rewrite `@`'s tree out-of-band without updating the on-disk
-        // working-copy state — what a mutation from another workspace's
-        // client looks like to this one.
+    /// Rewrites `@`'s tree out-of-band without updating the on-disk
+    /// working-copy state — what a mutation from another workspace's client
+    /// looks like to this one.
+    fn make_workspace_stale(root: &Path) {
         let settings = test_settings();
         let workspace = Workspace::load(
             &settings,
-            dir.path(),
+            root,
             &StoreFactories::default(),
             &default_working_copy_factories(),
         )
@@ -4610,6 +4822,14 @@ mod tests {
             .unwrap();
         pollster::block_on(tx.repo_mut().rebase_descendants()).unwrap();
         pollster::block_on(tx.commit("rewrite from elsewhere")).unwrap();
+    }
+
+    #[test]
+    fn refresh_degrades_to_read_only_when_workspace_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+        make_workspace_stale(dir.path());
 
         // Refresh still answers — read-only, without syncing — while
         // mutations keep refusing until the workspace is updated.
@@ -4619,6 +4839,160 @@ mod tests {
             .describe(dir.path(), &snapshot.working_copy, "nope")
             .unwrap_err();
         assert!(matches!(err, BackendError::StaleWorkspace(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn stale_workspace_surfaces_in_snapshot_and_update_recovers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+
+        // A fresh repo reports a fresh current workspace and no stale item.
+        let fresh = backend.open(dir.path()).unwrap();
+        let current = fresh.workspaces.iter().find(|w| w.is_current).unwrap();
+        assert!(current.is_default);
+        assert!(!current.is_stale);
+        assert!(fresh.conflicts.iter().all(|c| c.kind != ConflictKind::StaleWorkspace));
+
+        check_out_working_copy(dir.path());
+        make_workspace_stale(dir.path());
+
+        // Detection: the summary flips and the inbox item names the current
+        // workspace, pointing at the drawn working-copy row.
+        let stale = backend.open(dir.path()).unwrap();
+        assert!(stale.workspaces.iter().find(|w| w.is_current).unwrap().is_stale);
+        let item = stale
+            .conflicts
+            .iter()
+            .find(|c| c.kind == ConflictKind::StaleWorkspace)
+            .unwrap();
+        assert_eq!(item.workspace.as_deref(), Some("default"));
+        assert_eq!(item.node_id.as_deref(), Some(stale.working_copy.as_str()));
+
+        // An edit made while stale must survive the recovery.
+        std::fs::write(dir.path().join("sneaky.txt"), "do not lose me\n").unwrap();
+
+        let outcome = backend.update_stale_workspace(dir.path()).unwrap();
+        assert_eq!(outcome.operation_id, None, "the checkout records no operation");
+        assert!(
+            outcome.summary.starts_with("Updated the workspace to"),
+            "got {}",
+            outcome.summary
+        );
+
+        // The repo's position is on disk now; the sneaky edit left the disk
+        // (it is not part of the fresh tree) but was snapshotted into a
+        // visible commit first, exactly like the CLI.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+            "rewritten\n"
+        );
+        assert!(!dir.path().join("sneaky.txt").exists());
+        let settings = test_settings();
+        let workspace = Workspace::load(
+            &settings,
+            dir.path(),
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head()).unwrap();
+        let sneaky = RepoPathBuf::from_internal_string("sneaky.txt").unwrap();
+        let preserved = repo.view().heads().iter().any(|id| {
+            let commit = repo.store().get_commit(id).unwrap();
+            !commit.tree().path_value(&sneaky).unwrap().is_absent()
+        });
+        assert!(preserved, "the stale working copy's edit was snapshotted");
+        assert_workspace_fresh(dir.path());
+
+        // The stale state cleared, and mutations work again. The rescued
+        // stale copy is a visible sibling of the same change, so the change
+        // is divergent and the outcome follows the checked-out copy by
+        // commit id — slice 8's addressing rule.
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(outcome.target_change.as_deref(), Some(after.working_copy.as_str()));
+        assert!(!after.workspaces.iter().find(|w| w.is_current).unwrap().is_stale);
+        assert!(after.conflicts.iter().all(|c| c.kind != ConflictKind::StaleWorkspace));
+        backend.describe(dir.path(), &after.working_copy, "back to life").unwrap();
+
+        // Running the recovery on a fresh workspace records nothing.
+        let noop = backend.update_stale_workspace(dir.path()).unwrap();
+        assert_eq!(noop.operation_id, None);
+        assert_eq!(noop.summary, "The workspace is not stale");
+    }
+
+    #[test]
+    fn update_stale_workspace_recovers_when_the_working_copy_operation_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+        check_out_working_copy(dir.path());
+        make_workspace_stale(dir.path());
+
+        // Simulate `jj op abandon` + `jj util gc` of the operation the
+        // working copy was last updated at: reparent the op chain past it,
+        // then delete its object.
+        let settings = test_settings();
+        let workspace = Workspace::load(
+            &settings,
+            dir.path(),
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head()).unwrap();
+        let lost_id = workspace.working_copy().operation_id().clone();
+        let lost_op = pollster::block_on(repo.loader().load_operation(&lost_id)).unwrap();
+        let dest = lost_op.parents().next().unwrap().unwrap();
+        let head = repo.operation().clone();
+        let stats = op_walk::reparent_range(
+            repo.op_store().as_ref(),
+            std::slice::from_ref(&lost_op),
+            std::slice::from_ref(&head),
+            &dest,
+        )
+        .unwrap();
+        pollster::block_on(
+            repo.op_heads_store()
+                .update_op_heads(&[head.id().clone()], &stats.new_head_ids[0]),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            dir.path().join(".jj/repo/op_store/operations").join(lost_id.hex()),
+        )
+        .unwrap();
+        drop(repo);
+        drop(workspace);
+
+        // Detection reports the lost-operation flavor...
+        let snapshot = backend.open(dir.path()).unwrap();
+        let item = snapshot
+            .conflicts
+            .iter()
+            .find(|c| c.kind == ConflictKind::StaleWorkspace)
+            .unwrap();
+        assert!(item.summary.contains("no longer has"), "got {}", item.summary);
+
+        // ...and recovery parks the workspace's files in a recovery commit,
+        // which is a real, undoable operation.
+        let outcome = backend.update_stale_workspace(dir.path()).unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert!(
+            outcome.summary.starts_with("Recovered the workspace"),
+            "got {}",
+            outcome.summary
+        );
+
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(outcome.target_change.as_deref(), Some(after.working_copy.as_str()));
+        let wc_node = after.nodes.iter().find(|n| n.id == after.working_copy).unwrap();
+        assert!(
+            wc_node.description.starts_with("RECOVERY COMMIT"),
+            "got {}",
+            wc_node.description
+        );
+        assert!(after.conflicts.iter().all(|c| c.kind != ConflictKind::StaleWorkspace));
+        assert_workspace_fresh(dir.path());
     }
 
     /// Runs git against the colocated repo, like a user in a terminal.

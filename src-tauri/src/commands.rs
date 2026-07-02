@@ -393,3 +393,13 @@ pub fn resolve_conflict(
         backend.resolve_conflict(path, &change_id, &file_path)
     })
 }
+
+/// The inbox's stale-workspace recovery (`jj workspace update-stale`): the
+/// one mutation allowed while the working copy is stale.
+#[tauri::command]
+pub fn update_stale_workspace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<MutationOutcome, CommandError> {
+    state.mutate(&app, |backend, path| backend.update_stale_workspace(path))
+}

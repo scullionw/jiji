@@ -122,6 +122,12 @@ export function resolveConflict(
   return invoke<MutationOutcome>("resolve_conflict", { changeId, filePath });
 }
 
+// Recovers a stale working copy (`jj workspace update-stale`) — the inbox's
+// guided recovery for the current workspace.
+export function updateStaleWorkspace(): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("update_stale_workspace");
+}
+
 export function onSnapshotUpdated(
   callback: (snapshot: RepoSnapshot) => void,
 ): Promise<UnlistenFn> {

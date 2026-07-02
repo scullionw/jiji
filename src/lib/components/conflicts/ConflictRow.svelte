@@ -3,9 +3,13 @@
   import Icon from "$lib/components/ui/Icon.svelte";
   import { findNode, splitPath } from "$lib/components/inspector/inspect";
   import { errorMessage } from "$lib/api";
-  import { jumpToChange, resolveConflict } from "$lib/state/actions";
+  import {
+    jumpToChange,
+    resolveConflict,
+    updateStaleWorkspace,
+  } from "$lib/state/actions";
   import { app } from "$lib/state/app.svelte";
-  import { canResolve, mergeToolLabel } from "./conflicts";
+  import { canRecoverWorkspace, canResolve, mergeToolLabel } from "./conflicts";
 
   let { item }: { item: ConflictItem } = $props();
 
@@ -44,6 +48,24 @@
       await resolveConflict(node.id, path);
     } catch (error) {
       resolveError = errorMessage(error);
+    }
+  }
+
+  // The stale-workspace recovery (`jj workspace update-stale`) only reaches
+  // the workspace Jiji has open; sibling cards explain the CLI route.
+  const recoverable = $derived(canRecoverWorkspace(snapshot, item));
+  let updating = $state(false);
+  let updateError = $state<string | null>(null);
+
+  async function updateWorkspace() {
+    updateError = null;
+    updating = true;
+    try {
+      await updateStaleWorkspace();
+    } catch (error) {
+      updateError = errorMessage(error);
+    } finally {
+      updating = false;
     }
   }
 </script>
@@ -136,18 +158,44 @@
       {/each}
     </span>
   </div>
-{:else if node}
-  <button
-    class="row jump"
-    data-conflict-id={item.id}
-    title="Open {node.id} in the workbench"
-    onclick={() => jumpToChange(node.id)}
-  >
-    {@render head()}
-  </button>
 {:else}
   <div class="row" data-conflict-id={item.id}>
-    {@render head()}
+    {#if node}
+      <button
+        class="head-jump"
+        title="Open {node.id} in the workbench"
+        onclick={() => jumpToChange(node.id)}
+      >
+        {@render head()}
+      </button>
+    {:else}
+      {@render head()}
+    {/if}
+    {#if recoverable}
+      <div class="recover">
+        <span class="note">
+          Local edits are saved first, then the working copy catches up to
+          where the repo moved.
+        </span>
+        <button
+          class="resolve"
+          data-update-workspace
+          disabled={updating}
+          title="Record on-disk edits, then check out the repo's current position (jj workspace update-stale)"
+          onclick={updateWorkspace}
+        >
+          {updating ? "Updating…" : "Update workspace"}
+        </button>
+      </div>
+    {:else}
+      <p class="note aside">
+        Jiji can only update the workspace it has open — run
+        <code>jj workspace update-stale</code> inside this one.
+      </p>
+    {/if}
+    {#if updateError}
+      <p class="resolve-error">{updateError}</p>
+    {/if}
   </div>
 {/if}
 
@@ -166,11 +214,6 @@
     transition:
       background var(--t-fast) var(--ease-out),
       border-color var(--t-fast) var(--ease-out);
-  }
-
-  button.row.jump:hover {
-    background: var(--clr-bg-hover);
-    border-color: var(--clr-border-1);
   }
 
   .head {
@@ -226,10 +269,6 @@
     font-size: var(--text-xs);
     color: var(--clr-text-3);
     transition: color var(--t-fast) var(--ease-out);
-  }
-
-  button.row.jump:hover .go {
-    color: var(--clr-accent-strong);
   }
 
   .paths {
@@ -310,6 +349,35 @@
     padding-left: calc(18px + var(--sp-2));
     font-size: var(--text-xs);
     color: var(--clr-danger);
+  }
+
+  .recover {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding-left: calc(18px + var(--sp-2));
+    min-height: 24px;
+  }
+
+  .note {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .recover .note {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .note.aside {
+    margin: 0;
+    padding-left: calc(18px + var(--sp-2));
+  }
+
+  .note code {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+    color: var(--clr-text-2);
   }
 
   .targets {
