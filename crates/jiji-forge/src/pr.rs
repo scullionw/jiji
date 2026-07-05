@@ -32,6 +32,9 @@ pub struct PrSummary {
     /// repo's owner for cross-fork PRs, `None` when the fork is gone.
     pub head_owner: Option<String>,
     pub base_branch: String,
+    /// The PR's description text — what the submit engine reconciles
+    /// commit descriptions against. `None` when GitHub reports no body.
+    pub body: Option<String>,
     pub review: ReviewDecision,
     pub checks: ChecksRollup,
 }
@@ -165,6 +168,7 @@ fn parse_pr_node(node: &Value) -> Result<PrSummary, ForgeError> {
         head_commit: str_field("headRefOid")?,
         head_owner: node["headRepositoryOwner"]["login"].as_str().map(str::to_owned),
         base_branch: str_field("baseRefName")?,
+        body: node["body"].as_str().map(str::to_owned),
         review,
         checks,
     })
@@ -209,6 +213,7 @@ pub fn parse_rest_pr(pr: &Value) -> Result<PrSummary, ForgeError> {
             .as_str()
             .map(str::to_owned),
         base_branch: str_at(&["base", "ref"])?,
+        body: pr["body"].as_str().map(str::to_owned),
         review: ReviewDecision::None,
         checks: ChecksRollup::None,
     })

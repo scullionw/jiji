@@ -157,4 +157,54 @@ describe("actionRow", () => {
       "Retarget #7: base main → auth",
     );
   });
+
+  it("phrases text updates by what changes", () => {
+    const bodyOnly: SubmitAction = {
+      kind: "updatePrText",
+      number: 7n,
+      bookmark: "feat",
+      title: null,
+      body: "wrapped",
+      seed: false,
+    };
+    expect(actionRow(bodyOnly, "origin").text).toBe(
+      "Update #7’s description from feat’s commit text",
+    );
+    const withTitle: SubmitAction = { ...bodyOnly, title: "feat: renamed" };
+    expect(actionRow(withTitle, "origin").text).toContain(
+      "title and description",
+    );
+    const seed: SubmitAction = { ...bodyOnly, seed: true };
+    expect(actionRow(seed, "origin").text).toContain("Adopt #7’s description");
+  });
+
+  it("phrases comment syncs for existing and not-yet-created PRs", () => {
+    const onExisting: SubmitAction = {
+      kind: "syncStackComment",
+      bookmark: "feat",
+      number: 7n,
+      create: false,
+    };
+    expect(actionRow(onExisting, "origin").text).toBe(
+      "Update the stack comment on #7",
+    );
+    const onCreated: SubmitAction = {
+      kind: "syncStackComment",
+      bookmark: "feat",
+      number: null,
+      create: true,
+    };
+    expect(actionRow(onCreated, "origin").text).toBe(
+      "Post the stack comment on feat’s new pull request",
+    );
+    const firstOnExisting: SubmitAction = {
+      kind: "syncStackComment",
+      bookmark: "feat",
+      number: 7n,
+      create: true,
+    };
+    expect(actionRow(firstOnExisting, "origin").text).toBe(
+      "Post the stack comment on #7",
+    );
+  });
 });

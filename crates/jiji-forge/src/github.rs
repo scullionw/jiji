@@ -26,7 +26,7 @@ query($owner: String!, $name: String!) {
     pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
-        number title url isDraft state
+        number title url isDraft state body
         baseRefName headRefName headRefOid
         headRepositoryOwner { login }
         reviewDecision
@@ -128,6 +128,82 @@ impl GitHubClient {
         self.patch(
             &format!("repos/{owner}/{name}/pulls/{number}"),
             &json!({ "base": base }),
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite an existing PR's body — and its title, when given — in one
+    /// call (`PATCH /repos/{owner}/{name}/pulls/{number}`).
+    pub fn update_pr_text(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        let mut payload = json!({ "body": body });
+        if let Some(title) = title {
+            payload["title"] = json!(title);
+        }
+        self.patch(&format!("repos/{owner}/{name}/pulls/{number}"), &payload)?;
+        Ok(())
+    }
+
+    /// A PR's issue comments as `(id, body)` pairs
+    /// (`GET /repos/{owner}/{name}/issues/{number}/comments`). One page of
+    /// 100 — the stack comment is posted early in a PR's life, so it is
+    /// practically always in the first page.
+    pub fn list_comments(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<Vec<(u64, String)>, ForgeError> {
+        let answer = self.get(&format!(
+            "repos/{owner}/{name}/issues/{number}/comments?per_page=100"
+        ))?;
+        let comments = answer
+            .as_array()
+            .ok_or_else(|| ForgeError::Api("comments answer was not a list".to_owned()))?;
+        Ok(comments
+            .iter()
+            .filter_map(|comment| {
+                let id = comment["id"].as_u64()?;
+                let body = comment["body"].as_str().unwrap_or_default().to_owned();
+                Some((id, body))
+            })
+            .collect())
+    }
+
+    /// Post an issue comment on a PR
+    /// (`POST /repos/{owner}/{name}/issues/{number}/comments`).
+    pub fn create_comment(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        self.post(
+            &format!("repos/{owner}/{name}/issues/{number}/comments"),
+            &json!({ "body": body }),
+        )?;
+        Ok(())
+    }
+
+    /// Edit an existing issue comment
+    /// (`PATCH /repos/{owner}/{name}/issues/comments/{comment_id}`).
+    pub fn update_comment(
+        &self,
+        owner: &str,
+        name: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        self.patch(
+            &format!("repos/{owner}/{name}/issues/comments/{comment_id}"),
+            &json!({ "body": body }),
         )?;
         Ok(())
     }

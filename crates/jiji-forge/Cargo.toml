@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 jiji-core = { path = "../jiji-core" }
 keyring.workspace = true
 log.workspace = true

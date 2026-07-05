@@ -34,4 +34,10 @@ blockers: Array<string>,
 /**
  * Worth knowing, but the plan still runs.
  */
-warnings: Array<string>, };
+warnings: Array<string>, 
+/**
+ * The stack-info comment as it will read, rendered for the panel
+ * when the plan syncs comments (PRs created by this plan appear as
+ * plain names — their links exist only after execution).
+ */
+stackCommentPreview: string | null, };

@@ -144,7 +144,10 @@ fn plan(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     let resolved = resolve_token(&KeychainTokenStore::new(&repo.host))?.ok_or(ForgeError::NoToken)?;
     let client = GitHubClient::for_repo(&repo, &resolved.token)?;
     let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
-    let plan = plan_submit(&snapshot, &prs, &repo, head)?;
+    // Planning reads existing stack comments (still read-only) so the
+    // printed plan matches what the app would show.
+    let forge_side = jiji_forge::RepoForge { client: &client, repo: &repo };
+    let plan = plan_submit(&snapshot, &prs, &repo, head, &forge_side)?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
     Ok(())
 }

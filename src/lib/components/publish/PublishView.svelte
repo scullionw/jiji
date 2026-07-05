@@ -358,6 +358,17 @@
                 </ul>
               {/if}
 
+              {#if plan.stackCommentPreview}
+                <details class="comment-preview" data-submit-comment-preview>
+                  <summary>The stack comment those PRs will carry</summary>
+                  <pre>{plan.stackCommentPreview
+                    .split("\n")
+                    .filter((line) => !line.startsWith("<!--"))
+                    .join("\n")
+                    .trim()}</pre>
+                </details>
+              {/if}
+
               {#each plan.blockers as blocker (blocker)}
                 <p class="blocker" data-submit-blocker>{blocker}</p>
               {/each}
@@ -715,6 +726,35 @@
     white-space: nowrap;
     padding: 0;
     cursor: pointer;
+  }
+
+  .comment-preview {
+    margin-bottom: var(--sp-2);
+  }
+
+  .comment-preview summary {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .comment-preview summary:hover {
+    color: var(--clr-text-2);
+  }
+
+  .comment-preview pre {
+    margin-top: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--clr-text-2);
+    background: var(--clr-bg-1);
+    border: 1px solid var(--clr-border-2);
+    border-radius: var(--radius-s);
+    white-space: pre-wrap;
+    overflow-x: auto;
   }
 
   .blocker {

@@ -13,11 +13,15 @@
 //!   batched GraphQL query for PR state)
 //! - [`pr`]: PR state mapped into Jiji-owned, TS-exported DTOs
 //! - [`submit`]: the analyze → plan → execute submission engine
+//! - [`reconcile`]: fingerprinted PR title/description reconciliation
+//! - [`comment`]: the stack-info comment GitHub readers see
 
 pub mod auth;
+pub mod comment;
 pub mod error;
 pub mod github;
 pub mod pr;
+pub mod reconcile;
 pub mod remote;
 pub mod submit;
 
@@ -33,6 +37,7 @@ pub use pr::{
 };
 pub use remote::{detect_github_repo, no_github_remote, parse_github_url, ForgeProvider, ForgeRepo};
 pub use submit::{
-    execute_submit, plan_submit, RepoForge, SubmitAction, SubmitForge, SubmitOutcome, SubmitPlan,
-    SubmitSegment, SubmitStep, SubmitStepStatus, SubmitVcs,
+    execute_submit, plan_submit, ExistingComment, RepoForge, StackCommentSource, SubmitAction,
+    SubmitForge, SubmitOutcome, SubmitPlan, SubmitSegment, SubmitStep, SubmitStepStatus,
+    SubmitVcs,
 };

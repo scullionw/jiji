@@ -94,5 +94,32 @@ export function actionRow(action: SubmitAction, remote: string): ActionRow {
         tone: "accent",
         text: `Retarget #${action.number}: base ${action.fromBase} → ${action.toBase}`,
       };
+    case "updatePrText":
+      if (action.seed) {
+        return {
+          glyph: "✎",
+          tone: "accent",
+          text: `Adopt #${action.number}’s description — it matches ${action.bookmark}’s commit, so Jiji records its fingerprints and keeps it updated from now on`,
+        };
+      }
+      return {
+        glyph: "✎",
+        tone: "accent",
+        text: `Update #${action.number}’s ${
+          action.title != null ? "title and description" : "description"
+        } from ${action.bookmark}’s commit text`,
+      };
+    case "syncStackComment":
+      return {
+        glyph: "☰",
+        tone: "ok",
+        text: action.create
+          ? `Post the stack comment on ${
+              action.number != null
+                ? `#${action.number}`
+                : `${action.bookmark}’s new pull request`
+            }`
+          : `Update the stack comment on #${action.number}`,
+      };
   }
 }

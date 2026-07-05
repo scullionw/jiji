@@ -17,6 +17,7 @@ function pr(overrides: Partial<PrSummary> = {}): PrSummary {
     headCommit: "a".repeat(40),
     headOwner: "o",
     baseBranch: "main",
+    body: null,
     review: "none" as ReviewDecision,
     checks: "none" as ChecksRollup,
     ...overrides,

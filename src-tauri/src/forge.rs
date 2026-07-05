@@ -195,8 +195,9 @@ fn submit_context(
 }
 
 /// Plan submitting the stack under a bookmark: what would push, which PRs
-/// would open against which bases, which existing PRs retarget. Read-only —
-/// GitHub is asked for fresh open-PR state, nothing else runs.
+/// would open against which bases, which existing PRs retarget, which PR
+/// text and stack comments refresh. Read-only — GitHub is asked for fresh
+/// open-PR state and existing stack comments, nothing else runs.
 #[tauri::command(async)]
 pub fn submit_plan(
     state: State<'_, AppState>,
@@ -205,8 +206,12 @@ pub fn submit_plan(
     let snapshot = state
         .current_snapshot_clone()
         .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
-    let (repo, _client, prs) = submit_context(&state)?;
-    plan_submit(&snapshot, &prs, &repo, &head_bookmark).map_err(Into::into)
+    let (repo, client, prs) = submit_context(&state)?;
+    let forge_side = RepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    plan_submit(&snapshot, &prs, &repo, &head_bookmark, &forge_side).map_err(Into::into)
 }
 
 /// The submit executor's jj half: pushes run through the shared mutation
@@ -246,7 +251,11 @@ pub fn submit_stack(
         .current_snapshot_clone()
         .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
     let (repo, client, prs) = submit_context(&state)?;
-    let fresh = plan_submit(&snapshot, &prs, &repo, &head_bookmark)?;
+    let forge_side = RepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    let fresh = plan_submit(&snapshot, &prs, &repo, &head_bookmark, &forge_side)?;
     if fresh.actions != plan.actions {
         return Err(CommandError::new(
             "plan_stale",
@@ -257,10 +266,6 @@ pub fn submit_stack(
     let vcs = HostVcs {
         app: &app,
         state: &state,
-    };
-    let forge_side = RepoForge {
-        client: &client,
-        repo: &repo,
     };
     execute_submit(&fresh, &vcs, &forge_side).map_err(Into::into)
 }

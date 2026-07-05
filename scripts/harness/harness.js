@@ -47,18 +47,33 @@
 //                        one entry per bookmark/branch name with dot-joined
 //                        flags: draft|merged|closed, approved|changes|
 //                        review, passing|failing|pending, fork (excluded
-//                        from the badge map like a real cross-fork PR).
+//                        from the badge map like a real cross-fork PR),
+//                        plus the PR-text states stale (the PR body carries
+//                        Jiji's managed section for an older commit body —
+//                        a re-submit plans the description update),
+//                        edited (the user rewrote the managed section —
+//                        respected, nothing plans) and conflict (both
+//                        sides moved — the plan warns and leaves it).
+//                        Fabricated titles mirror the bookmark's change
+//                        title so plans stay quiet by default; retitled
+//                        fabricates a hand-renamed PR instead (the
+//                        markerless title-drift warning).
 //                        Needs &forge= — badges only render once the
 //                        connection is verified
 //   &prstrunc=1          the fabricated report says it was capped at 100
 //                        PRs (the Publish section states it)
 //   &splan=<bookmark>    click that stack row in Publish and wait for its
 //                        submit plan (a JS twin of plan_submit over the
-//                        captured snapshot + &prs= state). Needs &forge=
+//                        captured snapshot + &prs= state, incl. the
+//                        reconcile fingerprints and stack-comment actions).
+//                        Needs &forge=
+//   &sprev=1             open the plan card's stack-comment preview
+//                        disclosure
 //   &sgo=1               click Publish on the derived plan and wait for
 //                        the executed per-step results (stubbed: pushes
 //                        mark bookmarks synced, created PRs join the
-//                        fabricated open-PR state)
+//                        fabricated open-PR state, text updates and stack
+//                        comments persist so a replan settles idle)
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -301,6 +316,71 @@
     // PRs the stubbed submit_stack opened this session; forge_prs folds
     // them in so the refreshed count and badges follow the executed flow.
     createdPrs: [],
+    // Stack comments and PR-text rewrites the stubbed submit_stack made,
+    // keyed by PR number, so a replan after the executed flow settles.
+    comments: new Map(),
+    textOverrides: new Map(),
+  };
+  // JS twins of jiji-forge's reconcile fingerprints (FNV-1a 64) and
+  // managed-body markers, enough for the plan twin to mirror the Rust
+  // engine over fabricated PR bodies.
+  const fnvFp = (text) => {
+    let hash = 0xcbf29ce484222325n;
+    for (const byte of new TextEncoder().encode(text)) {
+      hash ^= BigInt(byte);
+      hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+    }
+    return hash.toString(16).padStart(16, "0");
+  };
+  const DESC_START = "<!-- jiji:description -->";
+  const DESC_END = "<!-- /jiji:description -->";
+  const wrapManaged = (body, title) =>
+    `${DESC_START}\n${body}\n${DESC_END}\n<!-- jiji:body-fp ${fnvFp(body)} -->` +
+    (title != null ? `\n<!-- jiji:title-fp ${fnvFp(title)} -->` : "");
+  const managedOf = (body) => {
+    const start = body.indexOf(DESC_START);
+    if (start === -1) return null;
+    const end = body.indexOf(DESC_END, start + DESC_START.length);
+    if (end === -1) return null;
+    return body.slice(start + DESC_START.length, end).trim();
+  };
+  const storedFp = (body, kind) =>
+    body.match(new RegExp(`<!-- jiji:${kind}-fp ([0-9a-f]+) -->`))?.[1] ?? null;
+  const TRAILER_KEYS = new Set([
+    "co-authored-by", "co-developed-by", "signed-off-by", "helped-by",
+    "reviewed-by", "acked-by", "tested-by", "reported-by", "suggested-by",
+    "change-id",
+  ]);
+  const titleBodyOf = (description, fallback) => {
+    const text = (description || "").trim();
+    if (!text) return { title: fallback, body: "" };
+    const title = text.split("\n")[0];
+    const lines = text.slice(title.length).trim().split("\n");
+    let end = lines.length;
+    while (end > 0) {
+      const line = lines[end - 1].trim();
+      if (!line) {
+        end -= 1;
+        continue;
+      }
+      const key = line.split(":")[0]?.trim().toLowerCase();
+      if (line.includes(":") && TRAILER_KEYS.has(key) && line.split(":")[1]?.trim()) end -= 1;
+      else break;
+    }
+    return { title, body: lines.slice(0, end).join("\n").trimEnd() };
+  };
+  // The visible half of the Rust engine's stack comment (the base64 data
+  // line is an implementation detail the UI strips anyway).
+  const renderStackComment = (entries, current) => {
+    let body = "<!-- jiji:stack-info -->\n";
+    body += "This pull request is part of a stack, in merge order:\n\n";
+    for (const entry of entries) {
+      if (current === entry.bookmark) body += `1. **\`${entry.bookmark}\` ← this PR**\n`;
+      else if (entry.url) body += `1. [\`${entry.bookmark}\`](${entry.url})\n`;
+      else body += `1. \`${entry.bookmark}\`\n`;
+    }
+    body += "\n---\n*This comment is kept up to date by Jiji.*\n";
+    return body;
   };
   // A JS twin of the backend's GitHub detection, just enough for shots:
   // github.com HTTPS/SSH forms, origin > upstream > name order.
@@ -343,6 +423,31 @@
     (branch.charAt(0).toUpperCase() + branch.slice(1)).replace(/-/g, " ");
   const forgePrsOf = (snap) => {
     const repo = forgeRepoOf(snap);
+    // The commit-derived title/body a Jiji-created PR for this bookmark
+    // would carry — the fabrication default, so plans stay quiet unless a
+    // flag asks for drift. Like the engine, the text comes from the
+    // segment's BOTTOM change: walk first parents down from the bookmark
+    // until another local bookmark's change or immutable history.
+    const expectedTextOf = (branch) => {
+      const locals = new Set(
+        (snap?.bookmarks || [])
+          .filter((b) => b.isLocal && !b.isTrunk)
+          .map((b) => b.name),
+      );
+      const nodes = new Map((snap?.nodes || []).map((n) => [n.id, n]));
+      const target = (snap?.bookmarks || []).find((b) => b.name === branch)?.target;
+      let bottom = nodes.get(target) ?? null;
+      let cursor = bottom ? nodes.get(bottom.parents[0]) : null;
+      while (
+        cursor &&
+        cursor.kind !== "immutable" &&
+        !cursor.bookmarks.some((name) => locals.has(name))
+      ) {
+        bottom = cursor;
+        cursor = nodes.get(cursor.parents[0]);
+      }
+      return titleBodyOf(bottom?.description, humanize(branch));
+    };
     const prs = (params.get("prs") || "")
       .split(",")
       .filter(Boolean)
@@ -369,9 +474,25 @@
               ? "pending"
               : "none";
         const number = 101 + index;
+        const expected = expectedTextOf(branch);
+        const title = flags.has("retitled")
+          ? `${humanize(branch)} (hand-renamed)`
+          : expected.title;
+        let body = null;
+        if (flags.has("stale"))
+          body = wrapManaged("An earlier take on this change.", title);
+        else if (flags.has("edited"))
+          // The managed text was rewritten by hand; the stored fingerprint
+          // still matches the commit, so Jiji leaves it alone.
+          body =
+            `${DESC_START}\nA description someone rewrote on GitHub.\n${DESC_END}\n` +
+            `<!-- jiji:body-fp ${fnvFp(expected.body)} -->\n` +
+            `<!-- jiji:title-fp ${fnvFp(title)} -->`;
+        else if (flags.has("conflict"))
+          body = `${DESC_START}\nAn earlier take on this change.\n${DESC_END}\n<!-- jiji:body-fp 0000000000000000 -->`;
         return {
           number,
-          title: humanize(branch),
+          title,
           url: `https://github.com/${repo ? `${repo.owner}/${repo.name}` : "o/r"}/pull/${number}`,
           state,
           isDraft: flags.has("draft"),
@@ -379,10 +500,12 @@
           headCommit: "ad".repeat(20),
           headOwner: flags.has("fork") ? "someone-else" : (repo?.owner ?? null),
           baseBranch: snap?.trunkBookmark || "main",
+          body,
           review,
           checks,
         };
-      });
+      })
+      .map((pr) => ({ ...pr, ...(forge.textOverrides.get(pr.number) || {}) }));
     const all = prs.concat(forge.createdPrs);
     const byBranch = {};
     for (const pr of all) {
@@ -423,8 +546,10 @@
     const segments = [];
     const actions = [];
     const prActions = [];
+    const textActions = [];
     const blockers = [];
     const warnings = [];
+    const live = [];
     let base = snap.trunkBookmark;
     let pending = [];
     for (const node of chain) {
@@ -442,7 +567,8 @@
       const segNodes = pending;
       pending = [];
       const bottom = segNodes[0];
-      const title = (bottom.description || name).split("\n")[0];
+      const expected = titleBodyOf(bottom.description, name);
+      const title = expected.title;
       const pr = prState.byBranch[name] || null;
       segments.push({
         bookmark: name,
@@ -477,19 +603,126 @@
             fromBase: pr.baseBranch,
             toBase: base,
           });
+        // The text-reconcile twin: mirrors jiji-forge's plan_pr_text over
+        // the fabricated bodies (markerless empty/identical adoption, the
+        // fingerprint three-way, drift warnings).
+        if (bottom.description) {
+          const body = pr.body || "";
+          const managed = managedOf(body);
+          const titleFp = storedFp(body, "title");
+          let newTitle = null;
+          if (pr.title !== expected.title) {
+            if (titleFp === null) {
+              if (segNodes.length === 1)
+                warnings.push(
+                  `#${pr.number} (${name}): the PR title (\u{201c}${pr.title}\u{201d}) ` +
+                    `differs from the commit (\u{201c}${expected.title}\u{201d}) and ` +
+                    `Jiji does not know which is intended`,
+                );
+            } else if (titleFp === fnvFp(pr.title)) newTitle = expected.title;
+            else if (titleFp !== fnvFp(expected.title))
+              warnings.push(
+                `#${pr.number} (${name}): the PR title and the commit's first line ` +
+                  `both changed; leaving the title alone`,
+              );
+          }
+          let newBody = null;
+          let seed = false;
+          const claimTitle = pr.title === expected.title || newTitle !== null;
+          const wrapNew = (text) => wrapManaged(text, claimTitle ? expected.title : null);
+          if (managed === null) {
+            if (!body.trim()) {
+              if (expected.body) newBody = wrapNew(expected.body);
+            } else if (body.trim() === expected.body) {
+              newBody = wrapNew(expected.body);
+              seed = newTitle === null;
+            }
+          } else {
+            const bodyFp = storedFp(body, "body");
+            if (managed === expected.body) {
+              if (bodyFp === null) {
+                newBody = wrapNew(expected.body);
+                seed = newTitle === null;
+              } else if (newTitle !== null) newBody = wrapNew(expected.body);
+            } else if (bodyFp === null || (fnvFp(managed) !== bodyFp && fnvFp(expected.body) !== bodyFp)) {
+              warnings.push(
+                bodyFp === null
+                  ? `#${pr.number} (${name}): the PR description was edited on GitHub ` +
+                      `(or predates Jiji's tracking); leaving it alone`
+                  : `#${pr.number} (${name}): the PR description and the commit ` +
+                      `description both changed since Jiji last wrote it; leaving ` +
+                      `the PR text alone`,
+              );
+            } else if (fnvFp(managed) === bodyFp) newBody = wrapNew(expected.body);
+            // fp matches the commit: the user edited the PR — leave it.
+          }
+          if (newBody !== null)
+            textActions.push({
+              kind: "updatePrText",
+              number: pr.number,
+              bookmark: name,
+              title: newTitle,
+              body: newBody,
+              seed,
+            });
+        }
       } else {
         prActions.push({
           kind: "createPr",
           bookmark: name,
           base,
           title,
-          body: "",
+          body: wrapManaged(expected.body, title),
         });
       }
+      live.push({ bookmark: name, number: pr?.number ?? null, url: pr?.url ?? null });
       base = name;
     }
     actions.push(...prActions.filter((a) => a.kind === "createPr"));
     actions.push(...prActions.filter((a) => a.kind === "retargetPr"));
+    actions.push(...textActions);
+    // The stack-comment twin: pending creations sync every live PR; a
+    // fully-known stack compares rendered bodies against the stub's
+    // comment store so an executed flow replans to quiet.
+    const creating = prActions.some((a) => a.kind === "createPr");
+    const commentActions = [];
+    for (const entry of live) {
+      if (entry.number != null) {
+        const existing = forge.comments.get(entry.number) ?? null;
+        if (creating) {
+          commentActions.push({
+            kind: "syncStackComment",
+            bookmark: entry.bookmark,
+            number: entry.number,
+            create: existing === null,
+          });
+        } else {
+          const rendered = renderStackComment(live, entry.bookmark);
+          if (existing !== null && existing !== rendered)
+            commentActions.push({
+              kind: "syncStackComment",
+              bookmark: entry.bookmark,
+              number: entry.number,
+              create: false,
+            });
+          else if (existing === null && live.length >= 2)
+            commentActions.push({
+              kind: "syncStackComment",
+              bookmark: entry.bookmark,
+              number: entry.number,
+              create: true,
+            });
+        }
+      } else if (live.length >= 2) {
+        commentActions.push({
+          kind: "syncStackComment",
+          bookmark: entry.bookmark,
+          number: null,
+          create: true,
+        });
+      }
+    }
+    actions.push(...commentActions);
     return {
       headBookmark: head,
       remote: repo ? repo.remote : "origin",
@@ -498,6 +731,9 @@
       actions,
       blockers,
       warnings,
+      stackCommentPreview: commentActions.length
+        ? renderStackComment(live, null)
+        : null,
     };
   };
 
@@ -1363,6 +1599,7 @@
             }
           }
           const repo = forgeRepoOf(snap);
+          const createdByBookmark = new Map();
           const steps = plan.actions.map((action) => {
             if (action.kind === "push")
               return { action, status: "done", detail: pushDetail, pr: null };
@@ -1378,15 +1615,55 @@
                 headCommit: "ad".repeat(20),
                 headOwner: repo?.owner ?? null,
                 baseBranch: action.base,
+                body: action.body,
                 review: "none",
                 checks: "none",
               };
               forge.createdPrs.push(pr);
+              createdByBookmark.set(action.bookmark, pr);
               return {
                 action,
                 status: "done",
                 detail: `Opened #${number} for ${action.bookmark}`,
                 pr,
+              };
+            }
+            if (action.kind === "updatePrText") {
+              forge.textOverrides.set(action.number, {
+                body: action.body,
+                ...(action.title != null ? { title: action.title } : {}),
+              });
+              const detail = action.seed
+                ? `Recorded Jiji's description fingerprints on #${action.number}`
+                : action.title != null
+                  ? `Updated #${action.number}'s title and description from ${action.bookmark}`
+                  : `Updated #${action.number}'s description from ${action.bookmark}`;
+              return { action, status: "done", detail, pr: null };
+            }
+            if (action.kind === "syncStackComment") {
+              const number =
+                action.number ?? createdByBookmark.get(action.bookmark)?.number;
+              const entries = plan.segments
+                .map((segment) => {
+                  const pr =
+                    segment.pr ?? createdByBookmark.get(segment.bookmark) ?? null;
+                  return pr
+                    ? { bookmark: segment.bookmark, number: pr.number, url: pr.url }
+                    : null;
+                })
+                .filter(Boolean);
+              const existed = forge.comments.has(number);
+              forge.comments.set(
+                number,
+                renderStackComment(entries, action.bookmark),
+              );
+              return {
+                action,
+                status: "done",
+                detail: existed
+                  ? `Updated the stack comment on #${number}`
+                  : `Posted the stack comment on #${number}`,
+                pr: null,
               };
             }
             return {
@@ -1543,6 +1820,15 @@
         document.querySelector('[data-submit-state="up-to-date"]') !== null ||
         document.querySelector("[data-submit-error]") !== null,
     );
+  }
+  if (params.get("sprev")) {
+    // Open the plan card's stack-comment preview disclosure.
+    steps.push(() => {
+      const preview = document.querySelector("[data-submit-comment-preview]");
+      if (!preview) return false;
+      preview.open = true;
+      return true;
+    });
   }
   if (params.get("sgo")) {
     steps.push(() => click("[data-submit-go] .btn.primary:not(:disabled)"));

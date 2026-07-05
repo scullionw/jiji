@@ -23,4 +23,9 @@ headCommit: string,
  * Owner of the repo the head branch lives in; differs from the base
  * repo's owner for cross-fork PRs, `None` when the fork is gone.
  */
-headOwner: string | null, baseBranch: string, review: ReviewDecision, checks: ChecksRollup, };
+headOwner: string | null, baseBranch: string, 
+/**
+ * The PR's description text — what the submit engine reconciles
+ * commit descriptions against. `None` when GitHub reports no body.
+ */
+body: string | null, review: ReviewDecision, checks: ChecksRollup, };

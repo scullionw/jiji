@@ -3,4 +3,27 @@
 /**
  * One remote action the plan will run, in execution order.
  */
-export type SubmitAction = { "kind": "push", bookmark: string, create: boolean, } | { "kind": "createPr", bookmark: string, base: string, title: string, body: string, } | { "kind": "retargetPr", number: bigint, bookmark: string, fromBase: string, toBase: string, };
+export type SubmitAction = { "kind": "push", bookmark: string, create: boolean, } | { "kind": "createPr", bookmark: string, base: string, title: string, body: string, } | { "kind": "retargetPr", number: bigint, bookmark: string, fromBase: string, toBase: string, } | { "kind": "updatePrText", number: bigint, bookmark: string, 
+/**
+ * The title to set; `None` leaves the PR's title alone.
+ */
+title: string | null, 
+/**
+ * The full replacement body, managed section and fingerprints
+ * rewritten, user text carried over.
+ */
+body: string, 
+/**
+ * True when nothing visible changes — the write only records
+ * Jiji's fingerprints on a PR it recognizes as its own.
+ */
+seed: boolean, } | { "kind": "syncStackComment", bookmark: string, 
+/**
+ * The PR's number; `None` when the PR is created earlier in this
+ * same plan and the number is not known yet.
+ */
+number: bigint | null, 
+/**
+ * True posts a new comment; false edits the existing one.
+ */
+create: boolean, };

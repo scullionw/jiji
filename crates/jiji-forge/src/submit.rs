@@ -10,21 +10,28 @@
 //! ts-rs DTO so the Publish section renders exactly what will run, and a
 //! future CLI can print the same object.
 //!
-//! What this slice deliberately leaves to later slices: PR body
-//! reconciliation against hand edits (jjpr's fingerprinting), the
-//! stack-info comment, draft handling, foreign bases (a coworker's branch
-//! in the stack's ancestry — the snapshot does not carry remote-only
-//! bookmarks on nodes yet), and recognizing already-merged PRs (needs a
-//! per-bookmark merged-PR query; the land flow owns it).
+//! Re-submitting also reconciles what GitHub shows: existing PR titles and
+//! descriptions update from the commits through the fingerprint machinery
+//! in [`crate::reconcile`] (hand edits are detected and respected, never
+//! clobbered), and every PR in a multi-PR stack carries the stack-info
+//! comment from [`crate::comment`], edited in place on later submits.
+//!
+//! What this slice deliberately leaves to later slices: draft handling,
+//! foreign bases (a coworker's branch in the stack's ancestry — the
+//! snapshot does not carry remote-only bookmarks on nodes yet), and
+//! recognizing already-merged PRs (needs a per-bookmark merged-PR query;
+//! the land flow owns it).
 
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SyncState};
 use jiji_core::BackendError;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::comment::{inherit_fossils, parse_stack_data, render_stack_comment, StackEntry};
 use crate::error::ForgeError;
 use crate::github::GitHubClient;
 use crate::pr::{PrSummary, RepoPrState};
+use crate::reconcile::{plan_pr_text, wrap_managed_body, TextWarning};
 use crate::remote::ForgeRepo;
 
 /// One publishable run of changes under a bookmark, listed bottom-up in
@@ -72,6 +79,34 @@ pub enum SubmitAction {
         from_base: String,
         to_base: String,
     },
+    /// Rewrite an existing PR's Jiji-managed text from the commits. Hand
+    /// edits survive: the managed description section is fingerprinted
+    /// (`crate::reconcile`), so only text Jiji provably wrote is replaced,
+    /// and user prose outside the sentinels is preserved verbatim.
+    #[serde(rename_all = "camelCase")]
+    UpdatePrText {
+        number: u64,
+        bookmark: String,
+        /// The title to set; `None` leaves the PR's title alone.
+        title: Option<String>,
+        /// The full replacement body, managed section and fingerprints
+        /// rewritten, user text carried over.
+        body: String,
+        /// True when nothing visible changes — the write only records
+        /// Jiji's fingerprints on a PR it recognizes as its own.
+        seed: bool,
+    },
+    /// Post or refresh the stack-info comment that explains the stack to
+    /// GitHub readers.
+    #[serde(rename_all = "camelCase")]
+    SyncStackComment {
+        bookmark: String,
+        /// The PR's number; `None` when the PR is created earlier in this
+        /// same plan and the number is not known yet.
+        number: Option<u64>,
+        /// True posts a new comment; false edits the existing one.
+        create: bool,
+    },
 }
 
 /// What submitting a stack will do, derived before anything runs.
@@ -94,6 +129,10 @@ pub struct SubmitPlan {
     pub blockers: Vec<String>,
     /// Worth knowing, but the plan still runs.
     pub warnings: Vec<String>,
+    /// The stack-info comment as it will read, rendered for the panel
+    /// when the plan syncs comments (PRs created by this plan appear as
+    /// plain names — their links exist only after execution).
+    pub stack_comment_preview: Option<String>,
 }
 
 /// Per-action result of executing a plan.
@@ -136,9 +175,23 @@ pub trait SubmitVcs {
     fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError>;
 }
 
+/// A PR's existing Jiji stack comment, found by its sentinel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingComment {
+    pub id: u64,
+    pub body: String,
+}
+
+/// Where planning reads existing stack comments from. Split out of
+/// [`SubmitForge`] because planning only reads — a stub answering `None`
+/// keeps plan tests network-free.
+pub trait StackCommentSource {
+    fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError>;
+}
+
 /// The forge side of executing a plan; implemented by [`RepoForge`] over
 /// the real client, a stub in tests.
-pub trait SubmitForge {
+pub trait SubmitForge: StackCommentSource {
     fn create_pr(
         &self,
         title: &str,
@@ -147,12 +200,32 @@ pub trait SubmitForge {
         base: &str,
     ) -> Result<PrSummary, ForgeError>;
     fn update_pr_base(&self, number: u64, base: &str) -> Result<(), ForgeError>;
+    fn update_pr_text(
+        &self,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), ForgeError>;
+    fn create_comment(&self, number: u64, body: &str) -> Result<(), ForgeError>;
+    fn update_comment(&self, comment_id: u64, body: &str) -> Result<(), ForgeError>;
 }
 
 /// [`SubmitForge`] over the real GitHub client, bound to a detected repo.
 pub struct RepoForge<'a> {
     pub client: &'a GitHubClient,
     pub repo: &'a ForgeRepo,
+}
+
+impl StackCommentSource for RepoForge<'_> {
+    fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError> {
+        let comments = self
+            .client
+            .list_comments(&self.repo.owner, &self.repo.name, number)?;
+        Ok(comments
+            .into_iter()
+            .find(|(_, body)| crate::comment::is_stack_comment(body))
+            .map(|(id, body)| ExistingComment { id, body }))
+    }
 }
 
 impl SubmitForge for RepoForge<'_> {
@@ -171,17 +244,41 @@ impl SubmitForge for RepoForge<'_> {
         self.client
             .update_pr_base(&self.repo.owner, &self.repo.name, number, base)
     }
+
+    fn update_pr_text(
+        &self,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        self.client
+            .update_pr_text(&self.repo.owner, &self.repo.name, number, title, body)
+    }
+
+    fn create_comment(&self, number: u64, body: &str) -> Result<(), ForgeError> {
+        self.client
+            .create_comment(&self.repo.owner, &self.repo.name, number, body)
+    }
+
+    fn update_comment(&self, comment_id: u64, body: &str) -> Result<(), ForgeError> {
+        self.client
+            .update_comment(&self.repo.owner, &self.repo.name, comment_id, body)
+    }
 }
 
 /// Build the submission plan for the stack under `head_bookmark`: walk the
 /// snapshot graph from the bookmark down first parents to the immutable
 /// base, segment the mutable chain at local non-trunk bookmarks, and
-/// compare each segment against the forge's open-PR state.
+/// compare each segment against the forge's open-PR state — including each
+/// existing PR's title/description text and its stack comment, so the plan
+/// enumerates every remote write before anything runs and an up-to-date
+/// stack still plans nothing.
 pub fn plan_submit(
     snapshot: &RepoSnapshot,
     prs: &RepoPrState,
     repo: &ForgeRepo,
     head_bookmark: &str,
+    comments: &dyn StackCommentSource,
 ) -> Result<SubmitPlan, ForgeError> {
     let bookmark = snapshot
         .bookmarks
@@ -280,6 +377,10 @@ pub fn plan_submit(
     let mut segments: Vec<SubmitSegment> = Vec::new();
     let mut actions: Vec<SubmitAction> = Vec::new();
     let mut pr_actions: Vec<SubmitAction> = Vec::new();
+    let mut text_actions: Vec<SubmitAction> = Vec::new();
+    // Segments that will have a PR once the plan runs (existing or being
+    // created) — the stack the comment describes. Bottom-up.
+    let mut live: Vec<(String, Option<PrSummary>)> = Vec::new();
     let mut effective_base = snapshot.trunk_bookmark.clone();
     if prs.report.truncated {
         warnings.push(
@@ -375,27 +476,152 @@ pub fn plan_submit(
                         to_base: effective_base.clone(),
                     });
                 }
+
+                // Reconcile the PR's title and description against the
+                // commit. Skipped for an undescribed bottom change — its
+                // expected title is only the bookmark-name fallback, not
+                // something to correct the PR toward.
+                if !bottom.description.is_empty() {
+                    let text = plan_pr_text(
+                        &pr.title,
+                        pr.body.as_deref().unwrap_or(""),
+                        &title,
+                        &body,
+                    );
+                    if let Some(new_body) = text.body.clone() {
+                        text_actions.push(SubmitAction::UpdatePrText {
+                            number: pr.number,
+                            bookmark: name.to_owned(),
+                            title: text.title.clone(),
+                            body: new_body,
+                            seed: text.seed,
+                        });
+                    }
+                    for warning in &text.warnings {
+                        let story = match warning {
+                            TextWarning::BodyConflict { unfingerprinted: false } => format!(
+                                "#{} ({name}): the PR description and the commit description \
+                                 both changed since Jiji last wrote it; leaving the PR text alone",
+                                pr.number
+                            ),
+                            TextWarning::BodyConflict { unfingerprinted: true } => format!(
+                                "#{} ({name}): the PR description was edited on GitHub (or \
+                                 predates Jiji's tracking); leaving it alone",
+                                pr.number
+                            ),
+                            TextWarning::TitleConflict => format!(
+                                "#{} ({name}): the PR title and the commit's first line both \
+                                 changed; leaving the title alone",
+                                pr.number
+                            ),
+                            // Ownership unknown: warn only for one-change
+                            // segments — multi-change PRs often carry a
+                            // hand-curated title (jjpr's heuristic).
+                            TextWarning::TitleDrift => {
+                                if raw.nodes.len() != 1 {
+                                    continue;
+                                }
+                                format!(
+                                    "#{} ({name}): the PR title (\u{201c}{}\u{201d}) differs \
+                                     from the commit (\u{201c}{title}\u{201d}) and Jiji does \
+                                     not know which is intended",
+                                    pr.number, pr.title
+                                )
+                            }
+                        };
+                        warnings.push(story);
+                    }
+                }
             }
             None => {
                 pr_actions.push(SubmitAction::CreatePr {
                     bookmark: name.to_owned(),
                     base: effective_base.clone(),
-                    title,
-                    body,
+                    title: title.clone(),
+                    // Sentinel-wrapped and fingerprinted from birth, so
+                    // later submits can update it without guessing.
+                    body: wrap_managed_body(&body, &title),
                 });
             }
         }
 
+        live.push((name.to_owned(), pr.clone()));
         effective_base = name.to_owned();
         segments.push(segment);
     }
     // Pushes first (a new PR's head and base branches must exist), then PR
-    // creations bottom-up, then retargets.
+    // creations bottom-up, then retargets, then text updates, then the
+    // stack comments (they mention the PRs everything above sets up).
     let (creates, retargets): (Vec<_>, Vec<_>) = pr_actions
         .into_iter()
         .partition(|a| matches!(a, SubmitAction::CreatePr { .. }));
+    let creating = !creates.is_empty();
     actions.extend(creates);
     actions.extend(retargets);
+    actions.extend(text_actions);
+
+    // The stack comment: every PR in a multi-PR stack carries one. When no
+    // PR is being created every link is already known, so the exact bodies
+    // compare against the existing comments and an unchanged stack plans
+    // nothing; pending creations make the contents unknowable until
+    // execution, so every live PR syncs. A lone PR never gets a first
+    // comment ("part of a stack" on a single PR is noise) but an existing
+    // one keeps updating — jjpr's rule.
+    let entries: Vec<StackEntry> = live
+        .iter()
+        .map(|(name, pr)| StackEntry {
+            bookmark: name.clone(),
+            number: pr.as_ref().map(|pr| pr.number),
+            url: pr.as_ref().map(|pr| pr.url.clone()),
+        })
+        .collect();
+    let mut comment_actions: Vec<SubmitAction> = Vec::new();
+    for (name, pr) in &live {
+        match pr {
+            Some(pr) => {
+                let existing = comments.stack_comment(pr.number)?;
+                if creating {
+                    comment_actions.push(SubmitAction::SyncStackComment {
+                        bookmark: name.clone(),
+                        number: Some(pr.number),
+                        create: existing.is_none(),
+                    });
+                    continue;
+                }
+                let previous = existing.as_ref().and_then(|c| parse_stack_data(&c.body));
+                let fossils = inherit_fossils(previous.as_ref(), &entries);
+                let body = render_stack_comment(&entries, &fossils, Some(name));
+                match &existing {
+                    Some(existing) if existing.body != body => {
+                        comment_actions.push(SubmitAction::SyncStackComment {
+                            bookmark: name.clone(),
+                            number: Some(pr.number),
+                            create: false,
+                        });
+                    }
+                    None if live.len() >= 2 => {
+                        comment_actions.push(SubmitAction::SyncStackComment {
+                            bookmark: name.clone(),
+                            number: Some(pr.number),
+                            create: true,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            None if live.len() >= 2 => {
+                comment_actions.push(SubmitAction::SyncStackComment {
+                    bookmark: name.clone(),
+                    number: None,
+                    create: true,
+                });
+            }
+            None => {}
+        }
+    }
+    let stack_comment_preview = (!comment_actions.is_empty())
+        .then(|| render_stack_comment(&entries, &[], None));
+    actions.extend(comment_actions);
 
     Ok(SubmitPlan {
         head_bookmark: head_bookmark.to_owned(),
@@ -405,6 +631,7 @@ pub fn plan_submit(
         actions,
         blockers,
         warnings,
+        stack_comment_preview,
     })
 }
 
@@ -460,9 +687,14 @@ fn strip_trailers(body: &str) -> String {
 }
 
 /// Run a plan: one batched push, then PR creations bottom-up, then base
-/// retargets. The first failure stops execution — later steps report as
-/// skipped rather than running against a half-updated remote. A plan with
-/// blockers refuses to run at all.
+/// retargets, text updates, and stack comments. The first failure stops
+/// execution — later steps report as skipped rather than running against a
+/// half-updated remote. A plan with blockers refuses to run at all.
+///
+/// Stack-comment steps re-read and re-render at execution time (the
+/// read-merge-write jjpr does): PRs created moments earlier now have real
+/// numbers and links, and a comment that already reads right is left
+/// untouched rather than edited to an identical body.
 pub fn execute_submit(
     plan: &SubmitPlan,
     vcs: &dyn SubmitVcs,
@@ -519,47 +751,68 @@ pub fn execute_submit(
         }
     }
 
+    // PRs opened by this run, for the comment steps that follow them.
+    let mut created: std::collections::HashMap<String, PrSummary> =
+        std::collections::HashMap::new();
     if !failed {
         for step in &mut steps {
-            match &step.action {
-                SubmitAction::Push { .. } => {}
+            let result: Result<(String, Option<PrSummary>), ForgeError> = match &step.action {
+                SubmitAction::Push { .. } => continue,
                 SubmitAction::CreatePr {
                     bookmark,
                     base,
                     title,
                     body,
-                } => match forge.create_pr(title, body, bookmark, base) {
-                    Ok(pr) => {
-                        step.status = SubmitStepStatus::Done;
-                        step.detail = Some(format!("Opened #{} for {bookmark}", pr.number));
-                        step.pr = Some(pr);
-                    }
-                    Err(err) => {
-                        step.status = SubmitStepStatus::Failed;
-                        step.detail = Some(err.to_string());
-                        failed = true;
-                        break;
-                    }
-                },
+                } => forge.create_pr(title, body, bookmark, base).map(|pr| {
+                    created.insert(bookmark.clone(), pr.clone());
+                    (format!("Opened #{} for {bookmark}", pr.number), Some(pr))
+                }),
                 SubmitAction::RetargetPr {
                     number,
                     bookmark,
                     from_base,
                     to_base,
-                } => match forge.update_pr_base(*number, to_base) {
-                    Ok(()) => {
-                        step.status = SubmitStepStatus::Done;
-                        step.detail = Some(format!(
+                } => forge.update_pr_base(*number, to_base).map(|()| {
+                    (
+                        format!(
                             "Retargeted #{number} ({bookmark}) from {from_base} to {to_base}"
-                        ));
-                    }
-                    Err(err) => {
-                        step.status = SubmitStepStatus::Failed;
-                        step.detail = Some(err.to_string());
-                        failed = true;
-                        break;
-                    }
-                },
+                        ),
+                        None,
+                    )
+                }),
+                SubmitAction::UpdatePrText {
+                    number,
+                    bookmark,
+                    title,
+                    body,
+                    seed,
+                } => forge.update_pr_text(*number, title.as_deref(), body).map(|()| {
+                    let story = if *seed {
+                        format!("Recorded Jiji's description fingerprints on #{number}")
+                    } else if title.is_some() {
+                        format!("Updated #{number}'s title and description from {bookmark}")
+                    } else {
+                        format!("Updated #{number}'s description from {bookmark}")
+                    };
+                    (story, None)
+                }),
+                SubmitAction::SyncStackComment { bookmark, number, .. } => {
+                    sync_stack_comment(plan, forge, &created, bookmark, *number)
+                        .map(|story| (story, None))
+                }
+            };
+            match result {
+                Ok((detail, pr)) => {
+                    step.status = SubmitStepStatus::Done;
+                    step.detail = Some(detail);
+                    step.pr = pr;
+                }
+                Err(err) => {
+                    step.status = SubmitStepStatus::Failed;
+                    step.detail = Some(err.to_string());
+                    failed = true;
+                    break;
+                }
             }
         }
     }
@@ -567,13 +820,86 @@ pub fn execute_submit(
     Ok(SubmitOutcome { steps, failed })
 }
 
+/// One comment step: resolve the PR (planned number or just created),
+/// re-read its existing comment, merge fossils, render, and write only
+/// when the text actually changes.
+fn sync_stack_comment(
+    plan: &SubmitPlan,
+    forge: &dyn SubmitForge,
+    created: &std::collections::HashMap<String, PrSummary>,
+    bookmark: &str,
+    number: Option<u64>,
+) -> Result<String, ForgeError> {
+    let number = number
+        .or_else(|| created.get(bookmark).map(|pr| pr.number))
+        .ok_or_else(|| {
+            ForgeError::Plan(format!(
+                "no pull request exists for \u{201c}{bookmark}\u{201d} to comment on"
+            ))
+        })?;
+    // The live stack as it stands after the steps above: the plan's
+    // segments that have a PR, links filled in from this run's creations.
+    let entries: Vec<StackEntry> = plan
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let pr = segment
+                .pr
+                .as_ref()
+                .or_else(|| created.get(&segment.bookmark))?;
+            Some(StackEntry {
+                bookmark: segment.bookmark.clone(),
+                number: Some(pr.number),
+                url: Some(pr.url.clone()),
+            })
+        })
+        .collect();
+    let existing = forge.stack_comment(number)?;
+    let previous = existing.as_ref().and_then(|c| parse_stack_data(&c.body));
+    let fossils = inherit_fossils(previous.as_ref(), &entries);
+    let body = render_stack_comment(&entries, &fossils, Some(bookmark));
+    match existing {
+        Some(existing) if existing.body == body => {
+            Ok(format!("The stack comment on #{number} already reads right"))
+        }
+        Some(existing) => {
+            forge.update_comment(existing.id, &body)?;
+            Ok(format!("Updated the stack comment on #{number}"))
+        }
+        None => {
+            forge.create_comment(number, &body)?;
+            Ok(format!("Posted the stack comment on #{number}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pr::{ChecksRollup, PrState, PrStateReport, ReviewDecision};
+    use crate::reconcile::{extract_managed_body, fingerprint, stored_body_fp};
     use crate::remote::ForgeProvider;
     use jiji_core::snapshot::{BookmarkState, ConflictItem, ConflictKind};
     use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// Planning against a forge with no stack comments anywhere.
+    struct NoComments;
+
+    impl StackCommentSource for NoComments {
+        fn stack_comment(&self, _number: u64) -> Result<Option<ExistingComment>, ForgeError> {
+            Ok(None)
+        }
+    }
+
+    /// Planning against known existing comments, keyed by PR number.
+    struct StubComments(HashMap<u64, ExistingComment>);
+
+    impl StackCommentSource for StubComments {
+        fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError> {
+            Ok(self.0.get(&number).cloned())
+        }
+    }
 
     fn node(
         id: &str,
@@ -639,8 +965,19 @@ mod tests {
             head_commit: "feedface".into(),
             head_owner: Some("o".into()),
             base_branch: base.into(),
+            body: None,
             review: ReviewDecision::None,
             checks: ChecksRollup::None,
+        }
+    }
+
+    /// A PR whose title and body already read exactly as Jiji would write
+    /// them for the given commit text — the in-sync state.
+    fn text_pr(number: u64, head: &str, base: &str, title: &str, commit_body: &str) -> PrSummary {
+        PrSummary {
+            title: title.into(),
+            body: Some(wrap_managed_body(commit_body, title)),
+            ..open_pr(number, head, base)
         }
     }
 
@@ -683,16 +1020,17 @@ mod tests {
     }
 
     #[test]
-    fn plans_pushes_creations_and_retargets_bottom_up() {
+    fn plans_pushes_creations_retargets_text_and_comments_in_order() {
         let mut snap = stack_snapshot();
         // `auth` segments at a2 (its bookmark target), profile above it.
         snap.bookmarks[1].target = "a2".into();
         snap.nodes[1].bookmarks = vec!["auth".into()];
         snap.nodes[2].bookmarks = vec![];
-        // profile already has a PR, parked on the wrong base.
+        // profile already has a PR, parked on the wrong base, with a title
+        // Jiji never wrote and an empty body.
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
         assert_eq!(plan.base_branch, "main");
         assert_eq!(plan.remote, "origin");
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
@@ -707,8 +1045,9 @@ mod tests {
         assert_eq!(plan.segments[0].title, "auth: login flow");
         assert_eq!(plan.segments[1].pr.as_ref().unwrap().number, 7);
 
+        assert_eq!(plan.actions.len(), 7, "{:?}", plan.actions);
         assert_eq!(
-            plan.actions,
+            plan.actions[..4].to_vec(),
             vec![
                 SubmitAction::Push { bookmark: "auth".into(), create: true },
                 SubmitAction::Push { bookmark: "profile".into(), create: false },
@@ -716,8 +1055,9 @@ mod tests {
                     bookmark: "auth".into(),
                     base: "main".into(),
                     title: "auth: login flow".into(),
-                    // Body keeps the prose, drops the trailer block.
-                    body: "The form.".into(),
+                    // The prose survives, the trailer block drops, and the
+                    // body is born sentinel-wrapped and fingerprinted.
+                    body: wrap_managed_body("The form.", "auth: login flow"),
                 },
                 SubmitAction::RetargetPr {
                     number: 7,
@@ -727,23 +1067,298 @@ mod tests {
                 },
             ]
         );
+        // #7's empty body fills in from the commit; the hand-written title
+        // is not claimed (no title fingerprint), only warned about.
+        let SubmitAction::UpdatePrText { number, title, body, seed, .. } = &plan.actions[4]
+        else {
+            panic!("expected UpdatePrText, got {:?}", plan.actions[4]);
+        };
+        assert_eq!(*number, 7);
+        assert_eq!(*title, None);
+        assert!(!seed);
+        assert_eq!(extract_managed_body(body), Some("With uploads."));
+        assert_eq!(stored_body_fp(body), Some(fingerprint("With uploads.").as_str()));
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("PR 7") && w.contains("title")),
+            "{:?}",
+            plan.warnings
+        );
+        // A creation is pending, so every live PR syncs its stack comment;
+        // the created PR's number is unknowable until execution.
+        assert_eq!(
+            plan.actions[5..].to_vec(),
+            vec![
+                SubmitAction::SyncStackComment {
+                    bookmark: "auth".into(),
+                    number: None,
+                    create: true,
+                },
+                SubmitAction::SyncStackComment {
+                    bookmark: "profile".into(),
+                    number: Some(7),
+                    create: true,
+                },
+            ]
+        );
+        let preview = plan.stack_comment_preview.as_deref().expect("preview renders");
+        assert!(preview.contains("1. `auth`"), "created PRs render plain: {preview}");
+        assert!(preview.contains("[`profile`]"), "existing PRs link: {preview}");
     }
 
-    #[test]
-    fn consistent_stacks_plan_nothing() {
+    /// The fully-synced fixture: bookmarks synced, PR bases right, PR text
+    /// exactly as Jiji writes it, and both stack comments current.
+    fn consistent_stack() -> (RepoSnapshot, RepoPrState, StubComments) {
         let mut snap = stack_snapshot();
         snap.bookmarks[1].sync = SyncState::Synced;
         snap.bookmarks[1].remote = Some("origin".into());
         snap.bookmarks[2].sync = SyncState::Synced;
         let prs = pr_state(
-            vec![open_pr(6, "auth", "main"), open_pr(7, "profile", "auth")],
+            vec![
+                text_pr(6, "auth", "main", "auth: login flow", "The form."),
+                // The upper PR's commit has no body: an empty body with no
+                // markers is also in-sync (nothing to manage yet).
+                PrSummary {
+                    title: "auth: sessions".into(),
+                    ..open_pr(7, "profile", "auth")
+                },
+            ],
             false,
         );
+        let entries = vec![
+            crate::comment::StackEntry {
+                bookmark: "auth".into(),
+                number: Some(6),
+                url: Some("https://github.com/o/r/pull/6".into()),
+            },
+            crate::comment::StackEntry {
+                bookmark: "profile".into(),
+                number: Some(7),
+                url: Some("https://github.com/o/r/pull/7".into()),
+            },
+        ];
+        let comments = StubComments(HashMap::from([
+            (
+                6,
+                ExistingComment {
+                    id: 60,
+                    body: render_stack_comment(&entries, &[], Some("auth")),
+                },
+            ),
+            (
+                7,
+                ExistingComment {
+                    id: 70,
+                    body: render_stack_comment(&entries, &[], Some("profile")),
+                },
+            ),
+        ]));
+        (snap, prs, comments)
+    }
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+    #[test]
+    fn consistent_stacks_plan_nothing() {
+        let (snap, prs, comments) = consistent_stack();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.blockers.is_empty());
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.stack_comment_preview, None);
         assert_eq!(plan.segments.len(), 2);
+    }
+
+    #[test]
+    fn stale_pr_text_updates_and_hand_edits_are_respected() {
+        // The auth commit's body moved since Jiji wrote #6.
+        let (mut snap, prs, comments) = consistent_stack();
+        snap.nodes[2].description =
+            "auth: login flow\n\nThe form, now with validation.".into();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let updates: Vec<_> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                SubmitAction::UpdatePrText { number, body, seed, title, .. } => {
+                    Some((*number, body.clone(), *seed, title.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates.len(), 1, "{:?}", plan.actions);
+        let (number, body, seed, title) = &updates[0];
+        assert_eq!(*number, 6);
+        assert!(!seed);
+        assert_eq!(*title, None, "the title did not move");
+        assert_eq!(
+            extract_managed_body(body),
+            Some("The form, now with validation.")
+        );
+
+        // The same drift on GitHub's side instead: the user rewrote the
+        // managed section, the commit is unchanged — nothing plans.
+        let (snap, mut prs, _) = consistent_stack();
+        let hand_edited = wrap_managed_body("The form.", "auth: login flow")
+            .replace("The form.", "My hand-written description.");
+        prs.report.prs[0].body = Some(hand_edited.clone());
+        prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
+        let (_, _, comments) = consistent_stack();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        // Both sides moved: no action, a warning that names the conflict.
+        let (mut snap, mut prs, _) = consistent_stack();
+        snap.nodes[2].description = "auth: login flow\n\nRewritten in the commit.".into();
+        let hand_edited = wrap_managed_body("The form.", "auth: login flow")
+            .replace("The form.", "Rewritten on GitHub.");
+        prs.report.prs[0].body = Some(hand_edited.clone());
+        prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
+        let (_, _, comments) = consistent_stack();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        assert!(
+            !plan.actions.iter().any(|a| matches!(a, SubmitAction::UpdatePrText { .. })),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("#6") && w.contains("both changed")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn titles_update_through_their_fingerprint() {
+        // Jiji wrote #6's title; the commit's first line moved.
+        let (mut snap, prs, comments) = consistent_stack();
+        snap.nodes[2].description = "auth: login and signup flow\n\nThe form.".into();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let update = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                SubmitAction::UpdatePrText { number: 6, title, body, seed, .. } => {
+                    Some((title.clone(), body.clone(), *seed))
+                }
+                _ => None,
+            })
+            .expect("the title update plans");
+        assert_eq!(update.0.as_deref(), Some("auth: login and signup flow"));
+        assert!(!update.2);
+        // The managed body text is untouched by a title-only update.
+        assert_eq!(extract_managed_body(&update.1), Some("The form."));
+    }
+
+    #[test]
+    fn identical_markerless_bodies_adopt_quietly() {
+        // A PR created before fingerprinting: right text, no markers.
+        let (snap, mut prs, comments) = consistent_stack();
+        prs.report.prs[0].body = Some("The form.".into());
+        prs.by_branch.get_mut("auth").unwrap().body = Some("The form.".into());
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let seed = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                SubmitAction::UpdatePrText { number: 6, seed, body, .. } => {
+                    Some((*seed, body.clone()))
+                }
+                _ => None,
+            })
+            .expect("adoption plans a seed write");
+        assert!(seed.0, "nothing visible changes");
+        assert_eq!(extract_managed_body(&seed.1), Some("The form."));
+
+        // A markerless body that reads differently is the user's: silence.
+        let (snap, mut prs, comments) = consistent_stack();
+        prs.report.prs[0].body = Some("A description someone wrote by hand.".into());
+        prs.by_branch.get_mut("auth").unwrap().body =
+            Some("A description someone wrote by hand.".into());
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn stack_comments_sync_only_when_stale() {
+        // One comment drifted (say the user edited it): exactly one
+        // update plans, aimed at that comment.
+        let (snap, prs, mut comments) = consistent_stack();
+        comments.0.get_mut(&7).unwrap().body = "someone touched this".into();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![SubmitAction::SyncStackComment {
+                bookmark: "profile".into(),
+                number: Some(7),
+                create: false,
+            }]
+        );
+        assert!(plan.stack_comment_preview.is_some());
+
+        // No comments exist yet on a two-PR stack: both get one.
+        let (snap, prs, _) = consistent_stack();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let syncs: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SubmitAction::SyncStackComment { .. }))
+            .collect();
+        assert_eq!(syncs.len(), 2, "{:?}", plan.actions);
+        assert!(matches!(
+            *syncs[0],
+            SubmitAction::SyncStackComment { number: Some(6), create: true, .. }
+        ));
+
+        // A single-PR stack never gets a first comment…
+        let (mut snap, mut prs, _) = consistent_stack();
+        snap.bookmarks.remove(1); // drop `auth`
+        snap.nodes[2].bookmarks = vec![];
+        prs.report.prs.remove(0);
+        prs.by_branch.remove("auth");
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        assert!(
+            !plan.actions.iter().any(|a| matches!(a, SubmitAction::SyncStackComment { .. })),
+            "{:?}",
+            plan.actions
+        );
+
+        // …but an existing one keeps updating as the stack shrinks: the
+        // now-gone `auth` entry is inherited as a fossil.
+        let entries = vec![crate::comment::StackEntry {
+            bookmark: "profile".into(),
+            number: Some(7),
+            url: Some("https://github.com/o/r/pull/7".into()),
+        }];
+        let previous = render_stack_comment(
+            &[
+                crate::comment::StackEntry {
+                    bookmark: "auth".into(),
+                    number: Some(6),
+                    url: Some("https://github.com/o/r/pull/6".into()),
+                },
+                entries[0].clone(),
+            ],
+            &[],
+            Some("profile"),
+        );
+        let comments = StubComments(HashMap::from([(
+            7,
+            ExistingComment { id: 70, body: previous },
+        )]));
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let syncs: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SubmitAction::SyncStackComment { .. }))
+            .collect();
+        assert_eq!(
+            syncs,
+            vec![&SubmitAction::SyncStackComment {
+                bookmark: "profile".into(),
+                number: Some(7),
+                create: false,
+            }]
+        );
     }
 
     #[test]
@@ -752,7 +1367,7 @@ mod tests {
         snap.nodes[1].description = String::new(); // a2, in auth's segment
         snap.nodes[0].has_conflict = true; // b1, profile's segment
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
         assert_eq!(plan.blockers.len(), 2, "{:?}", plan.blockers);
         assert!(plan.blockers[0].contains("no description"), "{:?}", plan.blockers);
         assert!(plan.blockers[1].contains("has conflicts"), "{:?}", plan.blockers);
@@ -764,7 +1379,7 @@ mod tests {
         synced.bookmarks[1].sync = SyncState::Synced;
         synced.bookmarks[1].remote = Some("origin".into());
         synced.bookmarks[2].sync = SyncState::Synced;
-        let plan = plan_submit(&synced, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&synced, &prs, &forge_repo(), "profile", &NoComments).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     }
 
@@ -774,7 +1389,7 @@ mod tests {
         snap.nodes[1].is_empty = true; // a2
         snap.nodes[2].is_empty = true; // a1 — auth's whole segment empty
         let prs = pr_state(vec![], true);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
 
         // auth neither pushes nor gets a PR, but profile still bases on it.
         assert!(plan
@@ -814,7 +1429,7 @@ mod tests {
             workspace: None,
         });
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
         assert!(
             plan.blockers.iter().any(|b| b.contains("is conflicted")),
             "{:?}",
@@ -822,15 +1437,15 @@ mod tests {
         );
 
         let snap = stack_snapshot();
-        let err = plan_submit(&snap, &prs, &forge_repo(), "nope").unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), "nope", &NoComments).unwrap_err();
         assert_eq!(err.code(), "plan_failed");
-        let err = plan_submit(&snap, &prs, &forge_repo(), "main").unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), "main", &NoComments).unwrap_err();
         assert!(err.to_string().contains("trunk"), "{err}");
         // A bookmark parked on immutable history has nothing to publish.
         let mut on_trunk = stack_snapshot();
         on_trunk.bookmarks.push(bookmark("old", "m", SyncState::LocalOnly, false));
         on_trunk.nodes[3].bookmarks.push("old".into());
-        let err = plan_submit(&on_trunk, &prs, &forge_repo(), "old").unwrap_err();
+        let err = plan_submit(&on_trunk, &prs, &forge_repo(), "old", &NoComments).unwrap_err();
         assert!(err.to_string().contains("immutable"), "{err}");
     }
 
@@ -844,7 +1459,7 @@ mod tests {
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(9, "auth-alias", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].bookmark, "auth-alias");
         assert!(
@@ -883,6 +1498,13 @@ mod tests {
     struct StubForge {
         log: RefCell<Vec<String>>,
         fail_create: Option<String>,
+        comments: RefCell<HashMap<u64, ExistingComment>>,
+    }
+
+    impl StackCommentSource for StubForge {
+        fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError> {
+            Ok(self.comments.borrow().get(&number).cloned())
+        }
     }
 
     impl SubmitForge for StubForge {
@@ -904,6 +1526,35 @@ mod tests {
             self.log.borrow_mut().push(format!("retarget #{number}->{base}"));
             Ok(())
         }
+
+        fn update_pr_text(
+            &self,
+            number: u64,
+            title: Option<&str>,
+            _body: &str,
+        ) -> Result<(), ForgeError> {
+            self.log.borrow_mut().push(format!(
+                "text #{number} title:{}",
+                title.unwrap_or("unchanged")
+            ));
+            Ok(())
+        }
+
+        fn create_comment(&self, number: u64, body: &str) -> Result<(), ForgeError> {
+            self.log.borrow_mut().push(format!("comment-create #{number}"));
+            self.comments.borrow_mut().insert(
+                number,
+                ExistingComment { id: number * 10, body: body.to_owned() },
+            );
+            Ok(())
+        }
+
+        fn update_comment(&self, comment_id: u64, _body: &str) -> Result<(), ForgeError> {
+            self.log
+                .borrow_mut()
+                .push(format!("comment-update id:{comment_id}"));
+            Ok(())
+        }
     }
 
     fn plan_with_all_action_kinds() -> SubmitPlan {
@@ -912,7 +1563,7 @@ mod tests {
         snap.nodes[1].bookmarks = vec!["auth".into()];
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
-        plan_submit(&snap, &prs, &forge_repo(), "profile").unwrap()
+        plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap()
     }
 
     #[test]
@@ -929,11 +1580,16 @@ mod tests {
             vcs.calls.borrow().as_slice(),
             &[(vec!["auth".to_owned(), "profile".to_owned()], "origin".to_owned())]
         );
+        // The comment on `auth` resolves the number from the PR the create
+        // step just opened (#42).
         assert_eq!(
             forge.log.borrow().as_slice(),
             &[
                 "create auth->main: auth: login flow".to_owned(),
                 "retarget #7->auth".to_owned(),
+                "text #7 title:unchanged".to_owned(),
+                "comment-create #42".to_owned(),
+                "comment-create #7".to_owned(),
             ]
         );
         let created = outcome
@@ -942,6 +1598,99 @@ mod tests {
             .find(|s| matches!(s.action, SubmitAction::CreatePr { .. }))
             .unwrap();
         assert_eq!(created.pr.as_ref().unwrap().number, 42);
+        // Both comments list the whole stack, with their own PR bolded and
+        // the created PR's real link filled in.
+        let comments = forge.comments.borrow();
+        let on_created = &comments[&42].body;
+        assert!(on_created.contains("**`auth` ← this PR**"), "{on_created}");
+        assert!(on_created.contains("[`profile`](https://github.com/o/r/pull/7)"));
+        let on_existing = &comments[&7].body;
+        assert!(on_existing.contains("[`auth`](https://github.com/o/r/pull/42)"));
+        assert!(on_existing.contains("**`profile` ← this PR**"));
+    }
+
+    #[test]
+    fn comment_steps_merge_fossils_and_skip_current_comments() {
+        // The plan syncs one existing PR's comment (no creations pending).
+        let (snap, prs, _) = consistent_stack();
+        let previous_with_fossil = {
+            let entries = vec![
+                crate::comment::StackEntry {
+                    bookmark: "landed".into(),
+                    number: Some(4),
+                    url: Some("https://github.com/o/r/pull/4".into()),
+                },
+                crate::comment::StackEntry {
+                    bookmark: "auth".into(),
+                    number: Some(6),
+                    url: Some("https://github.com/o/r/pull/6".into()),
+                },
+            ];
+            render_stack_comment(&entries, &[], Some("auth"))
+        };
+        let comments = StubComments(HashMap::from([(
+            6,
+            ExistingComment { id: 60, body: previous_with_fossil.clone() },
+        )]));
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+
+        let forge = StubForge::default();
+        forge.comments.borrow_mut().insert(
+            6,
+            ExistingComment { id: 60, body: previous_with_fossil },
+        );
+        let vcs = StubVcs::default();
+        let outcome = execute_submit(&plan, &vcs, &forge).unwrap();
+        assert!(!outcome.failed);
+        // `landed` left the local stack; it survives struck-through, and
+        // #7's missing comment is posted alongside the #6 edit.
+        let log = forge.log.borrow();
+        assert!(log.iter().any(|l| l == "comment-update id:60"), "{log:?}");
+        assert!(log.iter().any(|l| l == "comment-create #7"), "{log:?}");
+        let update_step = outcome
+            .steps
+            .iter()
+            .find(|s| {
+                matches!(s.action, SubmitAction::SyncStackComment { number: Some(6), .. })
+            })
+            .unwrap();
+        assert!(update_step.detail.as_deref().unwrap().contains("Updated"));
+
+        // Re-running against the now-current comments plans nothing.
+        let fresh = StubComments(forge.comments.borrow().clone());
+        // The #6 update above logged but did not store; store it like the
+        // real forge would so the replan sees the written body.
+        let replan_comments = {
+            let mut map = fresh.0;
+            let entries = vec![
+                crate::comment::StackEntry {
+                    bookmark: "auth".into(),
+                    number: Some(6),
+                    url: Some("https://github.com/o/r/pull/6".into()),
+                },
+                crate::comment::StackEntry {
+                    bookmark: "profile".into(),
+                    number: Some(7),
+                    url: Some("https://github.com/o/r/pull/7".into()),
+                },
+            ];
+            let fossils = vec![crate::comment::StackDataItem {
+                bookmark: "landed".into(),
+                number: 4,
+                url: "https://github.com/o/r/pull/4".into(),
+            }];
+            map.insert(
+                6,
+                ExistingComment {
+                    id: 60,
+                    body: render_stack_comment(&entries, &fossils, Some("auth")),
+                },
+            );
+            StubComments(map)
+        };
+        let plan =
+            plan_submit(&snap, &prs, &forge_repo(), "profile", &replan_comments).unwrap();
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
     }
 
     #[test]
@@ -963,7 +1712,8 @@ mod tests {
         }
         assert!(forge.log.borrow().is_empty());
 
-        // A PR creation fails: the push stays done, the retarget skips.
+        // A PR creation fails: the pushes stay done, everything after —
+        // retarget, text update, both comments — skips.
         let vcs = StubVcs::default();
         let forge = StubForge { fail_create: Some("auth".into()), ..Default::default() };
         let outcome = execute_submit(&plan, &vcs, &forge).unwrap();
@@ -976,6 +1726,9 @@ mod tests {
                 SubmitStepStatus::Done,
                 SubmitStepStatus::Done,
                 SubmitStepStatus::Failed,
+                SubmitStepStatus::Skipped,
+                SubmitStepStatus::Skipped,
+                SubmitStepStatus::Skipped,
                 SubmitStepStatus::Skipped,
             ]
         );
