@@ -279,6 +279,39 @@ pub trait RepoBackend: Send + Sync {
     /// remote counterpart is deleted on the next push, like the CLI.
     fn delete_bookmark(&self, path: &Path, name: &str) -> Result<MutationOutcome, BackendError>;
 
+    /// Push bookmarks to a git remote (`jj git push --bookmark <name>...`),
+    /// pinned against jj 0.41. Each named bookmark's remote counterpart is
+    /// updated to the local position with force-with-lease semantics: the
+    /// remote is expected to sit where the last fetch recorded it, so a
+    /// remote moved by someone else refuses instead of overwriting their
+    /// work. A bookmark with no remote counterpart is created and starts
+    /// tracking it (the CLI's auto-track on push); a locally-deleted
+    /// bookmark whose tracked remote still exists propagates the deletion.
+    /// Backwards and sideways moves push fine — rewriting is jj's normal
+    /// state of affairs and the lease is the safety.
+    ///
+    /// `remote` picks the git remote by name; `None` resolves like the CLI:
+    /// the `git.push` setting, else the repo's sole remote, else "origin".
+    /// Like the CLI, commits that would land on the remote are checked
+    /// first — no description, conflicts, or a missing author/committer
+    /// refuse the push before anything runs. Conflicted bookmarks and
+    /// non-tracking remote counterparts refuse like the CLI. Pushing
+    /// everything already matching records nothing.
+    ///
+    /// Curated deviations, both documented on the implementation: a name
+    /// with nothing to push anywhere is refused (the CLI warns "No matching
+    /// bookmarks" and exits cleanly — from an explicit UI action that is a
+    /// bug), and when the remote rejects only part of a multi-bookmark push
+    /// the accepted subset still records its operation while the refusal
+    /// lists what moved on the remote (the CLI prints the same story but
+    /// buries the partial success in warnings).
+    fn push_bookmarks(
+        &self,
+        path: &Path,
+        names: &[String],
+        remote: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Revert one earlier operation by applying its inverse on top of the
     /// current state (`jj op revert <op>`); everything recorded after it
     /// stays. Reverting the operation a mutation just recorded is the
@@ -374,11 +407,13 @@ impl MockBackend {
         let index = mutations.len();
         let mut outcome = crate::mock::mutation_outcome(&snapshot, &mutations, &mutation, index)?;
         if outcome.operation_id.is_some() {
+            let follows_working_copy = mutation.is_time_travel();
             mutations.push(mutation);
             drop(mutations);
             // Revert/restore outcomes follow the working copy, which only
-            // the replayed snapshot knows.
-            if outcome.target_change.is_none() {
+            // the replayed snapshot knows; other mutations answering no
+            // target (a push moves nothing local) keep it that way.
+            if follows_working_copy && outcome.target_change.is_none() {
                 outcome.target_change = Some(self.overlaid_snapshot(path)?.working_copy);
             }
         }
@@ -611,6 +646,21 @@ impl RepoBackend for MockBackend {
             path,
             crate::mock::MockMutation::DeleteBookmark {
                 name: name.trim().to_owned(),
+            },
+        )
+    }
+
+    fn push_bookmarks(
+        &self,
+        path: &Path,
+        names: &[String],
+        remote: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::Push {
+                names: names.iter().map(|n| n.trim().to_owned()).collect(),
+                remote: remote.unwrap_or("origin").to_owned(),
             },
         )
     }
@@ -984,6 +1034,65 @@ mod tests {
         // parent happens to be the destination here, like `jj squash -r`.
         let tmp = after.bookmarks.iter().find(|b| b.name == "tmp").unwrap();
         assert_eq!(tmp.target, wc_parent);
+    }
+
+    #[test]
+    fn mock_push_replays_tracking_and_sync_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+        let local_only = before
+            .bookmarks
+            .iter()
+            .find(|b| b.name == "diff-virtualization")
+            .unwrap();
+        assert_eq!(local_only.sync, crate::snapshot::SyncState::LocalOnly);
+
+        // Pushing the local-only bookmark (already-synced main just skips)
+        // records one op with the CLI's description; it reads tracked and
+        // synced after.
+        let outcome = backend
+            .push_bookmarks(
+                dir.path(),
+                &["main".into(), "diff-virtualization".into()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(outcome.summary, "Pushed diff-virtualization to origin");
+        assert!(outcome.target_change.is_none());
+        let after = backend.open(dir.path()).unwrap();
+        let pushed = after
+            .bookmarks
+            .iter()
+            .find(|b| b.name == "diff-virtualization")
+            .unwrap();
+        assert_eq!(pushed.sync, crate::snapshot::SyncState::Synced);
+        assert_eq!(pushed.remote.as_deref(), Some("origin"));
+        assert_eq!(
+            after.operations[0].description,
+            "push bookmark diff-virtualization to git remote origin"
+        );
+
+        // Re-pushing records nothing; conflicted bookmarks, bookmarks on
+        // conflicted changes, and unknown names refuse like the real
+        // backend.
+        let noop = backend
+            .push_bookmarks(dir.path(), &["diff-virtualization".into()], None)
+            .unwrap();
+        assert!(noop.operation_id.is_none());
+        let err = backend
+            .push_bookmarks(dir.path(), &["watcher-fix".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("is conflicted"), "{err}");
+        let err = backend
+            .push_bookmarks(dir.path(), &["conflict-inbox".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("has conflicts"), "{err}");
+        let err = backend
+            .push_bookmarks(dir.path(), &["nope".into()], None)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::BookmarkMissing(_)), "got {err:?}");
     }
 
     #[test]

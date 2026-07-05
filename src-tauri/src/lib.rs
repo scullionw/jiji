@@ -48,7 +48,9 @@ pub fn run() {
             forge::forge_verify,
             forge::forge_login,
             forge::forge_logout,
-            forge::forge_prs
+            forge::forge_prs,
+            forge::submit_plan,
+            forge::submit_stack
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

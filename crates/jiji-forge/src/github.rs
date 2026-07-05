@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use crate::error::ForgeError;
-use crate::pr::{parse_open_prs, PrStateReport};
+use crate::pr::{parse_open_prs, PrStateReport, PrSummary};
 use crate::remote::ForgeRepo;
 
 /// One batched query per repo: open PRs with review decision and check
@@ -97,6 +97,41 @@ impl GitHubClient {
         parse_open_prs(&data)
     }
 
+    /// Open a pull request (`POST /repos/{owner}/{name}/pulls`). `head` is
+    /// the pushed branch, `base` what it merges into. Created ready (not
+    /// draft) — draft handling belongs to a later slice.
+    pub fn create_pr(
+        &self,
+        owner: &str,
+        name: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PrSummary, ForgeError> {
+        let answer = self.post(
+            &format!("repos/{owner}/{name}/pulls"),
+            &json!({ "title": title, "body": body, "head": head, "base": base, "draft": false }),
+        )?;
+        crate::pr::parse_rest_pr(&answer)
+    }
+
+    /// Retarget an existing PR's base branch
+    /// (`PATCH /repos/{owner}/{name}/pulls/{number}`).
+    pub fn update_pr_base(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        base: &str,
+    ) -> Result<(), ForgeError> {
+        self.patch(
+            &format!("repos/{owner}/{name}/pulls/{number}"),
+            &json!({ "base": base }),
+        )?;
+        Ok(())
+    }
+
     fn get(&self, path: &str) -> Result<Value, ForgeError> {
         let url = format!("{}{}", self.api_root, path);
         let response = self
@@ -104,6 +139,36 @@ impl GitHubClient {
             .get(&url)
             .send()
             .map_err(|err| ForgeError::Network(err.to_string()))?;
+        Self::read_json("GET", path, response)
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Result<Value, ForgeError> {
+        let url = format!("{}{}", self.api_root, path);
+        let response = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        Self::read_json("POST", path, response)
+    }
+
+    fn patch(&self, path: &str, body: &Value) -> Result<Value, ForgeError> {
+        let url = format!("{}{}", self.api_root, path);
+        let response = self
+            .http
+            .patch(&url)
+            .json(body)
+            .send()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        Self::read_json("PATCH", path, response)
+    }
+
+    fn read_json(
+        method: &str,
+        path: &str,
+        response: reqwest::blocking::Response,
+    ) -> Result<Value, ForgeError> {
         let status = response.status();
         let text = response
             .text()
@@ -111,8 +176,9 @@ impl GitHubClient {
         if !status.is_success() {
             return Err(classify_http_failure(status, &text));
         }
-        serde_json::from_str(&text)
-            .map_err(|err| ForgeError::Api(format!("GET {path} answered malformed JSON: {err}")))
+        serde_json::from_str(&text).map_err(|err| {
+            ForgeError::Api(format!("{method} {path} answered malformed JSON: {err}"))
+        })
     }
 
     /// POST a GraphQL query and unwrap the `data` object; GraphQL-level

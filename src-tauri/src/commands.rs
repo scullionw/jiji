@@ -179,6 +179,28 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// The latest published snapshot — what the user currently sees, which
+    /// is what submit plans must be derived from.
+    pub(crate) fn current_snapshot_clone(&self) -> Option<RepoSnapshot> {
+        self.current
+            .lock()
+            .expect("snapshot state lock poisoned")
+            .clone()
+    }
+
+    /// Push bookmarks through the backend and republish the refreshed
+    /// snapshot, like every other mutation — the submit executor's jj half.
+    pub(crate) fn push_and_publish(
+        &self,
+        app: &AppHandle,
+        names: &[String],
+        remote: &str,
+    ) -> Result<MutationOutcome, CommandError> {
+        self.mutate(app, |backend, path| {
+            backend.push_bookmarks(path, names, Some(remote))
+        })
+    }
+
     fn open_repo_path(&self) -> Result<String, CommandError> {
         self.current
             .lock()

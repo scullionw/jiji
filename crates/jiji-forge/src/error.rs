@@ -19,6 +19,8 @@ pub enum ForgeError {
     Network(String),
     #[error("Could not access the system keychain: {0}")]
     Keychain(String),
+    #[error("Cannot submit this stack: {0}")]
+    Plan(String),
 }
 
 impl ForgeError {
@@ -32,6 +34,7 @@ impl ForgeError {
             ForgeError::Api(_) => "api_failed",
             ForgeError::Network(_) => "network_failed",
             ForgeError::Keychain(_) => "keychain_failed",
+            ForgeError::Plan(_) => "plan_failed",
         }
     }
 }

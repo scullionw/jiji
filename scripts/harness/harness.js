@@ -52,6 +52,13 @@
 //                        connection is verified
 //   &prstrunc=1          the fabricated report says it was capped at 100
 //                        PRs (the Publish section states it)
+//   &splan=<bookmark>    click that stack row in Publish and wait for its
+//                        submit plan (a JS twin of plan_submit over the
+//                        captured snapshot + &prs= state). Needs &forge=
+//   &sgo=1               click Publish on the derived plan and wait for
+//                        the executed per-step results (stubbed: pushes
+//                        mark bookmarks synced, created PRs join the
+//                        fabricated open-PR state)
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -291,6 +298,9 @@
   const forge = {
     source: forgeSourceByParam[params.get("forge")] || null,
     login: params.get("fuser") || "jiji-dev",
+    // PRs the stubbed submit_stack opened this session; forge_prs folds
+    // them in so the refreshed count and badges follow the executed flow.
+    createdPrs: [],
   };
   // A JS twin of the backend's GitHub detection, just enough for shots:
   // github.com HTTPS/SSH forms, origin > upstream > name order.
@@ -373,8 +383,9 @@
           checks,
         };
       });
+    const all = prs.concat(forge.createdPrs);
     const byBranch = {};
-    for (const pr of prs) {
+    for (const pr of all) {
       const sameRepo =
         repo &&
         pr.headOwner &&
@@ -382,8 +393,111 @@
       if (sameRepo && !(pr.headBranch in byBranch)) byBranch[pr.headBranch] = pr;
     }
     return {
-      report: { prs, truncated: Boolean(params.get("prstrunc")) },
+      report: { prs: all, truncated: Boolean(params.get("prstrunc")) },
       byBranch,
+    };
+  };
+
+  // A JS twin of jiji-forge's plan_submit, just enough for shots: walk
+  // first parents from the bookmark to the immutable base, segment at
+  // local non-trunk bookmarks, compare against the fabricated PR state.
+  // Blockers/warnings mirror the Rust wording the panel renders.
+  const submitPlanOf = (snap, head) => {
+    const repo = forgeRepoOf(snap);
+    const prState = forgePrsOf(snap);
+    const local = new Map(
+      (snap.bookmarks || [])
+        .filter((b) => b.isLocal && !b.isTrunk)
+        .map((b) => [b.name, b]),
+    );
+    const state = local.get(head);
+    if (!state) return null;
+    const nodes = new Map(snap.nodes.map((n) => [n.id, n]));
+    const chain = [];
+    let cursor = nodes.get(state.target);
+    while (cursor && cursor.kind !== "immutable") {
+      chain.push(cursor);
+      cursor = nodes.get(cursor.parents[0]);
+    }
+    chain.reverse();
+    const segments = [];
+    const actions = [];
+    const prActions = [];
+    const blockers = [];
+    const warnings = [];
+    let base = snap.trunkBookmark;
+    let pending = [];
+    for (const node of chain) {
+      pending.push(node);
+      const names = node.bookmarks
+        .filter((name) => local.has(name))
+        .sort(
+          (a, b) =>
+            (a !== head) - (b !== head) ||
+            !(a in prState.byBranch) - !(b in prState.byBranch) ||
+            a.localeCompare(b),
+        );
+      if (!names.length) continue;
+      const name = names[0];
+      const segNodes = pending;
+      pending = [];
+      const bottom = segNodes[0];
+      const title = (bottom.description || name).split("\n")[0];
+      const pr = prState.byBranch[name] || null;
+      segments.push({
+        bookmark: name,
+        base,
+        changeIds: segNodes.map((n) => n.id),
+        title,
+        pr,
+      });
+      if (segNodes.every((n) => n.isEmpty)) {
+        warnings.push(
+          `every change under \u{201c}${name}\u{201d} is empty; skipping its push and PR`,
+        );
+        base = name;
+        continue;
+      }
+      const bm = local.get(name);
+      if (bm.sync !== "synced" || !bm.remote) {
+        for (const n of segNodes) {
+          if (!n.description)
+            blockers.push(`${n.changeId} has no description; describe it first`);
+          if (n.hasConflict)
+            blockers.push(`${n.changeId} has conflicts; resolve them first`);
+        }
+        actions.push({ kind: "push", bookmark: name, create: bm.sync === "localOnly" });
+      }
+      if (pr) {
+        if (pr.baseBranch !== base)
+          prActions.push({
+            kind: "retargetPr",
+            number: pr.number,
+            bookmark: name,
+            fromBase: pr.baseBranch,
+            toBase: base,
+          });
+      } else {
+        prActions.push({
+          kind: "createPr",
+          bookmark: name,
+          base,
+          title,
+          body: "",
+        });
+      }
+      base = name;
+    }
+    actions.push(...prActions.filter((a) => a.kind === "createPr"));
+    actions.push(...prActions.filter((a) => a.kind === "retargetPr"));
+    return {
+      headBookmark: head,
+      remote: repo ? repo.remote : "origin",
+      baseBranch: snap.trunkBookmark,
+      segments,
+      actions,
+      blockers,
+      warnings,
     };
   };
 
@@ -1221,6 +1335,69 @@
             return reject("no_token", "no GitHub token is available");
           return Promise.resolve(forgePrsOf(snap));
         }
+        // The publish-stack workflow: the plan derives from the captured
+        // snapshot + fabricated PR state via a JS twin of plan_submit;
+        // executing marks pushed bookmarks synced in the live snapshot and
+        // remembers created PRs so the refreshed count/badges follow.
+        case "submit_plan": {
+          const plan = submitPlanOf(snap, args?.headBookmark);
+          if (!plan)
+            return reject(
+              "plan_failed",
+              `there is no local bookmark named \u{201c}${args?.headBookmark}\u{201d}`,
+            );
+          return Promise.resolve(plan);
+        }
+        case "submit_stack": {
+          const plan = submitPlanOf(snap, args?.headBookmark);
+          if (!plan) return reject("plan_failed", "the bookmark is gone");
+          const pushed = plan.actions.filter((a) => a.kind === "push");
+          const pushDetail = `Pushed ${
+            pushed.length === 1 ? pushed[0].bookmark : `${pushed.length} bookmarks`
+          } to ${plan.remote}`;
+          for (const action of pushed) {
+            const bm = snap.bookmarks.find((b) => b.name === action.bookmark);
+            if (bm) {
+              bm.sync = "synced";
+              bm.remote = plan.remote;
+            }
+          }
+          const repo = forgeRepoOf(snap);
+          const steps = plan.actions.map((action) => {
+            if (action.kind === "push")
+              return { action, status: "done", detail: pushDetail, pr: null };
+            if (action.kind === "createPr") {
+              const number = 201 + forge.createdPrs.length;
+              const pr = {
+                number,
+                title: action.title,
+                url: `https://github.com/${repo ? `${repo.owner}/${repo.name}` : "o/r"}/pull/${number}`,
+                state: "open",
+                isDraft: false,
+                headBranch: action.bookmark,
+                headCommit: "ad".repeat(20),
+                headOwner: repo?.owner ?? null,
+                baseBranch: action.base,
+                review: "none",
+                checks: "none",
+              };
+              forge.createdPrs.push(pr);
+              return {
+                action,
+                status: "done",
+                detail: `Opened #${number} for ${action.bookmark}`,
+                pr,
+              };
+            }
+            return {
+              action,
+              status: "done",
+              detail: `Retargeted #${action.number} (${action.bookmark}) from ${action.fromBase} to ${action.toBase}`,
+              pr: null,
+            };
+          });
+          return Promise.resolve({ steps, failed: false });
+        }
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -1354,6 +1531,22 @@
         document.querySelector('[data-forge-state="disconnected"]') !== null ||
         document.querySelector(".managed") !== null,
     );
+  }
+  // Publish-stack flows (section=publish + forge=): click a stack row to
+  // derive its plan, then optionally publish and wait for the results.
+  const submitStack = params.get("splan");
+  if (submitStack) {
+    steps.push(() => click(`[data-submit-stack="${submitStack}"]`));
+    steps.push(
+      () =>
+        document.querySelector("[data-submit-plan]") !== null ||
+        document.querySelector('[data-submit-state="up-to-date"]') !== null ||
+        document.querySelector("[data-submit-error]") !== null,
+    );
+  }
+  if (params.get("sgo")) {
+    steps.push(() => click("[data-submit-go] .btn.primary:not(:disabled)"));
+    steps.push(() => document.querySelector("[data-submit-outcome]") !== null);
   }
   const open = params.get("open");
   if (open === "files") steps.push(() => click(".files-button"));

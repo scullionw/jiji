@@ -24,7 +24,11 @@ use jj_lib::copies::{CopiesTreeDiffEntryPath, CopyOperation, CopyRecords};
 use jj_lib::diff_presentation::unified::{git_diff_part, unified_diff_hunks, DiffLineType};
 use jj_lib::diff_presentation::{DiffTokenType, LineCompareMode};
 use jj_lib::fileset::{self, FilesetAliasesMap, FilesetDiagnostics, FilesetParseContext};
-use jj_lib::git::{self, REMOTE_NAME_FOR_LOCAL_GIT_REPO};
+use jj_lib::config::ConfigGetError;
+use jj_lib::git::{
+    self, GitProgress, GitSidebandLineTerminator, GitSubprocessCallback,
+    REMOTE_NAME_FOR_LOCAL_GIT_REPO,
+};
 use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
 use jj_lib::hex_util;
 use jj_lib::matchers::{EverythingMatcher, FilesMatcher, Matcher, NothingMatcher};
@@ -36,6 +40,7 @@ use jj_lib::op_store::{OpStoreError, OperationId, RefTarget, RemoteRefState, Vie
 use jj_lib::op_walk;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::{RefName, RemoteName, RemoteRefSymbol};
+use jj_lib::refs::{classify_bookmark_push_action, BookmarkPushAction, BookmarkPushUpdate, LocalAndRemoteRef};
 use jj_lib::repo::{ReadonlyRepo, Repo, StoreFactories};
 use jj_lib::repo_path::{RepoPath, RepoPathBuf, RepoPathUiConverter};
 use jj_lib::revset::{
@@ -46,7 +51,7 @@ use jj_lib::rewrite::{
     move_commits, restore_tree, squash_commits, CommitWithSelection, MoveCommitsLocation,
     MoveCommitsTarget, RebaseOptions, RebasedCommit, RewriteRefsOptions,
 };
-use jj_lib::settings::HumanByteSize;
+use jj_lib::settings::{HumanByteSize, UserSettings};
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::{SnapshotOptions, WorkingCopyFreshness};
@@ -860,6 +865,190 @@ impl RepoBackend for JjBackend {
             operation_id: Some(short_operation_id(new_repo.op_id())),
             summary: format!("Deleted {name}"),
             target_change,
+        })
+    }
+
+    fn push_bookmarks(
+        &self,
+        path: &Path,
+        names: &[String],
+        remote: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        if names.is_empty() {
+            return Err(BackendError::MutationFailed(
+                "there are no bookmarks to push".to_owned(),
+            ));
+        }
+        let remote_name = match remote {
+            Some(name) => name.trim().to_owned(),
+            None => default_push_remote(workspace.settings(), repo.store())?,
+        };
+        if RemoteName::new(&remote_name) == REMOTE_NAME_FOR_LOCAL_GIT_REPO {
+            return Err(BackendError::MutationFailed(
+                "the \u{201c}git\u{201d} remote is jj's internal name for the backing \
+                 git repository and cannot be pushed to"
+                    .to_owned(),
+            ));
+        }
+        if !git_remotes(repo.store()).iter().any(|r| r.name == remote_name) {
+            return Err(BackendError::MutationFailed(format!(
+                "there is no git remote named \u{201c}{remote_name}\u{201d}"
+            )));
+        }
+        let remote_ref_name = RemoteName::new(&remote_name);
+
+        // Classify every requested bookmark against its tracked remote
+        // counterpart — jj-lib's own push classification, the same rules
+        // `jj git push` applies.
+        let view = repo.view();
+        let mut updates: Vec<(&str, BookmarkPushUpdate)> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for raw in names {
+            let name = raw.trim();
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            let ref_name = RefName::new(name);
+            let local_target = view.get_local_bookmark(ref_name);
+            let remote_ref = view.get_remote_bookmark(RemoteRefSymbol {
+                name: ref_name,
+                remote: remote_ref_name,
+            });
+            // Curated deviation: a name with no local bookmark and no
+            // tracked remote counterpart has nothing to push or delete. The
+            // CLI warns "No matching bookmarks" and exits cleanly; from an
+            // explicit UI action that is a stale plan, so it refuses.
+            if local_target.is_absent() && remote_ref.tracked_target().is_absent() {
+                return Err(BackendError::BookmarkMissing(name.to_owned()));
+            }
+            match classify_bookmark_push_action(LocalAndRemoteRef {
+                local_target,
+                remote_ref,
+            }) {
+                BookmarkPushAction::AlreadyMatches => {}
+                BookmarkPushAction::LocalConflicted => {
+                    return Err(BackendError::MutationFailed(format!(
+                        "Bookmark \u{201c}{name}\u{201d} is conflicted; repoint it \
+                         before pushing"
+                    )));
+                }
+                BookmarkPushAction::RemoteConflicted => {
+                    return Err(BackendError::MutationFailed(format!(
+                        "Bookmark \u{201c}{name}@{remote_name}\u{201d} is conflicted; \
+                         fetch to update it first"
+                    )));
+                }
+                BookmarkPushAction::RemoteUntracked => {
+                    return Err(BackendError::MutationFailed(format!(
+                        "A non-tracking remote bookmark \u{201c}{name}@{remote_name}\u{201d} \
+                         already exists; track it first (jj bookmark track \
+                         {name} --remote={remote_name})"
+                    )));
+                }
+                BookmarkPushAction::Update(update) => updates.push((name, update)),
+            }
+        }
+        if updates.is_empty() {
+            return Ok(MutationOutcome {
+                operation_id: None,
+                summary: format!("Everything is already pushed to {remote_name}"),
+                target_change: None,
+            });
+        }
+
+        // CLI parity: every commit that would land on the remote — the
+        // range from the remote's current positions up to the pushed
+        // targets — must be presentable before anything runs.
+        check_commits_ready_to_push(repo.as_ref(), remote_ref_name, &updates)?;
+
+        let op_description = match &updates[..] {
+            [(name, _)] => format!("push bookmark {name} to git remote {remote_name}"),
+            _ => format!(
+                "push bookmarks {} to git remote {remote_name}",
+                updates.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ")
+            ),
+        };
+
+        let subprocess_options = git::GitSubprocessOptions::from_settings(workspace.settings())
+            .map_err(|err| BackendError::ConfigInvalid(format!("git.executable-path: {err}")))?;
+        let targets = git::GitBranchPushTargets {
+            branch_updates: updates
+                .iter()
+                .map(|(name, update)| (RefName::new(name).to_owned(), update.clone()))
+                .collect(),
+        };
+        let mut tx = repo.start_transaction();
+        let stats = git::push_branches(
+            tx.repo_mut(),
+            subprocess_options,
+            remote_ref_name,
+            &targets,
+            &mut QuietGitCallback,
+            &git::GitPushOptions::default(),
+        )
+        .map_err(|err| {
+            BackendError::MutationFailed(format!("could not push to {remote_name}: {err}"))
+        })?;
+        if !stats.unexported_bookmarks.is_empty() {
+            tracing::warn!(
+                count = stats.unexported_bookmarks.len(),
+                "some pushed bookmarks failed to export to the backing git repo"
+            );
+        }
+
+        // Force-with-lease refusals: the remote moved past what the last
+        // fetch recorded. Nothing pushed → record nothing, like the CLI; a
+        // partial push keeps its operation (the remote really moved) and
+        // the error tells the rest of the story.
+        let rejected: Vec<String> = stats
+            .rejected
+            .iter()
+            .chain(stats.remote_rejected.iter())
+            .map(|(ref_name, _)| bookmark_of_git_ref(ref_name.as_str()))
+            .collect();
+        if !rejected.is_empty() && stats.pushed.is_empty() {
+            return Err(remote_moved_error(&rejected, &remote_name, None));
+        }
+        let new_repo = finish_mutation(&mut workspace, &repo, tx, op_description)?;
+        if !rejected.is_empty() {
+            let pushed: Vec<String> = stats
+                .pushed
+                .iter()
+                .map(|ref_name| bookmark_of_git_ref(ref_name.as_str()))
+                .collect();
+            return Err(remote_moved_error(&rejected, &remote_name, Some(&pushed)));
+        }
+
+        let (pushed, deleted): (Vec<&str>, Vec<&str>) = {
+            let mut pushed = Vec::new();
+            let mut deleted = Vec::new();
+            for (name, update) in &updates {
+                if update.new_target.is_some() {
+                    pushed.push(*name);
+                } else {
+                    deleted.push(*name);
+                }
+            }
+            (pushed, deleted)
+        };
+        let summary = match (&pushed[..], &deleted[..]) {
+            ([name], []) => format!("Pushed {name} to {remote_name}"),
+            (names, []) => format!("Pushed {} bookmarks to {remote_name}", names.len()),
+            ([], [name]) => format!("Deleted {name} on {remote_name}"),
+            ([], names) => format!("Deleted {} bookmarks on {remote_name}", names.len()),
+            (names, gone) => format!(
+                "Pushed {} bookmark{} and deleted {} on {remote_name}",
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                gone.len()
+            ),
+        };
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary,
+            target_change: None,
         })
     }
 
@@ -2103,6 +2292,140 @@ fn validate_bookmark_name(name: &str) -> Result<(), BackendError> {
         )));
     }
     Ok(())
+}
+
+/// The CLI's default push remote: the `git.push` setting when configured,
+/// else the repo's sole remote, else literally "origin" — which may not
+/// exist; the caller's existence check reports that the same way the CLI
+/// errors with "No git remote named 'origin'".
+fn default_push_remote(
+    settings: &UserSettings,
+    store: &Arc<Store>,
+) -> Result<String, BackendError> {
+    match settings.get_string("git.push") {
+        Ok(name) => return Ok(name),
+        Err(ConfigGetError::NotFound { .. }) => {}
+        Err(err) => return Err(BackendError::ConfigInvalid(format!("git.push: {err}"))),
+    }
+    let remotes = git_remotes(store);
+    if let [only] = &remotes[..] {
+        return Ok(only.name.clone());
+    }
+    Ok("origin".to_owned())
+}
+
+/// CLI parity for `jj git push`'s commit sanity checks: every commit the
+/// push would put on the remote — the range from the remote's current
+/// positions up to the pushed targets — must have a description, an author
+/// and committer, and no conflicts. Wordings match the CLI's "Won't push
+/// commit … since it …". (`git.private-commits` defaults to `none()` and is
+/// not modeled.)
+fn check_commits_ready_to_push(
+    repo: &dyn Repo,
+    remote: &RemoteName,
+    updates: &[(&str, BookmarkPushUpdate)],
+) -> Result<(), BackendError> {
+    let new_heads: Vec<CommitId> = updates
+        .iter()
+        .filter_map(|(_, update)| update.new_target.clone())
+        .collect();
+    if new_heads.is_empty() {
+        return Ok(()); // pure deletions put nothing new on the remote
+    }
+    let old_heads: Vec<CommitId> = repo
+        .view()
+        .remote_bookmarks(remote)
+        .flat_map(|(_, remote_ref)| remote_ref.target.added_ids().cloned().collect::<Vec<_>>())
+        .collect();
+    let expr = RevsetExpression::commits(old_heads)
+        .union(&RevsetExpression::root())
+        .range(&RevsetExpression::commits(new_heads));
+    let revset = expr.evaluate(repo).map_err(snapshot_err)?;
+    for commit_id in revset.iter() {
+        let commit_id = commit_id.map_err(snapshot_err)?;
+        let commit = repo.store().get_commit(&commit_id).map_err(snapshot_err)?;
+        let reason = if commit.description().trim().is_empty() {
+            "it has no description"
+        } else if commit.author().name.is_empty()
+            || commit.author().email.is_empty()
+            || commit.committer().name.is_empty()
+            || commit.committer().email.is_empty()
+        {
+            "it has no author and/or committer set"
+        } else if commit.has_conflict() {
+            "it has conflicts"
+        } else {
+            continue;
+        };
+        return Err(BackendError::MutationFailed(format!(
+            "Won't push commit {} since {reason}",
+            &commit.id().hex()[..12]
+        )));
+    }
+    Ok(())
+}
+
+/// "refs/heads/feature" → "feature", for reporting push results by the
+/// bookmark name the user knows.
+fn bookmark_of_git_ref(qualified: &str) -> String {
+    qualified
+        .strip_prefix("refs/heads/")
+        .unwrap_or(qualified)
+        .to_owned()
+}
+
+/// The force-with-lease refusal: the remote no longer sits where the last
+/// fetch recorded it, so pushing would overwrite someone else's move.
+fn remote_moved_error(
+    rejected: &[String],
+    remote_name: &str,
+    pushed: Option<&[String]>,
+) -> BackendError {
+    let refused = rejected.join(", ");
+    let message = match pushed {
+        Some(pushed) if !pushed.is_empty() => format!(
+            "Pushed {} to {remote_name}, but {refused} moved on the remote since the \
+             last fetch; fetch, reconcile, and push again",
+            pushed.join(", ")
+        ),
+        _ => format!(
+            "{refused} moved on the remote since the last fetch; fetch, reconcile, \
+             and push again"
+        ),
+    };
+    BackendError::MutationFailed(message)
+}
+
+/// Push progress has no terminal to stream to; sideband messages (which can
+/// include credential-helper chatter) go to the log.
+struct QuietGitCallback;
+
+impl GitSubprocessCallback for QuietGitCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+
+    fn progress(&mut self, _progress: &GitProgress) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn local_sideband(
+        &mut self,
+        message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        tracing::debug!(message = %String::from_utf8_lossy(message), "git push");
+        Ok(())
+    }
+
+    fn remote_sideband(
+        &mut self,
+        message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        tracing::debug!(message = %String::from_utf8_lossy(message), "git push (remote)");
+        Ok(())
+    }
 }
 
 /// How `jj squash` combines descriptions without an editor: an empty side
@@ -6292,6 +6615,13 @@ mod tests {
     fn build_colocated_repo(root: &Path, backend: &JjBackend) -> String {
         let settings = test_settings();
         pollster::block_on(Workspace::init_colocated_git(&settings, root)).unwrap();
+        // The backend loads its own settings (`UserConfigSource::None`), so
+        // author identity has to come from repo config — like any real repo
+        // has. Push refuses authorless commits, exactly like the CLI.
+        write_repo_config(
+            root,
+            "user.name = \"Test User\"\nuser.email = \"test@example.com\"\n",
+        );
         std::fs::write(root.join("file.txt"), "one\n").unwrap();
         backend.refresh(root).unwrap();
         let first = backend.refresh(root).unwrap().working_copy;
@@ -6408,10 +6738,278 @@ mod tests {
         assert!(snapshot.bookmarks.iter().any(|b| b.name == "topic"));
     }
 
-    /// A repo whose stack carries a real rebase conflict: `theirs` rebased
-    /// onto `ours` after both rewrote notes.txt, with a child on top that
-    /// never touched the file (it inherits the conflict). Returns
-    /// (ours, theirs, child) node ids.
+    /// A bare git repo in its own directory, wired into the colocated
+    /// fixture as the `origin` remote — pushes run against it over the
+    /// file transport, no network or auth involved.
+    fn add_bare_origin(root: &Path, bare: &Path) {
+        git(bare, &["init", "--bare", "--quiet"]);
+        git(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    }
+
+    /// Full commit hex a bare repo's branch points at, `None` when the
+    /// branch does not exist.
+    fn bare_branch(bare: &Path, name: &str) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")])
+            .output()
+            .expect("git binary available");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap().trim().to_owned())
+    }
+
+    #[test]
+    fn push_creates_moves_and_deletes_remote_bookmarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let first = build_colocated_repo(dir.path(), &backend);
+        add_bare_origin(dir.path(), bare.path());
+
+        // Pushing a new bookmark creates the remote branch and starts
+        // tracking it; an immutable target (main is trunk) is fine — a
+        // push rewrites nothing.
+        let outcome = backend
+            .push_bookmarks(dir.path(), &["main".into()], None)
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, "Pushed main to origin");
+        assert!(outcome.target_change.is_none());
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "push bookmark main to git remote origin"
+        );
+        let main = snapshot.bookmarks.iter().find(|b| b.name == "main").unwrap();
+        assert_eq!(main.remote.as_deref(), Some("origin"));
+        assert_eq!(main.sync, SyncState::Synced);
+        let first_commit = node_by_description(&snapshot, "first change").commit_id.clone();
+        assert!(bare_branch(bare.path(), "main").unwrap().starts_with(&first_commit));
+
+        // Everything in place records nothing, like the CLI's "Nothing
+        // changed."; requested names already matching are just skipped.
+        let noop = backend
+            .push_bookmarks(dir.path(), &["main".into()], None)
+            .unwrap();
+        assert!(noop.operation_id.is_none());
+        assert_eq!(noop.summary, "Everything is already pushed to origin");
+
+        // Stack two described bookmarks on top; a mixed request pushes
+        // only what moved and the op description names exactly that.
+        let feature_change = backend.open(dir.path()).unwrap().working_copy;
+        backend.describe(dir.path(), &feature_change, "feat: work").unwrap();
+        backend.create_bookmark(dir.path(), "feature", &feature_change).unwrap();
+        backend.new_change(dir.path(), &feature_change).unwrap();
+        let stacked_change = backend.open(dir.path()).unwrap().working_copy;
+        backend.describe(dir.path(), &stacked_change, "feat: stacked").unwrap();
+        backend.create_bookmark(dir.path(), "stacked", &stacked_change).unwrap();
+        backend.new_change(dir.path(), &stacked_change).unwrap();
+        let outcome = backend
+            .push_bookmarks(dir.path(), &["main".into(), "feature".into()], None)
+            .unwrap();
+        assert_eq!(outcome.summary, "Pushed feature to origin");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "push bookmark feature to git remote origin"
+        );
+
+        // Rewriting the stack moves both bookmarks; one call pushes both
+        // in one operation, with the CLI's plural op description.
+        backend
+            .describe(dir.path(), &feature_change, "feat: work, amended")
+            .unwrap();
+        let outcome = backend
+            .push_bookmarks(dir.path(), &["feature".into(), "stacked".into()], None)
+            .unwrap();
+        assert_eq!(outcome.summary, "Pushed 2 bookmarks to origin");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "push bookmarks feature, stacked to git remote origin"
+        );
+        for name in ["feature", "stacked"] {
+            let bookmark = snapshot.bookmarks.iter().find(|b| b.name == name).unwrap();
+            assert_eq!(bookmark.sync, SyncState::Synced, "{name} synced after push");
+            let target_commit = snapshot
+                .nodes
+                .iter()
+                .find(|n| n.id == bookmark.target)
+                .unwrap()
+                .commit_id
+                .clone();
+            assert!(
+                bare_branch(bare.path(), name).unwrap().starts_with(&target_commit),
+                "{name} on the remote where jj says it is"
+            );
+        }
+
+        // Deleting locally and pushing the name propagates the deletion:
+        // the remote branch goes away and the tombstone with it.
+        backend.delete_bookmark(dir.path(), "stacked").unwrap();
+        let outcome = backend
+            .push_bookmarks(dir.path(), &["stacked".into()], None)
+            .unwrap();
+        assert_eq!(outcome.summary, "Deleted stacked on origin");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "push bookmark stacked to git remote origin"
+        );
+        assert!(bare_branch(bare.path(), "stacked").is_none());
+        assert!(!snapshot.bookmarks.iter().any(|b| b.name == "stacked"));
+    }
+
+    #[test]
+    fn push_refuses_unpresentable_commits_and_bad_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let first = build_colocated_repo(dir.path(), &backend);
+        add_bare_origin(dir.path(), bare.path());
+        let before = backend.open(dir.path()).unwrap();
+        let first_commit = node_by_description(&before, "first change").commit_id.clone();
+
+        // A bookmark on the undescribed working copy refuses with the
+        // CLI's wording, recording nothing.
+        let wc = before.working_copy.clone();
+        backend.create_bookmark(dir.path(), "wip", &wc).unwrap();
+        let top_op = backend.open(dir.path()).unwrap().operations[0].id.clone();
+        let err = backend
+            .push_bookmarks(dir.path(), &["wip".into()], None)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+        assert!(err.to_string().contains("has no description"), "{err}");
+        assert!(bare_branch(bare.path(), "wip").is_none());
+
+        // A conflicted commit refuses the same way.
+        backend.describe(dir.path(), &wc, "feat: ours").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "ours\n").unwrap();
+        backend.refresh(dir.path()).unwrap();
+        backend.new_change(dir.path(), &first).unwrap();
+        let theirs = backend.open(dir.path()).unwrap().working_copy;
+        std::fs::write(dir.path().join("notes.txt"), "theirs\n").unwrap();
+        backend.describe(dir.path(), &theirs, "feat: theirs").unwrap();
+        backend.move_change(dir.path(), &theirs, &wc).unwrap();
+        backend.create_bookmark(dir.path(), "cbm", &theirs).unwrap();
+        let err = backend
+            .push_bookmarks(dir.path(), &["cbm".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("has conflicts"), "{err}");
+
+        // Unknown names refuse (the CLI warns and exits cleanly — from an
+        // explicit UI action that is a stale plan); unknown remotes and
+        // empty requests refuse too.
+        let err = backend
+            .push_bookmarks(dir.path(), &["nope".into()], None)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::BookmarkMissing(_)), "got {err:?}");
+        let err = backend
+            .push_bookmarks(dir.path(), &["wip".into()], Some("upstream"))
+            .unwrap_err();
+        assert!(err.to_string().contains("no git remote named"), "{err}");
+        let err = backend.push_bookmarks(dir.path(), &[], None).unwrap_err();
+        assert!(err.to_string().contains("no bookmarks"), "{err}");
+
+        // A remote branch jj never tracked blocks a same-name local push,
+        // like the CLI's "Non-tracking remote bookmark exists". Plain git
+        // creates it (and the local remote-tracking ref); the refresh
+        // imports it untracked.
+        let full_first = git(dir.path(), &["rev-parse", &first_commit]);
+        git(
+            dir.path(),
+            &["push", "--quiet", "origin", &format!("{full_first}:refs/heads/standalone")],
+        );
+        backend.refresh(dir.path()).unwrap();
+        backend.create_bookmark(dir.path(), "standalone", &first).unwrap();
+        let err = backend
+            .push_bookmarks(dir.path(), &["standalone".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("non-tracking remote bookmark"), "{err}");
+
+        // A conflicted bookmark refuses before anything runs. The two
+        // concurrent moves need *sibling* targets — ancestor/descendant
+        // adds fast-forward instead of conflicting (the slice-2 lesson).
+        backend.new_change(dir.path(), &first).unwrap();
+        let sibling = backend.open(dir.path()).unwrap().working_copy;
+        let settings = test_settings();
+        let workspace = Workspace::load(
+            &settings,
+            dir.path(),
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .unwrap();
+        let repo = pollster::block_on(workspace.repo_loader().load_at_head()).unwrap();
+        let ours_commit = resolve_change_commit(&repo, &wc).unwrap();
+        let sibling_commit = resolve_change_commit(&repo, &sibling).unwrap();
+        for (commit, op) in [(&ours_commit, "release at ours"), (&sibling_commit, "release at sibling")] {
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("release"),
+                RefTarget::normal(commit.id().clone()),
+            );
+            pollster::block_on(tx.commit(op)).unwrap();
+        }
+        let err = backend
+            .push_bookmarks(dir.path(), &["release".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("is conflicted"), "{err}");
+
+        // None of the refusals recorded a push operation.
+        let ops = backend.open(dir.path()).unwrap().operations;
+        assert!(
+            ops.iter().all(|op| !op.description.starts_with("push bookmark")),
+            "refusals recorded nothing"
+        );
+        let _ = top_op;
+    }
+
+    #[test]
+    fn push_refuses_when_the_remote_moved_underneath() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let first = build_colocated_repo(dir.path(), &backend);
+        add_bare_origin(dir.path(), bare.path());
+        let feature_change = backend.open(dir.path()).unwrap().working_copy;
+        backend.describe(dir.path(), &feature_change, "feat: work").unwrap();
+        backend
+            .create_bookmark(dir.path(), "feature", &feature_change)
+            .unwrap();
+        backend
+            .push_bookmarks(dir.path(), &["main".into(), "feature".into()], None)
+            .unwrap();
+
+        // Someone else moves the remote branch (straight in the bare repo,
+        // so this workspace has no idea). The next push must not overwrite
+        // their move: the force-with-lease expectation fails and nothing
+        // records — the CLI's exact posture.
+        let first_snapshot = backend.open(dir.path()).unwrap();
+        let first_commit_full = bare_branch(bare.path(), "main").unwrap();
+        git(bare.path(), &["update-ref", "refs/heads/feature", &first_commit_full]);
+        backend
+            .describe(dir.path(), &feature_change, "feat: work, amended")
+            .unwrap();
+        let err = backend
+            .push_bookmarks(dir.path(), &["feature".into()], None)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)), "got {err:?}");
+        assert!(err.to_string().contains("moved on the remote"), "{err}");
+        assert!(err.to_string().contains("fetch"), "{err}");
+        let ops = backend.open(dir.path()).unwrap().operations;
+        assert!(
+            ops[0].description.starts_with("describe commit"),
+            "the failed push recorded nothing: {}",
+            ops[0].description
+        );
+        // The remote still holds the other client's position.
+        assert_eq!(bare_branch(bare.path(), "feature").unwrap(), first_commit_full);
+        let _ = (first, first_snapshot);
+    }
     fn build_conflicted_repo(root: &Path, backend: &JjBackend) -> (String, String, String) {
         let settings = test_settings();
         let (_workspace, repo) =

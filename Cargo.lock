@@ -3105,6 +3105,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "insta",
+ "jiji-core",
  "keyring",
  "log",
  "reqwest 0.12.28",

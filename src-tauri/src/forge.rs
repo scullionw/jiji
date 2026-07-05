@@ -10,10 +10,11 @@
 use std::sync::Mutex;
 
 use jiji_forge::{
-    detect_github_repo, no_github_remote, resolve_token, ForgeAuth, ForgeError, ForgeRepo,
-    ForgeStatus, GitHubClient, KeychainTokenStore, RepoPrState, TokenSource, TokenStore as _,
+    detect_github_repo, execute_submit, no_github_remote, plan_submit, resolve_token, ForgeAuth,
+    ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, RepoForge, RepoPrState,
+    SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
 };
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::commands::{AppState, CommandError};
 
@@ -179,4 +180,87 @@ pub fn forge_prs(
         }
     }
     Ok(RepoPrState::new(report, &repo.owner))
+}
+
+/// The connected repo, its client, and fresh open-PR state — what both
+/// submit commands start from.
+fn submit_context(
+    state: &AppState,
+) -> Result<(ForgeRepo, GitHubClient, RepoPrState), CommandError> {
+    let repo = detected_repo(state).ok_or_else(no_github_remote)?;
+    let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
+    let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+    let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
+    Ok((repo, client, prs))
+}
+
+/// Plan submitting the stack under a bookmark: what would push, which PRs
+/// would open against which bases, which existing PRs retarget. Read-only —
+/// GitHub is asked for fresh open-PR state, nothing else runs.
+#[tauri::command(async)]
+pub fn submit_plan(
+    state: State<'_, AppState>,
+    head_bookmark: String,
+) -> Result<SubmitPlan, CommandError> {
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let (repo, _client, prs) = submit_context(&state)?;
+    plan_submit(&snapshot, &prs, &repo, &head_bookmark).map_err(Into::into)
+}
+
+/// The submit executor's jj half: pushes run through the shared mutation
+/// path so the snapshot republishes to every surface mid-flow.
+struct HostVcs<'a> {
+    app: &'a AppHandle,
+    state: &'a AppState,
+}
+
+impl SubmitVcs for HostVcs<'_> {
+    fn push_bookmarks(
+        &self,
+        bookmarks: &[String],
+        remote: &str,
+    ) -> Result<String, jiji_core::BackendError> {
+        self.state
+            .push_and_publish(self.app, bookmarks, remote)
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+}
+
+/// Execute a confirmed submit plan: one batched push, PR creations
+/// bottom-up, then base retargets. The plan is re-derived against the
+/// current snapshot and fresh PR state first, and refused when it no
+/// longer matches what the user confirmed — the stack or GitHub moved
+/// under the panel (the same never-clobber posture as split's hunk
+/// verification).
+#[tauri::command(async)]
+pub fn submit_stack(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    head_bookmark: String,
+    plan: SubmitPlan,
+) -> Result<SubmitOutcome, CommandError> {
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let (repo, client, prs) = submit_context(&state)?;
+    let fresh = plan_submit(&snapshot, &prs, &repo, &head_bookmark)?;
+    if fresh.actions != plan.actions {
+        return Err(CommandError::new(
+            "plan_stale",
+            "The stack or its pull requests changed since this plan was made; \
+             review the updated plan and publish again",
+        ));
+    }
+    let vcs = HostVcs {
+        app: &app,
+        state: &state,
+    };
+    let forge_side = RepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    execute_submit(&fresh, &vcs, &forge_side).map_err(Into::into)
 }

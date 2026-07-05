@@ -9,15 +9,17 @@
 //! What lives here today:
 //! - [`remote`]: detecting the GitHub repo behind a jj repo's git remotes
 //! - [`auth`]: token storage (system keychain) and the resolution chain
-//! - [`github`]: the API client (REST for identity, one batched GraphQL
-//!   query for PR state)
+//! - [`github`]: the API client (REST for identity and PR writes, one
+//!   batched GraphQL query for PR state)
 //! - [`pr`]: PR state mapped into Jiji-owned, TS-exported DTOs
+//! - [`submit`]: the analyze → plan → execute submission engine
 
 pub mod auth;
 pub mod error;
 pub mod github;
 pub mod pr;
 pub mod remote;
+pub mod submit;
 
 pub use auth::{
     resolve_token, ForgeAuth, ForgeStatus, KeychainTokenStore, MemoryTokenStore, ResolvedToken,
@@ -30,3 +32,7 @@ pub use pr::{
     RepoPrState, ReviewDecision,
 };
 pub use remote::{detect_github_repo, no_github_remote, parse_github_url, ForgeProvider, ForgeRepo};
+pub use submit::{
+    execute_submit, plan_submit, RepoForge, SubmitAction, SubmitForge, SubmitOutcome, SubmitPlan,
+    SubmitSegment, SubmitStep, SubmitStepStatus, SubmitVcs,
+};

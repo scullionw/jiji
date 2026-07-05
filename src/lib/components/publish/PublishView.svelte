@@ -1,20 +1,27 @@
 <script lang="ts">
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import type { SubmitOutcome } from "$lib/bindings/SubmitOutcome";
+  import type { SubmitPlan } from "$lib/bindings/SubmitPlan";
   import type { TokenSource } from "$lib/bindings/TokenSource";
+  import * as api from "$lib/api";
   import { errorMessage } from "$lib/api";
   import Button from "$lib/components/ui/Button.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { app } from "$lib/state/app.svelte";
   import {
     connectForge,
     disconnectForge,
     forge,
+    refreshForgePrs,
   } from "$lib/state/forge.svelte";
+  import { actionRow, publishableStacks } from "./submit";
 
   // The forge connection: which GitHub repo this jj repo publishes to and
   // whose token Jiji would act with. The state itself is shared (synced at
   // the shell whenever the repo's remotes change) — this surface renders
-  // it and hosts the connect/disconnect flow. Submit and landing build on
-  // it in the following slices.
+  // it and hosts the connect/disconnect flow. On top of it sits the first
+  // real workflow: publish a stack — plan (pushes, PR creations, base
+  // retargets, derived Rust-side by jiji-forge), confirm, execute.
 
   let token = $state("");
   let busy = $state(false);
@@ -59,6 +66,64 @@
   const auth = $derived(forge.status?.auth ?? null);
   const connected = $derived(auth?.source != null && auth?.login != null);
   const openPrs = $derived(forge.prs?.report.prs.length ?? 0);
+
+  // The publish-stack workflow. Planning is explicit (a click), matching
+  // the deliberate fetch cadence; the plan card is the confirm step and
+  // executing swaps it for the per-step results.
+  const stacks = $derived(
+    app.snapshot
+      ? publishableStacks(
+          app.snapshot,
+          new Set(Object.keys(forge.prs?.byBranch ?? {})),
+        )
+      : [],
+  );
+  let planFor = $state<string | null>(null);
+  let plan = $state<SubmitPlan | null>(null);
+  let planLoading = $state(false);
+  let planError = $state<string | null>(null);
+  let publishing = $state(false);
+  let outcome = $state<SubmitOutcome | null>(null);
+  let planSeq = 0;
+
+  async function loadPlan(headBookmark: string) {
+    const seq = ++planSeq;
+    planFor = headBookmark;
+    plan = null;
+    outcome = null;
+    planError = null;
+    planLoading = true;
+    try {
+      const answer = await api.submitPlan(headBookmark);
+      if (seq !== planSeq) return;
+      plan = answer;
+    } catch (err) {
+      if (seq !== planSeq) return;
+      planError = errorMessage(err);
+    } finally {
+      if (seq === planSeq) planLoading = false;
+    }
+  }
+
+  async function publish() {
+    if (!plan || !planFor || publishing || plan.blockers.length > 0) return;
+    publishing = true;
+    planError = null;
+    try {
+      outcome = await api.submitStack(planFor, plan);
+      // Fresh badges and PR counts follow what just landed on GitHub.
+      await refreshForgePrs();
+    } catch (err) {
+      planError = errorMessage(err);
+    }
+    publishing = false;
+  }
+
+  const stepGlyph: Record<string, string> = {
+    done: "✓",
+    failed: "×",
+    skipped: "–",
+  };
 </script>
 
 <div class="view">
@@ -192,9 +257,138 @@
           </p>
         {/if}
       </section>
-    {/if}
 
-    <span class="hint">stack submission arrives next</span>
+      <section class="group">
+        <div class="group-head">
+          <span class="group-label">Publish a stack</span>
+        </div>
+        {#if stacks.length === 0}
+          <p class="blurb quiet" data-submit-state="no-stacks">
+            No bookmarked stacks yet. Bookmark a change on the workbench and
+            it becomes publishable here.
+          </p>
+        {:else}
+          <div class="stacks">
+            {#each stacks as stack (stack.workstreamId)}
+              <button
+                class="stack-row"
+                class:picked={planFor === stack.headBookmark}
+                data-submit-stack={stack.headBookmark}
+                onclick={() => loadPlan(stack.headBookmark)}
+              >
+                <span class="stack-name mono">{stack.headBookmark}</span>
+                <span class="stack-title">{stack.title}</span>
+                <span class="stack-meta">
+                  {stack.changeCount} change{stack.changeCount === 1
+                    ? ""
+                    : "s"}{stack.isActive ? " · active" : ""}
+                </span>
+              </button>
+            {/each}
+          </div>
+
+          {#if planLoading}
+            <p class="blurb quiet" data-submit-state="planning">
+              Working out what publishing {planFor} needs…
+            </p>
+          {:else if plan && outcome}
+            <div class="plan" data-submit-outcome={outcome.failed ? "failed" : "done"}>
+              <p class="plan-head">
+                {outcome.failed
+                  ? "Publishing stopped partway — the steps below tell the story."
+                  : `Published ${plan.headBookmark}.`}
+              </p>
+              <ul class="steps">
+                {#each outcome.steps as step, index (index)}
+                  <li class="step" data-step={step.status}>
+                    <span class="step-glyph {step.status}">
+                      {stepGlyph[step.status]}
+                    </span>
+                    <span class="step-text">
+                      {actionRow(step.action, plan.remote).text}
+                      {#if step.detail}
+                        <span class="step-detail">{step.detail}</span>
+                      {/if}
+                    </span>
+                    {#if step.pr}
+                      {@const pr = step.pr}
+                      <button class="pr-link" onclick={() => openUrl(pr.url)}>
+                        #{pr.number} ↗
+                      </button>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {:else if plan}
+            <div class="plan" data-submit-plan={plan.headBookmark}>
+              <div class="plan-stack">
+                {#each plan.segments as segment (segment.bookmark)}
+                  <div class="segment" data-submit-segment={segment.bookmark}>
+                    <span class="seg-bookmark mono">{segment.bookmark}</span>
+                    <span class="seg-arrow">→</span>
+                    <span class="seg-base mono">{segment.base}</span>
+                    <span class="seg-meta">
+                      {segment.changeIds.length} change{segment.changeIds
+                        .length === 1
+                        ? ""
+                        : "s"}
+                      {#if segment.pr}
+                        · #{segment.pr.number} open
+                      {/if}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+
+              {#if plan.actions.length === 0 && plan.blockers.length === 0}
+                <p class="blurb" data-submit-state="up-to-date">
+                  Everything is already on GitHub the way the stack reads
+                  here — nothing to publish.
+                </p>
+              {:else}
+                <ul class="actions">
+                  {#each plan.actions as action, index (index)}
+                    {@const row = actionRow(action, plan.remote)}
+                    <li class="action" data-submit-action={action.kind}>
+                      <span class="action-glyph {row.tone}">{row.glyph}</span>
+                      <span>{row.text}</span>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+
+              {#each plan.blockers as blocker (blocker)}
+                <p class="blocker" data-submit-blocker>{blocker}</p>
+              {/each}
+              {#each plan.warnings as warning (warning)}
+                <p class="warning" data-submit-warning>{warning}</p>
+              {/each}
+
+              {#if plan.actions.length > 0}
+                <div class="plan-go" data-submit-go>
+                  <Button
+                    variant="primary"
+                    disabled={publishing || plan.blockers.length > 0}
+                    onclick={publish}
+                  >
+                    {publishing
+                      ? "Publishing…"
+                      : `Publish ${plan.headBookmark}`}
+                  </Button>
+                  {#if plan.blockers.length > 0}
+                    <span class="go-note">fix the blockers first</span>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+          {#if planError}
+            <p class="error" data-submit-error>{planError}</p>
+          {/if}
+        {/if}
+      </section>
+    {/if}
   </div>
 </div>
 
@@ -357,14 +551,193 @@
     color: var(--clr-danger);
   }
 
-  .hint {
-    display: inline-block;
-    margin-top: var(--sp-2);
-    font-family: var(--font-mono);
+  .stacks {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    margin-bottom: var(--sp-3);
+  }
+
+  .stack-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-3);
+    width: 100%;
+    text-align: left;
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: var(--radius-m);
+    cursor: pointer;
+    transition: border-color var(--t-fast) var(--ease-out);
+  }
+
+  .stack-row:hover {
+    border-color: var(--clr-border-1);
+  }
+
+  .stack-row.picked {
+    border-color: var(--clr-accent-strong);
+  }
+
+  .stack-name {
+    font-size: var(--text-s);
+    font-weight: 600;
+    color: var(--clr-text-1);
+  }
+
+  .stack-title {
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .stack-meta {
     font-size: var(--text-xs);
     color: var(--clr-text-3);
+    white-space: nowrap;
+  }
+
+  .plan {
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
-    border-radius: 999px;
-    padding: 3px 10px;
+    border-radius: var(--radius-m);
+  }
+
+  .plan-head {
+    font-size: var(--text-s);
+    color: var(--clr-text-1);
+    margin-bottom: var(--sp-2);
+  }
+
+  .plan-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: var(--sp-3);
+  }
+
+  .segment {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    font-size: var(--text-s);
+  }
+
+  .seg-bookmark {
+    color: var(--clr-text-1);
+    font-weight: 550;
+  }
+
+  .seg-arrow,
+  .seg-base {
+    color: var(--clr-text-3);
+  }
+
+  .seg-meta {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .actions,
+  .steps {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    padding: 0;
+    margin: 0 0 var(--sp-2);
+  }
+
+  .action,
+  .step {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  .action-glyph {
+    font-family: var(--font-mono);
+    width: 1.2em;
+    text-align: center;
+    flex: none;
+  }
+
+  .action-glyph.accent {
+    color: var(--clr-accent-strong);
+  }
+
+  .action-glyph.ok {
+    color: var(--clr-ok);
+  }
+
+  .step-glyph {
+    font-family: var(--font-mono);
+    width: 1.2em;
+    text-align: center;
+    flex: none;
+  }
+
+  .step-glyph.done {
+    color: var(--clr-ok);
+  }
+
+  .step-glyph.failed {
+    color: var(--clr-danger);
+  }
+
+  .step-glyph.skipped {
+    color: var(--clr-text-3);
+  }
+
+  .step-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .step-detail {
+    display: block;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .pr-link {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--clr-accent-strong);
+    white-space: nowrap;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  .blocker {
+    font-size: var(--text-s);
+    color: var(--clr-danger);
+    margin-bottom: var(--sp-1);
+  }
+
+  .warning {
+    font-size: var(--text-s);
+    color: var(--clr-warn);
+    margin-bottom: var(--sp-1);
+  }
+
+  .plan-go {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    margin-top: var(--sp-3);
+  }
+
+  .go-note {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
   }
 </style>

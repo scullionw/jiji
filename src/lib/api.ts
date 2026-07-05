@@ -9,6 +9,8 @@ import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { RepoPrState } from "$lib/bindings/RepoPrState";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
+import type { SubmitOutcome } from "$lib/bindings/SubmitOutcome";
+import type { SubmitPlan } from "$lib/bindings/SubmitPlan";
 
 export interface CommandError {
   code: string;
@@ -188,6 +190,23 @@ export function forgeLogout(): Promise<ForgeStatus> {
 // head-branch → PR attachment map already built.
 export function forgePrs(): Promise<RepoPrState> {
   return invoke<RepoPrState>("forge_prs");
+}
+
+// Plan submitting the stack under a bookmark: which bookmarks push, which
+// PRs open against which bases, which existing PRs retarget. Read-only —
+// the plan is the confirm step, nothing runs yet.
+export function submitPlan(headBookmark: string): Promise<SubmitPlan> {
+  return invoke<SubmitPlan>("submit_plan", { headBookmark });
+}
+
+// Execute a confirmed plan. The backend re-derives it first and refuses
+// with code `plan_stale` when the stack or GitHub moved since the panel
+// rendered it.
+export function submitStack(
+  headBookmark: string,
+  plan: SubmitPlan,
+): Promise<SubmitOutcome> {
+  return invoke<SubmitOutcome>("submit_stack", { headBookmark, plan });
 }
 
 export function onSnapshotUpdated(

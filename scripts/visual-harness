@@ -42,6 +42,7 @@ Scenario params (full list in scripts/harness/harness.js):
   compare=parent|trunk|base|<changeId>,
   oprevert=<opId>, oprestore=<opId>, undo=1,
   drag=<changeId>, dragto=<changeId>, dragalt=1, drop=1,
+  forge=keychain|env|gh, prs=<bookmark:flags,...>, splan=<bookmark>, sgo=1,
   expand=1, scroll=<px>, scrollx=<px>
 EOF
 }

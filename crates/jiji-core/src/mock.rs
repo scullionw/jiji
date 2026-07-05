@@ -79,6 +79,7 @@ pub enum MockMutation {
     MoveBookmark { name: String, target: String },
     RenameBookmark { old: String, new: String },
     DeleteBookmark { name: String },
+    Push { names: Vec<String>, remote: String },
     RevertOp { op_id: String },
     RestoreOp { op_id: String },
     Resolve { id: String, path: String },
@@ -87,7 +88,7 @@ pub enum MockMutation {
 impl MockMutation {
     /// Revert/restore entries time-travel other entries instead of touching
     /// the graph themselves.
-    fn is_time_travel(&self) -> bool {
+    pub(crate) fn is_time_travel(&self) -> bool {
         matches!(
             self,
             MockMutation::RevertOp { .. } | MockMutation::RestoreOp { .. }
@@ -446,6 +447,61 @@ pub fn mutation_outcome(
             let bookmark = find_bookmark(snapshot, name)?;
             let target = bookmark.target.clone();
             Ok(recorded(format!("Deleted {name}"), &target))
+        }
+        MockMutation::Push { names, remote } => {
+            // Mirrors the real backend's refusals in its order: unknown
+            // names, conflicted bookmarks, unpresentable commits, then the
+            // all-synced no-op. The mock has no remote to move underneath
+            // it, so lease refusals never replay.
+            let mut to_push = Vec::new();
+            for name in names {
+                let bookmark = find_bookmark(snapshot, name)?;
+                if !bookmark.is_local {
+                    return Err(BackendError::BookmarkMissing(name.clone()));
+                }
+                if snapshot
+                    .conflicts
+                    .iter()
+                    .any(|c| c.kind == ConflictKind::Bookmark && c.id == format!("bookmark-{name}"))
+                {
+                    return Err(BackendError::MutationFailed(format!(
+                        "Bookmark \u{201c}{name}\u{201d} is conflicted; repoint it \
+                         before pushing"
+                    )));
+                }
+                let node = find(&bookmark.target)?;
+                if node.description.is_empty() {
+                    return Err(BackendError::MutationFailed(format!(
+                        "Won't push commit {} since it has no description",
+                        node.commit_id
+                    )));
+                }
+                if node.has_conflict {
+                    return Err(BackendError::MutationFailed(format!(
+                        "Won't push commit {} since it has conflicts",
+                        node.commit_id
+                    )));
+                }
+                if bookmark.sync != SyncState::Synced || bookmark.remote.is_none() {
+                    to_push.push(name.clone());
+                }
+            }
+            if to_push.is_empty() {
+                return Ok(MutationOutcome {
+                    operation_id: None,
+                    summary: format!("Everything is already pushed to {remote}"),
+                    target_change: None,
+                });
+            }
+            let summary = match &to_push[..] {
+                [name] => format!("Pushed {name} to {remote}"),
+                names => format!("Pushed {} bookmarks to {remote}", names.len()),
+            };
+            Ok(MutationOutcome {
+                operation_id: Some(mock_operation_id(index)),
+                summary,
+                target_change: None,
+            })
         }
         // The two time-travel entries leave `target_change` empty: the
         // selection should follow the working copy of the replayed result,
@@ -1020,6 +1076,36 @@ pub fn apply_mutation(
                 }],
             );
         }
+        MockMutation::Push { names, remote } => {
+            // Pushed bookmarks read as tracked and synced afterwards; the
+            // op description matches the CLI's, like the real backend.
+            let mut pushed = Vec::new();
+            let mut effects = Vec::new();
+            for name in names {
+                let Some(bookmark) = snapshot.bookmarks.iter_mut().find(|b| b.name == *name)
+                else {
+                    continue;
+                };
+                if bookmark.sync == SyncState::Synced && bookmark.remote.is_some() {
+                    continue;
+                }
+                bookmark.remote = Some(remote.clone());
+                bookmark.sync = SyncState::Synced;
+                pushed.push(name.clone());
+                effects.push(OpEffect {
+                    kind: OpEffectKind::RemoteBookmark,
+                    label: format!("{name}@{remote} updated"),
+                });
+            }
+            let description = match &pushed[..] {
+                [name] => format!("push bookmark {name} to git remote {remote}"),
+                names => format!(
+                    "push bookmarks {} to git remote {remote}",
+                    names.join(", ")
+                ),
+            };
+            push_op(snapshot, index, description, effects);
+        }
         MockMutation::Resolve { id, path } => {
             // The resolved path leaves its inbox item; an item with no paths
             // left is done, and its node stops rendering as conflicted. Only
@@ -1109,6 +1195,10 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
         }
         MockMutation::RenameBookmark { old, new } => format!("rename bookmark {old} to {new}"),
         MockMutation::DeleteBookmark { name } => format!("delete bookmark {name}"),
+        MockMutation::Push { names, remote } => match &names[..] {
+            [name] => format!("push bookmark {name} to git remote {remote}"),
+            names => format!("push bookmarks {} to git remote {remote}", names.join(", ")),
+        },
         MockMutation::RevertOp { op_id } => format!("revert operation {op_id}"),
         MockMutation::RestoreOp { op_id } => format!("restore to operation {op_id}"),
         MockMutation::Resolve { id, .. } => {
@@ -1319,7 +1409,7 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
             "2026-06-09T19:12:00Z",
             NodeKind::Mutable,
             &["uvkmrtpz"],
-            &[],
+            &["diff-model"],
         ),
         // The rebase onto 0.41 (see the ops list) left this stack
         // conflicted: the wip change collided in ConflictList.svelte, and
@@ -1405,6 +1495,17 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         BookmarkState {
             name: "conflict-inbox".into(),
             target: "qvlxnsry".into(),
+            remote: Some("origin".into()),
+            sync: SyncState::Ahead,
+            is_trunk: false,
+            is_local: true,
+        },
+        // Mid-stack bookmark under diff-virtualization, so the publish
+        // flow has a two-segment stack to plan (push, PR-per-segment,
+        // base retargeting) on fabricated data.
+        BookmarkState {
+            name: "diff-model".into(),
+            target: "nzpwlxvr".into(),
             remote: Some("origin".into()),
             sync: SyncState::Ahead,
             is_trunk: false,

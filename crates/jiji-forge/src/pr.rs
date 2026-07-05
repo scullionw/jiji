@@ -170,6 +170,50 @@ fn parse_pr_node(node: &Value) -> Result<PrSummary, ForgeError> {
     })
 }
 
+/// Reshape a REST pull-request answer (`POST /pulls`, the create-PR
+/// response) into the same summary the GraphQL parse produces. REST
+/// carries no review decision or check rollup — a just-created PR has
+/// neither, so both read as "none".
+pub fn parse_rest_pr(pr: &Value) -> Result<PrSummary, ForgeError> {
+    let number = pr["number"]
+        .as_u64()
+        .ok_or_else(|| malformed("pull request without a number"))?;
+    let str_at = |path: &[&str]| -> Result<String, ForgeError> {
+        let mut value = pr;
+        for key in path {
+            value = &value[*key];
+        }
+        value.as_str().map(str::to_owned).ok_or_else(|| {
+            malformed(&format!("pull request #{number} missing {}", path.join(".")))
+        })
+    };
+    let state = match pr["state"].as_str() {
+        Some("open") => PrState::Open,
+        Some("closed") if pr["merged_at"].is_string() => PrState::Merged,
+        Some("closed") => PrState::Closed,
+        other => {
+            return Err(malformed(&format!(
+                "pull request #{number} has unexpected state {other:?}"
+            )))
+        }
+    };
+    Ok(PrSummary {
+        number,
+        title: str_at(&["title"])?,
+        url: str_at(&["html_url"])?,
+        state,
+        is_draft: pr["draft"].as_bool().unwrap_or(false),
+        head_branch: str_at(&["head", "ref"])?,
+        head_commit: str_at(&["head", "sha"])?,
+        head_owner: pr["head"]["repo"]["owner"]["login"]
+            .as_str()
+            .map(str::to_owned),
+        base_branch: str_at(&["base", "ref"])?,
+        review: ReviewDecision::None,
+        checks: ChecksRollup::None,
+    })
+}
+
 fn malformed(what: &str) -> ForgeError {
     ForgeError::Api(format!("unexpected GitHub answer: {what}"))
 }

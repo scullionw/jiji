@@ -16,6 +16,7 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --move-bookmark <name>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <old-name> --rename-bookmark <new-name>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <name> --delete-bookmark
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo <name[,name]> --push [remote]
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --revert-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --restore-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --resolve <file-path>
@@ -151,6 +152,15 @@ fn main() {
         (Some(name), Some("--delete-bookmark")) => backend
             .delete_bookmark(path, &name)
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),
+        // The second argument is a comma-separated bookmark list; the
+        // optional fourth is the remote name (default: the CLI's rules).
+        (Some(names), Some("--push")) => {
+            let names: Vec<String> = names.split(',').map(str::to_owned).collect();
+            let remote = std::env::args().nth(4);
+            backend
+                .push_bookmarks(path, &names, remote.as_deref())
+                .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap())
+        }
         // For these two the second argument is an operation id.
         (Some(op_id), Some("--revert-op")) => backend
             .revert_operation(path, &op_id)
