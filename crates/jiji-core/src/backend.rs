@@ -152,6 +152,27 @@ pub trait RepoBackend: Send + Sync {
     fn abandon_change(&self, path: &Path, change_id: &str)
         -> Result<MutationOutcome, BackendError>;
 
+    /// Abandon several changes as one operation (`jj abandon <rev> <rev>…`),
+    /// pinned against jj 0.41: descendants outside the set rebase onto the
+    /// nearest surviving ancestors, bookmarks pointing at any abandoned
+    /// change are deleted, and an abandoned working copy respawns as a new
+    /// empty change on the nearest surviving ancestor. The op description
+    /// matches the CLI's — `abandon commit <hex>` for one change, `abandon
+    /// commit <hex> and N more` past that, quoting the topologically newest
+    /// target regardless of call order (probed empirically). Duplicate ids
+    /// collapse like the CLI's revset union. The post-land cleanup sweeps a
+    /// squash-landed segment through this so the whole sweep is one
+    /// undoable operation.
+    ///
+    /// One curated deviation, documented on the implementation: an empty
+    /// list is refused where the CLI prints "No revisions to abandon." and
+    /// exits cleanly — coming from a confirmed plan, it is a stale plan.
+    fn abandon_changes(
+        &self,
+        path: &Path,
+        change_ids: &[String],
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Squash a change into its single parent (`jj squash -r <rev>`): the
     /// parent takes the change's content and combined description, the
     /// change itself is abandoned, and bookmarks on it move to the parent.
@@ -548,6 +569,24 @@ impl RepoBackend for MockBackend {
             path,
             crate::mock::MockMutation::Abandon {
                 id: change_id.to_owned(),
+            },
+        )
+    }
+
+    fn abandon_changes(
+        &self,
+        path: &Path,
+        change_ids: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        if change_ids.is_empty() {
+            return Err(BackendError::MutationFailed(
+                "there are no changes to abandon".to_owned(),
+            ));
+        }
+        self.mutate(
+            path,
+            crate::mock::MockMutation::AbandonMany {
+                ids: change_ids.to_vec(),
             },
         )
     }

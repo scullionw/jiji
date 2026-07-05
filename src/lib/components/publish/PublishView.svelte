@@ -1,5 +1,7 @@
 <script lang="ts">
   import { openUrl } from "@tauri-apps/plugin-opener";
+  import type { LandOutcome } from "$lib/bindings/LandOutcome";
+  import type { LandPlan } from "$lib/bindings/LandPlan";
   import type { SubmitOutcome } from "$lib/bindings/SubmitOutcome";
   import type { SubmitPlan } from "$lib/bindings/SubmitPlan";
   import type { TokenSource } from "$lib/bindings/TokenSource";
@@ -14,6 +16,7 @@
     forge,
     refreshForgePrs,
   } from "$lib/state/forge.svelte";
+  import { landActionRow, segmentChip } from "./land";
   import { actionRow, publishableStacks } from "./submit";
 
   // The forge connection: which GitHub repo this jj repo publishes to and
@@ -124,6 +127,56 @@
     failed: "×",
     skipped: "–",
   };
+
+  // The land-stack workflow: the same plan → confirm → execute shape as
+  // publishing, over jjpr's merge → fetch → reconcile loop. Landing is one
+  // merge round per run; re-running Land after GitHub finishes (checks,
+  // auto-merge, the queue) is the continue flow.
+  let landFor = $state<string | null>(null);
+  let land = $state<LandPlan | null>(null);
+  let landLoading = $state(false);
+  let landError = $state<string | null>(null);
+  let landing = $state(false);
+  let landOutcome = $state<LandOutcome | null>(null);
+  let landSeq = 0;
+
+  async function loadLandPlan(headBookmark: string) {
+    const seq = ++landSeq;
+    landFor = headBookmark;
+    land = null;
+    landOutcome = null;
+    landError = null;
+    landLoading = true;
+    try {
+      const answer = await api.landPlan(headBookmark);
+      if (seq !== landSeq) return;
+      land = answer;
+    } catch (err) {
+      if (seq !== landSeq) return;
+      landError = errorMessage(err);
+    } finally {
+      if (seq === landSeq) landLoading = false;
+    }
+  }
+
+  async function landStack() {
+    if (!land || !landFor || landing || land.blockers.length > 0) return;
+    landing = true;
+    landError = null;
+    try {
+      landOutcome = await api.landStack(landFor, land);
+      // The land run's mutations republished the snapshot step by step;
+      // pulling it once more makes the flow self-contained and
+      // deterministic (the same posture as runMutation), and badges and
+      // PR counts follow what just landed on GitHub.
+      const snapshot = await api.currentSnapshot();
+      if (snapshot) app.snapshot = snapshot;
+      await refreshForgePrs();
+    } catch (err) {
+      landError = errorMessage(err);
+    }
+    landing = false;
+  }
 </script>
 
 <div class="view">
@@ -399,6 +452,144 @@
           {/if}
         {/if}
       </section>
+
+      {#if stacks.length > 0}
+        <section class="group">
+          <div class="group-head">
+            <span class="group-label">Land a stack</span>
+          </div>
+          <p class="blurb quiet">
+            Merge the bottom pull request when it is ready — or hand it to
+            GitHub's auto-merge or merge queue — then rebase what remains
+            onto the new trunk and clean up the landed bookmark. Run Land
+            again after GitHub finishes a hand-off.
+          </p>
+          <div class="stacks">
+            {#each stacks as stack (stack.workstreamId)}
+              <button
+                class="stack-row"
+                class:picked={landFor === stack.headBookmark}
+                data-land-stack={stack.headBookmark}
+                onclick={() => loadLandPlan(stack.headBookmark)}
+              >
+                <span class="stack-name mono">{stack.headBookmark}</span>
+                <span class="stack-title">{stack.title}</span>
+                <span class="stack-meta">
+                  {stack.changeCount} change{stack.changeCount === 1
+                    ? ""
+                    : "s"}{stack.isActive ? " · active" : ""}
+                </span>
+              </button>
+            {/each}
+          </div>
+
+          {#if landLoading}
+            <p class="blurb quiet" data-land-state="planning">
+              Working out what landing {landFor} needs…
+            </p>
+          {:else if land && landOutcome}
+            <div
+              class="plan"
+              data-land-outcome={landOutcome.failed ? "failed" : "done"}
+            >
+              <p class="plan-head">
+                {landOutcome.failed
+                  ? "Landing stopped partway — the steps below tell the story."
+                  : `Landed ${land.headBookmark}'s round.`}
+              </p>
+              <ul class="steps">
+                {#each landOutcome.steps as step, index (index)}
+                  <li class="step" data-land-step={step.status}>
+                    <span class="step-glyph {step.status}">
+                      {stepGlyph[step.status]}
+                    </span>
+                    <span class="step-text">
+                      {landActionRow(step.action, land.remote).text}
+                      {#if step.detail}
+                        <span class="step-detail">{step.detail}</span>
+                      {/if}
+                    </span>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {:else if land}
+            <div class="plan" data-land-plan={land.headBookmark}>
+              <div class="plan-stack">
+                {#each land.segments as segment (segment.bookmark)}
+                  {@const chip = segmentChip(segment.status)}
+                  <div class="segment" data-land-segment={segment.bookmark}>
+                    <span class="seg-bookmark mono">{segment.bookmark}</span>
+                    <span class="seg-chip {chip.tone}" data-land-status={segment.status.kind}>
+                      {chip.label}
+                    </span>
+                    <span class="seg-meta">
+                      {segment.changeIds.length} change{segment.changeIds
+                        .length === 1
+                        ? ""
+                        : "s"}
+                      {#if segment.pr}
+                        · #{segment.pr.number} open
+                      {/if}
+                    </span>
+                    {#if segment.status.kind === "merged"}
+                      {@const merged = segment.status}
+                      <button
+                        class="pr-link"
+                        onclick={() => openUrl(merged.url)}
+                      >
+                        #{merged.number} ↗
+                      </button>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+
+              {#if land.actions.length === 0 && land.blockers.length === 0}
+                <p class="blurb" data-land-state="nothing-to-run">
+                  Nothing to run right now — the notes below say where
+                  things stand.
+                </p>
+              {:else}
+                <ul class="actions">
+                  {#each land.actions as action, index (index)}
+                    {@const row = landActionRow(action, land.remote)}
+                    <li class="action" data-land-action={action.kind}>
+                      <span class="action-glyph {row.tone}">{row.glyph}</span>
+                      <span>{row.text}</span>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+
+              {#each land.blockers as blocker (blocker)}
+                <p class="blocker" data-land-blocker>{blocker}</p>
+              {/each}
+              {#each land.warnings as warning (warning)}
+                <p class="warning" data-land-warning>{warning}</p>
+              {/each}
+
+              {#if land.actions.length > 0}
+                <div class="plan-go" data-land-go>
+                  <Button
+                    variant="primary"
+                    disabled={landing || land.blockers.length > 0}
+                    onclick={landStack}
+                  >
+                    {landing ? "Landing…" : `Land ${land.headBookmark}`}
+                  </Button>
+                  {#if land.blockers.length > 0}
+                    <span class="go-note">fix the blockers first</span>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+          {#if landError}
+            <p class="error" data-land-error>{landError}</p>
+          {/if}
+        </section>
+      {/if}
     {/if}
   </div>
 </div>
@@ -650,6 +841,30 @@
     color: var(--clr-text-3);
   }
 
+  .seg-chip {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    padding: 1px var(--sp-2);
+    border-radius: 999px;
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-3);
+  }
+
+  .seg-chip.ok {
+    color: var(--clr-ok);
+    border-color: color-mix(in oklab, var(--clr-ok) 40%, transparent);
+  }
+
+  .seg-chip.accent {
+    color: var(--clr-accent-strong);
+    border-color: color-mix(in oklab, var(--clr-accent-strong) 40%, transparent);
+  }
+
+  .seg-chip.warn {
+    color: var(--clr-warn);
+    border-color: color-mix(in oklab, var(--clr-warn) 40%, transparent);
+  }
+
   .seg-meta {
     font-size: var(--text-xs);
     color: var(--clr-text-3);
@@ -687,6 +902,10 @@
 
   .action-glyph.ok {
     color: var(--clr-ok);
+  }
+
+  .action-glyph.warn {
+    color: var(--clr-warn);
   }
 
   .step-glyph {

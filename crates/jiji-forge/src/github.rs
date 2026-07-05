@@ -14,7 +14,8 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use crate::error::ForgeError;
-use crate::pr::{parse_open_prs, PrStateReport, PrSummary};
+use crate::land::{parse_pr_land_state, MergeMethod, PrLandState};
+use crate::pr::{parse_open_prs, parse_rest_pr, PrState, PrStateReport, PrSummary};
 use crate::remote::ForgeRepo;
 
 /// One batched query per repo: open PRs with review decision and check
@@ -34,6 +35,39 @@ query($owner: String!, $name: String!) {
       }
     }
   }
+}";
+
+/// The land flow's per-PR question: is this PR ready to merge right now,
+/// and what landing automation does the repo offer? One query per landing
+/// candidate — mergeability is computed lazily by GitHub, so asking it for
+/// all 100 open PRs in the batched query would be wasteful and slow.
+const PR_LAND_QUERY: &str = "\
+query($owner: String!, $name: String!, $number: Int!, $base: String!) {
+  repository(owner: $owner, name: $name) {
+    autoMergeAllowed
+    squashMergeAllowed
+    mergeCommitAllowed
+    rebaseMergeAllowed
+    mergeQueue(branch: $base) { id }
+    pullRequest(number: $number) {
+      id state isDraft mergeable reviewDecision isInMergeQueue
+      autoMergeRequest { enabledAt }
+      baseRefName headRefOid
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    }
+  }
+}";
+
+const ENABLE_AUTO_MERGE_MUTATION: &str = "\
+mutation($id: ID!, $method: PullRequestMergeMethod!) {
+  enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) {
+    clientMutationId
+  }
+}";
+
+const ENQUEUE_PR_MUTATION: &str = "\
+mutation($id: ID!) {
+  enqueuePullRequest(input: { pullRequestId: $id }) { clientMutationId }
 }";
 
 pub struct GitHubClient {
@@ -208,6 +242,92 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// The merged PR a branch once headed, when there is one — the
+    /// per-bookmark question the batched open-PR query cannot answer
+    /// (it fetches open PRs only). REST, jjpr's shape: closed PRs
+    /// filtered by head `owner:branch` — which scopes to this repo's own
+    /// branches, so the fork rule comes free — newest first, the first
+    /// merged one wins. `None` means the branch never merged a PR.
+    pub fn find_merged_pr(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> Result<Option<PrSummary>, ForgeError> {
+        let head: String =
+            url::form_urlencoded::byte_serialize(format!("{owner}:{branch}").as_bytes()).collect();
+        let answer = self.get(&format!(
+            "repos/{owner}/{name}/pulls?head={head}&state=closed&per_page=30"
+        ))?;
+        let prs = answer
+            .as_array()
+            .ok_or_else(|| ForgeError::Api("closed-PR answer was not a list".to_owned()))?;
+        for pr in prs {
+            let parsed = parse_rest_pr(pr)?;
+            if parsed.state == PrState::Merged {
+                return Ok(Some(parsed));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One PR's land readiness plus the repo's landing capabilities, via
+    /// [`PR_LAND_QUERY`]. `base` is the branch the merge queue check runs
+    /// against — the trunk branch the PR is expected to land on.
+    pub fn pr_land_state(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        base: &str,
+    ) -> Result<PrLandState, ForgeError> {
+        let data = self.graphql(
+            PR_LAND_QUERY,
+            json!({ "owner": owner, "name": name, "number": number, "base": base }),
+        )?;
+        parse_pr_land_state(&data, number)
+    }
+
+    /// Merge a pull request (`PUT /repos/{owner}/{name}/pulls/{number}/merge`).
+    /// `expected_head` rides along as GitHub's own lease: the merge is
+    /// refused if the PR's head moved since the plan read it.
+    pub fn merge_pr(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        method: MergeMethod,
+        expected_head: &str,
+    ) -> Result<(), ForgeError> {
+        self.put(
+            &format!("repos/{owner}/{name}/pulls/{number}/merge"),
+            &json!({ "merge_method": method.rest_name(), "sha": expected_head }),
+        )?;
+        Ok(())
+    }
+
+    /// Enable GitHub's auto-merge on a PR: GitHub merges it itself once
+    /// the repo's requirements (checks, reviews) are met. Takes the PR's
+    /// GraphQL node id — auto-merge has no REST surface.
+    pub fn enable_auto_merge(
+        &self,
+        node_id: &str,
+        method: MergeMethod,
+    ) -> Result<(), ForgeError> {
+        self.graphql(
+            ENABLE_AUTO_MERGE_MUTATION,
+            json!({ "id": node_id, "method": method.graphql_name() }),
+        )?;
+        Ok(())
+    }
+
+    /// Add a PR to its base branch's merge queue — the only way to land
+    /// on a queue-protected branch.
+    pub fn enqueue_pr(&self, node_id: &str) -> Result<(), ForgeError> {
+        self.graphql(ENQUEUE_PR_MUTATION, json!({ "id": node_id }))?;
+        Ok(())
+    }
+
     fn get(&self, path: &str) -> Result<Value, ForgeError> {
         let url = format!("{}{}", self.api_root, path);
         let response = self
@@ -227,6 +347,17 @@ impl GitHubClient {
             .send()
             .map_err(|err| ForgeError::Network(err.to_string()))?;
         Self::read_json("POST", path, response)
+    }
+
+    fn put(&self, path: &str, body: &Value) -> Result<Value, ForgeError> {
+        let url = format!("{}{}", self.api_root, path);
+        let response = self
+            .http
+            .put(&url)
+            .json(body)
+            .send()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        Self::read_json("PUT", path, response)
     }
 
     fn patch(&self, path: &str, body: &Value) -> Result<Value, ForgeError> {

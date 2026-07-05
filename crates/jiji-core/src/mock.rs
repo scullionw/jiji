@@ -71,6 +71,7 @@ pub enum MockMutation {
     New { parent: String },
     Edit { id: String },
     Abandon { id: String },
+    AbandonMany { ids: Vec<String> },
     Squash { id: String },
     Split { id: String, selection: Vec<SplitSelection>, description: String },
     SquashInto { id: String, selection: Vec<SplitSelection>, destination: String },
@@ -224,6 +225,20 @@ pub fn mutation_outcome(
             require_mutable(node)?;
             let parent = node.parents.first().cloned().unwrap_or_default();
             Ok(recorded(format!("Abandoned {id}"), &parent))
+        }
+        MockMutation::AbandonMany { ids } => {
+            let mut parent = String::new();
+            for id in ids {
+                let node = find(id)?;
+                require_mutable(node)?;
+                // Like the real backend: the selection lands on the first
+                // parent outside the abandoned set (the last id's parent
+                // when the ids walk a chain top-down).
+                if let Some(p) = node.parents.iter().find(|p| !ids.contains(p)) {
+                    parent = p.clone();
+                }
+            }
+            Ok(recorded(format!("Abandoned {}", ids.join(", ")), &parent))
         }
         MockMutation::Squash { id } => {
             let node = find(id)?;
@@ -743,6 +758,55 @@ pub fn apply_mutation(
                 effects,
             );
         }
+        MockMutation::AbandonMany { ids } => {
+            // One op sweeping the set, like the real backend: each removal
+            // reparents children onto the removed node's parents, so chains
+            // inside the set collapse transitively.
+            let mut effects: Vec<OpEffect> = Vec::new();
+            let mut newest_commit = String::new();
+            let mut removed_count = 0usize;
+            for id in ids {
+                let Some(removed) = remove_node(snapshot, id) else {
+                    continue;
+                };
+                if newest_commit.is_empty() {
+                    // Snapshot nodes render newest-first, and the replay
+                    // removes in list order — the first removed id whose
+                    // node exists stands in for the CLI's topologically
+                    // newest (the land cleanup passes ids newest-first).
+                    newest_commit = removed.commit_id.clone();
+                }
+                removed_count += 1;
+                reparent_children(snapshot, id, &removed.parents);
+                snapshot.bookmarks.retain(|b| {
+                    if b.target == *id {
+                        effects.push(OpEffect {
+                            kind: OpEffectKind::Bookmark,
+                            label: format!("{} deleted", b.name),
+                        });
+                        false
+                    } else {
+                        true
+                    }
+                });
+                prune_workstreams(snapshot, id);
+                if snapshot.working_copy == *id {
+                    if let Some(parent) = removed.parents.first() {
+                        spawn_working_copy(snapshot, &parent.clone(), index);
+                    }
+                    effects.push(wc_moved_effect());
+                }
+            }
+            let description = if removed_count <= 1 {
+                format!("abandon commit {newest_commit}")
+            } else {
+                format!(
+                    "abandon commit {newest_commit} and {} more",
+                    removed_count - 1
+                )
+            };
+            push_op(snapshot, index, description, effects);
+        }
         MockMutation::Squash { id } => {
             let Some(removed) = remove_node(snapshot, id) else {
                 return;
@@ -1165,6 +1229,14 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
         MockMutation::New { .. } => "new empty commit".into(),
         MockMutation::Edit { id } => format!("edit commit {}", commit_of(id)),
         MockMutation::Abandon { id } => format!("abandon commit {}", commit_of(id)),
+        MockMutation::AbandonMany { ids } => match &ids[..] {
+            [id] => format!("abandon commit {}", commit_of(id)),
+            ids => format!(
+                "abandon commit {} and {} more",
+                commit_of(&ids[0]),
+                ids.len() - 1
+            ),
+        },
         MockMutation::Squash { id } => {
             let parent = snapshot
                 .nodes

@@ -266,34 +266,34 @@ impl SubmitForge for RepoForge<'_> {
     }
 }
 
-/// Build the submission plan for the stack under `head_bookmark`: walk the
-/// snapshot graph from the bookmark down first parents to the immutable
-/// base, segment the mutable chain at local non-trunk bookmarks, and
-/// compare each segment against the forge's open-PR state — including each
-/// existing PR's title/description text and its stack comment, so the plan
-/// enumerates every remote write before anything runs and an up-to-date
-/// stack still plans nothing.
-pub fn plan_submit(
-    snapshot: &RepoSnapshot,
+/// One bookmark-bounded run of the stack, bottom-up — the shape submit and
+/// land planning share.
+pub(crate) struct RawSegment<'a> {
+    pub bookmark: &'a str,
+    pub nodes: Vec<&'a GraphNode>,
+}
+
+/// Walk the snapshot graph from `head_bookmark` down first parents to the
+/// immutable base and cut the mutable chain at local non-trunk bookmarks.
+/// Several names on one change collapse into one segment (the PR-known
+/// name preferred, the head bookmark always publishing through itself),
+/// reported in the returned warnings. Errors are plain messages for each
+/// caller to wrap in its own `ForgeError` flavor.
+pub(crate) fn stack_segments<'a>(
+    snapshot: &'a RepoSnapshot,
     prs: &RepoPrState,
-    repo: &ForgeRepo,
     head_bookmark: &str,
-    comments: &dyn StackCommentSource,
-) -> Result<SubmitPlan, ForgeError> {
+) -> Result<(Vec<RawSegment<'a>>, Vec<String>), String> {
     let bookmark = snapshot
         .bookmarks
         .iter()
         .find(|b| b.name == head_bookmark && b.is_local)
-        .ok_or_else(|| {
-            ForgeError::Plan(format!(
-                "there is no local bookmark named \u{201c}{head_bookmark}\u{201d}"
-            ))
-        })?;
+        .ok_or_else(|| format!("there is no local bookmark named \u{201c}{head_bookmark}\u{201d}"))?;
     if bookmark.is_trunk {
-        return Err(ForgeError::Plan(format!(
+        return Err(format!(
             "\u{201c}{head_bookmark}\u{201d} is the trunk — it is what stacks land on, \
-             not something to submit"
-        )));
+             not a stack of its own"
+        ));
     }
 
     let node_by_id: std::collections::HashMap<&str, &GraphNode> =
@@ -311,10 +311,10 @@ pub fn plan_submit(
             .and_then(|id| node_by_id.get(id.as_str()).copied());
     }
     if chain.is_empty() {
-        return Err(ForgeError::Plan(format!(
-            "\u{201c}{head_bookmark}\u{201d} points at immutable history — there is \
-             nothing to publish"
-        )));
+        return Err(format!(
+            "\u{201c}{head_bookmark}\u{201d} points at immutable history — everything \
+             under it is already part of trunk"
+        ));
     }
     chain.reverse(); // bottom-up, ending at the head bookmark's change
 
@@ -322,17 +322,12 @@ pub fn plan_submit(
     // bookmark ends a segment; several on one change collapse into one
     // segment published through one of them (jjpr collapses the same way).
     let mut warnings: Vec<String> = Vec::new();
-    let mut blockers: Vec<String> = Vec::new();
     let local_bookmarks: std::collections::HashSet<&str> = snapshot
         .bookmarks
         .iter()
         .filter(|b| b.is_local && !b.is_trunk)
         .map(|b| b.name.as_str())
         .collect();
-    struct RawSegment<'a> {
-        bookmark: &'a str,
-        nodes: Vec<&'a GraphNode>,
-    }
     let mut raw_segments: Vec<RawSegment> = Vec::new();
     let mut pending: Vec<&GraphNode> = Vec::new();
     for node in &chain {
@@ -370,6 +365,26 @@ pub fn plan_submit(
     // The walk ends at the head bookmark's change, which closes the last
     // segment; anything left over would mean the bookmark vanished.
     debug_assert!(pending.is_empty());
+    Ok((raw_segments, warnings))
+}
+
+/// Build the submission plan for the stack under `head_bookmark`: walk the
+/// snapshot graph from the bookmark down first parents to the immutable
+/// base, segment the mutable chain at local non-trunk bookmarks, and
+/// compare each segment against the forge's open-PR state — including each
+/// existing PR's title/description text and its stack comment, so the plan
+/// enumerates every remote write before anything runs and an up-to-date
+/// stack still plans nothing.
+pub fn plan_submit(
+    snapshot: &RepoSnapshot,
+    prs: &RepoPrState,
+    repo: &ForgeRepo,
+    head_bookmark: &str,
+    comments: &dyn StackCommentSource,
+) -> Result<SubmitPlan, ForgeError> {
+    let (raw_segments, mut warnings) =
+        stack_segments(snapshot, prs, head_bookmark).map_err(ForgeError::Plan)?;
+    let mut blockers: Vec<String> = Vec::new();
 
     // Compare each segment with the forge state, bottom-up, tracking the
     // effective base like jjpr: trunk first, then each live segment's

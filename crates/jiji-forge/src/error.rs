@@ -21,6 +21,8 @@ pub enum ForgeError {
     Keychain(String),
     #[error("Cannot submit this stack: {0}")]
     Plan(String),
+    #[error("Cannot land this stack: {0}")]
+    Land(String),
 }
 
 impl ForgeError {
@@ -35,6 +37,7 @@ impl ForgeError {
             ForgeError::Network(_) => "network_failed",
             ForgeError::Keychain(_) => "keychain_failed",
             ForgeError::Plan(_) => "plan_failed",
+            ForgeError::Land(_) => "plan_failed",
         }
     }
 }

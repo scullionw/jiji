@@ -83,6 +83,27 @@
 //                        mark bookmarks synced, created PRs join the
 //                        fabricated open-PR state, text updates and stack
 //                        comments persist so a replan settles idle)
+//   &lplan=<bookmark>    click that stack row in Land a stack and wait for
+//                        its land plan (a JS twin of plan_land over the
+//                        captured snapshot + &prs= state). The candidate's
+//                        readiness reads the &prs= review/CI flags; a
+//                        `merged` flag on a lower bookmark is the
+//                        merged-PR-recognition path (reconcile-only plan);
+//                        the extra flag `unmergeable` fabricates GitHub's
+//                        CONFLICTING mergeability. Needs &forge=
+//   &lqueue=1            the trunk branch is protected by a merge queue
+//                        (the plan enqueues instead of merging)
+//   &lamon=1             auto-merge is already enabled on the candidate
+//                        (nothing to run; the plan says GitHub is driving)
+//   &lnoauto=1           the repo disallows auto-merge (wait states become
+//                        blockers instead of an auto-merge hand-off)
+//   &lgo=1               click Land on the derived plan and wait for the
+//                        executed per-step results (stubbed: the merge
+//                        marks the PR merged, the fetch fabricates the
+//                        squash commit arriving on trunk, rebases reparent
+//                        live, cleanup removes the landed bookmark and
+//                        changes, so the refreshed graph and PR state
+//                        follow the executed flow)
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -325,10 +346,14 @@
     // PRs the stubbed submit_stack opened this session; forge_prs folds
     // them in so the refreshed count and badges follow the executed flow.
     createdPrs: [],
-    // Stack comments and PR-text rewrites the stubbed submit_stack made,
-    // keyed by PR number, so a replan after the executed flow settles.
+    // Stack comments and PR overrides (text rewrites, retargeted bases)
+    // the stubbed submit/land flows made, keyed by PR number, so a replan
+    // after an executed flow settles.
     comments: new Map(),
-    textOverrides: new Map(),
+    prOverrides: new Map(),
+    // Branches whose PR the stubbed land flow merged this session: their
+    // fabricated PR reads merged and drops out of the byBranch attach map.
+    landedBranches: new Set(),
   };
   // JS twins of jiji-forge's reconcile fingerprints (FNV-1a 64) and
   // managed-body markers, enough for the plan twin to mirror the Rust
@@ -499,6 +524,9 @@
             `<!-- jiji:title-fp ${fnvFp(title)} -->`;
         else if (flags.has("conflict"))
           body = `${DESC_START}\nAn earlier take on this change.\n${DESC_END}\n<!-- jiji:body-fp 0000000000000000 -->`;
+        // A `base-<branch>` flag fabricates a stacked PR's non-trunk base
+        // (what the land reconcile's retarget row acts on).
+        const baseFlag = [...flags].find((flag) => flag.startsWith("base-"));
         return {
           number,
           title,
@@ -508,14 +536,18 @@
           headBranch: branch,
           headCommit: "ad".repeat(20),
           headOwner: flags.has("fork") ? "someone-else" : (repo?.owner ?? null),
-          baseBranch: snap?.trunkBookmark || "main",
+          baseBranch: baseFlag ? baseFlag.slice(5) : (snap?.trunkBookmark || "main"),
           body,
           review,
           checks,
         };
       })
-      .map((pr) => ({ ...pr, ...(forge.textOverrides.get(pr.number) || {}) }));
-    const all = prs.concat(forge.createdPrs);
+      .map((pr) => ({ ...pr, ...(forge.prOverrides.get(pr.number) || {}) }));
+    // Branches the stubbed land flow merged drop out entirely, like the
+    // real batched query no longer answering the merged PR.
+    const all = prs
+      .concat(forge.createdPrs)
+      .filter((pr) => !forge.landedBranches.has(pr.headBranch));
     const byBranch = {};
     for (const pr of all) {
       const sameRepo =
@@ -743,6 +775,284 @@
       stackCommentPreview: commentActions.length
         ? renderStackComment(live, null)
         : null,
+    };
+  };
+
+  // A JS twin of jiji-forge's plan_land, just enough for shots: the same
+  // segment walk as the submit twin, then bottom-up placement — fabricated
+  // merged PRs (the `merged` &prs= flag) reconcile, the first open PR is
+  // the landing candidate read from its fabricated review/CI flags, and
+  // everything above stacks. Wording mirrors the Rust engine's.
+  const landPlanOf = (snap, head) => {
+    const repo = forgeRepoOf(snap);
+    const prState = forgePrsOf(snap);
+    const local = new Map(
+      (snap.bookmarks || [])
+        .filter((b) => b.isLocal && !b.isTrunk)
+        .map((b) => [b.name, b]),
+    );
+    const state = local.get(head);
+    if (!state) return null;
+    const trunk = snap.trunkBookmark;
+    const nodes = new Map(snap.nodes.map((n) => [n.id, n]));
+    const chain = [];
+    let cursor = nodes.get(state.target);
+    while (cursor && cursor.kind !== "immutable") {
+      chain.push(cursor);
+      cursor = nodes.get(cursor.parents[0]);
+    }
+    chain.reverse();
+    const rawSegments = [];
+    let pending = [];
+    for (const node of chain) {
+      pending.push(node);
+      const names = node.bookmarks
+        .filter((name) => local.has(name))
+        .sort(
+          (a, b) =>
+            (a !== head) - (b !== head) ||
+            !(a in prState.byBranch) - !(b in prState.byBranch) ||
+            a.localeCompare(b),
+        );
+      if (!names.length) continue;
+      rawSegments.push({ bookmark: names[0], nodes: pending });
+      pending = [];
+    }
+    const warnings = [];
+    const blockers = [];
+    const segments = [];
+    let mergedTop = -1;
+    let candidate = null;
+    let noPr = null;
+    let bottomResolved = true;
+    rawSegments.forEach((raw, index) => {
+      const changeIds = raw.nodes.map((n) => n.id);
+      const pr = prState.byBranch[raw.bookmark] || null;
+      const openPr = pr && pr.state === "open" ? pr : null;
+      if (!bottomResolved) {
+        segments.push({
+          bookmark: raw.bookmark,
+          changeIds,
+          pr: openPr,
+          status: { kind: "stacked" },
+        });
+        return;
+      }
+      if (pr && pr.state === "merged") {
+        segments.push({
+          bookmark: raw.bookmark,
+          changeIds,
+          pr: null,
+          status: { kind: "merged", number: pr.number, url: pr.url },
+        });
+        mergedTop = index;
+      } else if (openPr) {
+        bottomResolved = false;
+        if (mergedTop >= 0) {
+          candidate = null; // reconcile-only run; this PR stays put
+          segments.push({
+            bookmark: raw.bookmark,
+            changeIds,
+            pr: openPr,
+            status: { kind: "stacked" },
+          });
+        } else {
+          candidate = { index, pr: openPr };
+          segments.push({
+            bookmark: raw.bookmark,
+            changeIds,
+            pr: openPr,
+            status: { kind: "waiting" },
+          });
+        }
+      } else {
+        noPr = raw.bookmark;
+        bottomResolved = false;
+        segments.push({
+          bookmark: raw.bookmark,
+          changeIds,
+          pr: null,
+          status: { kind: "waiting" },
+        });
+      }
+    });
+    const actions = [];
+    const subtreeOf = (id) =>
+      1 +
+      snap.nodes
+        .filter((n) => n.parents.includes(id))
+        .reduce((sum, child) => sum + subtreeOf(child.id), 0);
+    const reconcile = (landedIdx, method) => {
+      actions.push({ kind: "fetchRemote", remote: repo?.remote ?? "origin" });
+      const top = Math.max(...landedIdx);
+      const landedHead = rawSegments[top].nodes[rawSegments[top].nodes.length - 1];
+      snap.nodes
+        .filter((n) => n.parents.includes(landedHead.id))
+        .forEach((child) => {
+          actions.push({
+            kind: "rebaseOntoTrunk",
+            rootChange: child.id,
+            moves: subtreeOf(child.id),
+          });
+        });
+      const live = segments
+        .filter(
+          (segment, index) =>
+            index > top &&
+            snap.bookmarks.find((b) => b.name === segment.bookmark)?.remote,
+        )
+        .map((segment) => segment.bookmark);
+      if (live.length) actions.push({ kind: "pushStack", bookmarks: live });
+      const next = segments
+        .filter((_, index) => index > top)
+        .map((segment) => segment.pr)
+        .find(Boolean);
+      if (next && next.baseBranch !== trunk)
+        actions.push({
+          kind: "retargetPr",
+          number: next.number,
+          bookmark: next.headBranch,
+          toBase: trunk,
+        });
+      for (const index of landedIdx)
+        actions.push({
+          kind: "cleanupBookmark",
+          bookmark: rawSegments[index].bookmark,
+        });
+      if (method !== "merge")
+        for (const index of landedIdx) {
+          const raw = rawSegments[index];
+          if (raw.nodes.some((n) => n.id === snap.workingCopy))
+            warnings.push(
+              `the working copy sits on \u{201c}${raw.bookmark}\u{201d}'s landed ` +
+                `changes; it respawns as a fresh empty change when they are swept`,
+            );
+          actions.push({
+            kind: "abandonLanded",
+            bookmark: raw.bookmark,
+            changeIds: raw.nodes.map((n) => n.id).reverse(),
+          });
+        }
+    };
+    if (mergedTop >= 0) {
+      if (noPr) {
+        warnings.push(
+          `\u{201c}${noPr}\u{201d} has no pull request yet — publish the stack ` +
+            `once this reconcile lands`,
+        );
+        const waiting = segments.find((segment) => segment.bookmark === noPr);
+        if (waiting) waiting.status = { kind: "stacked" };
+      }
+      reconcile(
+        segments.flatMap((segment, index) =>
+          segment.status.kind === "merged" ? [index] : [],
+        ),
+        null,
+      );
+    } else if (noPr) {
+      blockers.push(
+        `\u{201c}${noPr}\u{201d} has no pull request — publish the stack first`,
+      );
+    } else if (candidate) {
+      const { index, pr } = candidate;
+      const bm = local.get(rawSegments[index].bookmark);
+      if (bm.sync !== "synced")
+        blockers.push(
+          `\u{201c}${bm.name}\u{201d} and its GitHub branch differ — publish the ` +
+            `stack first, so what merges is what you see here`,
+        );
+      const flags = new Set(
+        ((params.get("prs") || "")
+          .split(",")
+          .map((entry) => entry.split(":"))
+          .find(([branch]) => branch === pr.headBranch)?.[1] || "")
+          .split(/[.+\s]+/)
+          .filter(Boolean),
+      );
+      if (params.get("lamon")) {
+        warnings.push(
+          `auto-merge is already enabled on #${pr.number}; GitHub merges it ` +
+            `once its requirements are met — run Land again afterwards to reconcile`,
+        );
+      } else {
+        if (pr.isDraft)
+          blockers.push(
+            `#${pr.number} is still a draft — mark it ready for review on GitHub first`,
+          );
+        if (pr.baseBranch !== trunk)
+          blockers.push(
+            `#${pr.number} still targets \u{201c}${pr.baseBranch}\u{201d}, not ` +
+              `\u{201c}${trunk}\u{201d} — publish the stack to retarget it first`,
+          );
+        if (flags.has("unmergeable"))
+          blockers.push(
+            `#${pr.number} has merge conflicts with \u{201c}${trunk}\u{201d} — ` +
+              `rebase onto the fetched trunk, publish, and land again`,
+          );
+        if (pr.review === "changesRequested")
+          blockers.push(`changes were requested on #${pr.number}`);
+        if (pr.checks === "failing")
+          blockers.push(`#${pr.number}'s checks are failing`);
+        if (!blockers.length) {
+          const waits = [];
+          if (pr.checks === "pending")
+            waits.push(`#${pr.number}'s checks are still running`);
+          if (pr.review === "reviewRequired")
+            waits.push(`#${pr.number} still needs an approving review`);
+          if (params.get("lqueue")) {
+            actions.push({
+              kind: "enqueuePr",
+              number: pr.number,
+              bookmark: bm.name,
+            });
+            warnings.push(
+              `\u{201c}${trunk}\u{201d} is protected by a merge queue; GitHub ` +
+                `lands #${pr.number} from here — run Land again afterwards to reconcile`,
+            );
+          } else if (waits.length) {
+            if (params.get("lnoauto"))
+              blockers.push(
+                ...waits.map(
+                  (wait) =>
+                    `${wait} — this repository has auto-merge disabled, so ` +
+                    `land again when it settles`,
+                ),
+              );
+            else {
+              actions.push({
+                kind: "enableAutoMerge",
+                number: pr.number,
+                bookmark: bm.name,
+                method: "squash",
+              });
+              warnings.push(
+                `${waits.join("; ")} — auto-merge hands the wait to GitHub`,
+              );
+            }
+          } else {
+            actions.push({
+              kind: "mergePr",
+              number: pr.number,
+              bookmark: bm.name,
+              method: "squash",
+              expectedHead: pr.headCommit,
+            });
+            reconcile([index], "squash");
+          }
+        }
+      }
+      segments[index].status = blockers.length
+        ? { kind: "waiting" }
+        : { kind: "landing" };
+    }
+    return {
+      headBookmark: head,
+      remote: repo?.remote ?? "origin",
+      baseBranch: trunk,
+      segments,
+      actions,
+      blockers,
+      warnings,
     };
   };
 
@@ -1675,7 +1985,7 @@
               };
             }
             if (action.kind === "updatePrText") {
-              forge.textOverrides.set(action.number, {
+              forge.prOverrides.set(action.number, {
                 body: action.body,
                 ...(action.title != null ? { title: action.title } : {}),
               });
@@ -1718,6 +2028,144 @@
               detail: `Retargeted #${action.number} (${action.bookmark}) from ${action.fromBase} to ${action.toBase}`,
               pr: null,
             };
+          });
+          return Promise.resolve({ steps, failed: false });
+        }
+        // The land-stack workflow: the plan derives via a JS twin of
+        // plan_land; executing applies the world change to the live stub —
+        // the merged PR drops out of the open set, the fetch fabricates
+        // the squash commit arriving on trunk, rebases reparent live rows,
+        // and cleanup removes the landed bookmark and changes — so the
+        // refreshed graph, count, and badges follow the executed flow.
+        case "land_plan": {
+          const plan = landPlanOf(snap, args?.headBookmark);
+          if (!plan)
+            return reject(
+              "plan_failed",
+              `there is no local bookmark named \u{201c}${args?.headBookmark}\u{201d}`,
+            );
+          return Promise.resolve(plan);
+        }
+        case "land_stack": {
+          const plan = landPlanOf(snap, args?.headBookmark);
+          if (!plan) return reject("plan_failed", "the bookmark is gone");
+          let landedSeq = 0;
+          const steps = plan.actions.map((action) => {
+            const done = (detail) => ({ action, status: "done", detail });
+            switch (action.kind) {
+              case "mergePr": {
+                forge.landedBranches.add(action.bookmark);
+                return done(
+                  `Merged #${action.number} (${action.bookmark}) into ${plan.baseBranch}`,
+                );
+              }
+              case "enableAutoMerge":
+                return done(
+                  `Auto-merge enabled on #${action.number}; GitHub merges it ` +
+                    `once its requirements are met — run Land again afterwards ` +
+                    `to reconcile`,
+                );
+              case "enqueuePr":
+                return done(
+                  `#${action.number} added to the merge queue — run Land ` +
+                    `again once it lands`,
+                );
+              case "fetchRemote": {
+                // The squash commit arrives on trunk: a fresh immutable
+                // node on the old trunk target, the trunk bookmark (and
+                // its chip) moving to it.
+                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
+                const landing = plan.segments.find(
+                  (segment) =>
+                    segment.status.kind === "landing" ||
+                    segment.status.kind === "merged",
+                );
+                if (trunkBm) {
+                  landedSeq += 1;
+                  const old = requireNode(snap, trunkBm.target);
+                  const id = `zl${landedSeq}andsq`;
+                  const position = snap.nodes.findIndex(
+                    (n) => n.id === trunkBm.target,
+                  );
+                  const number =
+                    landing?.status.kind === "merged"
+                      ? landing.status.number
+                      : (landing?.pr?.number ?? 0);
+                  snap.nodes.splice(Math.max(position, 0), 0, {
+                    id,
+                    changeId: id,
+                    commitId: `e5${landedSeq}a4d`,
+                    description: `${humanize(landing?.bookmark ?? "stack")} (#${number})`,
+                    author: old?.author ?? "GitHub",
+                    timestamp: old?.timestamp ?? "2026-07-01T12:00:00Z",
+                    kind: "immutable",
+                    parents: trunkBm.target ? [trunkBm.target] : [],
+                    elidedParents: [],
+                    bookmarks: [trunkBm.name],
+                    isEmpty: false,
+                    hasConflict: false,
+                    isDivergent: false,
+                  });
+                  if (old)
+                    old.bookmarks = old.bookmarks.filter(
+                      (name) => name !== trunkBm.name,
+                    );
+                  trunkBm.target = id;
+                }
+                return done(
+                  `Fetched from ${action.remote} — ${trunkBm?.name ?? "trunk"} ` +
+                    `moved to the merged commit`,
+                );
+              }
+              case "rebaseOntoTrunk": {
+                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
+                const root = requireNode(snap, action.rootChange);
+                if (root && trunkBm) root.parents = [trunkBm.target];
+                return done(`Rebased ${action.rootChange} onto the new trunk`);
+              }
+              case "pushStack": {
+                action.bookmarks.forEach((name) => {
+                  const bm = snap.bookmarks.find((b) => b.name === name);
+                  if (bm) {
+                    bm.sync = "synced";
+                    bm.remote = plan.remote;
+                  }
+                });
+                return done(
+                  `Pushed ${action.bookmarks.join(", ")} to ${plan.remote}`,
+                );
+              }
+              case "retargetPr": {
+                forge.prOverrides.set(action.number, {
+                  ...(forge.prOverrides.get(action.number) || {}),
+                  baseBranch: action.toBase,
+                });
+                return done(`Retargeted #${action.number} onto ${action.toBase}`);
+              }
+              case "cleanupBookmark": {
+                snap.bookmarks = snap.bookmarks.filter(
+                  (b) => b.name !== action.bookmark,
+                );
+                snap.nodes.forEach((n) => {
+                  n.bookmarks = n.bookmarks.filter(
+                    (name) => name !== action.bookmark,
+                  );
+                });
+                forge.landedBranches.add(action.bookmark);
+                return done(
+                  `Deleted \u{201c}${action.bookmark}\u{201d} here and on ${plan.remote}`,
+                );
+              }
+              case "abandonLanded": {
+                action.changeIds.forEach((id) => {
+                  const node = requireNode(snap, id);
+                  if (node) removeNode(snap, id, node.parents);
+                });
+                return done(`Abandoned ${action.changeIds.join(", ")}`);
+              }
+              default:
+                return done("done");
+            }
           });
           return Promise.resolve({ steps, failed: false });
         }
@@ -1886,6 +2334,22 @@
   if (params.get("sgo")) {
     steps.push(() => click("[data-submit-go] .btn.primary:not(:disabled)"));
     steps.push(() => document.querySelector("[data-submit-outcome]") !== null);
+  }
+  // Land-stack flows (section=publish + forge=): click a stack row in the
+  // Land group to derive its plan, then optionally land and wait for the
+  // executed per-step results.
+  const landStackParam = params.get("lplan");
+  if (landStackParam) {
+    steps.push(() => click(`[data-land-stack="${landStackParam}"]`));
+    steps.push(
+      () =>
+        document.querySelector("[data-land-plan]") !== null ||
+        document.querySelector("[data-land-error]") !== null,
+    );
+  }
+  if (params.get("lgo")) {
+    steps.push(() => click("[data-land-go] .btn.primary:not(:disabled)"));
+    steps.push(() => document.querySelector("[data-land-outcome]") !== null);
   }
   const open = params.get("open");
   if (open === "files") steps.push(() => click(".files-button"));

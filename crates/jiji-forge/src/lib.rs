@@ -15,11 +15,13 @@
 //! - [`submit`]: the analyze → plan → execute submission engine
 //! - [`reconcile`]: fingerprinted PR title/description reconciliation
 //! - [`comment`]: the stack-info comment GitHub readers see
+//! - [`land`]: the merge → fetch → reconcile landing engine
 
 pub mod auth;
 pub mod comment;
 pub mod error;
 pub mod github;
+pub mod land;
 pub mod pr;
 pub mod reconcile;
 pub mod remote;
@@ -31,6 +33,10 @@ pub use auth::{
 };
 pub use error::ForgeError;
 pub use github::GitHubClient;
+pub use land::{
+    execute_land, plan_land, LandAction, LandForge, LandOutcome, LandPlan, LandRepoForge,
+    LandSegment, LandSegmentStatus, LandStep, LandVcs, MergeMethod, PrLandState,
+};
 pub use pr::{
     parse_open_prs, prs_by_branch, ChecksRollup, PrState, PrStateReport, PrSummary,
     RepoPrState, ReviewDecision,

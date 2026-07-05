@@ -444,6 +444,87 @@ impl RepoBackend for JjBackend {
         })
     }
 
+    fn abandon_changes(
+        &self,
+        path: &Path,
+        change_ids: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        // Curated deviation: the CLI prints "No revisions to abandon." and
+        // exits cleanly; an empty list from a confirmed plan is a stale
+        // plan, so it refuses instead.
+        if change_ids.is_empty() {
+            return Err(BackendError::MutationFailed(
+                "there are no changes to abandon".to_owned(),
+            ));
+        }
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let mut commits: Vec<Commit> = Vec::new();
+        let mut display_ids: Vec<String> = Vec::new();
+        for change_id in change_ids {
+            let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+            check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+            // Duplicates collapse like the CLI's revset union.
+            if !commits.iter().any(|c| c.id() == commit.id()) {
+                commits.push(commit);
+                display_ids.push(change_id.clone());
+            }
+        }
+        // The CLI resolves its arguments as one revset, which iterates
+        // newest-first, and quotes whichever commit comes first in that
+        // order in the op description — match it by evaluating the same
+        // set (probed empirically: input order does not matter).
+        let expr = RevsetExpression::commits(commits.iter().map(|c| c.id().clone()).collect());
+        let revset = expr.evaluate(repo.as_ref()).map_err(snapshot_err)?;
+        let mut ordered: Vec<Commit> = Vec::new();
+        for commit_id in revset.iter() {
+            let commit_id = commit_id.map_err(snapshot_err)?;
+            let commit = repo.store().get_commit(&commit_id).map_err(snapshot_err)?;
+            ordered.push(commit);
+        }
+        let newest = ordered.first().expect("the set is non-empty");
+        let oldest = ordered.last().expect("the set is non-empty");
+        // The selection ends up where the graph collapses to: the first
+        // parent of the oldest abandoned change (outside the set by
+        // topological order).
+        let parent = repo
+            .store()
+            .get_commit(&oldest.parent_ids()[0])
+            .map_err(snapshot_err)?;
+        let parent_display = display_id(repo.as_ref(), &parent);
+
+        let description = if ordered.len() == 1 {
+            format!("abandon commit {}", newest.id().hex())
+        } else {
+            format!(
+                "abandon commit {} and {} more",
+                newest.id().hex(),
+                ordered.len() - 1
+            )
+        };
+        let mut tx = repo.start_transaction();
+        for commit in &ordered {
+            tx.repo_mut().record_abandoned_commit(commit);
+        }
+        // Same semantics as the single abandon: bookmarks on abandoned
+        // changes are deleted, an abandoned working copy respawns inside
+        // the rebase, and chains inside the set reparent transitively.
+        let options = RebaseOptions {
+            rewrite_refs: RewriteRefsOptions {
+                delete_abandoned_bookmarks: true,
+            },
+            ..Default::default()
+        };
+        pollster::block_on(tx.repo_mut().rebase_descendants_with_options(&options, |_, _| {}))
+            .map_err(mutation_err)?;
+        let new_repo = finish_mutation(&mut workspace, &repo, tx, description)?;
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary: format!("Abandoned {}", display_ids.join(", ")),
+            target_change: Some(parent_display),
+        })
+    }
+
     fn squash_change(&self, path: &Path, change_id: &str) -> Result<MutationOutcome, BackendError> {
         let (mut workspace, repo) = self.load_repo_at_head(path)?;
         let repo = sync_workspace(&mut workspace, repo)?;
@@ -4881,6 +4962,82 @@ mod tests {
         assert_eq!(wc_node.parents, vec![feature_id]);
         assert!(wc_node.is_empty);
         assert_workspace_fresh(dir.path());
+    }
+
+    #[test]
+    fn abandon_changes_sweeps_a_chain_as_one_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        build_test_repo(dir.path());
+        let backend = test_backend();
+        let before = backend.open(dir.path()).unwrap();
+        let wc_id = before.working_copy.clone();
+        let feature_id = node_by_description(&before, "feat: first change").id.clone();
+        let trunk_id = node_by_description(&before, "release: cut 1.0").id.clone();
+        let wc_commit = before
+            .nodes
+            .iter()
+            .find(|n| n.id == wc_id)
+            .unwrap()
+            .commit_id
+            .clone();
+        let op_count = before.operations.len();
+
+        // Oldest-first on purpose: the op description quotes the
+        // topologically newest commit regardless of call order (probed
+        // against jj 0.41).
+        let outcome = backend
+            .abandon_changes(dir.path(), &[feature_id.clone(), wc_id.clone()])
+            .unwrap();
+        assert_eq!(outcome.summary, format!("Abandoned {feature_id}, {wc_id}"));
+        assert_eq!(outcome.target_change.as_deref(), Some(trunk_id.as_str()));
+
+        let after = backend.open(dir.path()).unwrap();
+        assert!(!after.nodes.iter().any(|n| n.id == feature_id));
+        // One operation swept the chain, described like the CLI.
+        assert_eq!(after.operations.len(), op_count + 1);
+        let description = &after.operations[0].description;
+        let quoted = description
+            .strip_prefix("abandon commit ")
+            .unwrap_or_else(|| panic!("unexpected op description {description:?}"));
+        assert!(quoted.starts_with(&wc_commit), "got {description:?}");
+        assert!(description.ends_with(" and 1 more"), "got {description:?}");
+        // The bookmark on the abandoned change is deleted, and a fresh
+        // working copy respawned on the nearest surviving ancestor.
+        assert!(!after.bookmarks.iter().any(|b| b.name == "feature-a"));
+        assert_ne!(after.working_copy, wc_id);
+        let wc_node = after
+            .nodes
+            .iter()
+            .find(|n| n.id == after.working_copy)
+            .unwrap();
+        assert_eq!(wc_node.parents, vec![trunk_id.clone()]);
+        assert_workspace_fresh(dir.path());
+
+        // Refusals record nothing: an empty list is a stale plan, and an
+        // immutable member refuses the whole sweep.
+        let err = backend.abandon_changes(dir.path(), &[]).unwrap_err();
+        assert!(matches!(err, BackendError::MutationFailed(_)));
+        let err = backend
+            .abandon_changes(dir.path(), &[trunk_id.clone()])
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ImmutableChange(_)));
+        let unchanged = backend.open(dir.path()).unwrap();
+        assert_eq!(unchanged.operations.len(), op_count + 1);
+
+        // Duplicates collapse like the CLI's revset union: the same change
+        // twice is one abandon with the single-form description.
+        let side_id = node_by_description(&unchanged, "wip: side experiment")
+            .id
+            .clone();
+        let outcome = backend
+            .abandon_changes(dir.path(), &[side_id.clone(), side_id.clone()])
+            .unwrap();
+        assert_eq!(outcome.summary, format!("Abandoned {side_id}"));
+        let final_snapshot = backend.open(dir.path()).unwrap();
+        assert!(final_snapshot.operations[0]
+            .description
+            .starts_with("abandon commit "));
+        assert!(!final_snapshot.operations[0].description.contains(" more"));
     }
 
     #[test]

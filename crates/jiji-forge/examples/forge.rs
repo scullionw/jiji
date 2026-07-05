@@ -10,17 +10,23 @@
 //!   cargo run -p jiji-forge --example forge -- login <token>
 //!   cargo run -p jiji-forge --example forge -- logout
 //!   cargo run -p jiji-forge --example forge -- plan <repo-path> <head-bookmark>
+//!   cargo run -p jiji-forge --example forge -- land <repo-path> <head-bookmark>
+//!   cargo run -p jiji-forge --example forge -- merged <owner>/<name> <branch>
+//!   cargo run -p jiji-forge --example forge -- landstate <owner>/<name> <number> <base>
 //!
 //! `status` reports where a token would come from (no network). `whoami`
 //! verifies the resolved token against the API. `login` validates a token
 //! and stores it in the system keychain; `logout` removes it. `plan`
 //! snapshots a real repo through `jiji-core`, fetches the detected GitHub
 //! repo's open-PR state, and prints the submission plan for the stack
-//! under the bookmark — read-only: nothing pushes, nothing posts.
+//! under the bookmark — read-only: nothing pushes, nothing posts. `land`
+//! prints the landing plan the same way (also read-only); `merged` probes
+//! the per-bookmark merged-PR recognition query, and `landstate` the
+//! per-PR land-readiness query.
 
 use jiji_forge::{
-    detect_github_repo, no_github_remote, plan_submit, resolve_token, ForgeAuth, ForgeError,
-    GitHubClient, KeychainTokenStore, RepoPrState, TokenSource,
+    detect_github_repo, no_github_remote, plan_land, plan_submit, resolve_token, ForgeAuth,
+    ForgeError, GitHubClient, KeychainTokenStore, LandRepoForge, RepoPrState, TokenSource,
 };
 
 fn main() {
@@ -33,10 +39,22 @@ fn main() {
         Some("login") => login(args.get(1).map(String::as_str)),
         Some("logout") => logout(),
         Some("plan") => plan(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
+        Some("land") => land(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
+        Some("merged") => merged(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        Some("landstate") => landstate(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+        ),
         _ => {
             eprintln!(
                 "usage: forge -- status | whoami | prs <owner>/<name> | detect <url>... \
-                 | login <token> | logout | plan <repo-path> <head-bookmark>"
+                 | login <token> | logout | plan <repo-path> <head-bookmark> \
+                 | land <repo-path> <head-bookmark> | merged <owner>/<name> <branch> \
+                 | landstate <owner>/<name> <number> <base>"
             );
             std::process::exit(2);
         }
@@ -149,5 +167,61 @@ fn plan(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     let forge_side = jiji_forge::RepoForge { client: &client, repo: &repo };
     let plan = plan_submit(&snapshot, &prs, &repo, head, &forge_side)?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
+    Ok(())
+}
+
+fn land(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
+    let (Some(repo_path), Some(head)) = (repo_path, head) else {
+        eprintln!("usage: forge -- land <repo-path> <head-bookmark>");
+        std::process::exit(2);
+    };
+    use jiji_core::RepoBackend as _;
+    let snapshot = jiji_core::JjBackend::default()
+        .open(std::path::Path::new(repo_path))
+        .map_err(|err| ForgeError::Land(format!("could not snapshot the repo: {err}")))?;
+    let repo = detect_github_repo(
+        snapshot
+            .git_remotes
+            .iter()
+            .map(|r| (r.name.as_str(), r.url.as_str())),
+    )
+    .ok_or_else(no_github_remote)?;
+    let resolved = resolve_token(&KeychainTokenStore::new(&repo.host))?.ok_or(ForgeError::NoToken)?;
+    let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+    let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
+    let forge_side = LandRepoForge { client: &client, repo: &repo };
+    let plan = plan_land(&snapshot, &prs, &repo, head, &forge_side)?;
+    println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
+    Ok(())
+}
+
+fn merged(slug: Option<&str>, branch: Option<&str>) -> Result<(), ForgeError> {
+    let (Some((owner, name)), Some(branch)) = (slug.and_then(|s| s.split_once('/')), branch)
+    else {
+        eprintln!("usage: forge -- merged <owner>/<name> <branch>");
+        std::process::exit(2);
+    };
+    let (client, _) = resolved_client()?;
+    let answer = client.find_merged_pr(owner, name, branch)?;
+    println!("{}", serde_json::to_string_pretty(&answer).expect("answer serializes"));
+    Ok(())
+}
+
+fn landstate(
+    slug: Option<&str>,
+    number: Option<&str>,
+    base: Option<&str>,
+) -> Result<(), ForgeError> {
+    let (Some((owner, name)), Some(number), Some(base)) = (
+        slug.and_then(|s| s.split_once('/')),
+        number.and_then(|n| n.parse::<u64>().ok()),
+        base,
+    ) else {
+        eprintln!("usage: forge -- landstate <owner>/<name> <number> <base>");
+        std::process::exit(2);
+    };
+    let (client, _) = resolved_client()?;
+    let state = client.pr_land_state(owner, name, number, base)?;
+    println!("{state:#?}");
     Ok(())
 }

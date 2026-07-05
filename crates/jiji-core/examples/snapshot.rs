@@ -111,6 +111,14 @@ fn main() {
         (Some(change_id), Some("--edit")) => backend
             .edit_change(path, &change_id)
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),
+        // A comma-separated change-id list sweeps the set as one operation
+        // (`jj abandon a b`); a single id keeps the single-change path.
+        (Some(change_id), Some("--abandon")) if change_id.contains(',') => {
+            let ids: Vec<String> = change_id.split(',').map(str::to_owned).collect();
+            backend
+                .abandon_changes(path, &ids)
+                .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap())
+        }
         (Some(change_id), Some("--abandon")) => backend
             .abandon_change(path, &change_id)
             .map(|outcome| serde_json::to_string_pretty(&outcome).unwrap()),

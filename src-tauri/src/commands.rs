@@ -255,8 +255,9 @@ pub fn compare_diff(
 impl AppState {
     /// The shape every write action shares: run the backend mutation,
     /// refresh the snapshot (published to all surfaces), and return the
-    /// operation breadcrumb.
-    fn mutate(
+    /// operation breadcrumb. `pub(crate)` so the forge module's land
+    /// executor can drive its jj half through the same path.
+    pub(crate) fn mutate(
         &self,
         app: &AppHandle,
         action: impl FnOnce(&dyn RepoBackend, &Path) -> Result<MutationOutcome, BackendError>,

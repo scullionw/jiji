@@ -10,8 +10,9 @@
 use std::sync::Mutex;
 
 use jiji_forge::{
-    detect_github_repo, execute_submit, no_github_remote, plan_submit, resolve_token, ForgeAuth,
-    ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, RepoForge, RepoPrState,
+    detect_github_repo, execute_land, execute_submit, no_github_remote, plan_land, plan_submit,
+    resolve_token, ForgeAuth, ForgeError, ForgeRepo, ForgeStatus, GitHubClient,
+    KeychainTokenStore, LandOutcome, LandPlan, LandRepoForge, LandVcs, RepoForge, RepoPrState,
     SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
 };
 use tauri::{AppHandle, State};
@@ -234,6 +235,70 @@ impl SubmitVcs for HostVcs<'_> {
     }
 }
 
+/// The land executor's jj half: every mutation runs through the shared
+/// `AppState::mutate` path, so the snapshot republishes to every surface
+/// after each step and the cleanup steps read honestly-fresh state.
+impl LandVcs for HostVcs<'_> {
+    fn git_fetch(&self, remote: &str) -> Result<String, jiji_core::BackendError> {
+        let remotes = vec![remote.to_owned()];
+        self.state
+            .mutate(self.app, |backend, path| {
+                backend.git_fetch(path, Some(&remotes))
+            })
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+
+    fn snapshot(&self) -> Result<jiji_core::snapshot::RepoSnapshot, jiji_core::BackendError> {
+        self.state.current_snapshot_clone().ok_or_else(|| {
+            jiji_core::BackendError::MutationFailed("No repository is currently open".into())
+        })
+    }
+
+    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, jiji_core::BackendError> {
+        let trunk_target = LandVcs::snapshot(self)?
+            .bookmarks
+            .iter()
+            .find(|b| b.is_trunk)
+            .map(|b| b.target.clone())
+            .ok_or_else(|| {
+                jiji_core::BackendError::MutationFailed(
+                    "the repository has no trunk bookmark to rebase onto".into(),
+                )
+            })?;
+        self.state
+            .mutate(self.app, |backend, path| {
+                backend.rebase_change(path, root_change, &trunk_target)
+            })
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+
+    fn push_bookmarks(
+        &self,
+        bookmarks: &[String],
+        remote: &str,
+    ) -> Result<String, jiji_core::BackendError> {
+        SubmitVcs::push_bookmarks(self, bookmarks, remote)
+    }
+
+    fn delete_bookmark(&self, name: &str) -> Result<String, jiji_core::BackendError> {
+        self.state
+            .mutate(self.app, |backend, path| backend.delete_bookmark(path, name))
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+
+    fn abandon_changes(&self, change_ids: &[String]) -> Result<String, jiji_core::BackendError> {
+        self.state
+            .mutate(self.app, |backend, path| {
+                backend.abandon_changes(path, change_ids)
+            })
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+}
+
 /// Execute a confirmed submit plan: one batched push, PR creations
 /// bottom-up, then base retargets. The plan is re-derived against the
 /// current snapshot and fresh PR state first, and refused when it no
@@ -268,4 +333,61 @@ pub fn submit_stack(
         state: &state,
     };
     execute_submit(&fresh, &vcs, &forge_side).map_err(Into::into)
+}
+
+/// Plan landing the stack under a bookmark: what already merged on GitHub,
+/// whether the bottom PR merges now (or hands off to auto-merge or a merge
+/// queue), and the reconcile that follows — fetch, rebase, push, retarget,
+/// bookmark and change cleanup. Read-only: GitHub is asked for fresh
+/// open-PR state, the candidate's land state, and merged-PR recognition,
+/// nothing else runs.
+#[tauri::command(async)]
+pub fn land_plan(
+    state: State<'_, AppState>,
+    head_bookmark: String,
+) -> Result<LandPlan, CommandError> {
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let (repo, client, prs) = submit_context(&state)?;
+    let forge_side = LandRepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    plan_land(&snapshot, &prs, &repo, &head_bookmark, &forge_side).map_err(Into::into)
+}
+
+/// Execute a confirmed land plan. The plan is re-derived against the
+/// current snapshot and fresh GitHub state first and refused when its
+/// actions no longer match what the user confirmed (the stack, the PR, or
+/// its checks moved under the panel — the same never-clobber posture as
+/// submit); the merge step re-checks GitHub once more just before merging.
+#[tauri::command(async)]
+pub fn land_stack(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    head_bookmark: String,
+    plan: LandPlan,
+) -> Result<LandOutcome, CommandError> {
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let (repo, client, prs) = submit_context(&state)?;
+    let forge_side = LandRepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    let fresh = plan_land(&snapshot, &prs, &repo, &head_bookmark, &forge_side)?;
+    if fresh.actions != plan.actions {
+        return Err(CommandError::new(
+            "plan_stale",
+            "The stack or its pull requests changed since this plan was made; \
+             review the updated plan and land again",
+        ));
+    }
+    let vcs = HostVcs {
+        app: &app,
+        state: &state,
+    };
+    execute_land(&fresh, &vcs, &forge_side).map_err(Into::into)
 }

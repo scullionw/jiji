@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
+import type { LandOutcome } from "$lib/bindings/LandOutcome";
+import type { LandPlan } from "$lib/bindings/LandPlan";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { RepoPrState } from "$lib/bindings/RepoPrState";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
@@ -214,6 +216,24 @@ export function submitStack(
   plan: SubmitPlan,
 ): Promise<SubmitOutcome> {
   return invoke<SubmitOutcome>("submit_stack", { headBookmark, plan });
+}
+
+// Plan landing the stack under a bookmark: what already merged, whether
+// the bottom PR merges now (or hands to GitHub's automation), and the
+// reconcile that follows. Read-only — the plan is the confirm step.
+export function landPlan(headBookmark: string): Promise<LandPlan> {
+  return invoke<LandPlan>("land_plan", { headBookmark });
+}
+
+// Execute a confirmed land plan. The backend re-derives it first and
+// refuses with code `plan_stale` when the stack or GitHub moved since the
+// panel rendered it, and the merge re-checks GitHub once more before it
+// runs.
+export function landStack(
+  headBookmark: string,
+  plan: LandPlan,
+): Promise<LandOutcome> {
+  return invoke<LandOutcome>("land_stack", { headBookmark, plan });
 }
 
 export function onSnapshotUpdated(
