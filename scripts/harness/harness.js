@@ -43,6 +43,15 @@
 //   &fdisconnect=1       click Disconnect on the connected card and wait
 //                        for the connect state (or the managed-outside
 //                        note when a fallback token remains)
+//   &prs=<b:flags,...>   fabricate open-PR state for the stubbed forge_prs,
+//                        one entry per bookmark/branch name with dot-joined
+//                        flags: draft|merged|closed, approved|changes|
+//                        review, passing|failing|pending, fork (excluded
+//                        from the badge map like a real cross-fork PR).
+//                        Needs &forge= — badges only render once the
+//                        connection is verified
+//   &prstrunc=1          the fabricated report says it was capped at 100
+//                        PRs (the Publish section states it)
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -313,6 +322,70 @@
       ? { source: forge.source, login }
       : { source: null, login: null },
   });
+  // Fabricated open-PR state from the &prs= DSL, keyed to the captured
+  // snapshot's bookmark names: `prs=branch:flag.flag,branch2:flag`, with
+  // flags draft|merged|closed (state), approved|changes|review (review
+  // decision), passing|failing|pending (CI rollup), and fork (a cross-fork
+  // PR — excluded from byBranch like the backend's prs_by_branch rule).
+  // Dot-joined because `+` in a query string decodes to a space (both are
+  // tolerated anyway).
+  const humanize = (branch) =>
+    (branch.charAt(0).toUpperCase() + branch.slice(1)).replace(/-/g, " ");
+  const forgePrsOf = (snap) => {
+    const repo = forgeRepoOf(snap);
+    const prs = (params.get("prs") || "")
+      .split(",")
+      .filter(Boolean)
+      .map((entry, index) => {
+        const [branch, flagStr] = entry.split(":");
+        const flags = new Set((flagStr || "").split(/[.+\s]+/).filter(Boolean));
+        const state = flags.has("merged")
+          ? "merged"
+          : flags.has("closed")
+            ? "closed"
+            : "open";
+        const review = flags.has("approved")
+          ? "approved"
+          : flags.has("changes")
+            ? "changesRequested"
+            : flags.has("review")
+              ? "reviewRequired"
+              : "none";
+        const checks = flags.has("passing")
+          ? "passing"
+          : flags.has("failing")
+            ? "failing"
+            : flags.has("pending")
+              ? "pending"
+              : "none";
+        const number = 101 + index;
+        return {
+          number,
+          title: humanize(branch),
+          url: `https://github.com/${repo ? `${repo.owner}/${repo.name}` : "o/r"}/pull/${number}`,
+          state,
+          isDraft: flags.has("draft"),
+          headBranch: branch,
+          headCommit: "ad".repeat(20),
+          headOwner: flags.has("fork") ? "someone-else" : (repo?.owner ?? null),
+          baseBranch: snap?.trunkBookmark || "main",
+          review,
+          checks,
+        };
+      });
+    const byBranch = {};
+    for (const pr of prs) {
+      const sameRepo =
+        repo &&
+        pr.headOwner &&
+        pr.headOwner.toLowerCase() === repo.owner.toLowerCase();
+      if (sameRepo && !(pr.headBranch in byBranch)) byBranch[pr.headBranch] = pr;
+    }
+    return {
+      report: { prs, truncated: Boolean(params.get("prstrunc")) },
+      byBranch,
+    };
+  };
 
   window.__TAURI_INTERNALS__ = {
     transformCallback: () => 0,
@@ -1134,6 +1207,19 @@
           forge.source =
             after === "env" ? "environment" : after === "gh" ? "ghCli" : null;
           return Promise.resolve(forgeStatusOf(snap, forge.login));
+        }
+        // Open-PR state for workbench badges, fabricated from &prs=. The
+        // app only asks once the connection is verified, so scenarios pair
+        // this with &forge=; the error answers mirror the backend's.
+        case "forge_prs": {
+          if (!forgeRepoOf(snap))
+            return reject(
+              "no_github_remote",
+              "no GitHub remote detected on this repository",
+            );
+          if (!forge.source)
+            return reject("no_token", "no GitHub token is available");
+          return Promise.resolve(forgePrsOf(snap));
         }
         case "plugin:event|listen":
           return Promise.resolve(0);

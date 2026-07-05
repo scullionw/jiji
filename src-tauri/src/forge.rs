@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use jiji_forge::{
     detect_github_repo, no_github_remote, resolve_token, ForgeAuth, ForgeError, ForgeRepo,
-    ForgeStatus, GitHubClient, KeychainTokenStore, PrStateReport, TokenSource, TokenStore as _,
+    ForgeStatus, GitHubClient, KeychainTokenStore, RepoPrState, TokenSource, TokenStore as _,
 };
 use tauri::State;
 
@@ -159,13 +159,14 @@ pub fn forge_logout(
     assemble_status(&state, &forge)
 }
 
-/// The detected repo's open-PR state: the one batched query later slices
-/// hang PR badges and publish flows on.
+/// The detected repo's open-PR state: the one batched query workbench
+/// badges and publish flows hang on, answered with the bookmark-attachment
+/// map already built (head branch → PR, fork-filtered).
 #[tauri::command(async)]
 pub fn forge_prs(
     state: State<'_, AppState>,
     forge: State<'_, ForgeState>,
-) -> Result<PrStateReport, CommandError> {
+) -> Result<RepoPrState, CommandError> {
     let repo = detected_repo(&state).ok_or_else(no_github_remote)?;
     let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
     let client = GitHubClient::for_repo(&repo, &resolved.token)?;
@@ -177,5 +178,5 @@ pub fn forge_prs(
             forge.remember(resolved.source, login);
         }
     }
-    Ok(report)
+    Ok(RepoPrState::new(report, &repo.owner))
 }

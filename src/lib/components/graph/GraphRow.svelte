@@ -3,7 +3,9 @@
   import { Tween } from "svelte/motion";
   import { SvelteMap } from "svelte/reactivity";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { prBadge, prForBookmark } from "$lib/components/publish/pr";
   import { GRAPH_MOTION_MS, motionMs } from "$lib/motion";
+  import { forge } from "$lib/state/forge.svelte";
   import { shortAge } from "$lib/time";
   import { drag } from "./dnd.svelte";
   import { rewritePreview } from "./preview.svelte";
@@ -192,6 +194,7 @@
     {/if}
     {#each row.bookmarks as bookmark (bookmark.name)}
       {@const sync = SYNC_GLYPH[bookmark.sync]}
+      {@const pr = prForBookmark(bookmark, forge.prs)}
       <span
         class="chip bm"
         class:trunk={bookmark.isTrunk}
@@ -201,6 +204,17 @@
         <span class="bm-name truncate">{bookmark.name}</span>
         {#if sync.glyph}<i class="sync {sync.tone}">{sync.glyph}</i>{/if}
       </span>
+      {#if pr}
+        {@const badge = prBadge(pr)}
+        <!-- The bookmark's pull request, right beside its chip. Passive
+             here (rows are buttons); the change header links out. -->
+        <span class="chip pr {badge.tone}" title={badge.title} data-pr={pr.number}>
+          <Icon name="branch" size={9} />
+          <span class="mono">{badge.label}</span>
+          {#if badge.review}<i class="pg {badge.review.tone}">{badge.review.glyph}</i>{/if}
+          {#if badge.checks}<i class="pg {badge.checks.tone}">{badge.checks.glyph}</i>{/if}
+        </span>
+      {/if}
     {/each}
     {#if row.isStackHead && row.behindTrunk > 0}
       <span class="chip behind" title="{row.behindTrunk} change{row.behindTrunk === 1 ? '' : 's'} behind trunk">
@@ -450,6 +464,46 @@
 
   .bm-name {
     max-width: 96px;
+  }
+
+  /* PR badge tones read like GitHub's states: open ready-green, draft
+     muted, merged accent, closed danger. */
+  .chip.pr.open {
+    background: color-mix(in srgb, var(--clr-ok) 12%, transparent);
+    color: var(--clr-ok);
+  }
+
+  .chip.pr.draft {
+    background: var(--clr-bg-3);
+    color: var(--clr-text-3);
+    border: 1px dashed var(--clr-border-1);
+  }
+
+  .chip.pr.merged {
+    background: var(--clr-accent-dim);
+    color: var(--clr-accent-strong);
+  }
+
+  .chip.pr.closed {
+    background: color-mix(in srgb, var(--clr-danger) 12%, transparent);
+    color: var(--clr-danger);
+  }
+
+  .pg {
+    font-style: normal;
+    font-size: 9px;
+  }
+
+  .pg.ok {
+    color: var(--clr-ok);
+  }
+
+  .pg.warn {
+    color: var(--clr-warn);
+  }
+
+  .pg.danger {
+    color: var(--clr-danger);
   }
 
   .sync {

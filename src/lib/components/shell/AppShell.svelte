@@ -18,6 +18,7 @@
     refreshSnapshot,
     togglePalette,
   } from "$lib/state/actions";
+  import { syncForgeConnection } from "$lib/state/forge.svelte";
   import { checkForAppUpdate } from "$lib/update";
 
   const sectionOrder: Section[] = [
@@ -31,6 +32,13 @@
   function goTo(index: number) {
     if (app.snapshot) app.section = sectionOrder[index];
   }
+
+  // The forge connection follows the open repo. This refires on every
+  // published snapshot, but the sync keys on the remotes' JSON and no-ops
+  // while they are unchanged — auto-refresh ticks cost nothing.
+  $effect(() => {
+    void syncForgeConnection(app.snapshot?.gitRemotes ?? null);
+  });
 
   onMount(() => {
     bootstrap();

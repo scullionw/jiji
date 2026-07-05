@@ -1,27 +1,26 @@
 <script lang="ts">
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
   import type { TokenSource } from "$lib/bindings/TokenSource";
-  import {
-    errorMessage,
-    forgeLogin,
-    forgeLogout,
-    forgeStatus,
-    forgeVerify,
-  } from "$lib/api";
+  import { errorMessage } from "$lib/api";
   import Button from "$lib/components/ui/Button.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
-  import { app } from "$lib/state/app.svelte";
+  import {
+    connectForge,
+    disconnectForge,
+    forge,
+  } from "$lib/state/forge.svelte";
 
   // The forge connection: which GitHub repo this jj repo publishes to and
-  // whose token Jiji would act with. Publish flows themselves (submit,
-  // badges, landing) build on this in the following slices.
+  // whose token Jiji would act with. The state itself is shared (synced at
+  // the shell whenever the repo's remotes change) — this surface renders
+  // it and hosts the connect/disconnect flow. Submit and landing build on
+  // it in the following slices.
 
-  let status = $state<ForgeStatus | null>(null);
-  let phase = $state<"loading" | "verifying" | "ready">("loading");
-  let error = $state<string | null>(null);
   let token = $state("");
   let busy = $state(false);
+  // Connect/disconnect refusals render here; connection-level failures
+  // from the shared sync arrive via forge.error.
+  let actionError = $state<string | null>(null);
 
   const sourceLabel: Record<TokenSource, string> = {
     keychain: "stored in your keychain",
@@ -29,50 +28,15 @@
     ghCli: "from the gh CLI",
   };
 
-  // Repo detection rides the snapshot, so re-check when another repo opens
-  // (or its remotes change out from under us).
-  const remotesKey = $derived(
-    JSON.stringify(app.snapshot?.gitRemotes ?? null),
-  );
-
-  $effect(() => {
-    void remotesKey;
-    let stale = false;
-    (async () => {
-      phase = "loading";
-      error = null;
-      try {
-        let next = await forgeStatus();
-        if (stale) return;
-        status = next;
-        // A token without a session-verified login: check it against the
-        // API once so "Connected as …" is earned, not assumed.
-        if (next.auth.source && !next.auth.login) {
-          phase = "verifying";
-          next = await forgeVerify();
-          if (stale) return;
-          status = next;
-        }
-      } catch (err) {
-        if (stale) return;
-        error = errorMessage(err);
-      }
-      phase = "ready";
-    })();
-    return () => {
-      stale = true;
-    };
-  });
-
   async function connect() {
     if (!token.trim() || busy) return;
     busy = true;
-    error = null;
+    actionError = null;
     try {
-      status = await forgeLogin(token);
+      await connectForge(token);
       token = "";
     } catch (err) {
-      error = errorMessage(err);
+      actionError = errorMessage(err);
     }
     busy = false;
   }
@@ -80,22 +44,21 @@
   async function disconnect() {
     if (busy) return;
     busy = true;
-    error = null;
+    actionError = null;
     try {
-      status = await forgeLogout();
-      // A fallback token (env/gh) may now be active but unverified.
-      if (status.auth.source && !status.auth.login) {
-        status = await forgeVerify();
-      }
+      await disconnectForge();
     } catch (err) {
-      error = errorMessage(err);
+      actionError = errorMessage(err);
     }
     busy = false;
   }
 
-  const repo = $derived(status?.repo ?? null);
-  const auth = $derived(status?.auth ?? null);
+  const phase = $derived(forge.phase === "idle" ? "loading" : forge.phase);
+  const error = $derived(actionError ?? forge.error);
+  const repo = $derived(forge.status?.repo ?? null);
+  const auth = $derived(forge.status?.auth ?? null);
   const connected = $derived(auth?.source != null && auth?.login != null);
+  const openPrs = $derived(forge.prs?.report.prs.length ?? 0);
 </script>
 
 <div class="view">
@@ -202,7 +165,36 @@
       {/if}
     </section>
 
-    <span class="hint">stack submission and PR badges arrive next</span>
+    {#if repo && connected}
+      <section class="group">
+        <div class="group-head">
+          <span class="group-label">Pull requests</span>
+        </div>
+        {#if forge.prsLoading && !forge.prs}
+          <p class="blurb quiet" data-forge-prs="loading">
+            Fetching open pull requests…
+          </p>
+        {:else if forge.prsError}
+          <p class="error" data-forge-prs="error">{forge.prsError}</p>
+        {:else if forge.prs}
+          <p class="blurb" data-forge-prs="ready">
+            {openPrs === 0
+              ? "No open pull requests"
+              : `${openPrs} open pull request${openPrs === 1 ? "" : "s"}`}
+            on <span class="mono">{repo.owner}/{repo.name}</span>.
+            {#if forge.prs.report.truncated}
+              Only the 100 most recently updated are tracked, so badges may
+              miss older ones.
+            {:else if openPrs > 0}
+              Ones matching a bookmark wear their badge on the workbench
+              graph.
+            {/if}
+          </p>
+        {/if}
+      </section>
+    {/if}
+
+    <span class="hint">stack submission arrives next</span>
   </div>
 </div>
 

@@ -7,6 +7,7 @@ import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
 import { stackPosition } from "$lib/components/inspector/inspect";
 import { app, type Section, type UiIntent } from "./app.svelte";
+import { refreshForgePrs } from "./forge.svelte";
 import { loadRecentRepos, rememberRepo } from "./recent";
 
 export async function bootstrap(): Promise<void> {
@@ -60,6 +61,10 @@ export async function chooseRepo(): Promise<void> {
 
 export async function refreshSnapshot(): Promise<void> {
   if (!app.snapshot) return;
+  // An explicit refresh also re-asks GitHub for PR state (the badges'
+  // manual cadence until background upstream checks land). Deliberately
+  // not awaited — the local snapshot must not wait on the network.
+  void refreshForgePrs();
   try {
     await api.refreshSnapshot();
   } catch (error) {

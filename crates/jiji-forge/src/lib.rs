@@ -27,6 +27,6 @@ pub use error::ForgeError;
 pub use github::GitHubClient;
 pub use pr::{
     parse_open_prs, prs_by_branch, ChecksRollup, PrState, PrStateReport, PrSummary,
-    ReviewDecision,
+    RepoPrState, ReviewDecision,
 };
 pub use remote::{detect_github_repo, no_github_remote, parse_github_url, ForgeProvider, ForgeRepo};

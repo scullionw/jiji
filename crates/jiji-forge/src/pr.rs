@@ -79,6 +79,28 @@ pub struct PrStateReport {
     pub truncated: bool,
 }
 
+/// The open-PR answer as the UI consumes it: the report plus its
+/// bookmark-attachment view — head branch → PR, fork-filtered via
+/// [`prs_by_branch`], so a local bookmark's badge is one map lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepoPrState {
+    pub report: PrStateReport,
+    pub by_branch: HashMap<String, PrSummary>,
+}
+
+impl RepoPrState {
+    /// `owner` is the detected repo's owner — the fork rule's anchor.
+    pub fn new(report: PrStateReport, owner: &str) -> Self {
+        let by_branch = prs_by_branch(&report.prs, owner)
+            .into_iter()
+            .map(|(branch, pr)| (branch.to_owned(), pr.clone()))
+            .collect();
+        Self { report, by_branch }
+    }
+}
+
 /// Reshape the batched open-PRs GraphQL answer (`data`) into the report.
 pub fn parse_open_prs(data: &Value) -> Result<PrStateReport, ForgeError> {
     let repository = data.get("repository").filter(|v| !v.is_null()).ok_or_else(|| {
@@ -282,5 +304,23 @@ mod tests {
         assert_eq!(map["cased"].number, 5);
         assert!(!map.contains_key("other"));
         assert!(!map.contains_key("ghost"));
+    }
+
+    #[test]
+    fn repo_pr_state_carries_the_same_attachment_view() {
+        let report = parse_open_prs(&data(
+            vec![
+                node(1, json!({ "headRefName": "feature" })),
+                node(2, json!({ "headRefName": "fork-branch", "headRepositoryOwner": { "login": "someone-else" } })),
+            ],
+            false,
+        ))
+        .unwrap();
+
+        let state = RepoPrState::new(report.clone(), "o");
+        assert_eq!(state.report, report);
+        assert_eq!(state.by_branch.len(), 1);
+        assert_eq!(state.by_branch["feature"], report.prs[0]);
+        assert!(!state.by_branch.contains_key("fork-branch"));
     }
 }

@@ -6,7 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
-import type { PrStateReport } from "$lib/bindings/PrStateReport";
+import type { RepoPrState } from "$lib/bindings/RepoPrState";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
 
@@ -184,9 +184,10 @@ export function forgeLogout(): Promise<ForgeStatus> {
 }
 
 // Open-PR state of the detected repo — what PR badges and publish flows
-// will render (one batched query on the backend).
-export function forgePrs(): Promise<PrStateReport> {
-  return invoke<PrStateReport>("forge_prs");
+// render (one batched query on the backend), with the fork-filtered
+// head-branch → PR attachment map already built.
+export function forgePrs(): Promise<RepoPrState> {
+  return invoke<RepoPrState>("forge_prs");
 }
 
 export function onSnapshotUpdated(

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import Icon from "$lib/components/ui/Icon.svelte";
   import type { FileDiff } from "$lib/bindings/FileDiff";
   import type { FileStatus } from "$lib/bindings/FileStatus";
@@ -45,7 +46,9 @@
     clearRewritePreview,
     setRewritePreview,
   } from "$lib/components/graph/preview.svelte";
+  import { prBadge, prForBookmark } from "$lib/components/publish/pr";
   import { app } from "$lib/state/app.svelte";
+  import { forge } from "$lib/state/forge.svelte";
   import { consumeIntent } from "$lib/state/actions";
   import { fileStats, totalStats, type DiffLayout } from "./diff";
   import {
@@ -942,6 +945,7 @@
     {/if}
     {#each marks as mark (mark.name)}
       {@const sync = SYNC_LABEL[mark.sync]}
+      {@const pr = prForBookmark(mark, forge.prs)}
       {#if mark.isLocal && !mark.isTrunk}
         <button
           class="bookmark-chip manageable"
@@ -960,6 +964,24 @@
           <span class="truncate">{mark.name}</span>
           <span class="sync {sync.tone}">{sync.text}</span>
         </span>
+      {/if}
+      {#if pr}
+        {@const badge = prBadge(pr)}
+        <!-- The bookmark's pull request: the workbench's link out to
+             GitHub, wearing the same state the graph badge shows. -->
+        <button
+          class="pr-chip {badge.tone}"
+          data-pr={pr.number}
+          title="{badge.title} · open on GitHub"
+          onclick={() => openUrl(pr.url)}
+        >
+          <Icon name="branch" size={10} />
+          <span class="mono">{badge.label}</span>
+          <span class="pr-state">{badge.tone}</span>
+          {#if badge.review}<span class="pr-glyph {badge.review.tone}">{badge.review.glyph}</span>{/if}
+          {#if badge.checks}<span class="pr-glyph {badge.checks.tone}">{badge.checks.glyph}</span>{/if}
+          <span class="pr-out">↗</span>
+        </button>
       {/if}
     {/each}
     {#if position}
@@ -2359,6 +2381,71 @@
 
   .sync.muted {
     color: var(--clr-text-3);
+  }
+
+  /* The bookmark's PR, toned like the graph badge, clickable out. */
+  .pr-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    font-size: var(--text-xs);
+    border-radius: 999px;
+    padding: 1px 8px;
+    border: 1px solid transparent;
+    transition: filter var(--t-fast) var(--ease-out);
+  }
+
+  .pr-chip:hover {
+    filter: brightness(1.15);
+  }
+
+  .pr-chip.open {
+    background: color-mix(in srgb, var(--clr-ok) 12%, transparent);
+    color: var(--clr-ok);
+  }
+
+  .pr-chip.draft {
+    background: var(--clr-bg-3);
+    color: var(--clr-text-3);
+    border-color: var(--clr-border-1);
+    border-style: dashed;
+  }
+
+  .pr-chip.merged {
+    background: var(--clr-accent-dim);
+    color: var(--clr-accent-strong);
+  }
+
+  .pr-chip.closed {
+    background: color-mix(in srgb, var(--clr-danger) 12%, transparent);
+    color: var(--clr-danger);
+  }
+
+  .pr-state {
+    color: inherit;
+    opacity: 0.85;
+  }
+
+  .pr-glyph {
+    font-size: 10px;
+  }
+
+  .pr-glyph.ok {
+    color: var(--clr-ok);
+  }
+
+  .pr-glyph.warn {
+    color: var(--clr-warn);
+  }
+
+  .pr-glyph.danger {
+    color: var(--clr-danger);
+  }
+
+  .pr-out {
+    font-size: 10px;
+    opacity: 0.7;
   }
 
   .stack-note {
