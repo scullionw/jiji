@@ -164,6 +164,13 @@ export function updateStaleWorkspace(): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("update_stale_workspace");
 }
 
+// Fetch from the repo's git remotes (`jj git fetch`) — the upstream check.
+// Stays pending for as long as the network takes; the backend publishes
+// the refreshed snapshot when remote state moved.
+export function gitFetch(): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("git_fetch");
+}
+
 // The forge connection (GitHub). `forgeStatus` answers without touching
 // the network; `forgeVerify` checks the resolved token against the API and
 // remembers the login for the session. Login validates before storing the

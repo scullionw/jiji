@@ -312,6 +312,37 @@ pub trait RepoBackend: Send + Sync {
         remote: Option<&str>,
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Fetch from git remotes (`jj git fetch`), pinned against jj 0.41:
+    /// update the remote-tracking refs from each remote and import what
+    /// moved — tracked local bookmarks follow, new remote bookmarks arrive
+    /// tracked or not per `git.auto-local-bookmark`, deleted remote
+    /// branches prune (a tracked local bookmark follows the deletion, and
+    /// newly-unreachable commits honor `git.abandon-unreachable-commits`).
+    /// This is how "the remote moved under you" becomes visible: sync
+    /// glyphs, behind-trunk counts, and conflicted bookmarks all read the
+    /// refreshed remote state.
+    ///
+    /// `remotes` names exactly which remotes to fetch; `None` resolves like
+    /// the CLI: the `git.fetch` setting (string or list, glob patterns
+    /// honored), else the repo's sole remote, else literally "origin".
+    /// Per-remote branch selection follows the CLI too:
+    /// `remotes.<name>.fetch-bookmarks`/`fetch-tags` when set, else the
+    /// remote's fetch refspecs from git config. The op description matches
+    /// the CLI's (`fetch from git remote(s) a,b` in remote-listing order),
+    /// and a fetch that changes nothing records nothing.
+    ///
+    /// One curated deviation, documented on the implementation: an
+    /// explicitly-passed remote name that does not exist is refused, where
+    /// the CLI warns and continues — from a UI action that is a stale plan.
+    /// Config-driven names keep the CLI's forgiving behavior (a `git.fetch`
+    /// entry pointing at a removed remote should not break the background
+    /// cadence); only zero matching remotes is an error.
+    fn git_fetch(
+        &self,
+        path: &Path,
+        remotes: Option<&[String]>,
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Revert one earlier operation by applying its inverse on top of the
     /// current state (`jj op revert <op>`); everything recorded after it
     /// stays. Reverting the operation a mutation just recorded is the
@@ -665,6 +696,41 @@ impl RepoBackend for MockBackend {
         )
     }
 
+    fn git_fetch(
+        &self,
+        path: &Path,
+        remotes: Option<&[String]>,
+    ) -> Result<MutationOutcome, BackendError> {
+        // The fabricated remote never moves, so a mock fetch is always the
+        // real backend's nothing-new no-op (recording nothing) — after the
+        // same explicit-unknown-remote refusal. Documented approximation:
+        // fabricated remote state is static, there is nothing to import.
+        let snapshot = self.overlaid_snapshot(path)?;
+        if let Some(names) = remotes {
+            for raw in names {
+                let name = raw.trim();
+                if !name.is_empty() && !snapshot.git_remotes.iter().any(|r| r.name == name) {
+                    return Err(BackendError::MutationFailed(format!(
+                        "there is no git remote named \u{201c}{name}\u{201d}"
+                    )));
+                }
+            }
+        }
+        let label = match remotes {
+            Some([one]) => one.trim().to_owned(),
+            _ => snapshot
+                .git_remotes
+                .first()
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "origin".to_owned()),
+        };
+        Ok(MutationOutcome {
+            operation_id: None,
+            summary: format!("Nothing new on {label}"),
+            target_change: None,
+        })
+    }
+
     fn revert_operation(&self, path: &Path, op_id: &str) -> Result<MutationOutcome, BackendError> {
         self.mutate(
             path,
@@ -756,6 +822,30 @@ mod tests {
         }
         let err = MockBackend::default().change_detail(dir.path(), "zzzzzzzz").unwrap_err();
         assert!(matches!(err, BackendError::ChangeMissing(_)));
+    }
+
+    #[test]
+    fn mock_git_fetch_answers_the_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+
+        // The fabricated remote never moves, so a mock fetch is always the
+        // real backend's nothing-new answer, recording nothing.
+        let outcome = backend.git_fetch(dir.path(), None).unwrap();
+        assert!(outcome.operation_id.is_none());
+        assert_eq!(outcome.summary, "Nothing new on origin");
+        let outcome = backend
+            .git_fetch(dir.path(), Some(&["origin".into()]))
+            .unwrap();
+        assert_eq!(outcome.summary, "Nothing new on origin");
+        let err = backend
+            .git_fetch(dir.path(), Some(&["nosuch".into()]))
+            .unwrap_err();
+        assert!(err.to_string().contains("no git remote named"), "{err}");
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(after.operations.len(), before.operations.len());
     }
 
     #[test]

@@ -26,8 +26,8 @@ use jj_lib::diff_presentation::{DiffTokenType, LineCompareMode};
 use jj_lib::fileset::{self, FilesetAliasesMap, FilesetDiagnostics, FilesetParseContext};
 use jj_lib::config::ConfigGetError;
 use jj_lib::git::{
-    self, GitProgress, GitSidebandLineTerminator, GitSubprocessCallback,
-    REMOTE_NAME_FOR_LOCAL_GIT_REPO,
+    self, expand_fetch_refspecs, load_default_fetch_bookmarks, GitFetch, GitFetchRefExpression,
+    GitProgress, GitSidebandLineTerminator, GitSubprocessCallback, REMOTE_NAME_FOR_LOCAL_GIT_REPO,
 };
 use jj_lib::gitignore::{GitIgnoreError, GitIgnoreFile};
 use jj_lib::hex_util;
@@ -53,6 +53,7 @@ use jj_lib::rewrite::{
 };
 use jj_lib::settings::{HumanByteSize, UserSettings};
 use jj_lib::store::Store;
+use jj_lib::str_util::StringExpression;
 use jj_lib::transaction::Transaction;
 use jj_lib::working_copy::{SnapshotOptions, WorkingCopyFreshness};
 use jj_lib::tree_merge::MergeOptions;
@@ -1044,6 +1045,179 @@ impl RepoBackend for JjBackend {
                 if names.len() == 1 { "" } else { "s" },
                 gone.len()
             ),
+        };
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary,
+            target_change: None,
+        })
+    }
+
+    fn git_fetch(
+        &self,
+        path: &Path,
+        remotes: Option<&[String]>,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let settings = workspace.settings().clone();
+
+        let all_remotes = git::get_all_remote_names(repo.store()).map_err(|err| {
+            BackendError::MutationFailed(format!("could not list git remotes: {err}"))
+        })?;
+
+        // Which remotes to fetch, kept in remote-listing order — the CLI's
+        // op description follows `get_all_remote_names`, not the order the
+        // names were asked for in (pinned empirically: `git.fetch =
+        // ["upstream", "mirror"]` records `…remote(s) mirror,upstream`).
+        let matching: Vec<&RemoteName> = match remotes {
+            Some(names) => {
+                let mut wanted: Vec<&str> = Vec::new();
+                for raw in names {
+                    let name = raw.trim();
+                    if name.is_empty() || wanted.contains(&name) {
+                        continue;
+                    }
+                    // Curated deviation: an explicitly-named remote that
+                    // does not exist refuses (the CLI warns "No matching
+                    // remotes" and continues) — from an explicit action
+                    // that is a stale plan.
+                    if !all_remotes.iter().any(|r| r.as_str() == name) {
+                        return Err(BackendError::MutationFailed(format!(
+                            "there is no git remote named \u{201c}{name}\u{201d}"
+                        )));
+                    }
+                    wanted.push(name);
+                }
+                all_remotes
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .filter(|r: &&RemoteName| wanted.contains(&r.as_str()))
+                    .collect()
+            }
+            None => {
+                let expr = default_fetch_remotes(&settings, &all_remotes)?;
+                let matcher = expr.to_matcher();
+                // CLI parity: a configured name with no matching remote
+                // only warns — a `git.fetch` entry pointing at a removed
+                // remote must not break the background cadence.
+                for name in expr.exact_strings() {
+                    if all_remotes.iter().all(|r| r.as_str() != name) {
+                        tracing::warn!(remote = name, "git.fetch names a remote that does not exist");
+                    }
+                }
+                all_remotes
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .filter(|r: &&RemoteName| matcher.is_match(r.as_str()))
+                    .collect()
+            }
+        };
+        if matching.is_empty() {
+            return Err(BackendError::MutationFailed(
+                "there are no git remotes to fetch from".to_owned(),
+            ));
+        }
+
+        // Per-remote branch/tag selection, like the CLI: the
+        // `remotes.<name>.fetch-bookmarks`/`fetch-tags` settings when set,
+        // else the remote's own fetch refspecs from git config. With no
+        // explicit tag selection git's implicit tag-following stays on.
+        let git_repo = git::get_git_backend(repo.store())
+            .map_err(mutation_err)?
+            .git_repo();
+        let mut expansions = Vec::with_capacity(matching.len());
+        for remote in &matching {
+            let bookmark = match remote_fetch_expression(&settings, remote, "fetch-bookmarks")? {
+                Some(expr) => expr,
+                None => {
+                    let (ignored, expr) =
+                        load_default_fetch_bookmarks(remote, &git_repo).map_err(|err| {
+                            BackendError::MutationFailed(format!(
+                                "could not read fetch refspecs for {}: {err}",
+                                remote.as_str()
+                            ))
+                        })?;
+                    for spec in ignored.0 {
+                        tracing::warn!(
+                            refspec = %spec.refspec,
+                            reason = spec.reason,
+                            "ignored a fetch refspec"
+                        );
+                    }
+                    expr
+                }
+            };
+            let (tag, no_implicit_tags) =
+                match remote_fetch_expression(&settings, remote, "fetch-tags")? {
+                    Some(expr) => (expr, true),
+                    None => (StringExpression::none(), false),
+                };
+            let expanded = expand_fetch_refspecs(remote, GitFetchRefExpression { bookmark, tag })
+                .map_err(|err| {
+                BackendError::MutationFailed(format!("could not build fetch refspecs: {err}"))
+            })?;
+            expansions.push((*remote, expanded, no_implicit_tags));
+        }
+
+        let op_description = format!(
+            "fetch from git remote(s) {}",
+            matching
+                .iter()
+                .map(|n| n.as_symbol().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let remotes_label = match &matching[..] {
+            [one] => one.as_str().to_owned(),
+            [a, b] => format!("{} and {}", a.as_str(), b.as_str()),
+            many => format!("{} remotes", many.len()),
+        };
+
+        let subprocess_options = git::GitSubprocessOptions::from_settings(&settings)
+            .map_err(|err| BackendError::ConfigInvalid(format!("git.executable-path: {err}")))?;
+        let import_options = git_import_options(&settings)?;
+        let mut tx = repo.start_transaction();
+        let stats = {
+            let mut fetch = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)
+                .map_err(mutation_err)?;
+            for (remote, expanded, no_implicit_tags) in expansions {
+                fetch
+                    .fetch(
+                        remote,
+                        expanded,
+                        &mut QuietGitCallback,
+                        None,
+                        no_implicit_tags.then_some(git::FetchTagsOverride::NoTags),
+                    )
+                    .map_err(|err| {
+                        BackendError::MutationFailed(format!(
+                            "could not fetch from {}: {err}",
+                            remote.as_str()
+                        ))
+                    })?;
+            }
+            fetch.import_refs().map_err(mutation_err)?
+        };
+        if !stats.failed_ref_names.is_empty() {
+            tracing::warn!(
+                count = stats.failed_ref_names.len(),
+                "some fetched git refs failed to import"
+            );
+        }
+        if !tx.repo().has_changes() {
+            return Ok(MutationOutcome {
+                operation_id: None,
+                summary: format!("Nothing new on {remotes_label}"),
+                target_change: None,
+            });
+        }
+        let moved = stats.changed_remote_bookmarks.len();
+        let new_repo = finish_mutation(&mut workspace, &repo, tx, op_description)?;
+        let summary = match moved {
+            0 => format!("Fetched from {remotes_label}"),
+            1 => format!("Fetched 1 bookmark update from {remotes_label}"),
+            n => format!("Fetched {n} bookmark updates from {remotes_label}"),
         };
         Ok(MutationOutcome {
             operation_id: Some(short_operation_id(new_repo.op_id())),
@@ -2122,21 +2296,7 @@ fn import_git_refs(
     if !is_colocated(workspace, repo.store()) {
         return Ok(repo);
     }
-    let settings = workspace.settings();
-    let config_err = |name: &str, err: &dyn std::fmt::Display| {
-        BackendError::ConfigInvalid(format!("{name}: {err}"))
-    };
-    let options = git::GitImportOptions {
-        auto_local_bookmark: settings
-            .get_bool("git.auto-local-bookmark")
-            .map_err(|err| config_err("git.auto-local-bookmark", &err))?,
-        abandon_unreachable_commits: settings
-            .get_bool("git.abandon-unreachable-commits")
-            .map_err(|err| config_err("git.abandon-unreachable-commits", &err))?,
-        // Per-remote auto-tracking is newer than the jj-lib we build
-        // against; bookmarks new to jj follow `git.auto-local-bookmark`.
-        remote_auto_track_bookmarks: HashMap::new(),
-    };
+    let options = git_import_options(workspace.settings())?;
     let mut tx = repo.start_transaction();
     let stats = git::import_refs(tx.repo_mut(), &options).map_err(mutation_err)?;
     if !stats.failed_ref_names.is_empty() {
@@ -2149,6 +2309,26 @@ fn import_git_refs(
         return Ok(repo);
     }
     finish_mutation(workspace, &repo, tx, "import git refs".to_owned())
+}
+
+/// The CLI's git-import options, shared by ref import and fetch:
+/// `git.auto-local-bookmark` and `git.abandon-unreachable-commits` from
+/// settings.
+fn git_import_options(settings: &UserSettings) -> Result<git::GitImportOptions, BackendError> {
+    let config_err = |name: &str, err: &dyn std::fmt::Display| {
+        BackendError::ConfigInvalid(format!("{name}: {err}"))
+    };
+    Ok(git::GitImportOptions {
+        auto_local_bookmark: settings
+            .get_bool("git.auto-local-bookmark")
+            .map_err(|err| config_err("git.auto-local-bookmark", &err))?,
+        abandon_unreachable_commits: settings
+            .get_bool("git.abandon-unreachable-commits")
+            .map_err(|err| config_err("git.abandon-unreachable-commits", &err))?,
+        // Per-remote auto-tracking is newer than the jj-lib we build
+        // against; bookmarks new to jj follow `git.auto-local-bookmark`.
+        remote_auto_track_bookmarks: HashMap::new(),
+    })
 }
 
 /// CLI parity for the start of every mutation: record what is on disk into
@@ -2298,6 +2478,68 @@ fn validate_bookmark_name(name: &str) -> Result<(), BackendError> {
 /// else the repo's sole remote, else literally "origin" — which may not
 /// exist; the caller's existence check reports that the same way the CLI
 /// errors with "No git remote named 'origin'".
+/// CLI parity for which remotes plain `jj git fetch` reads: the `git.fetch`
+/// setting as a list or single string (entries parse as string patterns,
+/// glob by default), else the repo's sole remote, else literally "origin".
+fn default_fetch_remotes(
+    settings: &UserSettings,
+    all_remotes: &[jj_lib::ref_name::RemoteNameBuf],
+) -> Result<StringExpression, BackendError> {
+    const KEY: &str = "git.fetch";
+    if let Ok(names) = settings.get::<Vec<String>>(KEY) {
+        return parse_name_patterns(&names, KEY);
+    }
+    match settings.get_string(KEY) {
+        Ok(name) => return parse_name_patterns(std::slice::from_ref(&name), KEY),
+        Err(ConfigGetError::NotFound { .. }) => {}
+        Err(err) => return Err(BackendError::ConfigInvalid(format!("{KEY}: {err}"))),
+    }
+    if let [only] = all_remotes {
+        return Ok(StringExpression::exact(only.as_str()));
+    }
+    Ok(StringExpression::exact("origin"))
+}
+
+/// Union of string patterns, the CLI's `parse_union_name_patterns`: each
+/// text parses with the revset string-expression syntax (`glob:` by
+/// default, `exact:`/negation supported).
+fn parse_name_patterns(texts: &[String], key: &str) -> Result<StringExpression, BackendError> {
+    let mut diagnostics = RevsetDiagnostics::new();
+    let expressions = texts
+        .iter()
+        .map(|text| revset::parse_string_expression(&mut diagnostics, text))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| BackendError::ConfigInvalid(format!("{key}: {err}")))?;
+    Ok(StringExpression::union_all(expressions))
+}
+
+/// The `remotes.<name>.fetch-bookmarks` / `fetch-tags` settings (jj ≥
+/// 0.41's per-remote fetch selection), parsed with the CLI's string
+/// expression syntax. The jj-lib we build against predates the typed
+/// fields, so they are read straight from config.
+fn remote_fetch_expression(
+    settings: &UserSettings,
+    remote: &RemoteName,
+    key: &str,
+) -> Result<Option<StringExpression>, BackendError> {
+    let text = match settings.get_string(["remotes", remote.as_str(), key]) {
+        Ok(text) => text,
+        Err(ConfigGetError::NotFound { .. }) => return Ok(None),
+        Err(err) => {
+            return Err(BackendError::ConfigInvalid(format!(
+                "remotes.{}.{key}: {err}",
+                remote.as_str()
+            )))
+        }
+    };
+    let mut diagnostics = RevsetDiagnostics::new();
+    revset::parse_string_expression(&mut diagnostics, &text)
+        .map(Some)
+        .map_err(|err| {
+            BackendError::ConfigInvalid(format!("remotes.{}.{key}: {err}", remote.as_str()))
+        })
+}
+
 fn default_push_remote(
     settings: &UserSettings,
     store: &Arc<Store>,
@@ -6742,8 +6984,38 @@ mod tests {
     /// fixture as the `origin` remote — pushes run against it over the
     /// file transport, no network or auth involved.
     fn add_bare_origin(root: &Path, bare: &Path) {
+        add_bare_remote(root, bare, "origin");
+    }
+
+    /// Same, under any remote name — how the fetch tests build multi-remote
+    /// shapes.
+    fn add_bare_remote(root: &Path, bare: &Path, name: &str) {
         git(bare, &["init", "--bare", "--quiet"]);
-        git(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(root, &["remote", "add", name, bare.to_str().unwrap()]);
+    }
+
+    /// Writes a new commit (empty tree) directly into a bare repo and
+    /// points `branch` at it — how tests move a remote out-of-band without
+    /// a second clone. Returns the full commit hex.
+    fn bare_commit(bare: &Path, branch: &str, parent: &str, message: &str) -> String {
+        let tree = git(bare, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+        let commit = git(
+            bare,
+            &[
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "commit-tree",
+                &tree,
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+        );
+        git(bare, &["update-ref", &format!("refs/heads/{branch}"), &commit]);
+        commit
     }
 
     /// Full commit hex a bare repo's branch points at, `None` when the
@@ -7010,6 +7282,167 @@ mod tests {
         assert_eq!(bare_branch(bare.path(), "feature").unwrap(), first_commit_full);
         let _ = (first, first_snapshot);
     }
+    #[test]
+    fn fetch_imports_remote_moves_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let first = build_colocated_repo(dir.path(), &backend);
+        add_bare_origin(dir.path(), bare.path());
+
+        // Local work published: `feature` on the described change under the
+        // working copy, `main` as trunk, both tracked after the push.
+        let feature_change = backend.open(dir.path()).unwrap().working_copy;
+        backend
+            .describe(dir.path(), &feature_change, "feat: local work")
+            .unwrap();
+        backend
+            .create_bookmark(dir.path(), "feature", &feature_change)
+            .unwrap();
+        backend.new_change(dir.path(), &feature_change).unwrap();
+        backend
+            .push_bookmarks(dir.path(), &["main".into(), "feature".into()], None)
+            .unwrap();
+
+        // Nothing new on the remote: records nothing, like the CLI's
+        // "Nothing changed.".
+        let noop = backend.git_fetch(dir.path(), None).unwrap();
+        assert!(noop.operation_id.is_none());
+        assert_eq!(noop.summary, "Nothing new on origin");
+
+        // Someone lands a commit on the remote's main (straight in the
+        // bare repo, so this workspace has no idea). A dirty on-disk edit
+        // snapshots first, like every mutation. Fetch imports the move:
+        // the tracked local main fast-forwards, and the feature stack now
+        // reads behind trunk — "the remote moved under you" made visible.
+        std::fs::write(dir.path().join("dirty.txt"), "dirty\n").unwrap();
+        let old_main = bare_branch(bare.path(), "main").unwrap();
+        let new_main = bare_commit(bare.path(), "main", &old_main, "upstream: lands work");
+        let outcome = backend.git_fetch(dir.path(), None).unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, "Fetched 1 bookmark update from origin");
+        assert!(outcome.target_change.is_none());
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "fetch from git remote(s) origin"
+        );
+        assert_eq!(snapshot.operations[1].description, "snapshot working copy");
+        let main = snapshot.bookmarks.iter().find(|b| b.name == "main").unwrap();
+        assert_eq!(main.sync, SyncState::Synced, "tracked main followed the remote");
+        let main_node = snapshot.nodes.iter().find(|n| n.id == main.target).unwrap();
+        assert!(new_main.starts_with(&main_node.commit_id));
+        let feature_stream = snapshot
+            .workstreams
+            .iter()
+            .find(|w| w.bookmark.as_deref() == Some("feature"))
+            .expect("feature stack still a workstream");
+        assert_eq!(feature_stream.behind_trunk, 1, "stack reads behind the moved trunk");
+
+        // Deleting a branch on the remote prunes on fetch: the tracked
+        // local bookmark follows the deletion, the now-unreachable commit
+        // is abandoned (`git.abandon-unreachable-commits`), and its
+        // descendant working copy rebases onto the surviving parent.
+        git(bare.path(), &["update-ref", "-d", "refs/heads/feature"]);
+        let outcome = backend.git_fetch(dir.path(), None).unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, "Fetched 1 bookmark update from origin");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert!(
+            !snapshot.bookmarks.iter().any(|b| b.name == "feature"),
+            "tracked bookmark followed the remote deletion"
+        );
+        assert!(
+            !snapshot
+                .nodes
+                .iter()
+                .any(|n| n.description.starts_with("feat: local work")),
+            "unreachable commit abandoned"
+        );
+        let wc_node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.id == snapshot.working_copy)
+            .unwrap();
+        assert_eq!(wc_node.parents, vec![first.clone()], "working copy rebased onto the parent");
+    }
+
+    #[test]
+    fn fetch_resolves_remotes_like_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare_upstream = tempfile::tempdir().unwrap();
+        let bare_mirror = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        build_colocated_repo(dir.path(), &backend);
+
+        // A sole remote is fetched whatever its name (the CLI's
+        // fetch-from-the-only-remote rule).
+        add_bare_remote(dir.path(), bare_upstream.path(), "upstream");
+        backend
+            .push_bookmarks(dir.path(), &["main".into()], Some("upstream"))
+            .unwrap();
+        let seed = bare_branch(bare_upstream.path(), "main").unwrap();
+        bare_commit(bare_upstream.path(), "main", &seed, "upstream: one");
+        let outcome = backend.git_fetch(dir.path(), None).unwrap();
+        assert_eq!(outcome.summary, "Fetched 1 bookmark update from upstream");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "fetch from git remote(s) upstream"
+        );
+
+        // With several remotes and no `git.fetch`, the CLI falls back to
+        // the literal name "origin" — which does not exist here, so there
+        // is nothing to fetch from.
+        add_bare_remote(dir.path(), bare_mirror.path(), "mirror");
+        git(dir.path(), &["push", "--quiet", "mirror", "refs/heads/main:refs/heads/main"]);
+        backend.refresh(dir.path()).unwrap();
+        let err = backend.git_fetch(dir.path(), None).unwrap_err();
+        assert!(err.to_string().contains("no git remotes to fetch from"), "{err}");
+
+        // The `git.fetch` setting picks the defaults instead.
+        write_repo_config(
+            dir.path(),
+            "user.name = \"Test User\"\nuser.email = \"test@example.com\"\n\
+             git.fetch = [\"mirror\"]\n",
+        );
+        let mirror_main = bare_branch(bare_mirror.path(), "main").unwrap();
+        bare_commit(bare_mirror.path(), "main", &mirror_main, "mirror: one");
+        let outcome = backend.git_fetch(dir.path(), None).unwrap();
+        assert!(outcome.operation_id.is_some());
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "fetch from git remote(s) mirror"
+        );
+
+        // An explicit multi-remote fetch runs as one operation, with the
+        // remotes named in listing order — not request order (pinned
+        // against the CLI, which does the same).
+        let up = bare_branch(bare_upstream.path(), "main").unwrap();
+        bare_commit(bare_upstream.path(), "main", &up, "upstream: two");
+        let mi = bare_branch(bare_mirror.path(), "main").unwrap();
+        bare_commit(bare_mirror.path(), "main", &mi, "mirror: two");
+        let outcome = backend
+            .git_fetch(dir.path(), Some(&["upstream".into(), "mirror".into()]))
+            .unwrap();
+        assert_eq!(outcome.summary, "Fetched 2 bookmark updates from mirror and upstream");
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "fetch from git remote(s) mirror,upstream"
+        );
+
+        // An explicitly-named unknown remote refuses (curated deviation —
+        // the CLI warns and continues), recording nothing.
+        let err = backend
+            .git_fetch(dir.path(), Some(&["upstream".into(), "nosuch".into()]))
+            .unwrap_err();
+        assert!(err.to_string().contains("no git remote named"), "{err}");
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(after.operations[0].id, snapshot.operations[0].id, "refusal recorded nothing");
+    }
+
     fn build_conflicted_repo(root: &Path, backend: &JjBackend) -> (String, String, String) {
         let settings = test_settings();
         let (_workspace, repo) =

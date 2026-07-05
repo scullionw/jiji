@@ -453,6 +453,19 @@ pub fn resolve_conflict(
     })
 }
 
+/// Fetch from the repo's git remotes (`jj git fetch` with the CLI's
+/// default remote resolution) — the upstream check behind the shell's
+/// fetch affordance and the background cadence. `async` moves it off the
+/// main thread: a fetch blocks on the network for as long as the remote
+/// takes to answer.
+#[tauri::command(async)]
+pub fn git_fetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<MutationOutcome, CommandError> {
+    state.mutate(&app, |backend, path| backend.git_fetch(path, None))
+}
+
 /// The inbox's stale-workspace recovery (`jj workspace update-stale`): the
 /// one mutation allowed while the working copy is stale.
 #[tauri::command]

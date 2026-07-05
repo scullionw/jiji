@@ -188,6 +188,19 @@ describe("paletteResults availability", () => {
     expect(ids(stackContext())).not.toContain("repo.undo");
     expect(ids({ ...stackContext(), canUndo: true })).toContain("repo.undo");
   });
+
+  it("offers the upstream fetch only when the repo has git remotes", () => {
+    const base = stackContext();
+    expect(ids(base)).not.toContain("repo.fetch");
+    const withRemote = {
+      ...base,
+      snapshot: {
+        ...base.snapshot!,
+        gitRemotes: [{ name: "origin", url: "https://example.com/r.git" }],
+      },
+    };
+    expect(ids(withRemote)).toContain("repo.fetch");
+  });
 });
 
 describe("paletteResults query", () => {

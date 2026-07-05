@@ -61,9 +61,10 @@ export async function chooseRepo(): Promise<void> {
 
 export async function refreshSnapshot(): Promise<void> {
   if (!app.snapshot) return;
-  // An explicit refresh also re-asks GitHub for PR state (the badges'
-  // manual cadence until background upstream checks land). Deliberately
-  // not awaited — the local snapshot must not wait on the network.
+  // An explicit refresh also re-asks GitHub for PR state. Deliberately
+  // not awaited — the local snapshot must not wait on the network. The
+  // git fetch itself stays with the upstream check (its chip and the
+  // background cadence); ⌘R is the fast local refresh.
   void refreshForgePrs();
   try {
     await api.refreshSnapshot();

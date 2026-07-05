@@ -25,6 +25,15 @@
 //                        button (section=conflicts; the captured snapshot
 //                        must carry a stale current workspace) and wait for
 //                        the item to settle
+//   &fetch=wait|fail|moved the stubbed git_fetch (the upstream check that
+//                        runs on open): never answers (the chip's checking
+//                        state), rejects like an unreachable remote (the
+//                        failed state), or finds the remote moved on every
+//                        fetch — recording a fetch operation with a
+//                        remote-bookmark effect (default: fetches nothing,
+//                        records nothing)
+//   &fetchnow=1          click the upstream chip's manual fetch and wait
+//                        for the breadcrumb (pair with fetch=moved)
 //   &forge=keychain|env|gh preset the GitHub connection's token source
 //                        (default: none — the Publish section's connect
 //                        state); the stubbed repo detection reads the
@@ -763,8 +772,13 @@
       };
       switch (cmd) {
         case "current_snapshot":
+          // A clone, like the real IPC boundary: every snapshot the app
+          // receives is a fresh value. Handing out the live stub object
+          // lets later stubbed mutations mutate it under Svelte's keyed
+          // each mid-flush (caught as each_key_duplicate when the upstream
+          // check's fetch op landed while a section switch rendered).
           return snap
-            ? Promise.resolve(snap)
+            ? Promise.resolve(structuredClone(snap))
             : reject("harness", `no captured snapshot named "${snapName}"`);
         case "change_diff": {
           const diff = (data.diffs || {})[args?.changeId];
@@ -1527,6 +1541,38 @@
             targetChange: snap.workingCopy,
           });
         }
+        case "git_fetch": {
+          // The upstream check (runs once on open, then on the cadence and
+          // the chip). Default answers the fetched-nothing no-op; `fetch=`
+          // drives the chip's other states: `fail` rejects like an
+          // unreachable remote, `wait` never answers (the checking state),
+          // `moved` records a fetch operation like a remote that moved.
+          const mode = params.get("fetch");
+          if (mode === "wait") return new Promise(() => {});
+          if (mode === "fail")
+            return reject(
+              "mutation_failed",
+              "could not fetch from origin: connection timed out",
+            );
+          const remote = (snap?.gitRemotes || [])[0]?.name || "origin";
+          if (mode === "moved") {
+            const opId = pushOp(
+              snap,
+              `fetch from git remote(s) ${remote}`,
+              [{ kind: "remoteBookmark", label: `${snap.trunkBookmark}@${remote} updated` }],
+            );
+            return Promise.resolve({
+              operationId: opId,
+              summary: `Fetched 1 bookmark update from ${remote}`,
+              targetChange: null,
+            });
+          }
+          return Promise.resolve({
+            operationId: null,
+            summary: `Nothing new on ${remote}`,
+            targetChange: null,
+          });
+        }
         // The forge connection (Publish section): repo detection mirrors
         // the backend's GitHub-URL parse over the captured gitRemotes;
         // auth state lives in `forge`, preset via &forge= and mutated by
@@ -1762,6 +1808,13 @@
         ? document.querySelector(".resolve.waiting") !== null
         : document.querySelector(".breadcrumb") !== null,
     );
+  }
+  // The upstream chip's manual fetch: click it and wait for the recorded
+  // operation's breadcrumb (pair with fetch=moved — the default stub
+  // answer fetches nothing, which records no operation).
+  if (params.get("fetchnow")) {
+    steps.push(() => click(".upstream-chip:not(:disabled)"));
+    steps.push(() => document.querySelector(".breadcrumb") !== null);
   }
   // Stale-workspace recovery: click the inbox card's Update workspace
   // button and wait for the stubbed mutation to settle the item.

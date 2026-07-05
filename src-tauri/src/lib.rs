@@ -44,6 +44,7 @@ pub fn run() {
             commands::restore_operation,
             commands::resolve_conflict,
             commands::update_stale_workspace,
+            commands::git_fetch,
             forge::forge_status,
             forge::forge_verify,
             forge::forge_login,

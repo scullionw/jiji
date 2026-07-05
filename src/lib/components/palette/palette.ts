@@ -19,6 +19,7 @@ export type PaletteAction =
   | { type: "chooseRepo" }
   | { type: "openRecent"; path: string }
   | { type: "refresh" }
+  | { type: "fetchUpstream" }
   | { type: "undo" }
   | { type: "newChild"; id: string }
   | { type: "edit"; id: string }
@@ -301,6 +302,16 @@ function buildItems(ctx: PaletteContext): PaletteItem[] {
       icon: "refresh",
       shortcut: "⌘R",
       action: { type: "refresh" },
+    });
+  }
+  if (snapshot && snapshot.gitRemotes.length > 0) {
+    items.push({
+      id: "repo.fetch",
+      group: "Repository",
+      title: "Fetch from remotes",
+      keywords: "git fetch upstream pull remote sync check",
+      icon: "refresh",
+      action: { type: "fetchUpstream" },
     });
   }
   if (ctx.canUndo) {

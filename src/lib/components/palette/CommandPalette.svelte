@@ -18,6 +18,7 @@
     sendIntent,
     undoLastMutation,
   } from "$lib/state/actions";
+  import { fetchUpstreamNow } from "$lib/state/upstream.svelte";
   import { findNode } from "$lib/components/inspector/inspect";
   import { paletteResults, type PaletteItem } from "./palette";
 
@@ -82,6 +83,9 @@
         break;
       case "refresh":
         void refreshSnapshot();
+        break;
+      case "fetchUpstream":
+        void fetchUpstreamNow();
         break;
       case "undo":
         void undoLastMutation();

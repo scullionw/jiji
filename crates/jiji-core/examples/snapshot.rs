@@ -17,6 +17,7 @@
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <old-name> --rename-bookmark <new-name>
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <name> --delete-bookmark
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <name[,name]> --push [remote]
+//!   cargo run -p jiji-core --example snapshot -- /path/to/repo --fetch [remote[,remote]]
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --revert-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <op-id> --restore-op
 //!   cargo run -p jiji-core --example snapshot -- /path/to/repo <change-id> --resolve <file-path>
@@ -58,6 +59,23 @@ fn main() {
     let path = std::path::Path::new(&path);
     if change_id.as_deref() == Some("--watch") {
         return watch_loop(backend.as_ref(), path);
+    }
+    // `--fetch [remote[,remote]]`: fetch like the app's upstream check —
+    // no remotes named resolves them like plain `jj git fetch`.
+    if change_id.as_deref() == Some("--fetch") {
+        let remotes: Option<Vec<String>> = mode
+            .as_deref()
+            .map(|names| names.split(',').map(str::to_owned).collect());
+        match backend.git_fetch(path, remotes.as_deref()) {
+            Ok(outcome) => {
+                println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                return;
+            }
+            Err(err) => {
+                eprintln!("error ({}): {}", err.code(), err);
+                std::process::exit(1);
+            }
+        }
     }
     if change_id.as_deref() == Some("--update-stale") {
         match backend.update_stale_workspace(path) {

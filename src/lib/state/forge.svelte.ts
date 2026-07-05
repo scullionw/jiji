@@ -3,9 +3,10 @@
 // PR badges. One source of truth, so connecting in Publish lights the
 // badges up immediately and both read the same fetch.
 //
-// The fetch cadence is deliberately manual for now — repo open (or the
-// repo's remotes changing out from under us), ⌘R, and connection changes.
-// The background cadence belongs to M4's upstream-checks item.
+// The fetch cadence: repo open (or the repo's remotes changing out from
+// under us), ⌘R, connection changes — and the background upstream check
+// (`upstream.svelte.ts`), which refreshes PR state on the same rhythm as
+// its `jj git fetch`.
 
 import * as api from "$lib/api";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
@@ -81,8 +82,9 @@ export async function syncForgeConnection(
   await refreshForgePrs();
 }
 
-/** Fetch the open-PR state badges and publish surfaces render. Manual
- * cadence (open, ⌘R, connect); a no-op without a ready connection. */
+/** Fetch the open-PR state badges and publish surfaces render (open, ⌘R,
+ * connect, and every upstream check); a no-op without a ready
+ * connection. */
 export async function refreshForgePrs(): Promise<void> {
   if (!connectionReady()) return;
   const seq = ++prsSeq;

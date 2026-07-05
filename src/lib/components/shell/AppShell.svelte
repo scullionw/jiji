@@ -19,6 +19,10 @@
     togglePalette,
   } from "$lib/state/actions";
   import { syncForgeConnection } from "$lib/state/forge.svelte";
+  import {
+    startUpstreamChecks,
+    syncUpstreamRepo,
+  } from "$lib/state/upstream.svelte";
   import { checkForAppUpdate } from "$lib/update";
 
   const sectionOrder: Section[] = [
@@ -40,11 +44,22 @@
     void syncForgeConnection(app.snapshot?.gitRemotes ?? null);
   });
 
+  // The upstream check follows the open repo the same way (keyed on the
+  // repo path): opening a repo with remotes fetches once, then the
+  // background cadence keeps remote state fresh.
+  $effect(() => {
+    syncUpstreamRepo(
+      app.snapshot?.repoPath ?? null,
+      (app.snapshot?.gitRemotes.length ?? 0) > 0,
+    );
+  });
+
   onMount(() => {
     bootstrap();
     void checkForAppUpdate();
+    const stopUpstream = startUpstreamChecks();
 
-    return tinykeys(window, {
+    const unbind = tinykeys(window, {
       "$mod+KeyK": (event) => {
         event.preventDefault();
         togglePalette();
@@ -63,6 +78,10 @@
       "$mod+Digit4": () => goTo(3),
       "$mod+Digit5": () => goTo(4),
     });
+    return () => {
+      stopUpstream();
+      unbind();
+    };
   });
 </script>
 

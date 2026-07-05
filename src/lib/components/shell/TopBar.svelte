@@ -4,9 +4,20 @@
   import LicenseBadge from "./LicenseBadge.svelte";
   import { app } from "$lib/state/app.svelte";
   import { chooseRepo, refreshSnapshot, togglePalette } from "$lib/state/actions";
+  import { fetchUpstreamNow, upstream } from "$lib/state/upstream.svelte";
+  import { upstreamChip } from "./upstream";
 
   const snapshot = $derived(app.snapshot);
   const trunk = $derived(snapshot?.bookmarks.find((b) => b.isTrunk));
+  const upstreamState = $derived(
+    snapshot
+      ? upstreamChip(
+          upstream,
+          snapshot.gitRemotes.map((r) => r.name),
+          upstream.now,
+        )
+      : null,
+  );
 
   const syncLabel: Record<string, string> = {
     synced: "up to date",
@@ -44,6 +55,23 @@
       <span class="sync-dot" class:ok={trunk.sync === "synced"}></span>
       <span class="sync-label">{syncLabel[trunk.sync] ?? trunk.sync}</span>
     </div>
+  {/if}
+  {#if upstreamState}
+    <button
+      class="upstream-chip"
+      class:busy={upstreamState.tone === "busy"}
+      class:failed={upstreamState.tone === "error"}
+      title={upstreamState.title}
+      aria-label={upstreamState.title}
+      data-upstream={upstreamState.tone}
+      disabled={upstream.checking}
+      onclick={() => void fetchUpstreamNow()}
+    >
+      <span class="upstream-dot"></span>
+      {upstreamState.label}
+    </button>
+  {/if}
+  {#if snapshot && trunk}
     <button
       class="icon-btn"
       title="Refresh snapshot (⌘R)"
@@ -134,6 +162,62 @@
 
   .sync-dot.ok {
     background: var(--clr-ok);
+  }
+
+  /* The upstream check: quiet by design (the GitButler lesson — always
+     visible, never noisy). Age text idle, a soft pulse while checking,
+     warn tone only when the remote could not be reached. */
+  .upstream-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 var(--sp-3);
+    border: 1px solid var(--clr-border-2);
+    border-radius: 999px;
+    background: var(--clr-bg-1);
+    color: var(--clr-text-3);
+    font-size: var(--text-s);
+    transition:
+      background var(--t-fast) var(--ease-out),
+      color var(--t-fast) var(--ease-out);
+  }
+
+  .upstream-chip:hover:not(:disabled) {
+    background: var(--clr-bg-hover);
+    color: var(--clr-text-1);
+  }
+
+  .upstream-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--clr-text-3);
+  }
+
+  .upstream-chip.busy .upstream-dot {
+    background: var(--clr-accent);
+    animation: upstream-pulse 1.2s ease-in-out infinite;
+  }
+
+  .upstream-chip.failed {
+    color: var(--clr-warn);
+  }
+
+  .upstream-chip.failed .upstream-dot {
+    background: var(--clr-warn);
+  }
+
+  @keyframes upstream-pulse {
+    50% {
+      opacity: 0.3;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .upstream-chip.busy .upstream-dot {
+      animation: none;
+    }
   }
 
   .sync-label {
