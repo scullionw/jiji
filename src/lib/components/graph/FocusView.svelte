@@ -20,6 +20,7 @@
     model,
     workstream,
     siblings,
+    lanes,
     selectedId,
     onselect,
     onfocus,
@@ -27,6 +28,9 @@
     model: FocusModel;
     workstream: WorkstreamSummary;
     siblings: WorkstreamSummary[];
+    /** Stream id → lane slot, from the full snapshot so hues match the
+     *  graph view. */
+    lanes: Map<string, number>;
     selectedId: string | null;
     onselect: (id: string) => void;
     onfocus: (id: string) => void;
@@ -65,6 +69,10 @@
 {#key workstream.id}
   <section class="lane" in:viewIn>
     <header class="lane-head">
+      <i
+        class="lane-dot"
+        style:--lane={`var(--lane-${lanes.get(workstream.id) ?? 0})`}
+      ></i>
       <h2 class="truncate">{workstream.title}</h2>
       {#if workstream.bookmark}
         <span class="chip">
@@ -96,11 +104,17 @@
               {row}
               columnCount={cols.current}
               emphasized={workstream.id}
+              {lanes}
               selected={selectedId === row.node.id}
               onselect={() => onselect(row.node.id)}
             />
           {:else}
-            <ElisionRow {row} columnCount={cols.current} emphasized={workstream.id} />
+            <ElisionRow
+              {row}
+              columnCount={cols.current}
+              emphasized={workstream.id}
+              {lanes}
+            />
           {/if}
         </div>
       {/each}
@@ -127,11 +141,17 @@
                 {row}
                 columnCount={cols.current}
                 emphasized={workstream.id}
+                {lanes}
                 selected={selectedId === row.node.id}
                 onselect={() => onselect(row.node.id)}
               />
             {:else}
-              <ElisionRow {row} columnCount={cols.current} emphasized={workstream.id} />
+              <ElisionRow
+                {row}
+                columnCount={cols.current}
+                emphasized={workstream.id}
+                {lanes}
+              />
             {/if}
           </div>
         {/each}
@@ -150,7 +170,11 @@
   <h3 class="aside-label">Other workstreams</h3>
   <div class="siblings">
     {#each siblings as sibling (sibling.id)}
-      <SiblingLane workstream={sibling} onfocus={() => onfocus(sibling.id)} />
+      <SiblingLane
+        workstream={sibling}
+        lane={lanes.get(sibling.id) ?? 0}
+        onfocus={() => onfocus(sibling.id)}
+      />
     {/each}
   </div>
 {/if}
@@ -160,8 +184,7 @@
     max-width: 720px;
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-xl);
-    box-shadow: var(--shadow-1);
+    border-radius: var(--radius-l);
     overflow: hidden;
   }
 
@@ -171,6 +194,14 @@
     gap: var(--sp-3);
     padding: var(--sp-3) var(--sp-4);
     border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .lane-dot {
+    flex-shrink: 0;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--lane, var(--clr-accent));
   }
 
   h2 {

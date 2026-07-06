@@ -12,6 +12,7 @@
     buildFocusModel,
     buildGraphModel,
     emphasizedStreamId,
+    laneMap,
     resolveFocusedWorkstream,
     selectableIds,
     streamOfNode,
@@ -26,6 +27,8 @@
   // Parent only renders this view when a snapshot exists.
   const snapshot = $derived(app.snapshot!);
   const model = $derived(buildGraphModel(snapshot));
+  // One stream, one hue: every stream-colored surface shares this map.
+  const lanes = $derived(laneMap(snapshot.workstreams));
   const emphasized = $derived(
     emphasizedStreamId(model, snapshot, app.selectedNodeId, app.focusedWorkstreamId),
   );
@@ -226,6 +229,7 @@
                 <GraphView
                   {model}
                   {emphasized}
+                  {lanes}
                   selectedId={app.selectedNodeId}
                   onselect={select}
                 />
@@ -248,6 +252,7 @@
                 model={focusModel}
                 workstream={focused}
                 {siblings}
+                {lanes}
                 selectedId={app.selectedNodeId}
                 onselect={select}
                 onfocus={focusWorkstream}
@@ -352,7 +357,6 @@
   .view-toggle button.active {
     background: var(--clr-bg-3);
     color: var(--clr-text-1);
-    box-shadow: var(--shadow-1);
   }
 
   .scroller {

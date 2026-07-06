@@ -41,13 +41,7 @@
     display: grid;
     place-items: center;
     border-radius: var(--radius-xl);
-    background: linear-gradient(
-      160deg,
-      color-mix(in srgb, var(--clr-accent) 16%, var(--clr-bg-2)),
-      var(--clr-bg-2) 70%
-    );
-    border: 1px solid color-mix(in srgb, var(--clr-accent) 18%, var(--clr-border-2));
-    box-shadow: var(--shadow-1);
+    background: var(--clr-accent-dim);
     color: var(--clr-accent-strong);
     margin-bottom: var(--sp-1);
   }

@@ -210,7 +210,6 @@
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
     background: var(--clr-bg-2);
-    box-shadow: var(--shadow-1);
     margin-bottom: var(--sp-3);
     transition:
       background var(--t-fast) var(--ease-out),

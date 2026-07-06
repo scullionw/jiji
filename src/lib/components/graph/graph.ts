@@ -388,8 +388,27 @@ export const SYNC_GLYPH: Record<
 
 /** Gutter geometry shared by the row renderers. */
 export const COL_WIDTH = 13;
-export const NODE_ROW_HEIGHT = 26;
+export const NODE_ROW_HEIGHT = 30;
 export const ELISION_ROW_HEIGHT = 18;
+
+/** Lane slots: a workstream's index in snapshot order, cycled through the
+ * six `--lane-*` hues. Every surface that colors by stream (rails, node
+ * markers, workstream dots) shares this map so hue stays identity. */
+export const LANE_COUNT = 6;
+
+export function laneMap(workstreams: WorkstreamSummary[]): Map<string, number> {
+  return new Map(workstreams.map((w, i) => [w.id, i % LANE_COUNT]));
+}
+
+/** The CSS custom-property reference for a stream's lane, or null for
+ * unowned/immutable context. */
+export function laneVar(
+  lanes: Map<string, number>,
+  stream: string | null,
+): string | undefined {
+  if (stream === null) return undefined;
+  return `var(--lane-${lanes.get(stream) ?? 0})`;
+}
 /** Corner radius where an edge bends into or out of a node. */
 export const RAIL_CORNER = 6;
 

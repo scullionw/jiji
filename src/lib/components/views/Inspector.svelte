@@ -97,19 +97,10 @@
 </script>
 
 <div class="inspector">
-  <!-- The repo's identity card: name, path, and the standing facts that
-       used to be a label/value table. One glance, no dead rows. -->
+  <!-- The working state at a glance: the sidebar owns the repo's identity,
+       so this header carries only the standing facts. -->
   <header class="repo-head">
-    <span class="repo-mark"><Icon name="folder" size={15} /></span>
-    <div class="repo-id">
-      <h3 class="truncate">{snapshot.repoName}</h3>
-      <span
-        class="repo-path mono selectable truncate"
-        title={snapshot.repoPath}
-      >
-        {snapshot.repoPath}
-      </span>
-    </div>
+    <h3 class="truncate">{snapshot.repoName}</h3>
     <div class="facts">
       {#if trunk}
         <span class="fact" title="Trunk target">
@@ -139,10 +130,11 @@
           <span class="count mono">{snapshot.workstreams.length}</span>
         </h4>
         <div class="ws-list">
-          {#each snapshot.workstreams as ws (ws.id)}
+          {#each snapshot.workstreams as ws, i (ws.id)}
             <button
               class="ws-row"
               class:current={ws.id === focused?.id}
+              style:--lane={`var(--lane-${i % 6})`}
               onclick={() => ws.nodeIds.length > 0 && jumpTo(ws.nodeIds[0])}
             >
               <i class="ws-dot" class:active={ws.isActive}></i>
@@ -275,38 +267,17 @@
     display: flex;
     align-items: center;
     gap: var(--sp-3);
-    margin-bottom: var(--sp-5);
+    margin-bottom: var(--sp-4);
     min-width: 0;
   }
 
-  .repo-mark {
-    flex-shrink: 0;
-    display: grid;
-    place-items: center;
-    width: 34px;
-    height: 34px;
-    border-radius: var(--radius-m);
-    background: var(--clr-accent-dim);
-    border: 1px solid color-mix(in srgb, var(--clr-accent) 22%, transparent);
-    color: var(--clr-accent-strong);
-  }
-
-  .repo-id {
-    min-width: 0;
+  .repo-head h3 {
     flex: 1;
-  }
-
-  .repo-id h3 {
+    min-width: 0;
     font-size: var(--text-l);
     font-weight: 650;
     letter-spacing: -0.01em;
     color: var(--clr-text-1);
-  }
-
-  .repo-path {
-    display: block;
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
   }
 
   .facts {
@@ -354,7 +325,6 @@
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
-    box-shadow: var(--shadow-1);
     padding: var(--sp-3) var(--sp-4) var(--sp-4);
     min-width: 0;
   }
@@ -413,7 +383,7 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    border: 1.5px solid color-mix(in srgb, var(--clr-accent) 45%, var(--clr-text-3));
+    border: 1.5px solid var(--lane, var(--clr-accent));
   }
 
   .ws-dot.active {

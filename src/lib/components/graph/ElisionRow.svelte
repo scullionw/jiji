@@ -6,6 +6,7 @@
   import {
     gutterWidth,
     keyedElisionRails,
+    laneVar,
     railX,
     ELISION_ROW_HEIGHT,
     type ElisionRow,
@@ -16,11 +17,14 @@
     row,
     columnCount,
     emphasized,
+    lanes,
   }: {
     row: ElisionRow;
     /** May be fractional mid-morph — the view tweens it. */
     columnCount: number;
     emphasized: string | null;
+    /** Stream id → lane slot; rails wear their stream's hue. */
+    lanes: Map<string, number>;
   } = $props();
 
   const H = ELISION_ROW_HEIGHT;
@@ -62,11 +66,16 @@
     <svg width={gw} height={H} viewBox="0 0 {gw} {H}" aria-hidden="true">
       {#each rails as kr (kr.key)}
         {#if kr.role === "pass"}
-          <path class="rail {railTone(kr.rail)}" d="M {xOf(kr.key, kr.rail)} 0 V {H}" />
+          <path
+            class="rail {railTone(kr.rail)}"
+            style:--lane={laneVar(lanes, kr.rail.stream)}
+            d="M {xOf(kr.key, kr.rail)} 0 V {H}"
+          />
         {:else}
           {#if row.continues}
             <path
               class="rail {railTone(kr.rail)}"
+              style:--lane={laneVar(lanes, kr.rail.stream)}
               d="M {xOf(kr.key, kr.rail)} {CY + 6} V {H}"
             />
           {/if}
@@ -97,11 +106,11 @@
   }
 
   .rail.hot {
-    stroke: color-mix(in srgb, var(--clr-accent) 72%, var(--clr-bg-3));
+    stroke: color-mix(in srgb, var(--lane, var(--clr-accent)) 75%, var(--clr-bg-3));
   }
 
   .rail.calm {
-    stroke: color-mix(in srgb, var(--clr-accent) 30%, var(--clr-bg-3));
+    stroke: color-mix(in srgb, var(--lane, var(--clr-accent)) 34%, var(--clr-bg-3));
   }
 
   .rail.base {

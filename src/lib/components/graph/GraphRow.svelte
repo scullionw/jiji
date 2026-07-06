@@ -12,6 +12,7 @@
   import {
     gutterWidth,
     keyedRails,
+    laneVar,
     railInPath,
     railOutPath,
     railX,
@@ -26,6 +27,7 @@
     row,
     columnCount,
     emphasized,
+    lanes,
     selected = false,
     onselect,
   }: {
@@ -34,6 +36,8 @@
     columnCount: number;
     /** Workstream id rendered hot; other streams render calm. */
     emphasized: string | null;
+    /** Stream id → lane slot; rails and markers wear their stream's hue. */
+    lanes: Map<string, number>;
     selected?: boolean;
     onselect: () => void;
   } = $props();
@@ -121,10 +125,12 @@
   class="row {tone}"
   class:selected
   class:base={isBase}
+  class:wc={row.isWorkingCopy}
   class:drag-source={isDragSource}
   class:drop-ok={dropOk || planDest}
   class:drop-no={isDropTarget && !dropOk}
   class:affected
+  style:--lane={laneVar(lanes, row.stream)}
   data-node-id={node.id}
   data-kind={node.kind}
   data-stream={row.stream}
@@ -137,6 +143,7 @@
         <path
           class="rail {railTone(kr.rail)}"
           class:elided={kr.rail.elided}
+          style:--lane={laneVar(lanes, kr.rail.stream)}
           d={railD(kr)}
         />
       {/each}
@@ -238,7 +245,7 @@
     align-items: center;
     gap: var(--sp-2);
     width: 100%;
-    height: 26px;
+    height: 30px;
     text-align: left;
     padding-right: var(--sp-3);
     transition: background var(--t-fast) var(--ease-out);
@@ -251,6 +258,13 @@
   /* The trunk/base zone reads recessed inside the same tree. */
   .row.base {
     background: color-mix(in srgb, var(--clr-bg-0) 40%, transparent);
+  }
+
+  /* "You are here": the working-copy row carries a quiet standing wash. */
+  .row.wc {
+    background: color-mix(in srgb, var(--clr-working-copy) 6%, transparent);
+    box-shadow: inset 2px 0 0
+      color-mix(in srgb, var(--clr-working-copy) 60%, transparent);
   }
 
   .row.selected {
@@ -304,11 +318,11 @@
   }
 
   .rail.hot {
-    stroke: color-mix(in srgb, var(--clr-accent) 72%, var(--clr-bg-3));
+    stroke: color-mix(in srgb, var(--lane, var(--clr-accent)) 75%, var(--clr-bg-3));
   }
 
   .rail.calm {
-    stroke: color-mix(in srgb, var(--clr-accent) 30%, var(--clr-bg-3));
+    stroke: color-mix(in srgb, var(--lane, var(--clr-accent)) 34%, var(--clr-bg-3));
   }
 
   .rail.base {
@@ -345,11 +359,11 @@
   }
 
   .mk-change.hot {
-    stroke: var(--clr-accent);
+    stroke: var(--lane, var(--clr-accent));
   }
 
   .mk-change.calm {
-    stroke: color-mix(in srgb, var(--clr-accent) 45%, var(--clr-text-3));
+    stroke: color-mix(in srgb, var(--lane, var(--clr-accent)) 55%, var(--clr-text-3));
   }
 
   .mk-base {
@@ -374,7 +388,7 @@
   }
 
   .id b {
-    color: var(--clr-accent-strong);
+    color: var(--lane, var(--clr-accent-strong));
     font-weight: 600;
   }
 

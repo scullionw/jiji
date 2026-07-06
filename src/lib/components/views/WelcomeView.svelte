@@ -62,13 +62,7 @@
     display: grid;
     place-items: center;
     border-radius: var(--radius-xl);
-    background: linear-gradient(
-      145deg,
-      color-mix(in srgb, var(--clr-accent) 30%, var(--clr-bg-2)),
-      color-mix(in srgb, var(--clr-accent) 10%, var(--clr-bg-1))
-    );
-    border: 1px solid color-mix(in srgb, var(--clr-accent) 30%, transparent);
-    box-shadow: var(--shadow-2);
+    background: var(--clr-accent-dim);
     color: var(--clr-accent-strong);
     font-size: var(--text-xl);
     font-weight: 700;
@@ -107,7 +101,6 @@
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
-    box-shadow: var(--shadow-1);
     padding: var(--sp-2);
   }
 

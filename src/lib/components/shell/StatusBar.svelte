@@ -128,13 +128,14 @@
 
 <style>
   .statusbar {
-    height: 32px;
+    height: 30px;
     display: flex;
     align-items: center;
     gap: var(--sp-2);
     padding: 0 var(--sp-4);
     font-size: var(--text-s);
     color: var(--clr-text-3);
+    border-top: 1px solid var(--clr-border-2);
   }
 
   .dot {

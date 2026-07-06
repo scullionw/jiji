@@ -4,14 +4,20 @@
 
   let {
     workstream,
+    lane,
     onfocus,
-  }: { workstream: WorkstreamSummary; onfocus: () => void } = $props();
+  }: {
+    workstream: WorkstreamSummary;
+    /** Lane slot shared with the graph view, so hue stays identity. */
+    lane: number;
+    onfocus: () => void;
+  } = $props();
 
   const count = $derived(workstream.nodeIds.length);
   const dots = $derived(Math.min(count, 4));
 </script>
 
-<button class="sibling" onclick={onfocus}>
+<button class="sibling" style:--lane={`var(--lane-${lane})`} onclick={onfocus}>
   <span class="mini" aria-hidden="true">
     {#each Array.from({ length: dots }) as _, i (i)}
       <i class="dot" class:wc={workstream.isActive && i === 0}></i>
@@ -72,7 +78,7 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--clr-accent) 55%, var(--clr-bg-3));
+    background: color-mix(in srgb, var(--lane, var(--clr-accent)) 60%, var(--clr-bg-3));
   }
 
   .dot.wc {

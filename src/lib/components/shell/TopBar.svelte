@@ -3,7 +3,7 @@
   import ThemeMenu from "./ThemeMenu.svelte";
   import LicenseBadge from "./LicenseBadge.svelte";
   import { app } from "$lib/state/app.svelte";
-  import { chooseRepo, refreshSnapshot, togglePalette } from "$lib/state/actions";
+  import { refreshSnapshot, togglePalette } from "$lib/state/actions";
   import { fetchUpstreamNow, upstream } from "$lib/state/upstream.svelte";
   import { upstreamChip } from "./upstream";
 
@@ -29,21 +29,6 @@
 </script>
 
 <header class="topbar" data-tauri-drag-region>
-  {#if snapshot}
-    <div class="repo">
-      <span class="repo-tile"><Icon name="folder" size={13} /></span>
-      <span class="name">{snapshot.repoName}</span>
-      <span class="path mono truncate" title={snapshot.repoPath}>
-        {snapshot.repoPath}
-      </span>
-    </div>
-  {:else}
-    <div class="repo">
-      <span class="name">Jiji</span>
-      <span class="path">No repository open</span>
-    </div>
-  {/if}
-
   <div class="fill" data-tauri-drag-region></div>
 
   {#if snapshot && trunk}
@@ -95,56 +80,16 @@
     <Icon name="command" size={14} />
   </button>
   <ThemeMenu />
-  <button
-    class="icon-btn"
-    title="Open repository (⌘O)"
-    aria-label="Open repository"
-    onclick={chooseRepo}
-  >
-    <Icon name="folder" size={15} />
-  </button>
 </header>
 
 <style>
   .topbar {
-    height: 46px;
+    height: 42px;
     display: flex;
     align-items: center;
     gap: var(--sp-3);
     padding: 0 var(--sp-2) 0 var(--sp-3);
-  }
-
-  .repo {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    color: var(--clr-text-3);
-    min-width: 0;
-  }
-
-  .repo-tile {
-    display: grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    border-radius: var(--radius-s);
-    background: var(--clr-bg-2);
-    border: 1px solid var(--clr-border-2);
-    color: var(--clr-text-2);
-    flex-shrink: 0;
-  }
-
-  .name {
-    font-weight: 650;
-    font-size: var(--text-m);
-    letter-spacing: -0.01em;
-    color: var(--clr-text-1);
-  }
-
-  .path {
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
-    max-width: 320px;
+    border-bottom: 1px solid var(--clr-border-2);
   }
 
   .divider {

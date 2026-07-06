@@ -10,12 +10,15 @@
   let {
     model,
     emphasized,
+    lanes,
     selectedId,
     onselect,
   }: {
     model: GraphModel;
     /** Workstream id rendered hot; other streams stay calm. */
     emphasized: string | null;
+    /** Stream id → lane slot, shared by every stream-colored surface. */
+    lanes: Map<string, number>;
     selectedId: string | null;
     onselect: (id: string) => void;
   } = $props();
@@ -46,11 +49,12 @@
           {row}
           columnCount={cols.current}
           {emphasized}
+          {lanes}
           selected={selectedId === row.node.id}
           onselect={() => onselect(row.node.id)}
         />
       {:else}
-        <ElisionRow {row} columnCount={cols.current} {emphasized} />
+        <ElisionRow {row} columnCount={cols.current} {emphasized} {lanes} />
       {/if}
     </div>
   {/each}

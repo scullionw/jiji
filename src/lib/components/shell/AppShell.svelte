@@ -130,19 +130,15 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    padding-right: var(--sp-2);
   }
 
+  /* Full-bleed working surface: the sidebar and bars are the bg-0 frame,
+     hairlines are the joinery, and the content plane sits one step up. */
   .content {
     flex: 1;
     min-height: 0;
     background: var(--clr-bg-1);
-    border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-l);
     overflow: hidden;
-    /* The workspace card floats just above the frame; the shadow is what
-       makes the inset read as a surface instead of a wireframe. */
-    box-shadow: var(--shadow-1);
   }
 
   .section {

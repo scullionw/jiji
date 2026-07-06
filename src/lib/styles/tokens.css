@@ -49,6 +49,20 @@
   --clr-warn: #d9a04c;
   --clr-danger: #e0605c;
 
+  /* Workstream lanes: in the graph, hue is identity. Streams take a slot
+     in snapshot order and cycle; rails, node markers, and workstream dots
+     all draw from the same slot so one stream reads as one color on every
+     surface. Slot 0 rides the theme accent; the fixed hues that follow are
+     spaced to stay apart from the semantic set (ok/warn/danger/working
+     copy). The dark set lives here; the light set is deepened alongside
+     the light syntax palette below. */
+  --lane-0: var(--clr-accent);
+  --lane-1: #5fb2e8;
+  --lane-2: #c88ee0;
+  --lane-3: #e389ad;
+  --lane-4: #62bd8f;
+  --lane-5: #cfa35d;
+
   /* Syntax (code) — one restrained set per scheme, shared by every theme:
      the diff should read calmer than the shell, so hues mark scan anchors
      (keywords, strings, types) and everything else stays plain text. The
@@ -454,4 +468,11 @@
   --syn-prop: #4a648c;
   --syn-comment: var(--clr-text-3);
   --syn-meta: #96632a;
+
+  /* Workstream lanes, deepened to hold contrast on paper. */
+  --lane-1: #1f78c0;
+  --lane-2: #9c46b8;
+  --lane-3: #c23a76;
+  --lane-4: #24875a;
+  --lane-5: #96690f;
 }

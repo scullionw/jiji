@@ -37,7 +37,6 @@
     margin-top: 2px;
     border-radius: var(--radius-m);
     background: var(--clr-accent-dim);
-    border: 1px solid color-mix(in srgb, var(--clr-accent) 22%, transparent);
     color: var(--clr-accent-strong);
   }
 
