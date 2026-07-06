@@ -188,6 +188,19 @@ impl AppState {
             .clone()
     }
 
+    /// The first of `candidates` existing as a text file in the trunk
+    /// tree — how forge planning reads the repo's PR template. A failed
+    /// read only loses that nicety, so it logs instead of erroring.
+    pub(crate) fn trunk_text_file(&self, candidates: &[String]) -> Option<(String, String)> {
+        let repo_path = self.open_repo_path().ok()?;
+        self.backend
+            .trunk_text_file(Path::new(&repo_path), candidates)
+            .unwrap_or_else(|err| {
+                log::warn!("could not probe trunk for a PR template: {err}");
+                None
+            })
+    }
+
     /// Push bookmarks through the backend and republish the refreshed
     /// snapshot, like every other mutation — the submit executor's jj half.
     pub(crate) fn push_and_publish(
@@ -465,6 +478,23 @@ pub fn git_fetch(
     state: State<'_, AppState>,
 ) -> Result<MutationOutcome, CommandError> {
     state.mutate(&app, |backend, path| backend.git_fetch(path, None))
+}
+
+/// Fetch a pull request's head (`refs/pull/N/head` via git against the
+/// repo's git store — jj cannot fetch non-branch refs, jj-vcs/jj#4388)
+/// into a new local bookmark for local review. `async` because it blocks
+/// on the network like any fetch.
+#[tauri::command(async)]
+pub fn fetch_pr(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    remote: String,
+    number: u64,
+    bookmark: String,
+) -> Result<MutationOutcome, CommandError> {
+    state.mutate(&app, |backend, path| {
+        backend.fetch_pr_head(path, &remote, number, &bookmark)
+    })
 }
 
 /// The inbox's stale-workspace recovery (`jj workspace update-stale`): the

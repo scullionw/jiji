@@ -13,16 +13,20 @@
 //!   cargo run -p jiji-forge --example forge -- land <repo-path> <head-bookmark>
 //!   cargo run -p jiji-forge --example forge -- merged <owner>/<name> <branch>
 //!   cargo run -p jiji-forge --example forge -- landstate <owner>/<name> <number> <base>
+//!   cargo run -p jiji-forge --example forge -- pr <owner>/<name> <number>
+//!   cargo run -p jiji-forge --example forge -- rerun <owner>/<name> <head-sha>
 //!
 //! `status` reports where a token would come from (no network). `whoami`
 //! verifies the resolved token against the API. `login` validates a token
 //! and stores it in the system keychain; `logout` removes it. `plan`
 //! snapshots a real repo through `jiji-core`, fetches the detected GitHub
-//! repo's open-PR state, and prints the submission plan for the stack
-//! under the bookmark — read-only: nothing pushes, nothing posts. `land`
-//! prints the landing plan the same way (also read-only); `merged` probes
-//! the per-bookmark merged-PR recognition query, and `landstate` the
-//! per-PR land-readiness query.
+//! repo's open-PR state (and the repo's PR template from the trunk tree),
+//! and prints the submission plan for the stack under the bookmark —
+//! read-only: nothing pushes, nothing posts. `land` prints the landing
+//! plan the same way (also read-only); `merged` probes the per-bookmark
+//! merged-PR recognition query, `landstate` the per-PR land-readiness
+//! query, `pr` the by-number lookup behind the review flow, and `rerun`
+//! re-runs the failed Actions runs on a commit (the one write here).
 
 use jiji_forge::{
     detect_github_repo, no_github_remote, plan_land, plan_submit, resolve_token, ForgeAuth,
@@ -49,12 +53,21 @@ fn main() {
             args.get(2).map(String::as_str),
             args.get(3).map(String::as_str),
         ),
+        Some("pr") => pr(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
+        Some("rerun") => rerun(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+        ),
         _ => {
             eprintln!(
                 "usage: forge -- status | whoami | prs <owner>/<name> | detect <url>... \
                  | login <token> | logout | plan <repo-path> <head-bookmark> \
                  | land <repo-path> <head-bookmark> | merged <owner>/<name> <branch> \
-                 | landstate <owner>/<name> <number> <base>"
+                 | landstate <owner>/<name> <number> <base> | pr <owner>/<name> <number> \
+                 | rerun <owner>/<name> <head-sha>"
             );
             std::process::exit(2);
         }
@@ -163,10 +176,52 @@ fn plan(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     let client = GitHubClient::for_repo(&repo, &resolved.token)?;
     let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
     // Planning reads existing stack comments (still read-only) so the
-    // printed plan matches what the app would show.
+    // printed plan matches what the app would show — and the repo's PR
+    // template from the trunk tree, like the app's submit commands.
+    let template = jiji_core::JjBackend::default()
+        .trunk_text_file(
+            std::path::Path::new(repo_path),
+            &jiji_forge::pr_template_candidates(),
+        )
+        .ok()
+        .flatten()
+        .map(|(path, text)| jiji_forge::PrTemplate { path, text });
     let forge_side = jiji_forge::RepoForge { client: &client, repo: &repo };
-    let plan = plan_submit(&snapshot, &prs, &repo, head, &forge_side)?;
+    let plan = plan_submit(&snapshot, &prs, &repo, head, &forge_side, template.as_ref())?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
+    Ok(())
+}
+
+fn pr(slug: Option<&str>, number: Option<&str>) -> Result<(), ForgeError> {
+    let (Some((owner, name)), Some(number)) = (
+        slug.and_then(|s| s.split_once('/')),
+        number.and_then(|n| n.parse::<u64>().ok()),
+    ) else {
+        eprintln!("usage: forge -- pr <owner>/<name> <number>");
+        std::process::exit(2);
+    };
+    let (client, _) = resolved_client()?;
+    let answer = client.pr_by_number(owner, name, number)?;
+    println!("{}", serde_json::to_string_pretty(&answer).expect("answer serializes"));
+    Ok(())
+}
+
+fn rerun(slug: Option<&str>, head_sha: Option<&str>) -> Result<(), ForgeError> {
+    let (Some((owner, name)), Some(head_sha)) = (slug.and_then(|s| s.split_once('/')), head_sha)
+    else {
+        eprintln!("usage: forge -- rerun <owner>/<name> <head-sha>");
+        std::process::exit(2);
+    };
+    let (client, _) = resolved_client()?;
+    let repo = jiji_forge::ForgeRepo {
+        provider: jiji_forge::ForgeProvider::GitHub,
+        host: "github.com".into(),
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        remote: "origin".into(),
+    };
+    let report = jiji_forge::rerun_failed_ci(&client, &repo, head_sha)?;
+    println!("{}", serde_json::to_string_pretty(&report).expect("report serializes"));
     Ok(())
 }
 

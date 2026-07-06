@@ -16,8 +16,11 @@
 //! - [`reconcile`]: fingerprinted PR title/description reconciliation
 //! - [`comment`]: the stack-info comment GitHub readers see
 //! - [`land`]: the merge → fetch → reconcile landing engine
+//! - [`template`]: the repo's PR template folded into new PR bodies
+//! - [`ci`]: the re-run-failed-CI review helper over GitHub Actions
 
 pub mod auth;
+pub mod ci;
 pub mod comment;
 pub mod error;
 pub mod github;
@@ -26,11 +29,13 @@ pub mod pr;
 pub mod reconcile;
 pub mod remote;
 pub mod submit;
+pub mod template;
 
 pub use auth::{
     resolve_token, ForgeAuth, ForgeStatus, KeychainTokenStore, MemoryTokenStore, ResolvedToken,
     TokenSource, TokenStore,
 };
+pub use ci::{rerun_failed_ci, CiRerunReport};
 pub use error::ForgeError;
 pub use github::GitHubClient;
 pub use land::{
@@ -47,3 +52,4 @@ pub use submit::{
     SubmitForge, SubmitOutcome, SubmitPlan, SubmitSegment, SubmitStep, SubmitStepStatus,
     SubmitVcs,
 };
+pub use template::{new_pr_body, pr_template_candidates, PrTemplate};

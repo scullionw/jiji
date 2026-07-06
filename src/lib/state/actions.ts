@@ -177,6 +177,17 @@ export function deleteBookmark(name: string): Promise<MutationOutcome> {
   return runMutation(() => api.deleteBookmark(name));
 }
 
+// Fetch a PR's head into a local review bookmark. The selection follows
+// the fetched head (`targetChange`), so jumping to the workbench lands on
+// the PR's diff.
+export function fetchPr(
+  remote: string,
+  number: number | bigint,
+  bookmark: string,
+): Promise<MutationOutcome> {
+  return runMutation(() => api.fetchPr(remote, number, bookmark));
+}
+
 // Hands one conflicted file to the external merge tool and waits for the
 // tool's window to close. `app.resolvingConflict` stays set the whole time
 // so every Resolve affordance shows the waiting state; errors propagate to

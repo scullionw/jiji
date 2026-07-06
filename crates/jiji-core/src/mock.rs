@@ -81,6 +81,7 @@ pub enum MockMutation {
     RenameBookmark { old: String, new: String },
     DeleteBookmark { name: String },
     Push { names: Vec<String>, remote: String },
+    FetchPr { number: u64, bookmark: String },
     RevertOp { op_id: String },
     RestoreOp { op_id: String },
     Resolve { id: String, path: String },
@@ -517,6 +518,18 @@ pub fn mutation_outcome(
                 summary,
                 target_change: None,
             })
+        }
+        MockMutation::FetchPr { number, bookmark } => {
+            validate_mock_bookmark_name(bookmark)?;
+            if snapshot.bookmarks.iter().any(|b| b.name == *bookmark) {
+                return Err(BackendError::MutationFailed(format!(
+                    "bookmark \u{201c}{bookmark}\u{201d} already exists"
+                )));
+            }
+            Ok(recorded(
+                format!("Fetched PR #{number} into {bookmark}"),
+                &mock_new_change_id(index),
+            ))
         }
         // The two time-travel entries leave `target_change` empty: the
         // selection should follow the working copy of the replayed result,
@@ -1170,6 +1183,61 @@ pub fn apply_mutation(
             };
             push_op(snapshot, index, description, effects);
         }
+        MockMutation::FetchPr { number, bookmark } => {
+            // Documented approximation: the fabricated remote serves every
+            // PR head as one fresh change directly on trunk (the real
+            // backend fetches whatever ancestry the PR really carries).
+            let new_id = mock_new_change_id(index);
+            let trunk = snapshot
+                .bookmarks
+                .iter()
+                .find(|b| b.is_trunk)
+                .map(|b| b.target.clone())
+                .unwrap_or_default();
+            snapshot.nodes.insert(
+                0,
+                GraphNode {
+                    id: new_id.clone(),
+                    change_id: new_id.clone(),
+                    commit_id: format!("9c{index:02}7de2"),
+                    description: format!("PR #{number} head (fetched for review)"),
+                    author: "them".into(),
+                    timestamp: mock_op_timestamp(index),
+                    kind: NodeKind::Mutable,
+                    parents: vec![trunk],
+                    elided_parents: Vec::new(),
+                    bookmarks: vec![bookmark.clone()],
+                    is_empty: false,
+                    has_conflict: false,
+                    is_divergent: false,
+                },
+            );
+            snapshot.bookmarks.push(BookmarkState {
+                name: bookmark.clone(),
+                target: new_id.clone(),
+                remote: None,
+                sync: SyncState::LocalOnly,
+                is_trunk: false,
+                is_local: true,
+            });
+            snapshot.workstreams.push(WorkstreamSummary {
+                id: format!("ws-{new_id}"),
+                title: format!("PR #{number} head (fetched for review)"),
+                node_ids: vec![new_id.clone()],
+                bookmark: Some(bookmark.clone()),
+                is_active: false,
+                behind_trunk: 0,
+            });
+            push_op(
+                snapshot,
+                index,
+                format!("fetch pull request #{number} into bookmark {bookmark}"),
+                vec![OpEffect {
+                    kind: OpEffectKind::Bookmark,
+                    label: format!("{bookmark} created"),
+                }],
+            );
+        }
         MockMutation::Resolve { id, path } => {
             // The resolved path leaves its inbox item; an item with no paths
             // left is done, and its node stops rendering as conflicted. Only
@@ -1271,6 +1339,9 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
             [name] => format!("push bookmark {name} to git remote {remote}"),
             names => format!("push bookmarks {} to git remote {remote}", names.join(", ")),
         },
+        MockMutation::FetchPr { number, bookmark } => {
+            format!("fetch pull request #{number} into bookmark {bookmark}")
+        }
         MockMutation::RevertOp { op_id } => format!("revert operation {op_id}"),
         MockMutation::RestoreOp { op_id } => format!("restore to operation {op_id}"),
         MockMutation::Resolve { id, .. } => {

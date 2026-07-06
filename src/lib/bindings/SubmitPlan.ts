@@ -40,4 +40,10 @@ warnings: Array<string>,
  * when the plan syncs comments (PRs created by this plan appear as
  * plain names — their links exist only after execution).
  */
-stackCommentPreview: string | null, };
+stackCommentPreview: string | null, 
+/**
+ * Where the repo's PR template lives, when trunk carries one and this
+ * plan creates a PR whose body folds it in — so the panel can say new
+ * descriptions start from it.
+ */
+prTemplatePath: string | null, };

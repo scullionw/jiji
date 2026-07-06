@@ -11,9 +11,10 @@ use std::sync::Mutex;
 
 use jiji_forge::{
     detect_github_repo, execute_land, execute_submit, no_github_remote, plan_land, plan_submit,
-    resolve_token, ForgeAuth, ForgeError, ForgeRepo, ForgeStatus, GitHubClient,
-    KeychainTokenStore, LandOutcome, LandPlan, LandRepoForge, LandVcs, RepoForge, RepoPrState,
-    SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
+    pr_template_candidates, resolve_token, CiRerunReport, ForgeAuth, ForgeError, ForgeRepo,
+    ForgeStatus, GitHubClient, KeychainTokenStore, LandOutcome, LandPlan, LandRepoForge, LandVcs,
+    PrSummary, PrTemplate, RepoForge, RepoPrState, SubmitOutcome, SubmitPlan, SubmitVcs,
+    TokenSource, TokenStore as _,
 };
 use tauri::{AppHandle, State};
 
@@ -195,6 +196,14 @@ fn submit_context(
     Ok((repo, client, prs))
 }
 
+/// The repo's PR template from the trunk tree, when one exists — folded
+/// into the bodies of PRs a submit plan creates.
+fn pr_template(state: &AppState) -> Option<PrTemplate> {
+    state
+        .trunk_text_file(&pr_template_candidates())
+        .map(|(path, text)| PrTemplate { path, text })
+}
+
 /// Plan submitting the stack under a bookmark: what would push, which PRs
 /// would open against which bases, which existing PRs retarget, which PR
 /// text and stack comments refresh. Read-only — GitHub is asked for fresh
@@ -212,7 +221,16 @@ pub fn submit_plan(
         client: &client,
         repo: &repo,
     };
-    plan_submit(&snapshot, &prs, &repo, &head_bookmark, &forge_side).map_err(Into::into)
+    let template = pr_template(&state);
+    plan_submit(
+        &snapshot,
+        &prs,
+        &repo,
+        &head_bookmark,
+        &forge_side,
+        template.as_ref(),
+    )
+    .map_err(Into::into)
 }
 
 /// The submit executor's jj half: pushes run through the shared mutation
@@ -320,7 +338,15 @@ pub fn submit_stack(
         client: &client,
         repo: &repo,
     };
-    let fresh = plan_submit(&snapshot, &prs, &repo, &head_bookmark, &forge_side)?;
+    let template = pr_template(&state);
+    let fresh = plan_submit(
+        &snapshot,
+        &prs,
+        &repo,
+        &head_bookmark,
+        &forge_side,
+        template.as_ref(),
+    )?;
     if fresh.actions != plan.actions {
         return Err(CommandError::new(
             "plan_stale",
@@ -333,6 +359,39 @@ pub fn submit_stack(
         state: &state,
     };
     execute_submit(&fresh, &vcs, &forge_side).map_err(Into::into)
+}
+
+/// One PR by number — the review flow's lookup for PRs the batched
+/// open-PR state cannot see (past the 100 cap, or closed), so "fetch any
+/// PR" really means any.
+#[tauri::command(async)]
+pub fn forge_pr(
+    state: State<'_, AppState>,
+    number: u64,
+) -> Result<PrSummary, CommandError> {
+    let repo = detected_repo(&state).ok_or_else(no_github_remote)?;
+    let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
+    let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+    client
+        .pr_by_number(&repo.owner, &repo.name, number)
+        .map_err(Into::into)
+}
+
+/// Re-run the failed GitHub Actions runs on a PR's head. The PR is
+/// re-fetched first so the re-run targets the head GitHub currently has,
+/// not the possibly-stale one a badge was drawn from; the answer says
+/// which workflow runs went back to work (empty means the failing check
+/// lives outside GitHub Actions' reach).
+#[tauri::command(async)]
+pub fn rerun_failed_ci(
+    state: State<'_, AppState>,
+    number: u64,
+) -> Result<CiRerunReport, CommandError> {
+    let repo = detected_repo(&state).ok_or_else(no_github_remote)?;
+    let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
+    let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+    let pr = client.pr_by_number(&repo.owner, &repo.name, number)?;
+    jiji_forge::rerun_failed_ci(&client, &repo, &pr.head_commit).map_err(Into::into)
 }
 
 /// Plan landing the stack under a bookmark: what already merged on GitHub,

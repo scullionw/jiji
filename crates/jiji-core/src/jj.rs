@@ -76,6 +76,9 @@ const MAX_BEHIND_COUNT: usize = 999;
 /// Changed-file lists are for inspection, not bulk processing; cap them so a
 /// vendored-dependency commit cannot flood the UI.
 const MAX_CHANGED_FILES: usize = 1000;
+/// `trunk_text_file` reads repo docs (a PR template) destined for PR
+/// bodies; anything bigger than this is not a document worth inlining.
+const MAX_TRUNK_TEXT_FILE_BYTES: u64 = 100 * 1024;
 /// Per-side file size limit for content diffs; larger files render as a
 /// "too large" placeholder instead of hunks.
 const MAX_DIFF_FILE_BYTES: usize = 1 << 20;
@@ -1305,6 +1308,151 @@ impl RepoBackend for JjBackend {
             summary,
             target_change: None,
         })
+    }
+
+    fn fetch_pr_head(
+        &self,
+        path: &Path,
+        remote: &str,
+        number: u64,
+        bookmark: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (mut workspace, repo) = self.load_repo_at_head(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let settings = workspace.settings().clone();
+
+        let name = bookmark.trim();
+        validate_bookmark_name(name)?;
+        if repo.view().get_local_bookmark(RefName::new(name)).is_present() {
+            return Err(BackendError::MutationFailed(format!(
+                "bookmark \u{201c}{name}\u{201d} already exists"
+            )));
+        }
+        let remote = remote.trim();
+        let all_remotes = git::get_all_remote_names(repo.store()).map_err(|err| {
+            BackendError::MutationFailed(format!("could not list git remotes: {err}"))
+        })?;
+        if !all_remotes.iter().any(|r| r.as_str() == remote) {
+            return Err(BackendError::MutationFailed(format!(
+                "there is no git remote named \u{201c}{remote}\u{201d}"
+            )));
+        }
+
+        // The raw fetch. jj-lib's fetch engine only expands branch and tag
+        // refspecs, and jj has no way to fetch `refs/pull/*` at all
+        // (jj-vcs/jj#4388) — so run git the way jj's own subprocess layer
+        // does (same executable setting, same git dir) into a temporary
+        // ref jj's importer never reads, then hand the arrived commit to
+        // jj-lib. `--no-write-fetch-head` keeps the fetch invisible to
+        // other git tooling, like jj's own fetches.
+        let subprocess_options = git::GitSubprocessOptions::from_settings(&settings)
+            .map_err(|err| BackendError::ConfigInvalid(format!("git.executable-path: {err}")))?;
+        let git_dir = git::get_git_backend(repo.store())
+            .map_err(mutation_err)?
+            .git_repo_path()
+            .to_owned();
+        let pr_ref = format!("refs/pull/{number}/head");
+        let temp_ref = format!("refs/jiji/pr-{number}-head");
+        run_git(
+            &subprocess_options,
+            &git_dir,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--",
+                remote,
+                &format!("+{pr_ref}:{temp_ref}"),
+            ],
+        )
+        .map_err(|stderr| {
+            if stderr.contains("couldn't find remote ref") {
+                BackendError::MutationFailed(format!(
+                    "{remote} has no pull request #{number} (it serves no {pr_ref})"
+                ))
+            } else {
+                BackendError::MutationFailed(format!(
+                    "could not fetch {pr_ref} from {remote}: {stderr}"
+                ))
+            }
+        })?;
+        let oid = run_git(&subprocess_options, &git_dir, &["rev-parse", "--verify", &temp_ref])
+            .map_err(|stderr| {
+                BackendError::MutationFailed(format!(
+                    "the fetched PR ref did not arrive: {stderr}"
+                ))
+            })?;
+        // Best-effort cleanup; a leftover temp ref is invisible to jj.
+        let _ = run_git(&subprocess_options, &git_dir, &["update-ref", "-d", &temp_ref]);
+        let commit_id = CommitId::try_from_hex(oid.trim()).ok_or_else(|| {
+            BackendError::MutationFailed(format!(
+                "git answered a malformed commit id for {pr_ref}: {oid}"
+            ))
+        })?;
+        let commit = repo.store().get_commit(&commit_id).map_err(mutation_err)?;
+
+        let mut tx = repo.start_transaction();
+        tx.repo_mut().add_head(&commit).map_err(mutation_err)?;
+        tx.repo_mut().set_local_bookmark_target(
+            RefName::new(name),
+            RefTarget::normal(commit_id.clone()),
+        );
+        // No CLI command exists for this, so the op description is Jiji's
+        // own — kept in jj's lowercase op-log voice.
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("fetch pull request #{number} into bookmark {name}"),
+        )?;
+        let target = display_id_of(new_repo.as_ref(), &commit_id)?;
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary: format!("Fetched PR #{number} into {name}"),
+            target_change: Some(target),
+        })
+    }
+
+    fn trunk_text_file(
+        &self,
+        path: &Path,
+        candidates: &[String],
+    ) -> Result<Option<(String, String)>, BackendError> {
+        let (_workspace, repo) = self.load_repo_at_head(path)?;
+        let Some(trunk) = resolve_trunk(repo.view()) else {
+            return Ok(None);
+        };
+        let commit = repo.store().get_commit(&trunk.target).map_err(snapshot_err)?;
+        let tree = commit.tree();
+        for candidate in candidates {
+            let Ok(repo_path) = RepoPath::from_internal_string(candidate) else {
+                continue;
+            };
+            // Only a plain, non-conflicted file answers; anything else
+            // (missing, conflicted, a symlink) skips to the next candidate.
+            let value = tree.path_value(repo_path).map_err(snapshot_err)?;
+            let materialized = pollster::block_on(jj_lib::conflicts::materialize_tree_value(
+                repo.store(),
+                repo_path,
+                value,
+                tree.labels(),
+            ))
+            .map_err(snapshot_err)?;
+            let MaterializedTreeValue::File(mut file) = materialized else {
+                continue;
+            };
+            let bytes =
+                pollster::block_on(file.read_all(repo_path)).map_err(snapshot_err)?;
+            if bytes.len() as u64 > MAX_TRUNK_TEXT_FILE_BYTES {
+                continue;
+            }
+            match String::from_utf8(bytes) {
+                Ok(text) => return Ok(Some((candidate.clone(), text))),
+                Err(_) => continue,
+            }
+        }
+        Ok(None)
     }
 
     fn revert_operation(&self, path: &Path, op_id: &str) -> Result<MutationOutcome, BackendError> {
@@ -2748,6 +2896,35 @@ impl GitSubprocessCallback for QuietGitCallback {
     ) -> std::io::Result<()> {
         tracing::debug!(message = %String::from_utf8_lossy(message), "git push (remote)");
         Ok(())
+    }
+}
+
+/// Run one git subcommand against the repo's backing git store, built the
+/// way jj-lib's own subprocess layer builds its commands (same executable
+/// setting, `LC_ALL=C` for parseable output, fsmonitor and submodule
+/// recursion forced off). Answers stdout; a failed run answers the trimmed
+/// stderr. Only for the operations jj-lib's fetch/push engines cannot
+/// express — today that is fetching a PR's `refs/pull/N/head`.
+fn run_git(
+    options: &git::GitSubprocessOptions,
+    git_dir: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(&options.executable_path);
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "submodule.recurse=false"])
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null());
+    cmd.envs(&options.environment);
+    let output = cmd
+        .output()
+        .map_err(|err| format!("could not run git ({}): {err}", options.executable_path.display()))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 }
 
@@ -7598,6 +7775,157 @@ mod tests {
         assert!(err.to_string().contains("no git remote named"), "{err}");
         let after = backend.open(dir.path()).unwrap();
         assert_eq!(after.operations[0].id, snapshot.operations[0].id, "refusal recorded nothing");
+    }
+
+    /// Writes a commit into a bare repo and publishes it as a PR head ref
+    /// (`refs/pull/<N>/head`) with no `refs/heads/*` counterpart — exactly
+    /// how GitHub serves a cross-fork PR on the base repository.
+    fn bare_pull_ref(bare: &Path, number: u64, parent: &str, message: &str) -> String {
+        let tree = git(bare, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+        let commit = git(
+            bare,
+            &[
+                "-c",
+                "user.name=Contributor",
+                "-c",
+                "user.email=contributor@example.com",
+                "commit-tree",
+                &tree,
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+        );
+        git(
+            bare,
+            &["update-ref", &format!("refs/pull/{number}/head"), &commit],
+        );
+        commit
+    }
+
+    #[test]
+    fn fetch_pr_head_creates_a_review_bookmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        build_colocated_repo(dir.path(), &backend);
+        add_bare_origin(dir.path(), bare.path());
+        backend
+            .push_bookmarks(dir.path(), &["main".into()], None)
+            .unwrap();
+
+        // The "PR": a contributor's commit the base repo serves only
+        // through refs/pull/7/head — jj alone cannot fetch it
+        // (jj-vcs/jj#4388), which is the whole point of this method.
+        let main_commit = bare_branch(bare.path(), "main").unwrap();
+        let pr_commit = bare_pull_ref(bare.path(), 7, &main_commit, "contributor: fix the thing");
+
+        let outcome = backend
+            .fetch_pr_head(dir.path(), "origin", 7, "pr/7")
+            .unwrap();
+        assert!(outcome.operation_id.is_some());
+        assert_eq!(outcome.summary, "Fetched PR #7 into pr/7");
+        let target = outcome.target_change.expect("selection follows the PR head");
+
+        let snapshot = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            snapshot.operations[0].description,
+            "fetch pull request #7 into bookmark pr/7"
+        );
+        let bookmark = snapshot
+            .bookmarks
+            .iter()
+            .find(|b| b.name == "pr/7")
+            .expect("review bookmark exists");
+        assert!(bookmark.is_local);
+        assert_eq!(bookmark.sync, SyncState::LocalOnly, "tracks nothing remote");
+        assert_eq!(bookmark.target, target);
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.id == target)
+            .expect("the PR head is drawn");
+        assert_eq!(node.description, "contributor: fix the thing");
+        assert!(pr_commit.starts_with(&node.commit_id));
+
+        // A taken bookmark name refuses before anything runs.
+        let err = backend
+            .fetch_pr_head(dir.path(), "origin", 7, "pr/7")
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // An unknown remote is a stale plan, refused like git_fetch's.
+        let err = backend
+            .fetch_pr_head(dir.path(), "nosuch", 7, "pr/7-again")
+            .unwrap_err();
+        assert!(err.to_string().contains("no git remote named"), "{err}");
+
+        // A PR the remote does not serve gets a plain story, and the
+        // refusal records nothing.
+        let before = backend.open(dir.path()).unwrap();
+        let err = backend
+            .fetch_pr_head(dir.path(), "origin", 99, "pr/99")
+            .unwrap_err();
+        assert!(err.to_string().contains("no pull request #99"), "{err}");
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(after.operations[0].id, before.operations[0].id);
+    }
+
+    #[test]
+    fn trunk_text_file_reads_docs_from_the_trunk_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        build_colocated_repo(dir.path(), &backend);
+
+        // Put a PR template (and a root-level decoy) on the change trunk
+        // points at: write the files, snapshot them into the working copy,
+        // and move main there.
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        std::fs::write(
+            dir.path().join(".github/PULL_REQUEST_TEMPLATE.md"),
+            "## Checklist\n- [ ] tests\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("PULL_REQUEST_TEMPLATE.md"), "root decoy\n").unwrap();
+        let wc = backend.refresh(dir.path()).unwrap().working_copy;
+        backend
+            .move_bookmark(dir.path(), "main", &wc)
+            .unwrap();
+
+        // The first candidate that exists wins — candidate order is the
+        // caller's precedence.
+        let found = backend
+            .trunk_text_file(
+                dir.path(),
+                &[
+                    ".github/PULL_REQUEST_TEMPLATE.md".to_owned(),
+                    "PULL_REQUEST_TEMPLATE.md".to_owned(),
+                ],
+            )
+            .unwrap()
+            .expect("template found on trunk");
+        assert_eq!(found.0, ".github/PULL_REQUEST_TEMPLATE.md");
+        assert_eq!(found.1, "## Checklist\n- [ ] tests\n");
+
+        // Missing candidates skip to the next; all-missing answers None.
+        let found = backend
+            .trunk_text_file(
+                dir.path(),
+                &[
+                    "docs/PULL_REQUEST_TEMPLATE.md".to_owned(),
+                    "PULL_REQUEST_TEMPLATE.md".to_owned(),
+                ],
+            )
+            .unwrap()
+            .expect("the root file answers when .github is not asked for");
+        assert_eq!(found.0, "PULL_REQUEST_TEMPLATE.md");
+        assert_eq!(
+            backend
+                .trunk_text_file(dir.path(), &["nope.md".to_owned()])
+                .unwrap(),
+            None
+        );
     }
 
     fn build_conflicted_repo(root: &Path, backend: &JjBackend) -> (String, String, String) {

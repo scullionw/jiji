@@ -242,6 +242,51 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// One PR by number (`GET /repos/{owner}/{name}/pulls/{number}`) —
+    /// the review flow's by-number lookup, reaching PRs the batched
+    /// open-PR query cannot see (past the 100 cap, or closed).
+    pub fn pr_by_number(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<PrSummary, ForgeError> {
+        let answer = self.get(&format!("repos/{owner}/{name}/pulls/{number}"))?;
+        parse_rest_pr(&answer)
+    }
+
+    /// GitHub Actions workflow runs for one commit
+    /// (`GET /repos/{owner}/{name}/actions/runs?head_sha=…`), newest
+    /// first — what the re-run-failed-CI helper filters.
+    pub fn workflow_runs(
+        &self,
+        owner: &str,
+        name: &str,
+        head_sha: &str,
+    ) -> Result<Vec<crate::ci::WorkflowRun>, ForgeError> {
+        let sha: String = url::form_urlencoded::byte_serialize(head_sha.as_bytes()).collect();
+        let answer = self.get(&format!(
+            "repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100"
+        ))?;
+        crate::ci::parse_workflow_runs(&answer)
+    }
+
+    /// Re-run only the failed jobs of one workflow run
+    /// (`POST /repos/{owner}/{name}/actions/runs/{run_id}/rerun-failed-jobs`).
+    /// Passing jobs keep their results.
+    pub fn rerun_failed_jobs(
+        &self,
+        owner: &str,
+        name: &str,
+        run_id: u64,
+    ) -> Result<(), ForgeError> {
+        self.post(
+            &format!("repos/{owner}/{name}/actions/runs/{run_id}/rerun-failed-jobs"),
+            &json!({}),
+        )?;
+        Ok(())
+    }
+
     /// The merged PR a branch once headed, when there is one — the
     /// per-bookmark question the batched open-PR query cannot answer
     /// (it fetches open PRs only). REST, jjpr's shape: closed PRs
@@ -382,6 +427,12 @@ impl GitHubClient {
             .map_err(|err| ForgeError::Network(err.to_string()))?;
         if !status.is_success() {
             return Err(classify_http_failure(status, &text));
+        }
+        // Some write endpoints answer 201/204 with an empty body (the
+        // Actions re-run endpoints do); that is success, not malformed
+        // JSON.
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
         }
         serde_json::from_str(&text).map_err(|err| {
             ForgeError::Api(format!("{method} {path} answered malformed JSON: {err}"))

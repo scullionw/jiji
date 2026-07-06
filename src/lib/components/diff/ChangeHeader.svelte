@@ -46,9 +46,12 @@
     clearRewritePreview,
     setRewritePreview,
   } from "$lib/components/graph/preview.svelte";
+  import type { PrSummary } from "$lib/bindings/PrSummary";
+  import { rerunFailedCi } from "$lib/api";
   import { prBadge, prForBookmark } from "$lib/components/publish/pr";
+  import { canRerun, rerunSummary } from "$lib/components/publish/review";
   import { app } from "$lib/state/app.svelte";
-  import { forge } from "$lib/state/forge.svelte";
+  import { forge, refreshForgePrs } from "$lib/state/forge.svelte";
   import { consumeIntent } from "$lib/state/actions";
   import { fileStats, totalStats, type DiffLayout } from "./diff";
   import {
@@ -290,6 +293,33 @@
   const movableMarks = $derived(
     snapshot.bookmarks.filter((b) => b.isLocal && b.target !== node.id),
   );
+
+  // Re-run failed CI on the bookmark's PR — the workbench side of the
+  // review helper (Publish's PR rows carry the same action). Keyed by PR
+  // number, so the outcome follows the PR wherever its bookmark renders;
+  // failures land in the status bar like other quiet actions.
+  let rerun = $state<{
+    number: string;
+    busy: boolean;
+    note: string | null;
+  } | null>(null);
+
+  async function rerunCi(pr: PrSummary) {
+    if (rerun?.busy) return;
+    rerun = { number: String(pr.number), busy: true, note: null };
+    try {
+      const report = await rerunFailedCi(pr.number);
+      rerun = {
+        number: String(pr.number),
+        busy: false,
+        note: rerunSummary(report),
+      };
+      await refreshForgePrs();
+    } catch (error) {
+      rerun = null;
+      app.error = errorMessage(error);
+    }
+  }
 
   function toggleBookmarkPanel() {
     bookmarkOpen = !bookmarkOpen;
@@ -982,6 +1012,21 @@
           {#if badge.checks}<span class="pr-glyph {badge.checks.tone}">{badge.checks.glyph}</span>{/if}
           <span class="pr-out">↗</span>
         </button>
+        {#if canRerun(pr)}
+          {@const mine = rerun?.number === String(pr.number) ? rerun : null}
+          <!-- The failing rollup's next move, right where it shows: ask
+               GitHub Actions to re-run only the failed jobs. -->
+          <button
+            class="rerun-chip"
+            data-action="rerun-ci"
+            disabled={mine?.busy === true}
+            title={mine?.note ??
+              `Re-run the failed GitHub Actions jobs on #${pr.number}`}
+            onclick={() => rerunCi(pr)}
+          >
+            {mine ? (mine.busy ? "Re-running…" : "CI re-run requested") : "Re-run failed CI"}
+          </button>
+        {/if}
       {/if}
     {/each}
     {#if position}
@@ -2446,6 +2491,28 @@
   .pr-out {
     font-size: 10px;
     opacity: 0.7;
+  }
+
+  /* The failing PR's next move: quiet, `.rel`-shaped, beside the chip. */
+  .rerun-chip {
+    flex-shrink: 0;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-3);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    transition: all var(--t-fast) var(--ease-out);
+  }
+
+  .rerun-chip:hover:not(:disabled) {
+    background: var(--clr-bg-hover);
+    color: var(--clr-text-1);
+  }
+
+  .rerun-chip:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   .stack-note {

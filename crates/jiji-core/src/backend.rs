@@ -364,6 +364,45 @@ pub trait RepoBackend: Send + Sync {
         remotes: Option<&[String]>,
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Fetch a pull request's current head into a new local bookmark for
+    /// local review. GitHub publishes every PR's head as
+    /// `refs/pull/<N>/head` on the base repository — which is what makes
+    /// cross-fork PRs fetchable without ever touching the fork — but jj
+    /// itself cannot fetch non-branch refs (jj-vcs/jj#4388), so the fetch
+    /// runs git directly against the repo's backing git store (the same
+    /// subprocess and `git.executable-path` setting jj's own fetch uses)
+    /// through a temporary ref, and the arrived commit becomes a visible
+    /// head with `bookmark` pointing at it, all recorded as one operation.
+    ///
+    /// The bookmark is an ordinary local bookmark: it reviews, compares,
+    /// and deletes like any other, and deleting it touches nothing remote
+    /// (it tracks no remote branch). There is no jj CLI command to pin
+    /// against, so the op description is Jiji's own (`fetch pull request
+    /// #N into bookmark <name>`). Taken names refuse like
+    /// `create_bookmark`; unknown remotes refuse like an explicitly-named
+    /// `git_fetch`; a PR head that is a rewrite of local work arrives as a
+    /// divergent copy, surfaced first-class like any other divergence.
+    fn fetch_pr_head(
+        &self,
+        path: &Path,
+        remote: &str,
+        number: u64,
+        bookmark: &str,
+    ) -> Result<MutationOutcome, BackendError>;
+
+    /// The first of `candidates` (repo-relative paths, matched exactly)
+    /// that exists as a regular non-conflicted UTF-8 file in the trunk
+    /// change's tree, answered as `(matched path, text)`. Read-only — how
+    /// forge workflows read repo conventions (a PR template) from what
+    /// trunk actually carries, which is where GitHub reads them from too.
+    /// Files over 100 KiB, binary files, and conflicted entries are
+    /// skipped rather than failing the probe.
+    fn trunk_text_file(
+        &self,
+        path: &Path,
+        candidates: &[String],
+    ) -> Result<Option<(String, String)>, BackendError>;
+
     /// Revert one earlier operation by applying its inverse on top of the
     /// current state (`jj op revert <op>`); everything recorded after it
     /// stays. Reverting the operation a mutation just recorded is the
@@ -768,6 +807,40 @@ impl RepoBackend for MockBackend {
             summary: format!("Nothing new on {label}"),
             target_change: None,
         })
+    }
+
+    fn fetch_pr_head(
+        &self,
+        path: &Path,
+        remote: &str,
+        number: u64,
+        bookmark: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        let snapshot = self.overlaid_snapshot(path)?;
+        let remote = remote.trim();
+        if !snapshot.git_remotes.iter().any(|r| r.name == remote) {
+            return Err(BackendError::MutationFailed(format!(
+                "there is no git remote named \u{201c}{remote}\u{201d}"
+            )));
+        }
+        self.mutate(
+            path,
+            crate::mock::MockMutation::FetchPr {
+                number,
+                bookmark: bookmark.trim().to_owned(),
+            },
+        )
+    }
+
+    fn trunk_text_file(
+        &self,
+        path: &Path,
+        _candidates: &[String],
+    ) -> Result<Option<(String, String)>, BackendError> {
+        // The fabricated trunk tree carries no repo docs — documented
+        // approximation: mock submit plans never see a PR template.
+        validate_repo_path(path)?;
+        Ok(None)
     }
 
     fn revert_operation(&self, path: &Path, op_id: &str) -> Result<MutationOutcome, BackendError> {

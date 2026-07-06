@@ -2,6 +2,7 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import type { LandOutcome } from "$lib/bindings/LandOutcome";
   import type { LandPlan } from "$lib/bindings/LandPlan";
+  import type { PrSummary } from "$lib/bindings/PrSummary";
   import type { SubmitOutcome } from "$lib/bindings/SubmitOutcome";
   import type { SubmitPlan } from "$lib/bindings/SubmitPlan";
   import type { TokenSource } from "$lib/bindings/TokenSource";
@@ -10,6 +11,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
   import { app } from "$lib/state/app.svelte";
+  import { fetchPr, jumpToChange } from "$lib/state/actions";
   import {
     connectForge,
     disconnectForge,
@@ -17,6 +19,12 @@
     refreshForgePrs,
   } from "$lib/state/forge.svelte";
   import { landActionRow, segmentChip } from "./land";
+  import {
+    bookmarkTaken,
+    rerunSummary,
+    reviewBookmark,
+    reviewRows,
+  } from "./review";
   import { actionRow, publishableStacks } from "./submit";
 
   // The forge connection: which GitHub repo this jj repo publishes to and
@@ -69,6 +77,98 @@
   const auth = $derived(forge.status?.auth ?? null);
   const connected = $derived(auth?.source != null && auth?.login != null);
   const openPrs = $derived(forge.prs?.report.prs.length ?? 0);
+
+  // The review helpers: every open PR as a row with fetch-for-review (any
+  // PR — cross-fork included — lands in a local bookmark via
+  // refs/pull/N/head) and re-run-failed-CI, plus a by-number lookup for
+  // PRs the open list cannot see.
+  const MAX_REVIEW_ROWS = 20;
+  const allReviewRows = $derived(
+    reviewRows(forge.prs, repo?.owner ?? null),
+  );
+  const visibleReviewRows = $derived(allReviewRows.slice(0, MAX_REVIEW_ROWS));
+
+  // The fetch-for-review panel: pick a PR (row click or number lookup),
+  // name the bookmark, confirm.
+  let reviewFor = $state<PrSummary | null>(null);
+  let reviewName = $state("");
+  let reviewBusy = $state(false);
+  let reviewError = $state<string | null>(null);
+  let reviewDone = $state<{ bookmark: string; target: string | null } | null>(
+    null,
+  );
+  const reviewNameTaken = $derived(bookmarkTaken(reviewName, app.snapshot));
+
+  function openReviewPanel(pr: PrSummary) {
+    reviewFor = pr;
+    reviewName = reviewBookmark(pr.number);
+    reviewError = null;
+    reviewDone = null;
+  }
+
+  function closeReviewPanel() {
+    reviewFor = null;
+    reviewError = null;
+  }
+
+  async function fetchForReview() {
+    if (!reviewFor || !repo || reviewBusy) return;
+    if (!reviewName.trim() || reviewNameTaken) return;
+    reviewBusy = true;
+    reviewError = null;
+    try {
+      const outcome = await fetchPr(
+        repo.remote,
+        reviewFor.number,
+        reviewName.trim(),
+      );
+      reviewDone = {
+        bookmark: reviewName.trim(),
+        target: outcome.targetChange,
+      };
+      reviewFor = null;
+    } catch (err) {
+      reviewError = errorMessage(err);
+    }
+    reviewBusy = false;
+  }
+
+  // The by-number lookup feeding the same panel.
+  let lookupNumber = $state("");
+  let lookupBusy = $state(false);
+  let lookupError = $state<string | null>(null);
+
+  async function lookupPr() {
+    const number = Number.parseInt(lookupNumber, 10);
+    if (!Number.isFinite(number) || number <= 0 || lookupBusy) return;
+    lookupBusy = true;
+    lookupError = null;
+    try {
+      openReviewPanel(await api.forgePr(number));
+    } catch (err) {
+      lookupError = errorMessage(err);
+    }
+    lookupBusy = false;
+  }
+
+  // Re-run failed CI, per row; the note under the list tells what
+  // happened, and the badge refresh follows GitHub's answer.
+  let rerunBusyFor = $state<string | null>(null);
+  let rerunNote = $state<string | null>(null);
+
+  async function rerunCi(pr: PrSummary) {
+    if (rerunBusyFor !== null) return;
+    rerunBusyFor = String(pr.number);
+    rerunNote = null;
+    try {
+      const report = await api.rerunFailedCi(pr.number);
+      rerunNote = `#${pr.number}: ${rerunSummary(report)}`;
+      await refreshForgePrs();
+    } catch (err) {
+      rerunNote = `#${pr.number}: ${errorMessage(err)}`;
+    }
+    rerunBusyFor = null;
+  }
 
   // The publish-stack workflow. Planning is explicit (a click), matching
   // the deliberate fetch cadence; the plan card is the confirm step and
@@ -305,9 +405,174 @@
               miss older ones.
             {:else if openPrs > 0}
               Ones matching a bookmark wear their badge on the workbench
-              graph.
+              graph; any of them can be fetched into a local bookmark for
+              review.
             {/if}
           </p>
+
+          {#if visibleReviewRows.length > 0}
+            <div class="prs">
+              {#each visibleReviewRows as row (row.pr.number)}
+                <div class="pr-row" data-review-pr={row.pr.number}>
+                  <button
+                    class="pr-number mono"
+                    title="#{row.pr.number} “{row.pr.title}” — open on GitHub"
+                    onclick={() => openUrl(row.pr.url)}
+                  >
+                    #{row.pr.number} ↗
+                  </button>
+                  <span class="pr-title truncate" title={row.pr.title}>
+                    {row.pr.title}
+                  </span>
+                  {#if row.fork}
+                    <span class="fork-chip" title="The head branch lives on a fork; fetching for review works the same way">fork</span>
+                  {/if}
+                  <span class="pr-head mono truncate" title="{row.headLabel} → {row.pr.baseBranch}">
+                    {row.headLabel}
+                  </span>
+                  {#if row.badge.review}
+                    <span class="pr-glyph {row.badge.review.tone}" title={row.badge.review.label}>{row.badge.review.glyph}</span>
+                  {/if}
+                  {#if row.badge.checks}
+                    <span class="pr-glyph {row.badge.checks.tone}" title={row.badge.checks.label}>{row.badge.checks.glyph}</span>
+                  {/if}
+                  <span class="spacer"></span>
+                  {#if row.canRerun}
+                    <button
+                      class="row-action"
+                      data-review-rerun={row.pr.number}
+                      disabled={rerunBusyFor !== null}
+                      title="Re-run the failed GitHub Actions jobs on this PR's head"
+                      onclick={() => rerunCi(row.pr)}
+                    >
+                      {rerunBusyFor === String(row.pr.number)
+                        ? "Re-running…"
+                        : "Re-run failed CI"}
+                    </button>
+                  {/if}
+                  <button
+                    class="row-action"
+                    data-review-fetch={row.pr.number}
+                    onclick={() => openReviewPanel(row.pr)}
+                  >
+                    Fetch for review
+                  </button>
+                </div>
+              {/each}
+            </div>
+            {#if allReviewRows.length > visibleReviewRows.length}
+              <p class="blurb quiet">
+                …and {allReviewRows.length - visibleReviewRows.length} more —
+                any PR fetches by number below.
+              </p>
+            {/if}
+          {/if}
+
+          {#if rerunNote}
+            <p class="note" data-review-rerun-note>{rerunNote}</p>
+          {/if}
+
+          {#if reviewFor}
+            {@const panelPr = reviewFor}
+            <div class="plan" data-review-panel={panelPr.number}>
+              <p class="plan-head">
+                Fetch <strong>#{panelPr.number}</strong> “{panelPr.title}”
+                for local review
+              </p>
+              <p class="blurb">
+                Jiji fetches the PR's current head
+                (<span class="mono">refs/pull/{panelPr.number}/head</span>
+                from <span class="mono">{repo.remote}</span> — cross-fork
+                PRs included) and points a new local bookmark at it. Nothing
+                is pushed; deleting the bookmark later touches nothing on
+                GitHub.
+              </p>
+              <form
+                class="review-name-row"
+                onsubmit={(event) => {
+                  event.preventDefault();
+                  fetchForReview();
+                }}
+              >
+                <label class="review-label" for="review-bookmark">
+                  Bookmark
+                </label>
+                <input
+                  id="review-bookmark"
+                  class="review-input mono"
+                  spellcheck="false"
+                  autocomplete="off"
+                  bind:value={reviewName}
+                  disabled={reviewBusy}
+                  data-review-name
+                />
+                <Button
+                  variant="primary"
+                  disabled={reviewBusy || !reviewName.trim() || reviewNameTaken}
+                >
+                  {reviewBusy ? "Fetching…" : "Fetch"}
+                </Button>
+                <button
+                  type="button"
+                  class="row-action"
+                  disabled={reviewBusy}
+                  onclick={closeReviewPanel}
+                >
+                  Cancel
+                </button>
+              </form>
+              {#if reviewNameTaken}
+                <p class="warning" data-review-taken>
+                  A local bookmark named “{reviewName.trim()}” already
+                  exists — pick another name.
+                </p>
+              {/if}
+              {#if reviewError}
+                <p class="error" data-review-error>{reviewError}</p>
+              {/if}
+            </div>
+          {/if}
+
+          {#if reviewDone}
+            <p class="note" data-review-done>
+              Fetched into <span class="mono">{reviewDone.bookmark}</span>.
+              {#if reviewDone.target}
+                {@const target = reviewDone.target}
+                <button class="link inline" onclick={() => jumpToChange(target)}>
+                  Review it on the workbench →
+                </button>
+              {/if}
+            </p>
+          {/if}
+
+          <form
+            class="lookup-row"
+            onsubmit={(event) => {
+              event.preventDefault();
+              lookupPr();
+            }}
+          >
+            <span class="lookup-label">Fetch any PR by number</span>
+            <input
+              class="review-input lookup-input mono"
+              placeholder="1234"
+              inputmode="numeric"
+              spellcheck="false"
+              autocomplete="off"
+              bind:value={lookupNumber}
+              disabled={lookupBusy}
+              data-review-lookup
+            />
+            <Button
+              variant="secondary"
+              disabled={lookupBusy || !/^\d+$/.test(lookupNumber.trim())}
+            >
+              {lookupBusy ? "Looking up…" : "Look up"}
+            </Button>
+          </form>
+          {#if lookupError}
+            <p class="error" data-review-lookup-error>{lookupError}</p>
+          {/if}
         {/if}
       </section>
 
@@ -420,6 +685,14 @@
                     .join("\n")
                     .trim()}</pre>
                 </details>
+              {/if}
+
+              {#if plan.prTemplatePath}
+                <p class="note" data-submit-template>
+                  New PR descriptions carry the repo's template
+                  (<span class="mono">{plan.prTemplatePath}</span>) below
+                  the commit text, ready to fill in on GitHub.
+                </p>
               {/if}
 
               {#each plan.blockers as blocker (blocker)}
@@ -986,6 +1259,154 @@
     font-size: var(--text-s);
     color: var(--clr-warn);
     margin-bottom: var(--sp-1);
+  }
+
+  .note {
+    margin-top: var(--sp-2);
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  /* The open-PR review list: one quiet row per PR, actions on the right. */
+  .prs {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    margin-top: var(--sp-3);
+  }
+
+  .pr-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-3);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: var(--radius-m);
+    font-size: var(--text-s);
+  }
+
+  .pr-number {
+    font-size: var(--text-xs);
+    color: var(--clr-accent-strong);
+    white-space: nowrap;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  .pr-title {
+    color: var(--clr-text-1);
+    min-width: 0;
+    flex-shrink: 1;
+  }
+
+  .fork-chip {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    padding: 0 var(--sp-2);
+    border-radius: 999px;
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-3);
+    white-space: nowrap;
+  }
+
+  .pr-head {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+    min-width: 0;
+    flex-shrink: 2;
+  }
+
+  .pr-glyph {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    flex: none;
+  }
+
+  .pr-glyph.ok {
+    color: var(--clr-ok);
+  }
+
+  .pr-glyph.warn {
+    color: var(--clr-warn);
+  }
+
+  .pr-glyph.danger {
+    color: var(--clr-danger);
+  }
+
+  .row-action {
+    font-size: var(--text-xs);
+    color: var(--clr-text-2);
+    white-space: nowrap;
+    padding: 1px var(--sp-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: 999px;
+    cursor: pointer;
+    transition:
+      border-color var(--t-fast) var(--ease-out),
+      color var(--t-fast) var(--ease-out);
+  }
+
+  .row-action:hover:not(:disabled) {
+    color: var(--clr-text-1);
+    border-color: var(--clr-border-1);
+  }
+
+  .row-action:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  /* The fetch-for-review panel's name row and the by-number lookup. */
+  .review-name-row,
+  .lookup-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+  }
+
+  .review-label,
+  .lookup-label {
+    font-size: var(--text-s);
+    color: var(--clr-text-3);
+    white-space: nowrap;
+  }
+
+  .review-input {
+    min-width: 0;
+    height: 28px;
+    padding: 2px var(--sp-3);
+    font-size: var(--text-s);
+    color: var(--clr-text-1);
+    background: var(--clr-bg-1);
+    border: 1px solid var(--clr-border-1);
+    border-radius: var(--radius-m);
+    transition: border-color var(--t-fast) var(--ease-out);
+  }
+
+  .review-input:focus {
+    outline: none;
+    border-color: var(--clr-accent-strong);
+  }
+
+  .review-input:disabled {
+    opacity: 0.6;
+  }
+
+  .review-name-row .review-input {
+    flex: 1;
+    max-width: 20em;
+  }
+
+  .lookup-input {
+    width: 6em;
+  }
+
+  .link.inline {
+    margin-top: 0;
+    color: var(--clr-accent-strong);
   }
 
   .plan-go {

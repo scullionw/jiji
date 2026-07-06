@@ -31,8 +31,9 @@ use crate::comment::{inherit_fossils, parse_stack_data, render_stack_comment, St
 use crate::error::ForgeError;
 use crate::github::GitHubClient;
 use crate::pr::{PrSummary, RepoPrState};
-use crate::reconcile::{plan_pr_text, wrap_managed_body, TextWarning};
+use crate::reconcile::{plan_pr_text, TextWarning};
 use crate::remote::ForgeRepo;
+use crate::template::{new_pr_body, PrTemplate};
 
 /// One publishable run of changes under a bookmark, listed bottom-up in
 /// [`SubmitPlan::segments`]. Mirrors jjpr's segment: the commits between
@@ -133,6 +134,10 @@ pub struct SubmitPlan {
     /// when the plan syncs comments (PRs created by this plan appear as
     /// plain names — their links exist only after execution).
     pub stack_comment_preview: Option<String>,
+    /// Where the repo's PR template lives, when trunk carries one and this
+    /// plan creates a PR whose body folds it in — so the panel can say new
+    /// descriptions start from it.
+    pub pr_template_path: Option<String>,
 }
 
 /// Per-action result of executing a plan.
@@ -381,6 +386,7 @@ pub fn plan_submit(
     repo: &ForgeRepo,
     head_bookmark: &str,
     comments: &dyn StackCommentSource,
+    pr_template: Option<&PrTemplate>,
 ) -> Result<SubmitPlan, ForgeError> {
     let (raw_segments, mut warnings) =
         stack_segments(snapshot, prs, head_bookmark).map_err(ForgeError::Plan)?;
@@ -554,8 +560,10 @@ pub fn plan_submit(
                     base: effective_base.clone(),
                     title: title.clone(),
                     // Sentinel-wrapped and fingerprinted from birth, so
-                    // later submits can update it without guessing.
-                    body: wrap_managed_body(&body, &title),
+                    // later submits can update it without guessing; the
+                    // repo's PR template (when trunk carries one) rides
+                    // below the managed section as user-space text.
+                    body: new_pr_body(&body, &title, pr_template),
                 });
             }
         }
@@ -637,6 +645,13 @@ pub fn plan_submit(
     let stack_comment_preview = (!comment_actions.is_empty())
         .then(|| render_stack_comment(&entries, &[], None));
     actions.extend(comment_actions);
+    let pr_template_path = pr_template
+        .filter(|_| {
+            actions
+                .iter()
+                .any(|a| matches!(a, SubmitAction::CreatePr { .. }))
+        })
+        .map(|t| t.path.clone());
 
     Ok(SubmitPlan {
         head_bookmark: head_bookmark.to_owned(),
@@ -647,6 +662,7 @@ pub fn plan_submit(
         blockers,
         warnings,
         stack_comment_preview,
+        pr_template_path,
     })
 }
 
@@ -892,7 +908,7 @@ fn sync_stack_comment(
 mod tests {
     use super::*;
     use crate::pr::{ChecksRollup, PrState, PrStateReport, ReviewDecision};
-    use crate::reconcile::{extract_managed_body, fingerprint, stored_body_fp};
+    use crate::reconcile::{extract_managed_body, fingerprint, stored_body_fp, wrap_managed_body};
     use crate::remote::ForgeProvider;
     use jiji_core::snapshot::{BookmarkState, ConflictItem, ConflictKind};
     use std::cell::RefCell;
@@ -1045,7 +1061,7 @@ mod tests {
         // Jiji never wrote and an empty body.
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert_eq!(plan.base_branch, "main");
         assert_eq!(plan.remote, "origin");
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
@@ -1120,6 +1136,78 @@ mod tests {
         assert!(preview.contains("[`profile`]"), "existing PRs link: {preview}");
     }
 
+    #[test]
+    fn new_pr_bodies_fold_in_the_repo_template() {
+        let snap = stack_snapshot();
+        let prs = pr_state(vec![], false);
+        let template = PrTemplate {
+            path: ".github/PULL_REQUEST_TEMPLATE.md".into(),
+            text: "## Checklist\n- [ ] tests\n".into(),
+        };
+
+        let plan = plan_submit(
+            &snap,
+            &prs,
+            &forge_repo(),
+            "profile",
+            &NoComments,
+            Some(&template),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.pr_template_path.as_deref(),
+            Some(".github/PULL_REQUEST_TEMPLATE.md")
+        );
+        let bodies: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                SubmitAction::CreatePr { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies {
+            // Managed description first, template below as user-space text.
+            assert!(body.starts_with(crate::reconcile::DESCRIPTION_START), "{body}");
+            assert!(body.ends_with("## Checklist\n- [ ] tests"), "{body}");
+        }
+    }
+
+    #[test]
+    fn update_only_plans_leave_the_template_out() {
+        // Both PRs exist with the right bases: the plan only pushes, so
+        // existing descriptions are never templated and the panel note
+        // would be noise.
+        let mut snap = stack_snapshot();
+        snap.bookmarks[1].target = "a2".into();
+        snap.nodes[1].bookmarks = vec!["auth".into()];
+        snap.nodes[2].bookmarks = vec![];
+        let prs = pr_state(
+            vec![
+                text_pr(6, "auth", "main", "auth: login flow", "The form."),
+                text_pr(7, "profile", "auth", "profile: avatars", "With uploads."),
+            ],
+            false,
+        );
+        let template = PrTemplate { path: "PULL_REQUEST_TEMPLATE.md".into(), text: "T".into() };
+        let plan = plan_submit(
+            &snap,
+            &prs,
+            &forge_repo(),
+            "profile",
+            &NoComments,
+            Some(&template),
+        )
+        .unwrap();
+        assert!(
+            plan.actions.iter().all(|a| !matches!(a, SubmitAction::CreatePr { .. })),
+            "{:?}",
+            plan.actions
+        );
+        assert_eq!(plan.pr_template_path, None);
+    }
+
     /// The fully-synced fixture: bookmarks synced, PR bases right, PR text
     /// exactly as Jiji writes it, and both stack comments current.
     fn consistent_stack() -> (RepoSnapshot, RepoPrState, StubComments) {
@@ -1173,7 +1261,7 @@ mod tests {
     #[test]
     fn consistent_stacks_plan_nothing() {
         let (snap, prs, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.blockers.is_empty());
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
@@ -1187,7 +1275,7 @@ mod tests {
         let (mut snap, prs, comments) = consistent_stack();
         snap.nodes[2].description =
             "auth: login flow\n\nThe form, now with validation.".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         let updates: Vec<_> = plan
             .actions
             .iter()
@@ -1216,7 +1304,7 @@ mod tests {
         prs.report.prs[0].body = Some(hand_edited.clone());
         prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
         let (_, _, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 
@@ -1228,7 +1316,7 @@ mod tests {
         prs.report.prs[0].body = Some(hand_edited.clone());
         prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
         let (_, _, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         assert!(
             !plan.actions.iter().any(|a| matches!(a, SubmitAction::UpdatePrText { .. })),
             "{:?}",
@@ -1246,7 +1334,7 @@ mod tests {
         // Jiji wrote #6's title; the commit's first line moved.
         let (mut snap, prs, comments) = consistent_stack();
         snap.nodes[2].description = "auth: login and signup flow\n\nThe form.".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         let update = plan
             .actions
             .iter()
@@ -1269,7 +1357,7 @@ mod tests {
         let (snap, mut prs, comments) = consistent_stack();
         prs.report.prs[0].body = Some("The form.".into());
         prs.by_branch.get_mut("auth").unwrap().body = Some("The form.".into());
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         let seed = plan
             .actions
             .iter()
@@ -1288,7 +1376,7 @@ mod tests {
         prs.report.prs[0].body = Some("A description someone wrote by hand.".into());
         prs.by_branch.get_mut("auth").unwrap().body =
             Some("A description someone wrote by hand.".into());
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
@@ -1299,7 +1387,7 @@ mod tests {
         // update plans, aimed at that comment.
         let (snap, prs, mut comments) = consistent_stack();
         comments.0.get_mut(&7).unwrap().body = "someone touched this".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         assert_eq!(
             plan.actions,
             vec![SubmitAction::SyncStackComment {
@@ -1312,7 +1400,7 @@ mod tests {
 
         // No comments exist yet on a two-PR stack: both get one.
         let (snap, prs, _) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         let syncs: Vec<_> = plan
             .actions
             .iter()
@@ -1330,7 +1418,7 @@ mod tests {
         snap.nodes[2].bookmarks = vec![];
         prs.report.prs.remove(0);
         prs.by_branch.remove("auth");
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert!(
             !plan.actions.iter().any(|a| matches!(a, SubmitAction::SyncStackComment { .. })),
             "{:?}",
@@ -1360,7 +1448,7 @@ mod tests {
             7,
             ExistingComment { id: 70, body: previous },
         )]));
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
         let syncs: Vec<_> = plan
             .actions
             .iter()
@@ -1382,7 +1470,7 @@ mod tests {
         snap.nodes[1].description = String::new(); // a2, in auth's segment
         snap.nodes[0].has_conflict = true; // b1, profile's segment
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert_eq!(plan.blockers.len(), 2, "{:?}", plan.blockers);
         assert!(plan.blockers[0].contains("no description"), "{:?}", plan.blockers);
         assert!(plan.blockers[1].contains("has conflicts"), "{:?}", plan.blockers);
@@ -1394,7 +1482,7 @@ mod tests {
         synced.bookmarks[1].sync = SyncState::Synced;
         synced.bookmarks[1].remote = Some("origin".into());
         synced.bookmarks[2].sync = SyncState::Synced;
-        let plan = plan_submit(&synced, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&synced, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     }
 
@@ -1404,7 +1492,7 @@ mod tests {
         snap.nodes[1].is_empty = true; // a2
         snap.nodes[2].is_empty = true; // a1 — auth's whole segment empty
         let prs = pr_state(vec![], true);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
 
         // auth neither pushes nor gets a PR, but profile still bases on it.
         assert!(plan
@@ -1444,7 +1532,7 @@ mod tests {
             workspace: None,
         });
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert!(
             plan.blockers.iter().any(|b| b.contains("is conflicted")),
             "{:?}",
@@ -1452,15 +1540,15 @@ mod tests {
         );
 
         let snap = stack_snapshot();
-        let err = plan_submit(&snap, &prs, &forge_repo(), "nope", &NoComments).unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), "nope", &NoComments, None).unwrap_err();
         assert_eq!(err.code(), "plan_failed");
-        let err = plan_submit(&snap, &prs, &forge_repo(), "main", &NoComments).unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), "main", &NoComments, None).unwrap_err();
         assert!(err.to_string().contains("trunk"), "{err}");
         // A bookmark parked on immutable history has nothing to publish.
         let mut on_trunk = stack_snapshot();
         on_trunk.bookmarks.push(bookmark("old", "m", SyncState::LocalOnly, false));
         on_trunk.nodes[3].bookmarks.push("old".into());
-        let err = plan_submit(&on_trunk, &prs, &forge_repo(), "old", &NoComments).unwrap_err();
+        let err = plan_submit(&on_trunk, &prs, &forge_repo(), "old", &NoComments, None).unwrap_err();
         assert!(err.to_string().contains("immutable"), "{err}");
     }
 
@@ -1474,7 +1562,7 @@ mod tests {
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(9, "auth-alias", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap();
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].bookmark, "auth-alias");
         assert!(
@@ -1578,7 +1666,7 @@ mod tests {
         snap.nodes[1].bookmarks = vec!["auth".into()];
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
-        plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments).unwrap()
+        plan_submit(&snap, &prs, &forge_repo(), "profile", &NoComments, None).unwrap()
     }
 
     #[test]
@@ -1647,7 +1735,7 @@ mod tests {
             6,
             ExistingComment { id: 60, body: previous_with_fossil.clone() },
         )]));
-        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), "profile", &comments, None).unwrap();
 
         let forge = StubForge::default();
         forge.comments.borrow_mut().insert(
@@ -1704,7 +1792,7 @@ mod tests {
             StubComments(map)
         };
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), "profile", &replan_comments).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), "profile", &replan_comments, None).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
     }
 

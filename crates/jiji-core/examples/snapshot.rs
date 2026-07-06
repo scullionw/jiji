@@ -77,6 +77,53 @@ fn main() {
             }
         }
     }
+    // `--fetch-pr <remote> <number> <bookmark>`: fetch a PR's head into a
+    // local review bookmark, like the Publish section's review flow.
+    if change_id.as_deref() == Some("--fetch-pr") {
+        let remote = mode.clone().expect("--fetch-pr needs the remote name");
+        let number: u64 = std::env::args()
+            .nth(4)
+            .expect("--fetch-pr needs the PR number")
+            .parse()
+            .expect("the PR number must be a number");
+        let bookmark = std::env::args()
+            .nth(5)
+            .expect("--fetch-pr needs the bookmark name");
+        match backend.fetch_pr_head(path, &remote, number, &bookmark) {
+            Ok(outcome) => {
+                println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                return;
+            }
+            Err(err) => {
+                eprintln!("error ({}): {}", err.code(), err);
+                std::process::exit(1);
+            }
+        }
+    }
+    // `--trunk-file <path1,path2,...>`: probe the trunk tree for the first
+    // existing text file — how forge planning reads a PR template.
+    if change_id.as_deref() == Some("--trunk-file") {
+        let candidates: Vec<String> = mode
+            .as_deref()
+            .expect("--trunk-file needs comma-separated candidate paths")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        match backend.trunk_text_file(path, &candidates) {
+            Ok(Some((found, text))) => {
+                println!("{found}\n---\n{text}");
+                return;
+            }
+            Ok(None) => {
+                println!("(none of the candidates exist on trunk)");
+                return;
+            }
+            Err(err) => {
+                eprintln!("error ({}): {}", err.code(), err);
+                std::process::exit(1);
+            }
+        }
+    }
     if change_id.as_deref() == Some("--update-stale") {
         match backend.update_stale_workspace(path) {
             Ok(outcome) => {

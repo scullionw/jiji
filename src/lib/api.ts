@@ -4,10 +4,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
+import type { CiRerunReport } from "$lib/bindings/CiRerunReport";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
 import type { LandOutcome } from "$lib/bindings/LandOutcome";
 import type { LandPlan } from "$lib/bindings/LandPlan";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
+import type { PrSummary } from "$lib/bindings/PrSummary";
 import type { RepoPrState } from "$lib/bindings/RepoPrState";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
@@ -173,6 +175,22 @@ export function gitFetch(): Promise<MutationOutcome> {
   return invoke<MutationOutcome>("git_fetch");
 }
 
+// Fetch a pull request's head (`refs/pull/N/head`, cross-fork included)
+// into a new local bookmark for local review. Network-blocking like any
+// fetch. (PR numbers are `bigint` in the ts-rs DTOs; the wire wants a
+// plain number.)
+export function fetchPr(
+  remote: string,
+  number: number | bigint,
+  bookmark: string,
+): Promise<MutationOutcome> {
+  return invoke<MutationOutcome>("fetch_pr", {
+    remote,
+    number: Number(number),
+    bookmark,
+  });
+}
+
 // The forge connection (GitHub). `forgeStatus` answers without touching
 // the network; `forgeVerify` checks the resolved token against the API and
 // remembers the login for the session. Login validates before storing the
@@ -199,6 +217,21 @@ export function forgeLogout(): Promise<ForgeStatus> {
 // head-branch → PR attachment map already built.
 export function forgePrs(): Promise<RepoPrState> {
   return invoke<RepoPrState>("forge_prs");
+}
+
+// One PR by number — the review flow's lookup for PRs the batched open-PR
+// state cannot see (past the 100 cap, or closed).
+export function forgePr(number: number | bigint): Promise<PrSummary> {
+  return invoke<PrSummary>("forge_pr", { number: Number(number) });
+}
+
+// Re-run the failed GitHub Actions runs on a PR's current head. The
+// answer names which workflow runs went back to work; empty means the
+// failing check lives outside Actions' reach.
+export function rerunFailedCi(
+  number: number | bigint,
+): Promise<CiRerunReport> {
+  return invoke<CiRerunReport>("rerun_failed_ci", { number: Number(number) });
 }
 
 // Plan submitting the stack under a bookmark: which bookmarks push, which

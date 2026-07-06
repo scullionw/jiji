@@ -104,6 +104,25 @@
 //                        live, cleanup removes the landed bookmark and
 //                        changes, so the refreshed graph and PR state
 //                        follow the executed flow)
+//   &rfetch=<number>     click that PR row's "Fetch for review" and wait
+//                        for the panel (needs &forge= + &prs=)
+//   &rlookup=<number>    type into the by-number lookup and submit; waits
+//                        for the panel (a fabricated number) or the
+//                        lookup error (an unknown one)
+//   &rname=<text>        retype the panel's bookmark name (a taken name
+//                        shows the inline warning and disables Fetch)
+//   &rgo=1               click Fetch in the open panel and wait for the
+//                        done note (the stubbed fetch_pr lands the PR
+//                        head as a fresh change on trunk wearing the
+//                        bookmark, like the Rust mock)
+//   &rrun=<number>       click that PR row's "Re-run failed CI" and wait
+//                        for the outcome note (a failing fabricated PR
+//                        re-runs one workflow; others answer the honest
+//                        empty report)
+//   &rrunhdr=1           click the workbench header's Re-run failed CI
+//                        chip (after &click selects a change whose
+//                        bookmark wears a failing PR) and wait for the
+//                        requested state
 //   &click=<changeId>    click a graph row
 //   &collapse=<n>        click the nth (0-based) file header in the diff
 //                        to collapse that file
@@ -775,6 +794,10 @@
       stackCommentPreview: commentActions.length
         ? renderStackComment(live, null)
         : null,
+      // The captured snapshots carry no PR template (the Rust mock's
+      // trunk_text_file answers None), so the plan-card note never shows
+      // here — a documented approximation.
+      prTemplatePath: null,
     };
   };
 
@@ -1883,6 +1906,65 @@
             targetChange: null,
           });
         }
+        // Fetch a PR's head for review: like the Rust mock, the fetched
+        // head arrives as one fresh change directly on trunk wearing the
+        // new bookmark (a documented approximation — the real backend
+        // fetches whatever ancestry the PR carries).
+        case "fetch_pr": {
+          const name = (args?.bookmark ?? "").trim();
+          if (!name)
+            return reject("mutation_failed", "bookmark name cannot be empty");
+          if (snap.bookmarks.some((b) => b.isLocal && b.name === name))
+            return reject(
+              "mutation_failed",
+              `bookmark “${name}” already exists`,
+            );
+          const number = args?.number;
+          const trunk = snap.bookmarks.find((b) => b.isTrunk);
+          const id = `pv${String(mutationIndex).padStart(2, "0")}rwqk`;
+          spawnedIds.add(id);
+          snap.nodes.unshift({
+            id,
+            changeId: id,
+            commitId: `9c${String(mutationIndex).padStart(2, "0")}7de2`,
+            description: `PR #${number} head (fetched for review)`,
+            author: "them",
+            timestamp: "2026-06-10T13:01:00Z",
+            kind: "mutable",
+            parents: [trunk?.target].filter(Boolean),
+            elidedParents: [],
+            bookmarks: [name],
+            isEmpty: false,
+            hasConflict: false,
+            isDivergent: false,
+          });
+          snap.bookmarks.push({
+            name,
+            target: id,
+            remote: null,
+            sync: "localOnly",
+            isTrunk: false,
+            isLocal: true,
+          });
+          snap.workstreams.push({
+            id: `ws-${id}`,
+            title: `PR #${number} head (fetched for review)`,
+            nodeIds: [id],
+            bookmark: name,
+            isActive: false,
+            behindTrunk: 0,
+          });
+          const opId = pushOp(
+            snap,
+            `fetch pull request #${number} into bookmark ${name}`,
+            [{ kind: "bookmark", label: `${name} created` }],
+          );
+          return Promise.resolve({
+            operationId: opId,
+            summary: `Fetched PR #${number} into ${name}`,
+            targetChange: id,
+          });
+        }
         // The forge connection (Publish section): repo detection mirrors
         // the backend's GitHub-URL parse over the captured gitRemotes;
         // auth state lives in `forge`, preset via &forge= and mutated by
@@ -1926,6 +2008,30 @@
           if (!forge.source)
             return reject("no_token", "no GitHub token is available");
           return Promise.resolve(forgePrsOf(snap));
+        }
+        // The review flow's by-number lookup: answered from the fabricated
+        // open set; unknown numbers read like GitHub's 404.
+        case "forge_pr": {
+          const pr = forgePrsOf(snap).report.prs.find(
+            (candidate) => candidate.number === args?.number,
+          );
+          return pr
+            ? Promise.resolve(pr)
+            : reject("not_found", "Not found on GitHub: Not Found");
+        }
+        // Re-run failed CI: a failing fabricated PR answers one re-run
+        // workflow; anything else answers the honest empty report (the
+        // failing check lives outside Actions' reach).
+        case "rerun_failed_ci": {
+          const pr = forgePrsOf(snap).report.prs.find(
+            (candidate) => candidate.number === args?.number,
+          );
+          if (!pr) return reject("not_found", "Not found on GitHub: Not Found");
+          return Promise.resolve(
+            pr.checks === "failing"
+              ? { rerun: ["ci"], refused: [] }
+              : { rerun: [], refused: [] },
+          );
         }
         // The publish-stack workflow: the plan derives from the captured
         // snapshot + fabricated PR state via a JS twin of plan_submit;
@@ -2350,6 +2456,69 @@
   if (params.get("lgo")) {
     steps.push(() => click("[data-land-go] .btn.primary:not(:disabled)"));
     steps.push(() => document.querySelector("[data-land-outcome]") !== null);
+  }
+  // Review-helper flows (section=publish + forge= + prs=): open the
+  // fetch-for-review panel from a PR row (&rfetch) or the by-number
+  // lookup (&rlookup), optionally retype the bookmark name (&rname), and
+  // confirm (&rgo). &rrun clicks a row's Re-run failed CI and waits for
+  // the note; &rrunhdr clicks the workbench header's re-run chip after
+  // &click selects the bookmarked change.
+  const reviewFetch = params.get("rfetch");
+  if (reviewFetch) {
+    steps.push(() => click(`[data-review-fetch="${reviewFetch}"]`));
+    steps.push(() => document.querySelector("[data-review-panel]") !== null);
+  }
+  const reviewLookup = params.get("rlookup");
+  if (reviewLookup) {
+    steps.push(() => {
+      const input = document.querySelector("[data-review-lookup]");
+      if (!input || input.disabled) return false;
+      input.value = reviewLookup;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
+    steps.push(() => click(".lookup-row .btn:not(:disabled)"));
+    steps.push(
+      () =>
+        document.querySelector("[data-review-panel]") !== null ||
+        document.querySelector("[data-review-lookup-error]") !== null,
+    );
+  }
+  const reviewName = params.get("rname");
+  if (reviewName) {
+    steps.push(() => {
+      const input = document.querySelector("[data-review-name]");
+      if (!input || input.disabled) return false;
+      input.value = reviewName;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    });
+  }
+  if (params.get("rgo")) {
+    steps.push(() =>
+      click(".review-name-row .btn.primary:not(:disabled)"),
+    );
+    steps.push(
+      () =>
+        document.querySelector("[data-review-done]") !== null ||
+        document.querySelector("[data-review-error]") !== null,
+    );
+  }
+  const reviewRerun = params.get("rrun");
+  if (reviewRerun) {
+    steps.push(() =>
+      click(`[data-review-rerun="${reviewRerun}"]:not(:disabled)`),
+    );
+    steps.push(
+      () => document.querySelector("[data-review-rerun-note]") !== null,
+    );
+  }
+  if (params.get("rrunhdr")) {
+    steps.push(() => click('[data-action="rerun-ci"]:not(:disabled)'));
+    steps.push(() => {
+      const chip = document.querySelector('[data-action="rerun-ci"]');
+      return chip !== null && /re-run requested/i.test(chip.textContent);
+    });
   }
   const open = params.get("open");
   if (open === "files") steps.push(() => click(".files-button"));
