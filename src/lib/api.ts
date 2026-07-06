@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { AutoLandState } from "$lib/bindings/AutoLandState";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
 import type { CiRerunReport } from "$lib/bindings/CiRerunReport";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
@@ -22,6 +23,7 @@ export interface CommandError {
 }
 
 const SNAPSHOT_UPDATED_EVENT = "snapshot://updated";
+const AUTOLAND_STATE_EVENT = "autoland://state";
 
 export function openRepo(path: string): Promise<RepoSnapshot> {
   return invoke<RepoSnapshot>("open_repo", { path });
@@ -269,10 +271,38 @@ export function landStack(
   return invoke<LandOutcome>("land_stack", { headBookmark, plan });
 }
 
+// Queue the stack under a bookmark for auto-land: a supervised background
+// job that keeps re-deriving the landing plan and running rounds as remote
+// conditions allow. Refused while another job is running.
+export function autolandStart(headBookmark: string): Promise<AutoLandState> {
+  return invoke<AutoLandState>("autoland_start", { headBookmark });
+}
+
+// Ask the running job to stop. Answers the state as of the request; the
+// definitive stopped phase arrives on the state event once the job winds
+// down (immediately from a wait, after the round from a round).
+export function autolandStop(): Promise<AutoLandState | null> {
+  return invoke<AutoLandState | null>("autoland_stop");
+}
+
+// The latest job state, terminal states included — how a reloading
+// frontend reattaches.
+export function autolandState(): Promise<AutoLandState | null> {
+  return invoke<AutoLandState | null>("autoland_state");
+}
+
 export function onSnapshotUpdated(
   callback: (snapshot: RepoSnapshot) => void,
 ): Promise<UnlistenFn> {
   return listen<RepoSnapshot>(SNAPSHOT_UPDATED_EVENT, (event) => {
+    callback(event.payload);
+  });
+}
+
+export function onAutoLandState(
+  callback: (state: AutoLandState) => void,
+): Promise<UnlistenFn> {
+  return listen<AutoLandState>(AUTOLAND_STATE_EVENT, (event) => {
     callback(event.payload);
   });
 }

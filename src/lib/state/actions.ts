@@ -7,6 +7,7 @@ import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { SplitSelection } from "$lib/bindings/SplitSelection";
 import { stackPosition } from "$lib/components/inspector/inspect";
 import { app, type Section, type UiIntent } from "./app.svelte";
+import { attachAutoLand } from "./autoland.svelte";
 import { refreshForgePrs } from "./forge.svelte";
 import { loadRecentRepos, rememberRepo } from "./recent";
 
@@ -23,6 +24,10 @@ export async function bootstrap(): Promise<void> {
     app.snapshot = snapshot;
     app.error = null;
   });
+
+  // Same shape for the auto-land job: subscribe, then reattach to
+  // whatever the backend is already doing.
+  await attachAutoLand();
 
   // Recover state if the webview reloaded while a repo was open.
   try {

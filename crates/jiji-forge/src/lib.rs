@@ -16,10 +16,12 @@
 //! - [`reconcile`]: fingerprinted PR title/description reconciliation
 //! - [`comment`]: the stack-info comment GitHub readers see
 //! - [`land`]: the merge → fetch → reconcile landing engine
+//! - [`autoland`]: the supervised auto-land job loop over the land engine
 //! - [`template`]: the repo's PR template folded into new PR bodies
 //! - [`ci`]: the re-run-failed-CI review helper over GitHub Actions
 
 pub mod auth;
+pub mod autoland;
 pub mod ci;
 pub mod comment;
 pub mod error;
@@ -35,12 +37,16 @@ pub use auth::{
     resolve_token, ForgeAuth, ForgeStatus, KeychainTokenStore, MemoryTokenStore, ResolvedToken,
     TokenSource, TokenStore,
 };
+pub use autoland::{
+    run_autoland, AutoLandConfig, AutoLandMerged, AutoLandPhase, AutoLandPrs, AutoLandState,
+    StopSignal,
+};
 pub use ci::{rerun_failed_ci, CiRerunReport};
 pub use error::ForgeError;
 pub use github::GitHubClient;
 pub use land::{
-    execute_land, plan_land, LandAction, LandForge, LandOutcome, LandPlan, LandRepoForge,
-    LandSegment, LandSegmentStatus, LandStep, LandVcs, MergeMethod, PrLandState,
+    execute_land, plan_land, LandAction, LandBlocker, LandForge, LandOutcome, LandPlan,
+    LandRepoForge, LandSegment, LandSegmentStatus, LandStep, LandVcs, MergeMethod, PrLandState,
 };
 pub use pr::{
     parse_open_prs, prs_by_branch, ChecksRollup, PrState, PrStateReport, PrSummary,

@@ -133,7 +133,15 @@ pub fn open_repo(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<RepoSnapshot, CommandError> {
+    let previous = state.open_repo_path().ok();
     let snapshot = state.sync_and_publish(&app, Path::new(&path))?;
+    // Switching repos stops a running auto-land job: its mutations go
+    // through this state, which now points somewhere else. Re-opening the
+    // same repo leaves it alone. (The engine's repo-path pin is the
+    // backstop for a round already in flight.)
+    if previous.as_deref() != Some(snapshot.repo_path.as_str()) {
+        app.state::<crate::autoland::AutoLandHost>().stop_active();
+    }
     state.start_watching(&app, Path::new(&path));
     Ok(snapshot)
 }

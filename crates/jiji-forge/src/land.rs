@@ -269,6 +269,36 @@ pub enum LandAction {
     },
 }
 
+/// One reason a land plan cannot act. `wait` says whether waiting alone
+/// can clear it: true for remote conditions that settle by themselves
+/// (checks running, an approval pending, GitHub still computing
+/// mergeability) — what an auto-land job watches through quietly — and
+/// false when the user has to act first (a draft, requested changes,
+/// failing checks, an unpublished stack).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct LandBlocker {
+    pub message: String,
+    pub wait: bool,
+}
+
+impl LandBlocker {
+    pub(crate) fn needs_user(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            wait: false,
+        }
+    }
+
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            wait: true,
+        }
+    }
+}
+
 /// What landing a stack will do this run, derived before anything runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -285,7 +315,7 @@ pub struct LandPlan {
     /// the merge queue) and there is nothing to do but wait.
     pub actions: Vec<LandAction>,
     /// Problems that stop this run from doing anything.
-    pub blockers: Vec<String>,
+    pub blockers: Vec<LandBlocker>,
     pub warnings: Vec<String>,
 }
 
@@ -397,8 +427,9 @@ pub(crate) enum Readiness {
     AutomationRunning(String),
     /// Waiting only on conditions GitHub automates on.
     WaitingOnAutomatable(Vec<String>),
-    /// Cannot land, and waiting will not fix it by itself.
-    Blocked(Vec<String>),
+    /// Cannot land right now; each blocker says whether waiting can clear
+    /// it on its own.
+    Blocked(Vec<LandBlocker>),
 }
 
 /// Classify a fresh [`PrLandState`] for a PR expected to land on `trunk`.
@@ -406,9 +437,9 @@ pub(crate) fn classify_candidate(number: u64, land: &PrLandState, trunk: &str) -
     match land.state {
         PrState::Merged => return Readiness::AlreadyMerged,
         PrState::Closed => {
-            return Readiness::Blocked(vec![format!(
+            return Readiness::Blocked(vec![LandBlocker::needs_user(format!(
                 "#{number} was closed on GitHub without merging — reopen it or publish again"
-            )])
+            ))])
         }
         PrState::Open => {}
     }
@@ -424,35 +455,39 @@ pub(crate) fn classify_candidate(number: u64, land: &PrLandState, trunk: &str) -
              requirements are met — run Land again afterwards to reconcile"
         ));
     }
-    let mut blockers: Vec<String> = Vec::new();
+    let mut blockers: Vec<LandBlocker> = Vec::new();
     if land.is_draft {
-        blockers.push(format!(
+        blockers.push(LandBlocker::needs_user(format!(
             "#{number} is still a draft — mark it ready for review on GitHub first"
-        ));
+        )));
     }
     if land.base_branch != trunk {
-        blockers.push(format!(
+        blockers.push(LandBlocker::needs_user(format!(
             "#{number} still targets \u{201c}{}\u{201d}, not \u{201c}{trunk}\u{201d} — \
              publish the stack to retarget it first",
             land.base_branch
-        ));
+        )));
     }
     match land.mergeable {
-        Mergeable::Conflicting => blockers.push(format!(
+        Mergeable::Conflicting => blockers.push(LandBlocker::needs_user(format!(
             "#{number} has merge conflicts with \u{201c}{trunk}\u{201d} — rebase onto \
              the fetched trunk, publish, and land again"
-        )),
-        Mergeable::Unknown => blockers.push(format!(
+        ))),
+        Mergeable::Unknown => blockers.push(LandBlocker::transient(format!(
             "GitHub is still working out whether #{number} merges cleanly — plan \
              again in a moment"
-        )),
+        ))),
         Mergeable::Mergeable => {}
     }
     if land.review == ReviewDecision::ChangesRequested {
-        blockers.push(format!("changes were requested on #{number}"));
+        blockers.push(LandBlocker::needs_user(format!(
+            "changes were requested on #{number}"
+        )));
     }
     if land.checks == ChecksRollup::Failing {
-        blockers.push(format!("#{number}'s checks are failing"));
+        blockers.push(LandBlocker::needs_user(format!(
+            "#{number}'s checks are failing"
+        )));
     }
     if !blockers.is_empty() {
         return Readiness::Blocked(blockers);
@@ -516,7 +551,7 @@ pub fn plan_land(
     let (raw_segments, mut warnings) =
         stack_segments(snapshot, prs, head_bookmark).map_err(ForgeError::Land)?;
     let trunk = snapshot.trunk_bookmark.clone();
-    let mut blockers: Vec<String> = Vec::new();
+    let mut blockers: Vec<LandBlocker> = Vec::new();
     if prs.report.truncated {
         warnings.push(
             "GitHub answered only the 100 most recently updated open PRs; a stack \
@@ -648,9 +683,9 @@ pub fn plan_land(
             &mut warnings,
         ));
     } else if let Some(bookmark) = no_pr_bookmark {
-        blockers.push(format!(
+        blockers.push(LandBlocker::needs_user(format!(
             "\u{201c}{bookmark}\u{201d} has no pull request — publish the stack first"
-        ));
+        )));
     } else if let Some((index, pr, Some(land))) = &candidate {
         // Merge run: nothing below is pending — evaluate the candidate.
         let raw = &raw_segments[*index];
@@ -660,19 +695,19 @@ pub fn plan_land(
             .find(|b| b.name == raw.bookmark)
             .expect("segment bookmarks come from the snapshot");
         if bookmark_state.sync != SyncState::Synced {
-            blockers.push(format!(
+            blockers.push(LandBlocker::needs_user(format!(
                 "\u{201c}{}\u{201d} and its GitHub branch differ — publish the stack \
                  first, so what merges is what you see here",
                 raw.bookmark
-            ));
+            )));
         }
         let method = pick_method(land);
         if method.is_none() {
-            blockers.push(format!(
+            blockers.push(LandBlocker::needs_user(format!(
                 "{}/{} allows none of GitHub's merge methods — check the \
                  repository's merge settings",
                 repo.owner, repo.name
-            ));
+            )));
         }
         let readiness = classify_candidate(pr.number, land, &trunk);
         match &readiness {
@@ -730,10 +765,10 @@ pub fn plan_land(
                         ));
                     } else {
                         blockers.extend(waits.iter().map(|wait| {
-                            format!(
+                            LandBlocker::transient(format!(
                                 "{wait} — this repository has auto-merge disabled, \
                                  so land again when it settles"
-                            )
+                            ))
                         }));
                     }
                 }
@@ -908,7 +943,11 @@ pub fn execute_land(
     if !plan.blockers.is_empty() {
         return Err(ForgeError::Land(format!(
             "the plan has blockers: {}",
-            plan.blockers.join("; ")
+            plan.blockers
+                .iter()
+                .map(|b| b.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         )));
     }
     let mut steps: Vec<LandStep> = plan
@@ -964,12 +1003,18 @@ fn run_land_step(
                     "#{number} was already merged on GitHub; reconciling"
                 )),
                 Readiness::AutomationRunning(story) => Err(story),
-                Readiness::WaitingOnAutomatable(reasons) | Readiness::Blocked(reasons) => {
-                    Err(format!(
-                        "#{number} is no longer ready to merge: {}",
-                        reasons.join("; ")
-                    ))
-                }
+                Readiness::WaitingOnAutomatable(reasons) => Err(format!(
+                    "#{number} is no longer ready to merge: {}",
+                    reasons.join("; ")
+                )),
+                Readiness::Blocked(blockers) => Err(format!(
+                    "#{number} is no longer ready to merge: {}",
+                    blockers
+                        .iter()
+                        .map(|b| b.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )),
                 Readiness::Ready => {
                     if land.head_commit != *expected_head {
                         return Err(format!(
@@ -1561,7 +1606,7 @@ mod tests {
         assert!(
             plan.blockers
                 .iter()
-                .any(|b| b.contains("has no pull request")),
+                .any(|b| b.message.contains("has no pull request") && !b.wait),
             "{:?}",
             plan.blockers
         );
@@ -1612,8 +1657,12 @@ mod tests {
         );
         let plan = plan_land(&snap, &prs, &forge_repo(), "profile", &forge).unwrap();
         assert!(plan.actions.is_empty());
+        // A pending-checks wait is transient — an auto-land job may watch
+        // through it even though the manual flow is blocked.
         assert!(
-            plan.blockers.iter().any(|b| b.contains("checks are still running")),
+            plan.blockers
+                .iter()
+                .any(|b| b.message.contains("checks are still running") && b.wait),
             "{:?}",
             plan.blockers
         );
@@ -1654,30 +1703,38 @@ mod tests {
             vec![open_pr(1, "auth", "main"), open_pr(7, "profile", "auth")],
             false,
         );
-        for (state, needle) in [
+        // The `wait` flag marks the one condition GitHub clears by itself
+        // (mergeability still computing); everything else needs the user.
+        for (state, needle, wait) in [
             (
                 PrLandState { mergeable: Mergeable::Conflicting, ..ready_state() },
                 "merge conflicts",
+                false,
             ),
             (
                 PrLandState { mergeable: Mergeable::Unknown, ..ready_state() },
                 "still working out",
+                true,
             ),
             (
                 PrLandState { is_draft: true, ..ready_state() },
                 "still a draft",
+                false,
             ),
             (
                 PrLandState { review: ReviewDecision::ChangesRequested, ..ready_state() },
                 "changes were requested",
+                false,
             ),
             (
                 PrLandState { checks: ChecksRollup::Failing, ..ready_state() },
                 "checks are failing",
+                false,
             ),
             (
                 PrLandState { base_branch: "old-base".into(), ..ready_state() },
                 "still targets",
+                false,
             ),
         ] {
             let mut forge = StubLandForge::default();
@@ -1685,7 +1742,9 @@ mod tests {
             let plan = plan_land(&snap, &prs, &forge_repo(), "profile", &forge).unwrap();
             assert!(plan.actions.is_empty(), "{needle}: {:?}", plan.actions);
             assert!(
-                plan.blockers.iter().any(|b| b.contains(needle)),
+                plan.blockers
+                    .iter()
+                    .any(|b| b.message.contains(needle) && b.wait == wait),
                 "{needle}: {:?}",
                 plan.blockers
             );
@@ -1707,7 +1766,9 @@ mod tests {
         let plan = plan_land(&snap, &prs, &forge_repo(), "profile", &forge).unwrap();
         assert!(plan.actions.is_empty());
         assert!(
-            plan.blockers.iter().any(|b| b.contains("GitHub branch differ")),
+            plan.blockers
+                .iter()
+                .any(|b| b.message.contains("GitHub branch differ") && !b.wait),
             "{:?}",
             plan.blockers
         );

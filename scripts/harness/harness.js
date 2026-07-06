@@ -113,6 +113,18 @@
 //                        live, cleanup removes the landed bookmark and
 //                        changes, so the refreshed graph and PR state
 //                        follow the executed flow)
+//   &alqueue=1           click the plan card's "Auto-land when ready" (pair
+//                        with &lplan=) and wait for the job card. The
+//                        stubbed job mirrors the engine's first poll:
+//                        blocked plans wait (attention when they need the
+//                        user), an actionable plan runs one round through
+//                        the shared land executor, a hand-off or a still-
+//                        stacked segment keeps watching, and a completed
+//                        stack reads done — the status-bar activity chip
+//                        follows the same state
+//   &alstop=1            click the running job card's Stop and wait for
+//                        the stopped state (only meaningful on a waiting
+//                        job — a finished card's button is Dismiss)
 //   &rfetch=<number>     click that PR row's "Fetch for review" and wait
 //                        for the panel (needs &forge= + &prs=)
 //   &rlookup=<number>    type into the by-number lookup and submit; waits
@@ -385,6 +397,8 @@
     // Branches whose PR the stubbed land flow merged this session: their
     // fabricated PR reads merged and drops out of the byBranch attach map.
     landedBranches: new Set(),
+    // The stubbed auto-land job's latest state (one job, like the host).
+    autoland: null,
   };
   // JS twins of jiji-forge's reconcile fingerprints (FNV-1a 64) and
   // managed-body markers, enough for the plan twin to mirror the Rust
@@ -985,17 +999,20 @@
         null,
       );
     } else if (noPr) {
-      blockers.push(
-        `\u{201c}${noPr}\u{201d} has no pull request — publish the stack first`,
-      );
+      blockers.push({
+        message: `\u{201c}${noPr}\u{201d} has no pull request — publish the stack first`,
+        wait: false,
+      });
     } else if (candidate) {
       const { index, pr } = candidate;
       const bm = local.get(rawSegments[index].bookmark);
       if (bm.sync !== "synced")
-        blockers.push(
-          `\u{201c}${bm.name}\u{201d} and its GitHub branch differ — publish the ` +
+        blockers.push({
+          message:
+            `\u{201c}${bm.name}\u{201d} and its GitHub branch differ — publish the ` +
             `stack first, so what merges is what you see here`,
-        );
+          wait: false,
+        });
       const flags = new Set(
         ((params.get("prs") || "")
           .split(",")
@@ -1011,23 +1028,34 @@
         );
       } else {
         if (pr.isDraft)
-          blockers.push(
-            `#${pr.number} is still a draft — mark it ready for review on GitHub first`,
-          );
+          blockers.push({
+            message: `#${pr.number} is still a draft — mark it ready for review on GitHub first`,
+            wait: false,
+          });
         if (pr.baseBranch !== trunk)
-          blockers.push(
-            `#${pr.number} still targets \u{201c}${pr.baseBranch}\u{201d}, not ` +
+          blockers.push({
+            message:
+              `#${pr.number} still targets \u{201c}${pr.baseBranch}\u{201d}, not ` +
               `\u{201c}${trunk}\u{201d} — publish the stack to retarget it first`,
-          );
+            wait: false,
+          });
         if (flags.has("unmergeable"))
-          blockers.push(
-            `#${pr.number} has merge conflicts with \u{201c}${trunk}\u{201d} — ` +
+          blockers.push({
+            message:
+              `#${pr.number} has merge conflicts with \u{201c}${trunk}\u{201d} — ` +
               `rebase onto the fetched trunk, publish, and land again`,
-          );
+            wait: false,
+          });
         if (pr.review === "changesRequested")
-          blockers.push(`changes were requested on #${pr.number}`);
+          blockers.push({
+            message: `changes were requested on #${pr.number}`,
+            wait: false,
+          });
         if (pr.checks === "failing")
-          blockers.push(`#${pr.number}'s checks are failing`);
+          blockers.push({
+            message: `#${pr.number}'s checks are failing`,
+            wait: false,
+          });
         if (!blockers.length) {
           const waits = [];
           if (pr.checks === "pending")
@@ -1047,11 +1075,12 @@
           } else if (waits.length) {
             if (params.get("lnoauto"))
               blockers.push(
-                ...waits.map(
-                  (wait) =>
+                ...waits.map((wait) => ({
+                  message:
                     `${wait} — this repository has auto-merge disabled, so ` +
                     `land again when it settles`,
-                ),
+                  wait: true,
+                })),
               );
             else {
               actions.push({
@@ -1090,6 +1119,133 @@
       warnings,
     };
   };
+
+  // Execute a land plan's actions against the live stub world — the
+  // world change behind both the manual Land flow and the auto-land
+  // job twin: the merged PR drops out of the open set, the fetch
+  // fabricates the squash commit arriving on trunk, rebases reparent
+  // live rows, and cleanup removes the landed bookmark and changes.
+  const executeLandTwin = (snap, plan) => {
+    let landedSeq = 0;
+    return plan.actions.map((action) => {
+            const done = (detail) => ({ action, status: "done", detail });
+            switch (action.kind) {
+              case "mergePr": {
+                forge.landedBranches.add(action.bookmark);
+                return done(
+                  `Merged #${action.number} (${action.bookmark}) into ${plan.baseBranch}`,
+                );
+              }
+              case "enableAutoMerge":
+                return done(
+                  `Auto-merge enabled on #${action.number}; GitHub merges it ` +
+                    `once its requirements are met — run Land again afterwards ` +
+                    `to reconcile`,
+                );
+              case "enqueuePr":
+                return done(
+                  `#${action.number} added to the merge queue — run Land ` +
+                    `again once it lands`,
+                );
+              case "fetchRemote": {
+                // The squash commit arrives on trunk: a fresh immutable
+                // node on the old trunk target, the trunk bookmark (and
+                // its chip) moving to it.
+                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
+                const landing = plan.segments.find(
+                  (segment) =>
+                    segment.status.kind === "landing" ||
+                    segment.status.kind === "merged",
+                );
+                if (trunkBm) {
+                  landedSeq += 1;
+                  const old = requireNode(snap, trunkBm.target);
+                  const id = `zl${landedSeq}andsq`;
+                  const position = snap.nodes.findIndex(
+                    (n) => n.id === trunkBm.target,
+                  );
+                  const number =
+                    landing?.status.kind === "merged"
+                      ? landing.status.number
+                      : (landing?.pr?.number ?? 0);
+                  snap.nodes.splice(Math.max(position, 0), 0, {
+                    id,
+                    changeId: id,
+                    commitId: `e5${landedSeq}a4d`,
+                    description: `${humanize(landing?.bookmark ?? "stack")} (#${number})`,
+                    author: old?.author ?? "GitHub",
+                    timestamp: old?.timestamp ?? "2026-07-01T12:00:00Z",
+                    kind: "immutable",
+                    parents: trunkBm.target ? [trunkBm.target] : [],
+                    elidedParents: [],
+                    bookmarks: [trunkBm.name],
+                    isEmpty: false,
+                    hasConflict: false,
+                    isDivergent: false,
+                  });
+                  if (old)
+                    old.bookmarks = old.bookmarks.filter(
+                      (name) => name !== trunkBm.name,
+                    );
+                  trunkBm.target = id;
+                }
+                return done(
+                  `Fetched from ${action.remote} — ${trunkBm?.name ?? "trunk"} ` +
+                    `moved to the merged commit`,
+                );
+              }
+              case "rebaseOntoTrunk": {
+                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
+                const root = requireNode(snap, action.rootChange);
+                if (root && trunkBm) root.parents = [trunkBm.target];
+                return done(`Rebased ${action.rootChange} onto the new trunk`);
+              }
+              case "pushStack": {
+                action.bookmarks.forEach((name) => {
+                  const bm = snap.bookmarks.find((b) => b.name === name);
+                  if (bm) {
+                    bm.sync = "synced";
+                    bm.remote = plan.remote;
+                  }
+                });
+                return done(
+                  `Pushed ${action.bookmarks.join(", ")} to ${plan.remote}`,
+                );
+              }
+              case "retargetPr": {
+                forge.prOverrides.set(action.number, {
+                  ...(forge.prOverrides.get(action.number) || {}),
+                  baseBranch: action.toBase,
+                });
+                return done(`Retargeted #${action.number} onto ${action.toBase}`);
+              }
+              case "cleanupBookmark": {
+                snap.bookmarks = snap.bookmarks.filter(
+                  (b) => b.name !== action.bookmark,
+                );
+                snap.nodes.forEach((n) => {
+                  n.bookmarks = n.bookmarks.filter(
+                    (name) => name !== action.bookmark,
+                  );
+                });
+                forge.landedBranches.add(action.bookmark);
+                return done(
+                  `Deleted \u{201c}${action.bookmark}\u{201d} here and on ${plan.remote}`,
+                );
+              }
+              case "abandonLanded": {
+                action.changeIds.forEach((id) => {
+                  const node = requireNode(snap, id);
+                  if (node) removeNode(snap, id, node.parents);
+                });
+                return done(`Abandoned ${action.changeIds.join(", ")}`);
+              }
+              default:
+                return done("done");
+            }
+          });
+  };
+
 
   window.__TAURI_INTERNALS__ = {
     transformCallback: () => 0,
@@ -2170,126 +2326,111 @@
         case "land_stack": {
           const plan = landPlanOf(snap, args?.headBookmark);
           if (!plan) return reject("plan_failed", "the bookmark is gone");
-          let landedSeq = 0;
-          const steps = plan.actions.map((action) => {
-            const done = (detail) => ({ action, status: "done", detail });
-            switch (action.kind) {
-              case "mergePr": {
-                forge.landedBranches.add(action.bookmark);
-                return done(
-                  `Merged #${action.number} (${action.bookmark}) into ${plan.baseBranch}`,
-                );
-              }
-              case "enableAutoMerge":
-                return done(
-                  `Auto-merge enabled on #${action.number}; GitHub merges it ` +
-                    `once its requirements are met — run Land again afterwards ` +
-                    `to reconcile`,
-                );
-              case "enqueuePr":
-                return done(
-                  `#${action.number} added to the merge queue — run Land ` +
-                    `again once it lands`,
-                );
-              case "fetchRemote": {
-                // The squash commit arrives on trunk: a fresh immutable
-                // node on the old trunk target, the trunk bookmark (and
-                // its chip) moving to it.
-                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
-                const landing = plan.segments.find(
-                  (segment) =>
-                    segment.status.kind === "landing" ||
-                    segment.status.kind === "merged",
-                );
-                if (trunkBm) {
-                  landedSeq += 1;
-                  const old = requireNode(snap, trunkBm.target);
-                  const id = `zl${landedSeq}andsq`;
-                  const position = snap.nodes.findIndex(
-                    (n) => n.id === trunkBm.target,
-                  );
-                  const number =
-                    landing?.status.kind === "merged"
-                      ? landing.status.number
-                      : (landing?.pr?.number ?? 0);
-                  snap.nodes.splice(Math.max(position, 0), 0, {
-                    id,
-                    changeId: id,
-                    commitId: `e5${landedSeq}a4d`,
-                    description: `${humanize(landing?.bookmark ?? "stack")} (#${number})`,
-                    author: old?.author ?? "GitHub",
-                    timestamp: old?.timestamp ?? "2026-07-01T12:00:00Z",
-                    kind: "immutable",
-                    parents: trunkBm.target ? [trunkBm.target] : [],
-                    elidedParents: [],
-                    bookmarks: [trunkBm.name],
-                    isEmpty: false,
-                    hasConflict: false,
-                    isDivergent: false,
-                  });
-                  if (old)
-                    old.bookmarks = old.bookmarks.filter(
-                      (name) => name !== trunkBm.name,
-                    );
-                  trunkBm.target = id;
-                }
-                return done(
-                  `Fetched from ${action.remote} — ${trunkBm?.name ?? "trunk"} ` +
-                    `moved to the merged commit`,
-                );
-              }
-              case "rebaseOntoTrunk": {
-                const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
-                const root = requireNode(snap, action.rootChange);
-                if (root && trunkBm) root.parents = [trunkBm.target];
-                return done(`Rebased ${action.rootChange} onto the new trunk`);
-              }
-              case "pushStack": {
-                action.bookmarks.forEach((name) => {
-                  const bm = snap.bookmarks.find((b) => b.name === name);
-                  if (bm) {
-                    bm.sync = "synced";
-                    bm.remote = plan.remote;
-                  }
-                });
-                return done(
-                  `Pushed ${action.bookmarks.join(", ")} to ${plan.remote}`,
-                );
-              }
-              case "retargetPr": {
-                forge.prOverrides.set(action.number, {
-                  ...(forge.prOverrides.get(action.number) || {}),
-                  baseBranch: action.toBase,
-                });
-                return done(`Retargeted #${action.number} onto ${action.toBase}`);
-              }
-              case "cleanupBookmark": {
-                snap.bookmarks = snap.bookmarks.filter(
-                  (b) => b.name !== action.bookmark,
-                );
-                snap.nodes.forEach((n) => {
-                  n.bookmarks = n.bookmarks.filter(
-                    (name) => name !== action.bookmark,
-                  );
-                });
-                forge.landedBranches.add(action.bookmark);
-                return done(
-                  `Deleted \u{201c}${action.bookmark}\u{201d} here and on ${plan.remote}`,
-                );
-              }
-              case "abandonLanded": {
-                action.changeIds.forEach((id) => {
-                  const node = requireNode(snap, id);
-                  if (node) removeNode(snap, id, node.parents);
-                });
-                return done(`Abandoned ${action.changeIds.join(", ")}`);
-              }
-              default:
-                return done("done");
-            }
+          return Promise.resolve({
+            steps: executeLandTwin(snap, plan),
+            failed: false,
           });
-          return Promise.resolve({ steps, failed: false });
         }
+        // The auto-land job twin: starting a job derives the same land
+        // plan and mirrors the Rust engine's first poll — blockers wait
+        // (attention when they need the user), an actionable plan runs one
+        // round through the shared land executor, a hand-off or a still-
+        // stacked segment keeps watching, a completed stack is done. The
+        // stubbed event plumbing never fires, so the answered state is
+        // what the shell renders.
+        case "autoland_start": {
+          const head = args?.headBookmark;
+          const plan = landPlanOf(snap, head);
+          if (!plan)
+            return reject(
+              "plan_failed",
+              `there is no local bookmark named \u{201c}${head}\u{201d}`,
+            );
+          const job = {
+            headBookmark: head,
+            phase: { kind: "waiting", attention: false, reasons: [] },
+            rounds: 0,
+            merged: plan.segments.flatMap((segment) =>
+              segment.status.kind === "merged"
+                ? [
+                    {
+                      number: segment.status.number,
+                      url: segment.status.url,
+                      bookmark: segment.bookmark,
+                    },
+                  ]
+                : [],
+            ),
+            segments: plan.segments,
+            lastOutcome: null,
+          };
+          if (plan.blockers.length) {
+            job.phase = {
+              kind: "waiting",
+              attention: plan.blockers.some((b) => !b.wait),
+              reasons: plan.blockers.map((b) => b.message),
+            };
+          } else if (!plan.actions.length) {
+            job.phase = {
+              kind: "waiting",
+              attention: false,
+              reasons: plan.warnings.length
+                ? plan.warnings
+                : [
+                    "Nothing to run yet — watching for the stack's conditions to change",
+                  ],
+            };
+          } else {
+            const steps = executeLandTwin(snap, plan);
+            job.rounds = 1;
+            job.lastOutcome = { steps, failed: false };
+            for (const step of steps)
+              if (step.action.kind === "mergePr")
+                job.merged.push({
+                  number: step.action.number,
+                  url:
+                    plan.segments.find(
+                      (segment) => segment.bookmark === step.action.bookmark,
+                    )?.pr?.url ?? "",
+                  bookmark: step.action.bookmark,
+                });
+            const handsOff = plan.actions.some(
+              (action) =>
+                action.kind === "enableAutoMerge" ||
+                action.kind === "enqueuePr",
+            );
+            const complete =
+              !handsOff &&
+              plan.segments.every(
+                (segment) =>
+                  segment.status.kind === "merged" ||
+                  segment.status.kind === "landing",
+              );
+            job.phase = complete
+              ? { kind: "done" }
+              : {
+                  kind: "waiting",
+                  attention: false,
+                  reasons: [
+                    handsOff
+                      ? "GitHub is driving the merge now — watching for it to finish"
+                      : "Landed a round — waiting for the rebased stack's checks before the next",
+                  ],
+                };
+          }
+          forge.autoland = job;
+          return Promise.resolve(structuredClone(job));
+        }
+        case "autoland_stop": {
+          if (forge.autoland) forge.autoland.phase = { kind: "stopped" };
+          return Promise.resolve(
+            forge.autoland ? structuredClone(forge.autoland) : null,
+          );
+        }
+        case "autoland_state":
+          return Promise.resolve(
+            forge.autoland ? structuredClone(forge.autoland) : null,
+          );
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -2475,6 +2616,21 @@
   if (params.get("lgo")) {
     steps.push(() => click("[data-land-go] .btn.primary:not(:disabled)"));
     steps.push(() => document.querySelector("[data-land-outcome]") !== null);
+  }
+  // Auto-land flows: queue the derived plan (&lplan first) and wait for
+  // the job card; &alstop clicks the running card's Stop.
+  if (params.get("alqueue")) {
+    steps.push(() =>
+      click("[data-autoland-queue] .btn:not(:disabled)"),
+    );
+    steps.push(() => document.querySelector("[data-autoland-job]") !== null);
+  }
+  if (params.get("alstop")) {
+    steps.push(() => click("[data-autoland-job] .btn:not(:disabled)"));
+    steps.push(
+      () =>
+        document.querySelector('[data-autoland-job="stopped"]') !== null,
+    );
   }
   // Review-helper flows (section=publish + forge= + prs=): open the
   // fetch-for-review panel from a PR row (&rfetch) or the by-number

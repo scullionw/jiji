@@ -2,13 +2,16 @@
   import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
   import { drag } from "$lib/components/graph/dnd.svelte";
+  import { autolandChip, autolandStory } from "$lib/components/publish/autoland";
   import { motionMs } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import {
     dismissBreadcrumb,
+    goToSection,
     showOperations,
     undoLastMutation,
   } from "$lib/state/actions";
+  import { autoland, dismissAutoLand } from "$lib/state/autoland.svelte";
 
   const snapshot = $derived(app.snapshot);
   const latestOp = $derived(snapshot?.operations[0]);
@@ -92,6 +95,33 @@
   {/if}
 
   <div class="fill"></div>
+
+  {#if autoland.job}
+    <!-- The activity chip: the auto-land job stays visible from every
+         section, and clicking it lands on the Publish job card. -->
+    {@const chip = autolandChip(autoland.job)}
+    <span class="al-wrap" in:fly={{ y: 6, duration: motionMs(150) }}>
+      <button
+        class="al-chip {chip.tone}"
+        data-autoland-chip={autoland.job.phase.kind}
+        title={autolandStory(autoland.job)}
+        onclick={() => goToSection("publish")}
+      >
+        <span class="al-dot" class:pulse={chip.pulse}></span>
+        <span class="truncate">{autoland.stopping && !chip.dismissable ? `Auto-land ${autoland.job.headBookmark}: stopping…` : chip.label}</span>
+      </button>
+      {#if chip.dismissable}
+        <button
+          class="al-x"
+          data-autoland-dismiss
+          title="Dismiss"
+          onclick={dismissAutoLand}
+        >
+          ×
+        </button>
+      {/if}
+    </span>
+  {/if}
 
   <span class="meta mono">backend: {snapshot?.backend ?? "—"}</span>
 </footer>
@@ -186,6 +216,82 @@
 
   .danger-text {
     color: var(--clr-danger);
+  }
+
+  .al-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    flex-shrink: 1;
+  }
+
+  .al-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: var(--text-xs);
+    font-weight: 500;
+    border: 1px solid var(--clr-border-2);
+    border-radius: 999px;
+    padding: 1px 9px;
+    color: var(--clr-text-2);
+    transition: border-color var(--t-fast) var(--ease-out);
+  }
+
+  .al-chip:hover {
+    border-color: color-mix(in srgb, var(--clr-accent) 45%, transparent);
+  }
+
+  .al-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+
+  .al-dot.pulse {
+    animation: pulse 2.4s var(--ease-out) infinite;
+  }
+
+  .al-chip.accent {
+    color: var(--clr-accent-strong);
+    border-color: color-mix(in srgb, var(--clr-accent) 35%, transparent);
+  }
+
+  .al-chip.ok {
+    color: var(--clr-ok);
+    border-color: color-mix(in srgb, var(--clr-ok) 35%, transparent);
+  }
+
+  .al-chip.warn {
+    color: var(--clr-warn);
+    border-color: color-mix(in srgb, var(--clr-warn) 35%, transparent);
+  }
+
+  .al-chip.danger {
+    color: var(--clr-danger);
+    border-color: color-mix(in srgb, var(--clr-danger) 35%, transparent);
+  }
+
+  .al-chip.muted {
+    color: var(--clr-text-3);
+  }
+
+  .al-x {
+    flex-shrink: 0;
+    font-size: var(--text-s);
+    line-height: 1;
+    color: var(--clr-text-3);
+    border-radius: 999px;
+    padding: 2px 5px;
+    transition: color var(--t-fast) var(--ease-out);
+  }
+
+  .al-x:hover {
+    color: var(--clr-text-1);
   }
 
   .badge {

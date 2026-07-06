@@ -15,11 +15,18 @@
   import { app } from "$lib/state/app.svelte";
   import { fetchPr, jumpToChange } from "$lib/state/actions";
   import {
+    autoland,
+    dismissAutoLand,
+    startAutoLand,
+    stopAutoLand,
+  } from "$lib/state/autoland.svelte";
+  import {
     connectForge,
     disconnectForge,
     forge,
     refreshForgePrs,
   } from "$lib/state/forge.svelte";
+  import { autolandStory, canQueueAutoLand, isTerminalPhase } from "./autoland";
   import { landActionRow, segmentChip } from "./land";
   import {
     bookmarkTaken,
@@ -279,6 +286,44 @@
     }
     landing = false;
   }
+
+  // Queue the planned stack for auto-land: the supervised job takes over
+  // from here — its card replaces the manual plan flow, and re-deriving
+  // plans is its whole point, so the confirmed plan object is not sent.
+  let queueing = $state(false);
+  let queueError = $state<string | null>(null);
+
+  async function queueAutoLand() {
+    if (!land || !landFor || queueing || landing) return;
+    if (!canQueueAutoLand(land)) return;
+    queueing = true;
+    queueError = null;
+    try {
+      await startAutoLand(landFor);
+      land = null;
+      landFor = null;
+      landOutcome = null;
+    } catch (err) {
+      queueError = errorMessage(err);
+    }
+    queueing = false;
+  }
+
+  // A job that is over frees the queue affordance; a live one owns it.
+  const jobActive = $derived(
+    autoland.job != null && !isTerminalPhase(autoland.job.phase),
+  );
+
+  // Whether the derived plan may be queued: work to run now, or only
+  // conditions waiting clears (transient blockers).
+  const queueable = $derived(
+    land != null && canQueueAutoLand(land) && !jobActive,
+  );
+
+  // The land steps' phrasing needs the remote name; the job state doesn't
+  // carry one, so the detected repo's remote (the same remote every land
+  // plan uses) fills it in.
+  const jobRemote = $derived(repo?.remote ?? "origin");
 </script>
 
 <div class="view">
@@ -765,8 +810,93 @@
             Merge the bottom pull request when it is ready — or hand it to
             GitHub's auto-merge or merge queue — then rebase what remains
             onto the new trunk and clean up the landed bookmark. Run Land
-            again after GitHub finishes a hand-off.
+            again after GitHub finishes a hand-off, or queue the stack and
+            let auto-land keep going while the app is open.
           </p>
+
+          {#if autoland.job}
+            <!-- The live job card: what the supervised auto-land is doing
+                 right now, the same per-segment story as the manual plan. -->
+            {@const job = autoland.job}
+            <div class="plan job" data-autoland-job={job.phase.kind} in:panelIn>
+              <div class="job-head">
+                <p class="plan-head">
+                  {#if job.phase.kind === "done"}
+                    Auto-landed {job.headBookmark}.
+                  {:else if job.phase.kind === "failed"}
+                    Auto-land parked on {job.headBookmark}.
+                  {:else if job.phase.kind === "stopped"}
+                    Auto-land stopped on {job.headBookmark}.
+                  {:else}
+                    Auto-landing {job.headBookmark} — one round whenever
+                    GitHub is ready.
+                  {/if}
+                </p>
+                {#if !isTerminalPhase(job.phase)}
+                  <Button
+                    disabled={autoland.stopping}
+                    onclick={() => void stopAutoLand()}
+                  >
+                    {autoland.stopping ? "Stopping…" : "Stop"}
+                  </Button>
+                {:else}
+                  <Button onclick={dismissAutoLand}>Dismiss</Button>
+                {/if}
+              </div>
+              <p class="blurb quiet" data-autoland-story>
+                {autolandStory(job)}
+              </p>
+              {#if job.segments.length > 0}
+                <div class="plan-stack">
+                  {#each job.segments as segment (segment.bookmark)}
+                    {@const chip = segmentChip(segment.status)}
+                    <div class="segment" data-autoland-segment={segment.bookmark}>
+                      <span class="seg-bookmark mono">{segment.bookmark}</span>
+                      <span
+                        class="seg-chip {chip.tone}"
+                        data-autoland-status={segment.status.kind}
+                      >
+                        {chip.label}
+                      </span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              {#if job.phase.kind === "waiting" && job.phase.attention}
+                {#each job.phase.reasons as reason (reason)}
+                  <p class="blocker" data-autoland-reason>{reason}</p>
+                {/each}
+              {/if}
+              {#if job.merged.length > 0}
+                <div class="job-merged">
+                  <span class="quiet-label">Landed</span>
+                  {#each job.merged as m (m.number)}
+                    <button class="pr-link" onclick={() => openUrl(m.url)}>
+                      #{m.number} ↗
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+              {#if job.lastOutcome}
+                <ul class="steps">
+                  {#each job.lastOutcome.steps as step, index (index)}
+                    <li class="step" data-autoland-step={step.status}>
+                      <span class="step-glyph {step.status}">
+                        {stepGlyph[step.status]}
+                      </span>
+                      <span class="step-text">
+                        {landActionRow(step.action, jobRemote).text}
+                        {#if step.detail}
+                          <span class="step-detail">{step.detail}</span>
+                        {/if}
+                      </span>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          {/if}
+
           <div class="stacks">
             {#each stacks as stack (stack.workstreamId)}
               <button
@@ -872,24 +1002,45 @@
                 </ul>
               {/if}
 
-              {#each land.blockers as blocker (blocker)}
-                <p class="blocker" data-land-blocker>{blocker}</p>
+              {#each land.blockers as blocker (blocker.message)}
+                <p
+                  class="blocker"
+                  data-land-blocker={blocker.wait ? "wait" : "user"}
+                >
+                  {blocker.message}
+                </p>
               {/each}
               {#each land.warnings as warning (warning)}
                 <p class="warning" data-land-warning>{warning}</p>
               {/each}
 
-              {#if land.actions.length > 0}
+              {#if land.actions.length > 0 || queueable}
                 <div class="plan-go" data-land-go>
-                  <Button
-                    variant="primary"
-                    disabled={landing || land.blockers.length > 0}
-                    onclick={landStack}
-                  >
-                    {landing ? "Landing…" : `Land ${land.headBookmark}`}
-                  </Button>
+                  {#if land.actions.length > 0}
+                    <Button
+                      variant="primary"
+                      disabled={landing || land.blockers.length > 0}
+                      onclick={landStack}
+                    >
+                      {landing ? "Landing…" : `Land ${land.headBookmark}`}
+                    </Button>
+                  {/if}
+                  {#if queueable}
+                    <span data-autoland-queue>
+                      <Button
+                        disabled={queueing || landing}
+                        onclick={queueAutoLand}
+                      >
+                        {queueing ? "Queueing…" : "Auto-land when ready"}
+                      </Button>
+                    </span>
+                  {/if}
                   {#if land.blockers.length > 0}
-                    <span class="go-note">fix the blockers first</span>
+                    <span class="go-note">
+                      {queueable
+                        ? "auto-land waits these out"
+                        : "fix the blockers first"}
+                    </span>
                   {/if}
                 </div>
               {/if}
@@ -897,6 +1048,9 @@
           {/if}
           {#if landError}
             <p class="error" data-land-error>{landError}</p>
+          {/if}
+          {#if queueError}
+            <p class="error" data-autoland-error>{queueError}</p>
           {/if}
         </section>
       {/if}
@@ -1140,6 +1294,35 @@
     color: var(--clr-text-3);
   }
 
+  /* The auto-land job card: the group's live status, above the stack
+     rows the manual flow starts from. */
+  .plan.job {
+    margin-bottom: var(--sp-3);
+  }
+
+  .job-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+  }
+
+  .job-head .plan-head {
+    margin-bottom: 0;
+  }
+
+  .job-merged {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+  }
+
+  .quiet-label {
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
   /* Loading shimmer: bars where content is about to land, pulsing like
      the diff surface's skeleton so waiting reads the same app-wide. */
   .shimmer i,
@@ -1343,6 +1526,12 @@
     font-size: var(--text-s);
     color: var(--clr-danger);
     margin-bottom: var(--sp-1);
+  }
+
+  /* Transient blockers are waiting conditions, not errors — warn-toned,
+     matching the auto-land posture (waiting clears them by itself). */
+  .blocker[data-land-blocker="wait"] {
+    color: var(--clr-warn);
   }
 
   .warning {

@@ -1,6 +1,8 @@
+mod autoland;
 mod commands;
 mod forge;
 
+use autoland::AutoLandHost;
 use commands::AppState;
 use forge::ForgeState;
 
@@ -20,6 +22,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(AppState::new())
         .manage(ForgeState::new())
+        .manage(AutoLandHost::new())
         .invoke_handler(tauri::generate_handler![
             commands::open_repo,
             commands::refresh_snapshot,
@@ -56,7 +59,10 @@ pub fn run() {
             forge::submit_plan,
             forge::submit_stack,
             forge::land_plan,
-            forge::land_stack
+            forge::land_stack,
+            autoland::autoland_start,
+            autoland::autoland_stop,
+            autoland::autoland_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

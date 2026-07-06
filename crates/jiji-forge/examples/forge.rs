@@ -11,6 +11,7 @@
 //!   cargo run -p jiji-forge --example forge -- logout
 //!   cargo run -p jiji-forge --example forge -- plan <repo-path> <head-bookmark>
 //!   cargo run -p jiji-forge --example forge -- land <repo-path> <head-bookmark>
+//!   cargo run -p jiji-forge --example forge -- watch <repo-path> <head-bookmark>
 //!   cargo run -p jiji-forge --example forge -- merged <owner>/<name> <branch>
 //!   cargo run -p jiji-forge --example forge -- landstate <owner>/<name> <number> <base>
 //!   cargo run -p jiji-forge --example forge -- pr <owner>/<name> <number>
@@ -26,7 +27,13 @@
 //! plan the same way (also read-only); `merged` probes the per-bookmark
 //! merged-PR recognition query, `landstate` the per-PR land-readiness
 //! query, `pr` the by-number lookup behind the review flow, and `rerun`
-//! re-runs the failed Actions runs on a commit (the one write here).
+//! re-runs the failed Actions runs on a commit.
+//!
+//! `watch` is the real thing — the desktop app's auto-land job driven
+//! headless (the future CLI entry point the spec asks the engine to
+//! support): it supervises the stack under the bookmark, merging and
+//! reconciling rounds as GitHub allows, mutating the repo and the PRs
+//! exactly like the app's queued job. Press Enter to stop it.
 
 use jiji_forge::{
     detect_github_repo, no_github_remote, plan_land, plan_submit, resolve_token, ForgeAuth,
@@ -44,6 +51,7 @@ fn main() {
         Some("logout") => logout(),
         Some("plan") => plan(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
         Some("land") => land(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
+        Some("watch") => watch(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
         Some("merged") => merged(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -65,9 +73,9 @@ fn main() {
             eprintln!(
                 "usage: forge -- status | whoami | prs <owner>/<name> | detect <url>... \
                  | login <token> | logout | plan <repo-path> <head-bookmark> \
-                 | land <repo-path> <head-bookmark> | merged <owner>/<name> <branch> \
-                 | landstate <owner>/<name> <number> <base> | pr <owner>/<name> <number> \
-                 | rerun <owner>/<name> <head-sha>"
+                 | land <repo-path> <head-bookmark> | watch <repo-path> <head-bookmark> \
+                 | merged <owner>/<name> <branch> | landstate <owner>/<name> <number> <base> \
+                 | pr <owner>/<name> <number> | rerun <owner>/<name> <head-sha>"
             );
             std::process::exit(2);
         }
@@ -247,6 +255,158 @@ fn land(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     let forge_side = LandRepoForge { client: &client, repo: &repo };
     let plan = plan_land(&snapshot, &prs, &repo, head, &forge_side)?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
+    Ok(())
+}
+
+/// The auto-land job's jj half for a CLI host: every mutation goes
+/// through `jiji-core`'s backend directly — the same snapshot-first
+/// plumbing the app's commands use, minus the event publishing a desktop
+/// shell adds on top.
+struct CliVcs {
+    backend: jiji_core::JjBackend,
+    path: std::path::PathBuf,
+}
+
+impl jiji_forge::LandVcs for CliVcs {
+    fn git_fetch(&self, remote: &str) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        let remotes = vec![remote.to_owned()];
+        self.backend
+            .git_fetch(&self.path, Some(&remotes))
+            .map(|outcome| outcome.summary)
+    }
+
+    fn snapshot(&self) -> Result<jiji_core::RepoSnapshot, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend.open(&self.path)
+    }
+
+    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        let trunk_target = self
+            .backend
+            .open(&self.path)?
+            .bookmarks
+            .iter()
+            .find(|b| b.is_trunk)
+            .map(|b| b.target.clone())
+            .ok_or_else(|| {
+                jiji_core::BackendError::MutationFailed(
+                    "the repository has no trunk bookmark to rebase onto".into(),
+                )
+            })?;
+        self.backend
+            .rebase_change(&self.path, root_change, &trunk_target)
+            .map(|outcome| outcome.summary)
+    }
+
+    fn push_bookmarks(
+        &self,
+        bookmarks: &[String],
+        remote: &str,
+    ) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend
+            .push_bookmarks(&self.path, bookmarks, Some(remote))
+            .map(|outcome| outcome.summary)
+    }
+
+    fn delete_bookmark(&self, name: &str) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend
+            .delete_bookmark(&self.path, name)
+            .map(|outcome| outcome.summary)
+    }
+
+    fn abandon_changes(&self, change_ids: &[String]) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend
+            .abandon_changes(&self.path, change_ids)
+            .map(|outcome| outcome.summary)
+    }
+}
+
+fn watch(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
+    use jiji_forge::AutoLandPhase;
+
+    let (Some(repo_path), Some(head)) = (repo_path, head) else {
+        eprintln!("usage: forge -- watch <repo-path> <head-bookmark>");
+        std::process::exit(2);
+    };
+    use jiji_core::RepoBackend as _;
+    let snapshot = jiji_core::JjBackend::default()
+        .open(std::path::Path::new(repo_path))
+        .map_err(|err| ForgeError::Land(format!("could not snapshot the repo: {err}")))?;
+    let repo = detect_github_repo(
+        snapshot
+            .git_remotes
+            .iter()
+            .map(|r| (r.name.as_str(), r.url.as_str())),
+    )
+    .ok_or_else(no_github_remote)?;
+    let resolved =
+        resolve_token(&KeychainTokenStore::new(&repo.host))?.ok_or(ForgeError::NoToken)?;
+    let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+    let forge_side = LandRepoForge {
+        client: &client,
+        repo: &repo,
+    };
+    let vcs = CliVcs {
+        backend: jiji_core::JjBackend::default(),
+        path: std::path::PathBuf::from(repo_path),
+    };
+
+    // Enter stops the watch (the same stop signal the app's Stop button
+    // drives); the job also ends by itself on done, parked, or a repo
+    // moved out from under it.
+    let stop = std::sync::Arc::new(jiji_forge::StopSignal::new());
+    println!(
+        "watching {}/{} — auto-landing \u{201c}{head}\u{201d}; press Enter to stop",
+        repo.owner, repo.name
+    );
+    {
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            stop.stop();
+        });
+    }
+
+    let mut publish = |state: &jiji_forge::AutoLandState| match &state.phase {
+        AutoLandPhase::Waiting { attention, reasons } => println!(
+            "  waiting{}: {}",
+            if *attention { " (needs you)" } else { "" },
+            reasons.join("; ")
+        ),
+        AutoLandPhase::Round => println!("  round {} running…", state.rounds + 1),
+        AutoLandPhase::Done => println!(
+            "  done: landed {} in {} round{}",
+            state
+                .merged
+                .iter()
+                .map(|m| format!("#{}", m.number))
+                .collect::<Vec<_>>()
+                .join(", "),
+            state.rounds,
+            if state.rounds == 1 { "" } else { "s" }
+        ),
+        AutoLandPhase::Failed { message } => println!("  parked: {message}"),
+        AutoLandPhase::Stopped => println!("  stopped"),
+    };
+    let final_state = jiji_forge::run_autoland(
+        &repo,
+        head,
+        &vcs,
+        &forge_side,
+        &forge_side,
+        &jiji_forge::AutoLandConfig::default(),
+        &stop,
+        &mut publish,
+    );
+    if matches!(final_state.phase, AutoLandPhase::Failed { .. }) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

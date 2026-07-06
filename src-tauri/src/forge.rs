@@ -60,14 +60,14 @@ impl ForgeState {
 }
 
 /// The GitHub repo behind the open repo's remotes, when there is one.
-fn detected_repo(state: &AppState) -> Option<ForgeRepo> {
+pub(crate) fn detected_repo(state: &AppState) -> Option<ForgeRepo> {
     let remotes = state.current_git_remotes();
     detect_github_repo(remotes.iter().map(|r| (r.name.as_str(), r.url.as_str())))
 }
 
 /// Token storage keys off the forge host, so a GitHub Enterprise remote
 /// would keep its token separate from github.com's.
-fn token_store(repo: Option<&ForgeRepo>) -> KeychainTokenStore {
+pub(crate) fn token_store(repo: Option<&ForgeRepo>) -> KeychainTokenStore {
     let host = repo.map_or("github.com", |r| r.host.as_str());
     KeychainTokenStore::new(host)
 }
@@ -234,10 +234,11 @@ pub fn submit_plan(
 }
 
 /// The submit executor's jj half: pushes run through the shared mutation
-/// path so the snapshot republishes to every surface mid-flow.
-struct HostVcs<'a> {
-    app: &'a AppHandle,
-    state: &'a AppState,
+/// path so the snapshot republishes to every surface mid-flow. Also the
+/// auto-land job's vcs — its thread builds one over the same state.
+pub(crate) struct HostVcs<'a> {
+    pub(crate) app: &'a AppHandle,
+    pub(crate) state: &'a AppState,
 }
 
 impl SubmitVcs for HostVcs<'_> {
