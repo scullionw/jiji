@@ -11,6 +11,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import SectionHeader from "$lib/components/ui/SectionHeader.svelte";
   import { panelIn } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import { fetchPr, jumpToChange } from "$lib/state/actions";
@@ -338,13 +339,11 @@
     />
   {:else}
   <div class="column">
-    <header class="head">
-      <h2>Publish &amp; review</h2>
-      <p>
-        Where your stacks meet GitHub: this connection is what stack
-        submission, PR state on the graph, and landing will act through.
-      </p>
-    </header>
+    <SectionHeader
+      icon="publish"
+      title="Publish & review"
+      description="Where your stacks meet GitHub: this connection is what stack submission, PR state on the graph, and landing will act through."
+    />
 
     <section class="group">
       <div class="group-head">
@@ -1071,23 +1070,6 @@
     padding: var(--sp-6) var(--sp-6) var(--sp-8);
   }
 
-  .head {
-    margin-bottom: var(--sp-5);
-  }
-
-  .head h2 {
-    font-size: var(--text-l);
-    font-weight: 600;
-    color: var(--clr-text-1);
-  }
-
-  .head p {
-    margin-top: var(--sp-1);
-    font-size: var(--text-s);
-    color: var(--clr-text-3);
-    max-width: 52em;
-  }
-
   .group {
     margin-bottom: var(--sp-5);
   }
@@ -1111,7 +1093,11 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: var(--clr-text-3);
+    color: var(--clr-text-2);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: 999px;
+    padding: 2px 10px;
   }
 
   .card {
@@ -1121,7 +1107,8 @@
     padding: var(--sp-3) var(--sp-4);
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-m);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-1);
     min-height: 46px;
   }
 
@@ -1235,6 +1222,7 @@
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-m);
+    box-shadow: var(--shadow-1);
     cursor: pointer;
     transition: border-color var(--t-fast) var(--ease-out);
   }
@@ -1273,7 +1261,8 @@
     padding: var(--sp-3) var(--sp-4);
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-m);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-1);
     transition: opacity var(--t-med) var(--ease-out);
   }
 
@@ -1616,10 +1605,12 @@
 
   .row-action {
     font-size: var(--text-xs);
-    color: var(--clr-text-2);
+    font-weight: 500;
+    color: var(--clr-accent-strong);
+    background: var(--clr-accent-dim);
     white-space: nowrap;
     padding: 1px var(--sp-2);
-    border: 1px solid var(--clr-border-2);
+    border: 1px solid transparent;
     border-radius: 999px;
     cursor: pointer;
     transition:
@@ -1628,8 +1619,7 @@
   }
 
   .row-action:hover:not(:disabled) {
-    color: var(--clr-text-1);
-    border-color: var(--clr-border-1);
+    border-color: color-mix(in srgb, var(--clr-accent) 45%, transparent);
   }
 
   .row-action:disabled {

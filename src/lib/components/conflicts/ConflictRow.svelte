@@ -206,19 +206,24 @@
     gap: var(--sp-2);
     width: 100%;
     text-align: left;
-    padding: var(--sp-3) var(--sp-3);
+    padding: var(--sp-3) var(--sp-4);
     border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-m);
+    border-radius: var(--radius-l);
     background: var(--clr-bg-2);
-    margin-bottom: var(--sp-2);
+    box-shadow: var(--shadow-1);
+    margin-bottom: var(--sp-3);
     transition:
       background var(--t-fast) var(--ease-out),
       border-color var(--t-fast) var(--ease-out);
   }
 
+  .row:hover {
+    border-color: var(--clr-border-1);
+  }
+
   .head {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: var(--sp-2);
     min-width: 0;
   }
@@ -241,15 +246,21 @@
 
   .glyph {
     flex-shrink: 0;
-    width: 18px;
-    text-align: center;
-    font-size: var(--text-m);
+    align-self: center;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: var(--radius-s);
+    font-size: var(--text-s);
     font-weight: 600;
     color: var(--clr-danger);
+    background: color-mix(in srgb, var(--clr-danger) 12%, transparent);
   }
 
   .glyph.warn {
     color: var(--clr-warn);
+    background: color-mix(in srgb, var(--clr-warn) 12%, transparent);
   }
 
   .summary {
@@ -276,7 +287,7 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding-left: calc(18px + var(--sp-2));
+    padding-left: calc(22px + var(--sp-2));
     font-size: var(--text-s);
   }
 
@@ -315,12 +326,13 @@
     flex-shrink: 0;
     margin-left: auto;
     font-size: var(--text-xs);
+    font-weight: 500;
     font-family: var(--font-ui);
     padding: 2px 10px;
     border-radius: 999px;
-    border: 1px solid var(--clr-border-2);
-    background: var(--clr-bg-3);
-    color: var(--clr-text-2);
+    border: 1px solid transparent;
+    background: var(--clr-accent-dim);
+    color: var(--clr-accent-strong);
     transition:
       background var(--t-fast) var(--ease-out),
       border-color var(--t-fast) var(--ease-out),
@@ -328,9 +340,7 @@
   }
 
   .resolve:hover:not(:disabled) {
-    background: var(--clr-accent-dim);
-    border-color: color-mix(in srgb, var(--clr-accent) 40%, transparent);
-    color: var(--clr-accent-strong);
+    border-color: color-mix(in srgb, var(--clr-accent) 45%, transparent);
   }
 
   .resolve:disabled {
@@ -346,7 +356,7 @@
 
   .resolve-error {
     margin: 0;
-    padding-left: calc(18px + var(--sp-2));
+    padding-left: calc(22px + var(--sp-2));
     font-size: var(--text-xs);
     color: var(--clr-danger);
   }
@@ -355,7 +365,7 @@
     display: flex;
     align-items: center;
     gap: var(--sp-3);
-    padding-left: calc(18px + var(--sp-2));
+    padding-left: calc(22px + var(--sp-2));
     min-height: 24px;
   }
 
@@ -371,7 +381,7 @@
 
   .note.aside {
     margin: 0;
-    padding-left: calc(18px + var(--sp-2));
+    padding-left: calc(22px + var(--sp-2));
   }
 
   .note code {
@@ -385,7 +395,7 @@
     align-items: center;
     flex-wrap: wrap;
     gap: var(--sp-2);
-    padding-left: calc(18px + var(--sp-2));
+    padding-left: calc(22px + var(--sp-2));
   }
 
   .targets-label {

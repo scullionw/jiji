@@ -76,6 +76,11 @@
 
   /* ── Structure (theme-independent) ── */
 
+  /* Derived surfaces — resolved at use time, so every theme gets its own
+     mix without redeclaring. The well recesses segmented controls and
+     input tracks below the surface they sit on. */
+  --clr-bg-well: color-mix(in srgb, var(--clr-bg-0) 65%, var(--clr-bg-1));
+
   /* Typography */
   --font-ui:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Ubuntu",
@@ -87,6 +92,9 @@
   --text-s: 11px;
   --text-m: 13px;
   --text-l: 15px;
+  /* Section-page titles: big enough to anchor a view, calmer than a
+     marketing headline. */
+  --text-title: 17px;
   --text-xl: 22px;
   /* Diff/code surfaces: tuned separately from UI text so long review
      sessions stay readable at density. */

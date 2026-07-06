@@ -140,6 +140,9 @@
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
     overflow: hidden;
+    /* The workspace card floats just above the frame; the shadow is what
+       makes the inset read as a surface instead of a wireframe. */
+    box-shadow: var(--shadow-1);
   }
 
   .section {

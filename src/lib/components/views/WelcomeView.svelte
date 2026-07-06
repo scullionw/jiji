@@ -57,17 +57,23 @@
   }
 
   .mark {
-    width: 56px;
-    height: 56px;
+    width: 64px;
+    height: 64px;
     display: grid;
     place-items: center;
     border-radius: var(--radius-xl);
-    background: var(--clr-accent-dim);
+    background: linear-gradient(
+      145deg,
+      color-mix(in srgb, var(--clr-accent) 30%, var(--clr-bg-2)),
+      color-mix(in srgb, var(--clr-accent) 10%, var(--clr-bg-1))
+    );
+    border: 1px solid color-mix(in srgb, var(--clr-accent) 30%, transparent);
+    box-shadow: var(--shadow-2);
     color: var(--clr-accent-strong);
     font-size: var(--text-xl);
     font-weight: 700;
     letter-spacing: -1px;
-    margin-bottom: var(--sp-1);
+    margin-bottom: var(--sp-2);
   }
 
   h1 {
@@ -96,11 +102,12 @@
   }
 
   .recents {
-    width: 440px;
+    width: 460px;
     max-width: 100%;
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
+    box-shadow: var(--shadow-1);
     padding: var(--sp-2);
   }
 
@@ -137,7 +144,8 @@
 
   .path {
     flex: 1;
-    font-size: var(--text-s);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
   }
 
   .when {

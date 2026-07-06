@@ -31,7 +31,7 @@
         aria-label={item.label}
         onclick={() => (app.section = item.id)}
       >
-        <Icon name={item.icon} size={17} />
+        <Icon name={item.icon} size={18} />
         {#if item.id === "conflicts" && hasRepo && conflictCount > 0}
           <span class="badge mono">
             {conflictCount > 9 ? "9+" : conflictCount}
@@ -61,12 +61,18 @@
   }
 
   .brand {
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     display: grid;
     place-items: center;
     border-radius: var(--radius-m);
-    background: var(--clr-accent-dim);
+    background: linear-gradient(
+      145deg,
+      color-mix(in srgb, var(--clr-accent) 26%, var(--clr-bg-2)),
+      color-mix(in srgb, var(--clr-accent) 10%, var(--clr-bg-1))
+    );
+    border: 1px solid color-mix(in srgb, var(--clr-accent) 28%, transparent);
+    box-shadow: var(--shadow-1);
     color: var(--clr-accent-strong);
     font-size: var(--text-m);
     font-weight: 700;
@@ -112,12 +118,26 @@
 
   .nav-item:hover:not(:disabled) {
     background: var(--clr-bg-hover);
-    color: var(--clr-text-2);
+    color: var(--clr-text-1);
   }
 
   .nav-item.active {
     background: var(--clr-accent-dim);
     color: var(--clr-accent-strong);
+  }
+
+  /* The "you are here" tick at the window edge, so the active section
+     reads even in the periphery. */
+  .nav-item.active::before {
+    content: "";
+    position: absolute;
+    left: -10px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3px;
+    height: 18px;
+    border-radius: 0 3px 3px 0;
+    background: var(--clr-accent);
   }
 
   .nav-item:disabled {

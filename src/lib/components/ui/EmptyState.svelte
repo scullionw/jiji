@@ -36,20 +36,26 @@
   }
 
   .glyph {
-    width: 54px;
-    height: 54px;
+    width: 56px;
+    height: 56px;
     display: grid;
     place-items: center;
-    border-radius: 50%;
-    background: var(--clr-bg-2);
-    border: 1px solid var(--clr-border-2);
-    color: var(--clr-text-3);
+    border-radius: var(--radius-xl);
+    background: linear-gradient(
+      160deg,
+      color-mix(in srgb, var(--clr-accent) 16%, var(--clr-bg-2)),
+      var(--clr-bg-2) 70%
+    );
+    border: 1px solid color-mix(in srgb, var(--clr-accent) 18%, var(--clr-border-2));
+    box-shadow: var(--shadow-1);
+    color: var(--clr-accent-strong);
     margin-bottom: var(--sp-1);
   }
 
   h3 {
     font-size: var(--text-l);
-    font-weight: 550;
+    font-weight: 650;
+    letter-spacing: -0.01em;
     color: var(--clr-text-1);
   }
 

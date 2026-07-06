@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "$lib/components/ui/Icon.svelte";
+  import SectionHeader from "$lib/components/ui/SectionHeader.svelte";
   import { app } from "$lib/state/app.svelte";
   import OperationRow from "./OperationRow.svelte";
   import { groupOperations, opsSince } from "./ops";
@@ -38,15 +39,11 @@
 
 <div class="view">
   <div class="column">
-    <header class="head">
-      <h2>Operations</h2>
-      <p>
-        Everything that has happened to this repository, newest first. Every
-        entry is a complete repo state: restore the repo to any point, or
-        revert a single operation — time travel is just another operation,
-        so it can always be undone again.
-      </p>
-    </header>
+    <SectionHeader
+      icon="operations"
+      title="Operations"
+      description="Everything that has happened to this repository, newest first. Every entry is a complete repo state: restore the repo to any point, or revert a single operation — time travel is just another operation, so it can always be undone again."
+    />
 
     {#each groups as group (group.label)}
       <section class="day">
@@ -109,23 +106,6 @@
     padding: var(--sp-6) var(--sp-6) var(--sp-8);
   }
 
-  .head {
-    margin-bottom: var(--sp-5);
-  }
-
-  .head h2 {
-    font-size: var(--text-l);
-    font-weight: 600;
-    color: var(--clr-text-1);
-  }
-
-  .head p {
-    margin-top: var(--sp-1);
-    font-size: var(--text-s);
-    color: var(--clr-text-3);
-    max-width: 52em;
-  }
-
   .day-head {
     position: sticky;
     top: 0;
@@ -149,7 +129,11 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: var(--clr-text-3);
+    color: var(--clr-text-2);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: 999px;
+    padding: 2px 10px;
   }
 
   /* Collapsed snapshot runs read like jj's elided-revisions rows. */

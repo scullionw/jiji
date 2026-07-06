@@ -295,6 +295,7 @@
   .detail-pane {
     height: 100%;
     overflow-y: auto;
+    container: detail-pane / inline-size;
   }
 
   .graph-pane {
@@ -310,50 +311,48 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--sp-3);
-    height: 36px;
-    padding: 0 var(--sp-3);
+    height: 40px;
+    padding: 0 var(--sp-3) 0 var(--sp-4);
     border-bottom: 1px solid var(--clr-border-2);
   }
 
   .pane-label {
-    font-size: var(--text-xs);
+    font-size: var(--text-s);
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: var(--clr-text-3);
+    color: var(--clr-text-2);
   }
 
+  /* Segmented control: a recessed well the active mode floats in. */
   .view-toggle {
     flex-shrink: 0;
     display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    background: var(--clr-bg-well);
     border: 1px solid var(--clr-border-2);
     border-radius: 999px;
-    overflow: hidden;
   }
 
   .view-toggle button {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 2px 9px;
+    padding: 2px 10px;
     font-size: var(--text-xs);
     font-weight: 500;
+    border-radius: 999px;
     color: var(--clr-text-3);
     transition: all var(--t-fast) var(--ease-out);
   }
 
-  .view-toggle button + button {
-    border-left: 1px solid var(--clr-border-2);
-  }
-
   .view-toggle button:hover {
-    background: var(--clr-bg-hover);
     color: var(--clr-text-1);
   }
 
   .view-toggle button.active {
     background: var(--clr-bg-3);
     color: var(--clr-text-1);
+    box-shadow: var(--shadow-1);
   }
 
   .scroller {

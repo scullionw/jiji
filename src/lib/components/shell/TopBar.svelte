@@ -31,9 +31,9 @@
 <header class="topbar" data-tauri-drag-region>
   {#if snapshot}
     <div class="repo">
-      <Icon name="folder" size={14} />
+      <span class="repo-tile"><Icon name="folder" size={13} /></span>
       <span class="name">{snapshot.repoName}</span>
-      <span class="path truncate" title={snapshot.repoPath}>
+      <span class="path mono truncate" title={snapshot.repoPath}>
         {snapshot.repoPath}
       </span>
     </div>
@@ -81,6 +81,9 @@
       <Icon name="refresh" size={15} />
     </button>
   {/if}
+  {#if snapshot}
+    <span class="divider" aria-hidden="true"></span>
+  {/if}
   <LicenseBadge />
   <button
     class="icon-btn"
@@ -113,26 +116,42 @@
 
   .repo {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: var(--sp-2);
     color: var(--clr-text-3);
     min-width: 0;
   }
 
-  .repo :global(svg) {
-    align-self: center;
+  .repo-tile {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: var(--radius-s);
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-2);
+    flex-shrink: 0;
   }
 
   .name {
-    font-weight: 600;
+    font-weight: 650;
     font-size: var(--text-m);
+    letter-spacing: -0.01em;
     color: var(--clr-text-1);
   }
 
   .path {
-    font-size: var(--text-s);
+    font-size: var(--text-xs);
     color: var(--clr-text-3);
     max-width: 320px;
+  }
+
+  .divider {
+    width: 1px;
+    height: 16px;
+    background: var(--clr-border-2);
+    flex-shrink: 0;
   }
 
   .fill {
@@ -230,14 +249,17 @@
     display: grid;
     place-items: center;
     border-radius: var(--radius-m);
+    border: 1px solid transparent;
     color: var(--clr-text-2);
     transition:
       background var(--t-fast) var(--ease-out),
+      border-color var(--t-fast) var(--ease-out),
       color var(--t-fast) var(--ease-out);
   }
 
   .icon-btn:hover {
     background: var(--clr-bg-hover);
+    border-color: var(--clr-border-2);
     color: var(--clr-text-1);
   }
 </style>

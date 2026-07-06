@@ -97,11 +97,47 @@
 </script>
 
 <div class="inspector">
-  <header>Details</header>
+  <!-- The repo's identity card: name, path, and the standing facts that
+       used to be a label/value table. One glance, no dead rows. -->
+  <header class="repo-head">
+    <span class="repo-mark"><Icon name="folder" size={15} /></span>
+    <div class="repo-id">
+      <h3 class="truncate">{snapshot.repoName}</h3>
+      <span
+        class="repo-path mono selectable truncate"
+        title={snapshot.repoPath}
+      >
+        {snapshot.repoPath}
+      </span>
+    </div>
+    <div class="facts">
+      {#if trunk}
+        <span class="fact" title="Trunk target">
+          <Icon name="branch" size={11} />
+          <span class="mono">
+            {trunk.name}{trunk.remote ? `@${trunk.remote}` : ""}
+          </span>
+        </span>
+      {/if}
+      {#if workspace}
+        <span class="fact" title="Current workspace">
+          <Icon name="workspaces" size={11} />
+          {workspace.name}
+        </span>
+      {/if}
+      <span class="fact" title="Backend">
+        <span class="mono">{snapshot.backend}</span>
+      </span>
+    </div>
+  </header>
 
-  {#if snapshot.workstreams.length > 0}
-      <section>
-        <h4>Workstreams</h4>
+  <div class="cards">
+    {#if snapshot.workstreams.length > 0}
+      <section class="card">
+        <h4>
+          Workstreams
+          <span class="count mono">{snapshot.workstreams.length}</span>
+        </h4>
         <div class="ws-list">
           {#each snapshot.workstreams as ws (ws.id)}
             <button
@@ -130,36 +166,11 @@
       </section>
     {/if}
 
-    <section>
-      <h4>Repository</h4>
-      <div class="row">
-        <span class="label">Path</span>
-        <span class="value mono selectable truncate" title={snapshot.repoPath}>
-          {snapshot.repoPath}
-        </span>
-      </div>
-      <div class="row">
-        <span class="label">Backend</span>
-        <span class="value mono">{snapshot.backend}</span>
-      </div>
-      {#if workspace}
-        <div class="row">
-          <span class="label">Workspace</span>
-          <span class="value">{workspace.name}</span>
-        </div>
-      {/if}
-      {#if trunk}
-        <div class="row">
-          <span class="label">Trunk</span>
-          <span class="value mono">
-            {trunk.name}{trunk.remote ? `@${trunk.remote}` : ""}
-          </span>
-        </div>
-      {/if}
-    </section>
-
-    <section>
-      <h4>Bookmarks</h4>
+    <section class="card">
+      <h4>
+        Bookmarks
+        <span class="count mono">{snapshot.bookmarks.length}</span>
+      </h4>
       {#each snapshot.bookmarks as bookmark (bookmark.name)}
         {@const sync = SYNC_LABEL[bookmark.sync] ?? {
           text: bookmark.sync,
@@ -240,41 +251,135 @@
         <p class="bm-error" title={bmError}>{bmError}</p>
       {/if}
     </section>
+  </div>
 
-    <p class="select-hint">Select a change in the graph to review its diff</p>
+  <p class="select-hint">
+    <span class="kbd">↑</span><span class="kbd">↓</span>
+    Select a change in the graph to review its diff
+  </p>
 </div>
 
 <style>
   /* The repo overview lives in the wide pane only while nothing is
      selected; cap the column so it reads well at full width. */
   .inspector {
-    padding: var(--sp-4) var(--sp-5) var(--sp-6);
-    max-width: 680px;
+    padding: var(--sp-5) var(--sp-6) var(--sp-6);
+    max-width: 880px;
+    margin-inline: auto;
     min-height: 100%;
+    display: flex;
+    flex-direction: column;
   }
 
-  header {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: var(--clr-text-3);
-    padding-bottom: var(--sp-3);
-    margin-bottom: var(--sp-3);
-    border-bottom: 1px solid var(--clr-border-2);
-  }
-
-  section {
+  .repo-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
     margin-bottom: var(--sp-5);
+    min-width: 0;
+  }
+
+  .repo-mark {
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: var(--radius-m);
+    background: var(--clr-accent-dim);
+    border: 1px solid color-mix(in srgb, var(--clr-accent) 22%, transparent);
+    color: var(--clr-accent-strong);
+  }
+
+  .repo-id {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .repo-id h3 {
+    font-size: var(--text-l);
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--clr-text-1);
+  }
+
+  .repo-path {
+    display: block;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .facts {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--sp-1);
+    flex-shrink: 0;
+  }
+
+  .fact {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 var(--sp-2);
+    font-size: var(--text-xs);
+    border-radius: 999px;
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-2);
+  }
+
+  .fact :global(svg) {
+    color: var(--clr-text-3);
+  }
+
+  /* Cards side by side when the pane is wide, stacked when the diff
+     split squeezes it. */
+  .cards {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--sp-4);
+    align-items: start;
+  }
+
+  @container detail-pane (min-width: 780px) {
+    .cards {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .card {
+    background: var(--clr-bg-2);
+    border: 1px solid var(--clr-border-2);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-1);
+    padding: var(--sp-3) var(--sp-4) var(--sp-4);
+    min-width: 0;
   }
 
   h4 {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
     font-size: var(--text-xs);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.07em;
     color: var(--clr-text-3);
+    padding-bottom: var(--sp-2);
     margin-bottom: var(--sp-2);
+    border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .count {
+    font-size: var(--text-xs);
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--clr-bg-3);
+    border: 1px solid var(--clr-border-2);
+    color: var(--clr-text-2);
   }
 
   .ws-list {
@@ -289,9 +394,9 @@
     width: 100%;
     min-width: 0;
     text-align: left;
-    padding: 3px var(--sp-2);
+    padding: 5px var(--sp-2);
     margin: 0 calc(-1 * var(--sp-2));
-    border-radius: var(--radius-s);
+    border-radius: var(--radius-m);
     transition: background var(--t-fast) var(--ease-out);
   }
 
@@ -353,16 +458,14 @@
     display: flex;
     align-items: center;
     gap: var(--sp-2);
-    padding: 3px 0;
+    padding: 4px 0;
     font-size: var(--text-m);
     min-width: 0;
   }
 
-  .label {
-    width: 76px;
-    flex-shrink: 0;
-    color: var(--clr-text-3);
-    font-size: var(--text-s);
+  .row.bm-row + .row.bm-row {
+    border-top: 1px solid
+      color-mix(in srgb, var(--clr-border-2) 55%, transparent);
   }
 
   .value {
@@ -526,9 +629,21 @@
   }
 
   .select-hint {
-    margin-top: var(--sp-6);
+    margin-top: auto;
+    padding-top: var(--sp-6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
     font-size: var(--text-s);
     color: var(--clr-text-3);
-    font-style: italic;
+  }
+
+  .select-hint .kbd {
+    padding: 0 4px;
+  }
+
+  .select-hint .kbd + .kbd {
+    margin-left: -4px;
   }
 </style>
