@@ -42,6 +42,7 @@
     type CompareMode,
   } from "$lib/components/inspector/inspect";
   import { drag } from "$lib/components/graph/dnd.svelte";
+  import { panelIn } from "$lib/motion";
   import {
     clearRewritePreview,
     setRewritePreview,
@@ -931,7 +932,7 @@
   </div>
 
   {#if editing}
-    <div class="describe-editor">
+    <div class="describe-editor" in:panelIn>
       <textarea
         bind:this={editorEl}
         bind:value={draft}
@@ -1255,6 +1256,7 @@
     {#if compareOpen}
       <div
         class="confirm-panel compare-panel"
+        in:panelIn
         role="dialog"
         aria-label="Compare this change against another point"
         tabindex="-1"
@@ -1368,6 +1370,7 @@
     {#if confirm === "squash" && parentNode}
       <div
         class="confirm-panel"
+        in:panelIn
         role="alertdialog"
         aria-label="Confirm squash"
         tabindex="-1"
@@ -1428,6 +1431,7 @@
     {:else if confirm === "abandon"}
       <div
         class="confirm-panel danger"
+        in:panelIn
         role="alertdialog"
         aria-label="Confirm abandon"
         tabindex="-1"
@@ -1494,6 +1498,7 @@
     {#if rebaseOpen}
       <div
         class="confirm-panel rebase-panel"
+        in:panelIn
         role="dialog"
         aria-label="Rebase this change"
         tabindex="-1"
@@ -1641,6 +1646,7 @@
     {#if splitOpen}
       <div
         class="confirm-panel split-panel"
+        in:panelIn
         role="dialog"
         aria-label="Split this change"
         tabindex="-1"
@@ -1954,6 +1960,7 @@
     {#if bookmarkOpen}
       <div
         class="confirm-panel bookmark-panel"
+        in:panelIn
         role="dialog"
         aria-label="Bookmark this change"
         tabindex="-1"
@@ -2026,6 +2033,7 @@
     {:else if managedMark}
       <div
         class="confirm-panel bookmark-panel"
+        in:panelIn
         role="dialog"
         aria-label="Manage bookmark {managedMark.name}"
         tabindex="-1"

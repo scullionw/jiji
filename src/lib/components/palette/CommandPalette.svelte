@@ -2,6 +2,7 @@
   import { tick } from "svelte";
   import { fade, fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { motionMs } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import { license } from "$lib/license/state.svelte";
   import { selectTheme, setMode, themes } from "$lib/state/theme.svelte";
@@ -139,7 +140,7 @@
 <div
   class="overlay"
   role="presentation"
-  in:fade={{ duration: 110 }}
+  in:fade={{ duration: motionMs(110) }}
   onpointerdown={(event) => {
     if (event.target === event.currentTarget) closePalette();
   }}
@@ -149,7 +150,7 @@
     role="dialog"
     aria-label="Command palette"
     tabindex="-1"
-    in:fly={{ y: -8, duration: 140 }}
+    in:fly={{ y: -8, duration: motionMs(140) }}
     onkeydown={onKeydown}
   >
     <div class="input-row">

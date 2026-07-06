@@ -19,6 +19,7 @@
     togglePalette,
   } from "$lib/state/actions";
   import { syncForgeConnection } from "$lib/state/forge.svelte";
+  import { viewIn } from "$lib/motion";
   import {
     startUpstreamChecks,
     syncUpstreamRepo,
@@ -90,19 +91,25 @@
   <div class="main">
     <TopBar />
     <div class="content">
-      {#if !app.snapshot}
-        <WelcomeView />
-      {:else if app.section === "workbench"}
-        <WorkbenchView />
-      {:else if app.section === "conflicts"}
-        <ConflictsView />
-      {:else if app.section === "publish"}
-        <PublishView />
-      {:else if app.section === "operations"}
-        <OperationsView />
-      {:else}
-        <PlaceholderView section={app.section} />
-      {/if}
+      <!-- Keyed on the section so switching settles the new surface in with
+           one quiet gesture instead of an instant swap. -->
+      {#key app.snapshot ? app.section : "welcome"}
+        <div class="section" in:viewIn>
+          {#if !app.snapshot}
+            <WelcomeView />
+          {:else if app.section === "workbench"}
+            <WorkbenchView />
+          {:else if app.section === "conflicts"}
+            <ConflictsView />
+          {:else if app.section === "publish"}
+            <PublishView />
+          {:else if app.section === "operations"}
+            <OperationsView />
+          {:else}
+            <PlaceholderView section={app.section} />
+          {/if}
+        </div>
+      {/key}
     </div>
     <StatusBar />
   </div>
@@ -133,5 +140,9 @@
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-l);
     overflow: hidden;
+  }
+
+  .section {
+    height: 100%;
   }
 </style>

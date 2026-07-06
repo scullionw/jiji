@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { fly } from "svelte/transition";
   import { tinykeys } from "tinykeys";
   import SplitPane from "$lib/components/shell/SplitPane.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -22,6 +21,7 @@
   import Inspector from "$lib/components/views/Inspector.svelte";
   import { app } from "$lib/state/app.svelte";
   import { consumeIntent } from "$lib/state/actions";
+  import { viewIn } from "$lib/motion";
 
   // Parent only renders this view when a snapshot exists.
   const snapshot = $derived(app.snapshot!);
@@ -220,7 +220,7 @@
       </div>
       <div class="scroller" bind:this={container}>
         {#key view}
-          <div class="view-body {view}" in:fly={{ y: 8, duration: 180 }}>
+          <div class="view-body {view}" in:viewIn>
             {#if view === "graph"}
               {#if model.rows.length > 0}
                 <GraphView

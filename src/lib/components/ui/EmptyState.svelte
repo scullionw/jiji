@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { fade } from "svelte/transition";
   import Icon from "./Icon.svelte";
   import type { IconName } from "./icons";
+  import { motionMs } from "$lib/motion";
 
   let {
     icon,
@@ -10,7 +12,9 @@
   }: { icon: IconName; title: string; body: string; hint?: string } = $props();
 </script>
 
-<div class="empty">
+<!-- Empty states often replace a skeleton or a list that just drained;
+     the soft arrival keeps that swap from reading as a flash. -->
+<div class="empty" in:fade={{ duration: motionMs(140) }}>
   <div class="glyph"><Icon name={icon} size={22} /></div>
   <h3>{title}</h3>
   <p>{body}</p>

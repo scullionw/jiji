@@ -38,6 +38,15 @@
 //                        (default: none — the Publish section's connect
 //                        state); the stubbed repo detection reads the
 //                        captured snapshot's gitRemotes
+//   &noremote=1          strip the captured snapshot's git remotes, so the
+//                        Publish section's no-GitHub-remote empty state
+//                        (and the remote-less shell) render on any capture
+//   &prswait=1           the stubbed forge_prs never answers, capturing
+//                        the PR-list loading skeleton
+//   &planwait=1          the stubbed submit_plan/land_plan never answer,
+//                        capturing the plan-card loading skeleton (pair
+//                        with &splan= or &lplan=; the wait step is skipped
+//                        since no plan card will arrive)
 //   &fuser=<login>       the login the stubbed token verifies as
 //                        (default jiji-dev)
 //   &fwait=1             the stubbed forge_verify never resolves,
@@ -232,6 +241,9 @@
   if (layout) localStorage.setItem("jiji.diff.layout", layout);
   const view = params.get("view");
   if (view) localStorage.setItem("jiji.workbench.view", view);
+  // &noremote=1: a repo with no git remotes, so remote-less states (the
+  // Publish empty state, the hidden upstream chip) render on any capture.
+  if (params.get("noremote") && data.snapshot) data.snapshot.gitRemotes = [];
 
   // Mutation stubs operate on the captured snapshot in place, mirroring the
   // Rust mock backend so action → refresh → breadcrumb flows render fully.
@@ -2000,6 +2012,7 @@
         // app only asks once the connection is verified, so scenarios pair
         // this with &forge=; the error answers mirror the backend's.
         case "forge_prs": {
+          if (params.get("prswait")) return new Promise(() => {});
           if (!forgeRepoOf(snap))
             return reject(
               "no_github_remote",
@@ -2038,6 +2051,7 @@
         // executing marks pushed bookmarks synced in the live snapshot and
         // remembers created PRs so the refreshed count/badges follow.
         case "submit_plan": {
+          if (params.get("planwait")) return new Promise(() => {});
           const plan = submitPlanOf(snap, args?.headBookmark);
           if (!plan)
             return reject(
@@ -2144,6 +2158,7 @@
         // and cleanup removes the landed bookmark and changes — so the
         // refreshed graph, count, and badges follow the executed flow.
         case "land_plan": {
+          if (params.get("planwait")) return new Promise(() => {});
           const plan = landPlanOf(snap, args?.headBookmark);
           if (!plan)
             return reject(
@@ -2421,11 +2436,13 @@
   const submitStack = params.get("splan");
   if (submitStack) {
     steps.push(() => click(`[data-submit-stack="${submitStack}"]`));
-    steps.push(
-      () =>
-        document.querySelector("[data-submit-plan]") !== null ||
-        document.querySelector('[data-submit-state="up-to-date"]') !== null ||
-        document.querySelector("[data-submit-error]") !== null,
+    // With &planwait the answer never comes; settle on the skeleton.
+    steps.push(() =>
+      params.get("planwait")
+        ? document.querySelector('[data-submit-state="planning"]') !== null
+        : document.querySelector("[data-submit-plan]") !== null ||
+          document.querySelector('[data-submit-state="up-to-date"]') !== null ||
+          document.querySelector("[data-submit-error]") !== null,
     );
   }
   if (params.get("sprev")) {
@@ -2447,10 +2464,12 @@
   const landStackParam = params.get("lplan");
   if (landStackParam) {
     steps.push(() => click(`[data-land-stack="${landStackParam}"]`));
-    steps.push(
-      () =>
-        document.querySelector("[data-land-plan]") !== null ||
-        document.querySelector("[data-land-error]") !== null,
+    // With &planwait the answer never comes; settle on the skeleton.
+    steps.push(() =>
+      params.get("planwait")
+        ? document.querySelector('[data-land-state="planning"]') !== null
+        : document.querySelector("[data-land-plan]") !== null ||
+          document.querySelector("[data-land-error]") !== null,
     );
   }
   if (params.get("lgo")) {

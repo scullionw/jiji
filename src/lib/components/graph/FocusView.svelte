@@ -2,9 +2,14 @@
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
   import { Tween } from "svelte/motion";
-  import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
-  import { growIn, motionMs, shrinkOut, GRAPH_MOTION_MS } from "$lib/motion";
+  import {
+    growIn,
+    motionMs,
+    shrinkOut,
+    viewIn,
+    GRAPH_MOTION_MS,
+  } from "$lib/motion";
   import GraphRow from "./GraphRow.svelte";
   import ElisionRow from "./ElisionRow.svelte";
   import SiblingLane from "./SiblingLane.svelte";
@@ -58,7 +63,7 @@
 </script>
 
 {#key workstream.id}
-  <section class="lane" in:fly={{ y: 8, duration: 180 }}>
+  <section class="lane" in:viewIn>
     <header class="lane-head">
       <h2 class="truncate">{workstream.title}</h2>
       {#if workstream.bookmark}

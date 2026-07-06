@@ -43,3 +43,29 @@ export function shrinkOut(node: Element): TransitionConfig {
     css: (t) => `height: ${t * height}px; opacity: ${t}; overflow: hidden;`,
   };
 }
+
+/** An inline plan panel or card opening: height unfolds immediately (no
+ * delay — the click that opened it is the cue) so the content below is
+ * pushed rather than jumped. Intro-only by design, the palette's posture:
+ * opening explains where the surface came from, closing on confirm or
+ * cancel is instant, which is what makes executing feel snappy. */
+export function panelIn(node: Element): TransitionConfig {
+  const height = (node as HTMLElement).offsetHeight;
+  return {
+    duration: motionMs(170),
+    easing: cubicOut,
+    css: (t) =>
+      `height: ${t * height}px; opacity: ${Math.min(1, t * 1.6)}; overflow: hidden;`,
+  };
+}
+
+/** A whole view or section arriving (section switch, workbench view
+ * toggle): a small settle-up so the swap reads as one gesture. Intro-only
+ * — the outgoing view is gone the moment the choice is made. */
+export function viewIn(node: Element): TransitionConfig {
+  return {
+    duration: motionMs(180),
+    easing: cubicOut,
+    css: (t) => `opacity: ${t}; transform: translateY(${(1 - t) * 8}px);`,
+  };
+}

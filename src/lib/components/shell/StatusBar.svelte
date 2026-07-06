@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
   import { drag } from "$lib/components/graph/dnd.svelte";
+  import { motionMs } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import {
     dismissBreadcrumb,
@@ -54,26 +56,30 @@
     <span class="dot danger"></span>
     <span class="msg danger-text truncate">{app.error}</span>
   {:else if breadcrumb}
-    <span class="dot accent"></span>
-    <button
-      class="msg breadcrumb truncate"
-      title="Show in Operations"
-      onclick={() => {
-        dismissBreadcrumb();
-        showOperations();
-      }}
-    >
-      {breadcrumb.outcome.summary}
-      {#if breadcrumb.outcome.operationId}
-        <span class="op-id mono">op {breadcrumb.outcome.operationId.slice(0, 8)}</span>
-      {/if}
-    </button>
-    {#if breadcrumb.outcome.operationId}
-      <button class="bc-undo" onclick={undo} disabled={undoing} title="Revert this operation">
-        <Icon name="undo" size={11} />
-        {undoing ? "Undoing…" : "Undo"}
+    <!-- The takeover rises in so a just-run mutation registers in the
+         periphery even when the eyes are on the graph. -->
+    <span class="bc-wrap" in:fly={{ y: 6, duration: motionMs(150) }}>
+      <span class="dot accent"></span>
+      <button
+        class="msg breadcrumb truncate"
+        title="Show in Operations"
+        onclick={() => {
+          dismissBreadcrumb();
+          showOperations();
+        }}
+      >
+        {breadcrumb.outcome.summary}
+        {#if breadcrumb.outcome.operationId}
+          <span class="op-id mono">op {breadcrumb.outcome.operationId.slice(0, 8)}</span>
+        {/if}
       </button>
-    {/if}
+      {#if breadcrumb.outcome.operationId}
+        <button class="bc-undo" onclick={undo} disabled={undoing} title="Revert this operation">
+          <Icon name="undo" size={11} />
+          {undoing ? "Undoing…" : "Undo"}
+        </button>
+      {/if}
+    </span>
   {:else if snapshot && latestOp}
     <span class="dot pulse"></span>
     <span class="msg truncate">{latestOp.description}</span>
@@ -88,7 +94,6 @@
   <div class="fill"></div>
 
   <span class="meta mono">backend: {snapshot?.backend ?? "—"}</span>
-  <span class="meta mono">milestone 3</span>
 </footer>
 
 <style>
@@ -125,6 +130,13 @@
 
   .msg {
     color: var(--clr-text-2);
+  }
+
+  .bc-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
   }
 
   .breadcrumb {

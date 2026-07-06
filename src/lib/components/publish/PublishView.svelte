@@ -9,7 +9,9 @@
   import * as api from "$lib/api";
   import { errorMessage } from "$lib/api";
   import Button from "$lib/components/ui/Button.svelte";
+  import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Icon from "$lib/components/ui/Icon.svelte";
+  import { panelIn } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import { fetchPr, jumpToChange } from "$lib/state/actions";
   import {
@@ -280,6 +282,16 @@
 </script>
 
 <div class="view">
+  {#if !repo && phase !== "loading" && !error}
+    <!-- Nothing to publish through: the whole section is one clear next
+         step instead of a page of groups that cannot act. -->
+    <EmptyState
+      icon="publish"
+      title="No GitHub remote"
+      body="This repository has nowhere to publish to yet. Add a GitHub remote and the connection, PR badges, and stack publishing light up here."
+      hint="jj git remote add origin <url>"
+    />
+  {:else}
   <div class="column">
     <header class="head">
       <h2>Publish &amp; review</h2>
@@ -301,6 +313,11 @@
               ? ""
               : ` on ${repo.host}`}
           </span>
+        </div>
+      {:else if phase === "loading"}
+        <!-- Don't claim "no remote" before the detection answers. -->
+        <div class="card shimmer" aria-hidden="true">
+          <i style:width="34%"></i>
         </div>
       {:else}
         <p class="blurb">
@@ -389,9 +406,15 @@
           <span class="group-label">Pull requests</span>
         </div>
         {#if forge.prsLoading && !forge.prs}
-          <p class="blurb quiet" data-forge-prs="loading">
-            Fetching open pull requests…
-          </p>
+          <!-- Skeleton rows the shape of the list that is coming, so the
+               group does not reflow when GitHub answers. -->
+          <div class="prs" data-forge-prs="loading" aria-label="Fetching open pull requests">
+            {#each [46, 62, 38] as width (width)}
+              <div class="pr-row shimmer" aria-hidden="true">
+                <i style:width="{width}%"></i>
+              </div>
+            {/each}
+          </div>
         {:else if forge.prsError}
           <p class="error" data-forge-prs="error">{forge.prsError}</p>
         {:else if forge.prs}
@@ -469,12 +492,12 @@
           {/if}
 
           {#if rerunNote}
-            <p class="note" data-review-rerun-note>{rerunNote}</p>
+            <p class="note" data-review-rerun-note in:panelIn>{rerunNote}</p>
           {/if}
 
           {#if reviewFor}
             {@const panelPr = reviewFor}
-            <div class="plan" data-review-panel={panelPr.number}>
+            <div class="plan" data-review-panel={panelPr.number} in:panelIn>
               <p class="plan-head">
                 Fetch <strong>#{panelPr.number}</strong> “{panelPr.title}”
                 for local review
@@ -534,7 +557,7 @@
           {/if}
 
           {#if reviewDone}
-            <p class="note" data-review-done>
+            <p class="note" data-review-done in:panelIn>
               Fetched into <span class="mono">{reviewDone.bookmark}</span>.
               {#if reviewDone.target}
                 {@const target = reviewDone.target}
@@ -606,9 +629,16 @@
           </div>
 
           {#if planLoading}
-            <p class="blurb quiet" data-submit-state="planning">
-              Working out what publishing {planFor} needs…
-            </p>
+            <div class="plan" data-submit-state="planning" in:panelIn>
+              <p class="plan-head quiet">
+                Working out what publishing {planFor} needs…
+              </p>
+              <div class="plan-shimmer" aria-hidden="true">
+                <i style:width="52%"></i>
+                <i style:width="68%"></i>
+                <i style:width="41%"></i>
+              </div>
+            </div>
           {:else if plan && outcome}
             <div class="plan" data-submit-outcome={outcome.failed ? "failed" : "done"}>
               <p class="plan-head">
@@ -639,7 +669,7 @@
               </ul>
             </div>
           {:else if plan}
-            <div class="plan" data-submit-plan={plan.headBookmark}>
+            <div class="plan" class:busy={publishing} data-submit-plan={plan.headBookmark}>
               <div class="plan-stack">
                 {#each plan.segments as segment (segment.bookmark)}
                   <div class="segment" data-submit-segment={segment.bookmark}>
@@ -757,9 +787,16 @@
           </div>
 
           {#if landLoading}
-            <p class="blurb quiet" data-land-state="planning">
-              Working out what landing {landFor} needs…
-            </p>
+            <div class="plan" data-land-state="planning" in:panelIn>
+              <p class="plan-head quiet">
+                Working out what landing {landFor} needs…
+              </p>
+              <div class="plan-shimmer" aria-hidden="true">
+                <i style:width="52%"></i>
+                <i style:width="68%"></i>
+                <i style:width="41%"></i>
+              </div>
+            </div>
           {:else if land && landOutcome}
             <div
               class="plan"
@@ -787,7 +824,7 @@
               </ul>
             </div>
           {:else if land}
-            <div class="plan" data-land-plan={land.headBookmark}>
+            <div class="plan" class:busy={landing} data-land-plan={land.headBookmark}>
               <div class="plan-stack">
                 {#each land.segments as segment (segment.bookmark)}
                   {@const chip = segmentChip(segment.status)}
@@ -865,6 +902,7 @@
       {/if}
     {/if}
   </div>
+  {/if}
 </div>
 
 <style>
@@ -1082,12 +1120,64 @@
     background: var(--clr-bg-2);
     border: 1px solid var(--clr-border-2);
     border-radius: var(--radius-m);
+    transition: opacity var(--t-med) var(--ease-out);
+  }
+
+  /* Executing: the card visibly steps back while the run is on the wire,
+     so "Publishing…" reads on the surface, not only in the button. */
+  .plan.busy {
+    opacity: 0.65;
+    pointer-events: none;
   }
 
   .plan-head {
     font-size: var(--text-s);
     color: var(--clr-text-1);
     margin-bottom: var(--sp-2);
+  }
+
+  .plan-head.quiet {
+    color: var(--clr-text-3);
+  }
+
+  /* Loading shimmer: bars where content is about to land, pulsing like
+     the diff surface's skeleton so waiting reads the same app-wide. */
+  .shimmer i,
+  .plan-shimmer i {
+    display: block;
+    height: 10px;
+    border-radius: 4px;
+    background: var(--clr-bg-3);
+    animation: shimmer-pulse 1.1s ease-in-out infinite alternate;
+  }
+
+  .plan-shimmer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-1) 0;
+  }
+
+  .plan-shimmer i:nth-child(2) {
+    animation-delay: 120ms;
+  }
+
+  .plan-shimmer i:nth-child(3) {
+    animation-delay: 240ms;
+  }
+
+  .pr-row.shimmer {
+    align-items: center;
+    min-height: 26px;
+  }
+
+  @keyframes shimmer-pulse {
+    from {
+      opacity: 0.45;
+    }
+    to {
+      opacity: 1;
+    }
   }
 
   .plan-stack {
