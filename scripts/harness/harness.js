@@ -125,6 +125,20 @@
 //   &alstop=1            click the running job card's Stop and wait for
 //                        the stopped state (only meaningful on a waiting
 //                        job — a finished card's button is Dismiss)
+//   &alrec=<bookmark>    fabricate a persisted job record that survived a
+//                        restart for that stack — the stubbed
+//                        autoland_state answers it at bootstrap with
+//                        live:false, the UI's interrupted state (pair
+//                        with &forge= + &prs=; &section=publish shows the
+//                        card with Resume/Dismiss, the status-bar chip
+//                        reads interrupted from any section)
+//   &alresume=1          click the interrupted card's Resume and wait for
+//                        the job to go live (the stubbed start seeds
+//                        rounds and landed PRs from the record, like the
+//                        host's autoland_start)
+//   &aldismiss=1         click the status-bar chip's dismiss and wait for
+//                        it to clear (terminal and interrupted records;
+//                        the stub drops its record like autoland_dismiss)
 //   &rfetch=<number>     click that PR row's "Fetch for review" and wait
 //                        for the panel (needs &forge= + &prs=)
 //   &rlookup=<number>    type into the by-number lookup and submit; waits
@@ -2346,21 +2360,39 @@
               "plan_failed",
               `there is no local bookmark named \u{201c}${head}\u{201d}`,
             );
+          // A surviving interrupted record for the same stack seeds the
+          // job, like the host: rounds and landed PRs carry over, so
+          // Resume continues the story instead of restarting it.
+          const prior =
+            forge.autoland &&
+            !forge.autoland.live &&
+            forge.autoland.record.state.headBookmark === head &&
+            !["done", "failed", "stopped"].includes(
+              forge.autoland.record.state.phase.kind,
+            )
+              ? forge.autoland.record.state
+              : null;
           const job = {
             headBookmark: head,
             phase: { kind: "waiting", attention: false, reasons: [] },
-            rounds: 0,
-            merged: plan.segments.flatMap((segment) =>
-              segment.status.kind === "merged"
-                ? [
-                    {
-                      number: segment.status.number,
-                      url: segment.status.url,
-                      bookmark: segment.bookmark,
-                    },
-                  ]
-                : [],
-            ),
+            rounds: prior ? prior.rounds : 0,
+            merged: [
+              ...(prior ? prior.merged : []),
+              ...plan.segments.flatMap((segment) =>
+                segment.status.kind === "merged" &&
+                !(prior ? prior.merged : []).some(
+                  (m) => m.number === segment.status.number,
+                )
+                  ? [
+                      {
+                        number: segment.status.number,
+                        url: segment.status.url,
+                        bookmark: segment.bookmark,
+                      },
+                    ]
+                  : [],
+              ),
+            ],
             segments: plan.segments,
             lastOutcome: null,
           };
@@ -2382,7 +2414,7 @@
             };
           } else {
             const steps = executeLandTwin(snap, plan);
-            job.rounds = 1;
+            job.rounds = (prior ? prior.rounds : 0) + 1;
             job.lastOutcome = { steps, failed: false };
             for (const step of steps)
               if (step.action.kind === "mergePr")
@@ -2418,19 +2450,72 @@
                   ],
                 };
           }
-          forge.autoland = job;
-          return Promise.resolve(structuredClone(job));
+          forge.autoland = {
+            record: {
+              version: 1,
+              repoPath: snap.repoPath,
+              state: job,
+              savedAtMs: Date.now(),
+            },
+            live: !["done", "failed", "stopped"].includes(job.phase.kind),
+          };
+          return Promise.resolve(structuredClone(forge.autoland));
         }
         case "autoland_stop": {
-          if (forge.autoland) forge.autoland.phase = { kind: "stopped" };
+          if (forge.autoland) {
+            forge.autoland.record.state.phase = { kind: "stopped" };
+            forge.autoland.live = false;
+          }
           return Promise.resolve(
             forge.autoland ? structuredClone(forge.autoland) : null,
           );
         }
         case "autoland_state":
+          // &alrec fabricates a record that survived a restart: the same
+          // first-poll twin the queue flow uses derives the segments, and
+          // live:false is what makes the UI read it as interrupted.
+          if (!forge.autoland && params.get("alrec")) {
+            const head = params.get("alrec");
+            const plan = landPlanOf(snap, head);
+            if (plan) {
+              forge.autoland = {
+                record: {
+                  version: 1,
+                  repoPath: snap.repoPath,
+                  state: {
+                    headBookmark: head,
+                    phase: {
+                      kind: "waiting",
+                      attention: false,
+                      reasons: ["watching for the stack's conditions to change"],
+                    },
+                    rounds: 1,
+                    merged: plan.segments.flatMap((segment) =>
+                      segment.status.kind === "merged"
+                        ? [
+                            {
+                              number: segment.status.number,
+                              url: segment.status.url,
+                              bookmark: segment.bookmark,
+                            },
+                          ]
+                        : [],
+                    ),
+                    segments: plan.segments,
+                    lastOutcome: null,
+                  },
+                  savedAtMs: Date.now() - 5 * 60 * 1000,
+                },
+                live: false,
+              };
+            }
+          }
           return Promise.resolve(
             forge.autoland ? structuredClone(forge.autoland) : null,
           );
+        case "autoland_dismiss":
+          forge.autoland = null;
+          return Promise.resolve(null);
         case "plugin:event|listen":
           return Promise.resolve(0);
         case "plugin:store|load":
@@ -2631,6 +2716,24 @@
       () =>
         document.querySelector('[data-autoland-job="stopped"]') !== null,
     );
+  }
+  // Persisted-record flows: &alrec presets an interrupted record (the
+  // stubbed autoland_state answers it at bootstrap); &alresume clicks the
+  // card's Resume and waits for the record to go live, &aldismiss clicks
+  // the status-bar chip's dismiss and waits for it to clear.
+  if (params.get("alresume")) {
+    steps.push(() => click("[data-autoland-resume] .btn:not(:disabled)"));
+    steps.push(() => {
+      const card = document.querySelector("[data-autoland-job]");
+      return (
+        card !== null &&
+        card.getAttribute("data-autoland-job") !== "interrupted"
+      );
+    });
+  }
+  if (params.get("aldismiss")) {
+    steps.push(() => click("[data-autoland-dismiss]"));
+    steps.push(() => document.querySelector("[data-autoland-chip]") === null);
   }
   // Review-helper flows (section=publish + forge= + prs=): open the
   // fetch-for-review panel from a PR row (&rfetch) or the by-number

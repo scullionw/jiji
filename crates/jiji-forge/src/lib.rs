@@ -38,8 +38,9 @@ pub use auth::{
     TokenSource, TokenStore,
 };
 pub use autoland::{
-    run_autoland, AutoLandConfig, AutoLandMerged, AutoLandPhase, AutoLandPrs, AutoLandState,
-    StopSignal,
+    clear_autoland_record, load_autoland_record, run_autoland, save_autoland_record, unix_now_ms,
+    AutoLandConfig, AutoLandMerged, AutoLandPhase, AutoLandPrs, AutoLandRecord, AutoLandState,
+    AutoLandStatus, StopSignal, AUTOLAND_RECORD_VERSION,
 };
 pub use ci::{rerun_failed_ci, CiRerunReport};
 pub use error::ForgeError;

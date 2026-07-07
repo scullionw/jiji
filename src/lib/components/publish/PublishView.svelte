@@ -13,6 +13,7 @@
   import Icon from "$lib/components/ui/Icon.svelte";
   import SectionHeader from "$lib/components/ui/SectionHeader.svelte";
   import { panelIn } from "$lib/motion";
+  import { fromNow } from "$lib/time";
   import { app } from "$lib/state/app.svelte";
   import { fetchPr, jumpToChange } from "$lib/state/actions";
   import {
@@ -27,7 +28,14 @@
     forge,
     refreshForgePrs,
   } from "$lib/state/forge.svelte";
-  import { autolandStory, canQueueAutoLand, isTerminalPhase } from "./autoland";
+  import {
+    autolandStory,
+    autolandVisible,
+    canQueueAutoLand,
+    isInterrupted,
+    isTerminalPhase,
+    resumeBlocker,
+  } from "./autoland";
   import { landActionRow, segmentChip } from "./land";
   import {
     bookmarkTaken,
@@ -310,9 +318,23 @@
     queueing = false;
   }
 
-  // A job that is over frees the queue affordance; a live one owns it.
+  // The job card renders only in the repo the record belongs to — a
+  // record restored from an earlier session must not narrate some other
+  // project's stack here.
+  const jobStatus = $derived(
+    autoland.job != null &&
+      autolandVisible(autoland.job, app.snapshot?.repoPath)
+      ? autoland.job
+      : null,
+  );
+
+  // A running job owns the queue affordance; a terminal or interrupted
+  // record frees it (resuming an interrupted job goes through the same
+  // start call, so either button works).
   const jobActive = $derived(
-    autoland.job != null && !isTerminalPhase(autoland.job.phase),
+    autoland.job != null &&
+      autoland.job.live &&
+      !isTerminalPhase(autoland.job.record.state.phase),
   );
 
   // Whether the derived plan may be queued: work to run now, or only
@@ -325,6 +347,23 @@
   // carry one, so the detected repo's remote (the same remote every land
   // plan uses) fills it in.
   const jobRemote = $derived(repo?.remote ?? "origin");
+
+  // Resuming an interrupted job is the same call queueing makes — the
+  // backend seeds the engine from the surviving record.
+  let resuming = $state(false);
+  let resumeError = $state<string | null>(null);
+
+  async function resumeAutoLand(headBookmark: string) {
+    if (resuming) return;
+    resuming = true;
+    resumeError = null;
+    try {
+      await startAutoLand(headBookmark);
+    } catch (err) {
+      resumeError = errorMessage(err);
+    }
+    resuming = false;
+  }
 </script>
 
 <div class="view">
@@ -813,14 +852,26 @@
             let auto-land keep going while the app is open.
           </p>
 
-          {#if autoland.job}
-            <!-- The live job card: what the supervised auto-land is doing
-                 right now, the same per-segment story as the manual plan. -->
-            {@const job = autoland.job}
-            <div class="plan job" data-autoland-job={job.phase.kind} in:panelIn>
+          {#if jobStatus}
+            <!-- The job card: what the supervised auto-land is doing right
+                 now — or, for a record that survived a restart, what it
+                 was doing and how to pick it back up. Same per-segment
+                 story as the manual plan. -->
+            {@const job = jobStatus.record.state}
+            {@const interrupted = isInterrupted(jobStatus)}
+            {@const blocker = interrupted
+              ? resumeBlocker(jobStatus, app.snapshot?.bookmarks ?? [])
+              : null}
+            <div
+              class="plan job"
+              data-autoland-job={interrupted ? "interrupted" : job.phase.kind}
+              in:panelIn
+            >
               <div class="job-head">
                 <p class="plan-head">
-                  {#if job.phase.kind === "done"}
+                  {#if interrupted}
+                    Auto-land interrupted on {job.headBookmark}.
+                  {:else if job.phase.kind === "done"}
                     Auto-landed {job.headBookmark}.
                   {:else if job.phase.kind === "failed"}
                     Auto-land parked on {job.headBookmark}.
@@ -831,7 +882,22 @@
                     GitHub is ready.
                   {/if}
                 </p>
-                {#if !isTerminalPhase(job.phase)}
+                {#if interrupted}
+                  <span class="job-actions">
+                    {#if !blocker}
+                      <span data-autoland-resume>
+                        <Button
+                          variant="primary"
+                          disabled={resuming}
+                          onclick={() => void resumeAutoLand(job.headBookmark)}
+                        >
+                          {resuming ? "Resuming…" : "Resume watching"}
+                        </Button>
+                      </span>
+                    {/if}
+                    <Button onclick={() => void dismissAutoLand()}>Dismiss</Button>
+                  </span>
+                {:else if !isTerminalPhase(job.phase)}
                   <Button
                     disabled={autoland.stopping}
                     onclick={() => void stopAutoLand()}
@@ -839,12 +905,23 @@
                     {autoland.stopping ? "Stopping…" : "Stop"}
                   </Button>
                 {:else}
-                  <Button onclick={dismissAutoLand}>Dismiss</Button>
+                  <Button onclick={() => void dismissAutoLand()}>Dismiss</Button>
                 {/if}
               </div>
               <p class="blurb quiet" data-autoland-story>
-                {autolandStory(job)}
+                {autolandStory(jobStatus)}
+                {#if interrupted}
+                  <span class="job-saved">
+                    Last update {fromNow(Number(jobStatus.record.savedAtMs))}.
+                  </span>
+                {/if}
               </p>
+              {#if blocker}
+                <p class="blocker" data-autoland-resume-blocker>{blocker}</p>
+              {/if}
+              {#if resumeError}
+                <p class="error" data-autoland-resume-error>{resumeError}</p>
+              {/if}
               {#if job.segments.length > 0}
                 <div class="plan-stack">
                   {#each job.segments as segment (segment.bookmark)}
@@ -861,7 +938,10 @@
                   {/each}
                 </div>
               {/if}
-              {#if job.phase.kind === "waiting" && job.phase.attention}
+              {#if !interrupted && job.phase.kind === "waiting" && job.phase.attention}
+                <!-- Interrupted records keep their old reasons out of view:
+                     they describe facts from before the restart, and the
+                     resumed job re-derives fresh ones on its first poll. -->
                 {#each job.phase.reasons as reason (reason)}
                   <p class="blocker" data-autoland-reason>{reason}</p>
                 {/each}
@@ -1295,6 +1375,17 @@
 
   .job-head .plan-head {
     margin-bottom: 0;
+  }
+
+  .job-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-shrink: 0;
+  }
+
+  .job-saved {
+    color: var(--clr-text-3);
   }
 
   .job-merged {

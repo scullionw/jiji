@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AutoLandState } from "$lib/bindings/AutoLandState";
+import type { AutoLandStatus } from "$lib/bindings/AutoLandStatus";
 import type { ChangeDiff } from "$lib/bindings/ChangeDiff";
 import type { CiRerunReport } from "$lib/bindings/CiRerunReport";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
@@ -273,22 +273,31 @@ export function landStack(
 
 // Queue the stack under a bookmark for auto-land: a supervised background
 // job that keeps re-deriving the landing plan and running rounds as remote
-// conditions allow. Refused while another job is running.
-export function autolandStart(headBookmark: string): Promise<AutoLandState> {
-  return invoke<AutoLandState>("autoland_start", { headBookmark });
+// conditions allow. Refused while another job is running. When the
+// persisted record matches this repo and bookmark (a restart survivor),
+// the job resumes from it — Resume and re-queue are the same call.
+export function autolandStart(headBookmark: string): Promise<AutoLandStatus> {
+  return invoke<AutoLandStatus>("autoland_start", { headBookmark });
 }
 
-// Ask the running job to stop. Answers the state as of the request; the
+// Ask the running job to stop. Answers the status as of the request; the
 // definitive stopped phase arrives on the state event once the job winds
 // down (immediately from a wait, after the round from a round).
-export function autolandStop(): Promise<AutoLandState | null> {
-  return invoke<AutoLandState | null>("autoland_stop");
+export function autolandStop(): Promise<AutoLandStatus | null> {
+  return invoke<AutoLandStatus | null>("autoland_stop");
 }
 
-// The latest job state, terminal states included — how a reloading
-// frontend reattaches.
-export function autolandState(): Promise<AutoLandState | null> {
-  return invoke<AutoLandState | null>("autoland_state");
+// The latest job status, terminal states and restart survivors included —
+// how a reloading frontend reattaches. A record with live: false and a
+// non-terminal phase is an interrupted job offering resume.
+export function autolandState(): Promise<AutoLandStatus | null> {
+  return invoke<AutoLandStatus | null>("autoland_state");
+}
+
+// Clear a finished or interrupted job record, memory and disk both.
+// Refused while the job is running.
+export function autolandDismiss(): Promise<void> {
+  return invoke<void>("autoland_dismiss");
 }
 
 export function onSnapshotUpdated(
@@ -300,9 +309,9 @@ export function onSnapshotUpdated(
 }
 
 export function onAutoLandState(
-  callback: (state: AutoLandState) => void,
+  callback: (status: AutoLandStatus) => void,
 ): Promise<UnlistenFn> {
-  return listen<AutoLandState>(AUTOLAND_STATE_EVENT, (event) => {
+  return listen<AutoLandStatus>(AUTOLAND_STATE_EVENT, (event) => {
     callback(event.payload);
   });
 }

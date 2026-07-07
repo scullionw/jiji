@@ -11,7 +11,7 @@
 //!   cargo run -p jiji-forge --example forge -- logout
 //!   cargo run -p jiji-forge --example forge -- plan <repo-path> <head-bookmark>
 //!   cargo run -p jiji-forge --example forge -- land <repo-path> <head-bookmark>
-//!   cargo run -p jiji-forge --example forge -- watch <repo-path> <head-bookmark>
+//!   cargo run -p jiji-forge --example forge -- watch <repo-path> <head-bookmark> [--state-file <path>]
 //!   cargo run -p jiji-forge --example forge -- merged <owner>/<name> <branch>
 //!   cargo run -p jiji-forge --example forge -- landstate <owner>/<name> <number> <base>
 //!   cargo run -p jiji-forge --example forge -- pr <owner>/<name> <number>
@@ -33,7 +33,10 @@
 //! headless (the future CLI entry point the spec asks the engine to
 //! support): it supervises the stack under the bookmark, merging and
 //! reconciling rounds as GitHub allows, mutating the repo and the PRs
-//! exactly like the app's queued job. Press Enter to stop it.
+//! exactly like the app's queued job. Press Enter to stop it. With
+//! `--state-file` it persists the same job record the app writes — a
+//! stopped or killed watch resumes its story (rounds, landed PRs) on the
+//! next run, the persistence slice's CLI proof.
 
 use jiji_forge::{
     detect_github_repo, no_github_remote, plan_land, plan_submit, resolve_token, ForgeAuth,
@@ -51,7 +54,14 @@ fn main() {
         Some("logout") => logout(),
         Some("plan") => plan(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
         Some("land") => land(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
-        Some("watch") => watch(args.get(1).map(String::as_str), args.get(2).map(String::as_str)),
+        Some("watch") => watch(
+            args.get(1).map(String::as_str),
+            args.get(2).map(String::as_str),
+            match (args.get(3).map(String::as_str), args.get(4)) {
+                (Some("--state-file"), Some(path)) => Some(path.as_str()),
+                _ => None,
+            },
+        ),
         Some("merged") => merged(
             args.get(1).map(String::as_str),
             args.get(2).map(String::as_str),
@@ -73,7 +83,8 @@ fn main() {
             eprintln!(
                 "usage: forge -- status | whoami | prs <owner>/<name> | detect <url>... \
                  | login <token> | logout | plan <repo-path> <head-bookmark> \
-                 | land <repo-path> <head-bookmark> | watch <repo-path> <head-bookmark> \
+                 | land <repo-path> <head-bookmark> \
+                 | watch <repo-path> <head-bookmark> [--state-file <path>] \
                  | merged <owner>/<name> <branch> | landstate <owner>/<name> <number> <base> \
                  | pr <owner>/<name> <number> | rerun <owner>/<name> <head-sha>"
             );
@@ -326,11 +337,15 @@ impl jiji_forge::LandVcs for CliVcs {
     }
 }
 
-fn watch(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
+fn watch(
+    repo_path: Option<&str>,
+    head: Option<&str>,
+    state_file: Option<&str>,
+) -> Result<(), ForgeError> {
     use jiji_forge::AutoLandPhase;
 
     let (Some(repo_path), Some(head)) = (repo_path, head) else {
-        eprintln!("usage: forge -- watch <repo-path> <head-bookmark>");
+        eprintln!("usage: forge -- watch <repo-path> <head-bookmark> [--state-file <path>]");
         std::process::exit(2);
     };
     use jiji_core::RepoBackend as _;
@@ -373,30 +388,69 @@ fn watch(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> 
         });
     }
 
-    let mut publish = |state: &jiji_forge::AutoLandState| match &state.phase {
-        AutoLandPhase::Waiting { attention, reasons } => println!(
-            "  waiting{}: {}",
-            if *attention { " (needs you)" } else { "" },
-            reasons.join("; ")
-        ),
-        AutoLandPhase::Round => println!("  round {} running…", state.rounds + 1),
-        AutoLandPhase::Done => println!(
-            "  done: landed {} in {} round{}",
-            state
-                .merged
-                .iter()
-                .map(|m| format!("#{}", m.number))
-                .collect::<Vec<_>>()
-                .join(", "),
-            state.rounds,
-            if state.rounds == 1 { "" } else { "s" }
-        ),
-        AutoLandPhase::Failed { message } => println!("  parked: {message}"),
-        AutoLandPhase::Stopped => println!("  stopped"),
+    // With a state file, the watch persists the same job record the app
+    // writes: a prior non-terminal record for this repo and bookmark
+    // resumes its story, and every published state saves over it.
+    let record_path = state_file.map(std::path::PathBuf::from);
+    let initial = match record_path
+        .as_deref()
+        .and_then(jiji_forge::load_autoland_record)
+        .filter(|record| {
+            record.repo_path == snapshot.repo_path
+                && record.state.head_bookmark == head
+                && !record.state.phase.is_terminal()
+        }) {
+        Some(record) => {
+            println!(
+                "  resuming from the saved record — {} round{} and {} PR{} landed before",
+                record.state.rounds,
+                if record.state.rounds == 1 { "" } else { "s" },
+                record.state.merged.len(),
+                if record.state.merged.len() == 1 { "" } else { "s" },
+            );
+            jiji_forge::AutoLandState::resumed(record.state)
+        }
+        None => jiji_forge::AutoLandState::queued(head),
+    };
+
+    let record_repo_path = snapshot.repo_path.clone();
+    let mut publish = |state: &jiji_forge::AutoLandState| {
+        if let Some(path) = &record_path {
+            let record = jiji_forge::AutoLandRecord {
+                version: jiji_forge::AUTOLAND_RECORD_VERSION,
+                repo_path: record_repo_path.clone(),
+                state: state.clone(),
+                saved_at_ms: jiji_forge::unix_now_ms(),
+            };
+            if let Err(err) = jiji_forge::save_autoland_record(path, &record) {
+                eprintln!("  (could not save the job record: {err})");
+            }
+        }
+        match &state.phase {
+            AutoLandPhase::Waiting { attention, reasons } => println!(
+                "  waiting{}: {}",
+                if *attention { " (needs you)" } else { "" },
+                reasons.join("; ")
+            ),
+            AutoLandPhase::Round => println!("  round {} running…", state.rounds + 1),
+            AutoLandPhase::Done => println!(
+                "  done: landed {} in {} round{}",
+                state
+                    .merged
+                    .iter()
+                    .map(|m| format!("#{}", m.number))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                state.rounds,
+                if state.rounds == 1 { "" } else { "s" }
+            ),
+            AutoLandPhase::Failed { message } => println!("  parked: {message}"),
+            AutoLandPhase::Stopped => println!("  stopped"),
+        }
     };
     let final_state = jiji_forge::run_autoland(
         &repo,
-        head,
+        initial,
         &vcs,
         &forge_side,
         &forge_side,

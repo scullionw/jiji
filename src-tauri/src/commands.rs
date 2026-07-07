@@ -222,7 +222,7 @@ impl AppState {
         })
     }
 
-    fn open_repo_path(&self) -> Result<String, CommandError> {
+    pub(crate) fn open_repo_path(&self) -> Result<String, CommandError> {
         self.current
             .lock()
             .expect("snapshot state lock poisoned")

@@ -19,10 +19,23 @@
 //! derive — each round is exactly the plan → execute the manual Land
 //! button runs, including its just-in-time re-checks.
 //!
-//! Deliberately deferred (later M5 slices): persisted job state across
-//! restarts, more than one job at a time, and queue-position/ETA
-//! supervision beyond polling until GitHub's automation finishes.
+//! Job state also persists (the M5 persistence slice): [`AutoLandRecord`]
+//! is the one-job record a host saves on every publish and loads at the
+//! next launch, so a waiting or parked job survives a restart as cleanly
+//! resumable status. The format and file IO live here — plain JSON
+//! written atomically via a sibling temp file and rename — so a future
+//! CLI persists the exact same record; the host owns only where the file
+//! lives and when to save. Deliberately no database crate: the concrete
+//! requirement is one small human-debuggable record written at most once
+//! per poll, which a JSON file meets outright (revisit if multi-job
+//! bookkeeping or job history outgrows it).
+//!
+//! Deliberately deferred (later M5 slices): more than one job at a time,
+//! and queue-position/ETA supervision beyond polling until GitHub's
+//! automation finishes.
 
+use std::io;
+use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -177,6 +190,114 @@ pub struct AutoLandState {
     pub last_outcome: Option<LandOutcome>,
 }
 
+impl AutoLandState {
+    /// A fresh job queued on a bookmark, about to take its first look.
+    pub fn queued(head_bookmark: &str) -> Self {
+        Self {
+            head_bookmark: head_bookmark.to_owned(),
+            phase: AutoLandPhase::Waiting {
+                attention: false,
+                reasons: vec!["Sizing up the stack".to_owned()],
+            },
+            rounds: 0,
+            merged: Vec::new(),
+            segments: Vec::new(),
+            last_outcome: None,
+        }
+    }
+
+    /// A restart survivor picking back up: progress (rounds, merged PRs,
+    /// the last round's steps) carries over so the story continues, while
+    /// the phase resets to sizing-up — every fact the old phase rested on
+    /// went stale while the job was away, and the first fresh poll
+    /// re-derives all of it.
+    pub fn resumed(prior: AutoLandState) -> Self {
+        Self {
+            phase: AutoLandPhase::Waiting {
+                attention: false,
+                reasons: vec!["Sizing up the stack".to_owned()],
+            },
+            ..prior
+        }
+    }
+}
+
+/// The persisted-record format version: a file written by a different
+/// version loads as nothing rather than being guessed at.
+pub const AUTOLAND_RECORD_VERSION: u32 = 1;
+
+/// The one-job record a host persists: the state plus which repo it
+/// belongs to and when it was saved. Saved on every publish and loaded at
+/// the next launch, so a waiting or parked job survives a restart as
+/// resumable status; status only renders when the same repo is open
+/// again, which is why the repo path rides along.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AutoLandRecord {
+    pub version: u32,
+    /// The repo the job was queued in (`RepoSnapshot::repo_path`).
+    pub repo_path: String,
+    pub state: AutoLandState,
+    /// Unix milliseconds of the save — the "as of" behind a restored
+    /// status.
+    pub saved_at_ms: u64,
+}
+
+/// A record as a host answers it to a (re)connecting surface: `live`
+/// distinguishes a record a thread is driving right now from one that
+/// survived from an earlier session (or whose thread died) — the UI's
+/// "interrupted — resume?" state is a non-terminal record that is not
+/// live.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AutoLandStatus {
+    pub record: AutoLandRecord,
+    pub live: bool,
+}
+
+/// Unix milliseconds now — the record's `saved_at_ms` clock. Lives here so
+/// every host stamps records the same way (the engine itself stays
+/// clock-free; only the persistence edge tells time).
+pub fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Save the record atomically: write a sibling temp file, then rename it
+/// over the target, so a crash mid-write leaves the previous record
+/// intact instead of half a JSON document.
+pub fn save_autoland_record(path: &Path, record: &AutoLandRecord) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Load a saved record. Anything wrong — no file, unreadable JSON, a
+/// different format version — answers `None`: a state file must never
+/// stop the app from starting, and stale-format records are dropped
+/// rather than guessed at.
+pub fn load_autoland_record(path: &Path) -> Option<AutoLandRecord> {
+    let bytes = std::fs::read(path).ok()?;
+    let record: AutoLandRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.version == AUTOLAND_RECORD_VERSION).then_some(record)
+}
+
+/// Remove the saved record — dismissing it. A missing file is fine.
+pub fn clear_autoland_record(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 /// What one poll decided.
 enum Step {
     /// Publish this phase and sleep before the next poll.
@@ -188,11 +309,14 @@ enum Step {
 /// Run the supervised auto-land loop until the stack is fully landed, the
 /// job is stopped, or it parks itself. Blocking — the host owns the
 /// thread. Every phase change is pushed through `publish` (the final state
-/// included), and the final state is also returned.
+/// included), and the final state is also returned. `initial` is
+/// [`AutoLandState::queued`] for a fresh job or [`AutoLandState::resumed`]
+/// for one picking back up after a restart — prior progress rides in, and
+/// the first poll re-derives everything else from fresh facts.
 #[allow(clippy::too_many_arguments)]
 pub fn run_autoland(
     repo: &ForgeRepo,
-    head_bookmark: &str,
+    initial: AutoLandState,
     vcs: &dyn LandVcs,
     forge: &dyn LandForge,
     prs: &dyn AutoLandPrs,
@@ -200,17 +324,7 @@ pub fn run_autoland(
     stop: &StopSignal,
     publish: &mut dyn FnMut(&AutoLandState),
 ) -> AutoLandState {
-    let mut state = AutoLandState {
-        head_bookmark: head_bookmark.to_owned(),
-        phase: AutoLandPhase::Waiting {
-            attention: false,
-            reasons: vec!["Sizing up the stack".to_owned()],
-        },
-        rounds: 0,
-        merged: Vec::new(),
-        segments: Vec::new(),
-        last_outcome: None,
-    };
+    let mut state = initial;
     let mut consecutive_errors: u32 = 0;
     // Pinned from the first snapshot: the job must never act on a
     // different repo than the one it was queued for.
@@ -770,6 +884,15 @@ mod tests {
     /// Drive a job to its end, logging every published state. The safety
     /// stop keeps a wrong loop from spinning forever.
     fn run(sim: &Sim, head: &str, config: &AutoLandConfig, stop: &StopSignal) -> (AutoLandState, Vec<AutoLandState>) {
+        run_from(sim, AutoLandState::queued(head), config, stop)
+    }
+
+    fn run_from(
+        sim: &Sim,
+        initial: AutoLandState,
+        config: &AutoLandConfig,
+        stop: &StopSignal,
+    ) -> (AutoLandState, Vec<AutoLandState>) {
         let log: RefCell<Vec<AutoLandState>> = RefCell::new(vec![]);
         let mut publish = |state: &AutoLandState| {
             log.borrow_mut().push(state.clone());
@@ -779,7 +902,7 @@ mod tests {
         };
         let final_state = run_autoland(
             &forge_repo(),
-            head,
+            initial,
             sim,
             sim,
             sim,
@@ -895,7 +1018,7 @@ mod tests {
         };
         let final_state = run_autoland(
             &forge_repo(),
-            "auth",
+            AutoLandState::queued("auth"),
             &sim,
             &sim,
             &sim,
@@ -1154,5 +1277,120 @@ mod tests {
             }
             other => panic!("expected failed, got {other:?}"),
         }
+    }
+
+    fn waiting_record(head: &str) -> AutoLandRecord {
+        AutoLandRecord {
+            version: AUTOLAND_RECORD_VERSION,
+            repo_path: "/tmp/repo".into(),
+            state: AutoLandState {
+                phase: AutoLandPhase::Waiting {
+                    attention: false,
+                    reasons: vec!["GitHub is driving the merge now".into()],
+                },
+                rounds: 2,
+                merged: vec![AutoLandMerged {
+                    number: 100,
+                    url: "https://github.com/o/r/pull/100".into(),
+                    bookmark: "profile".into(),
+                }],
+                ..AutoLandState::queued(head)
+            },
+            saved_at_ms: 1_751_500_000_000,
+        }
+    }
+
+    #[test]
+    fn record_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autoland.json");
+        let record = waiting_record("auth");
+
+        save_autoland_record(&path, &record).unwrap();
+        assert_eq!(load_autoland_record(&path), Some(record.clone()));
+        // The atomic-write temp file does not linger.
+        assert!(!path.with_extension("json.tmp").exists());
+
+        // Saving again overwrites in place — one record slot.
+        let mut newer = record;
+        newer.state.rounds = 3;
+        save_autoland_record(&path, &newer).unwrap();
+        assert_eq!(load_autoland_record(&path), Some(newer));
+
+        clear_autoland_record(&path).unwrap();
+        assert_eq!(load_autoland_record(&path), None);
+        // Clearing a record that is already gone is fine.
+        clear_autoland_record(&path).unwrap();
+    }
+
+    #[test]
+    fn broken_or_foreign_records_load_as_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autoland.json");
+
+        // No file at all.
+        assert_eq!(load_autoland_record(&path), None);
+        // Garbage on disk must never stop the app from starting.
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(load_autoland_record(&path), None);
+        // A record from a different format version is dropped, not guessed at.
+        let mut record = waiting_record("auth");
+        record.version = AUTOLAND_RECORD_VERSION + 1;
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(load_autoland_record(&path), None);
+    }
+
+    #[test]
+    fn resumed_state_keeps_progress_and_resets_the_phase() {
+        let prior = AutoLandState {
+            phase: AutoLandPhase::Waiting {
+                attention: true,
+                reasons: vec!["the checks are failing".into()],
+            },
+            ..waiting_record("auth").state
+        };
+        let resumed = AutoLandState::resumed(prior.clone());
+        assert_eq!(resumed.rounds, prior.rounds);
+        assert_eq!(resumed.merged, prior.merged);
+        assert_eq!(resumed.head_bookmark, "auth");
+        // The old phase rested on stale facts; a resumed job sizes up fresh.
+        match &resumed.phase {
+            AutoLandPhase::Waiting { attention, reasons } => {
+                assert!(!attention);
+                assert!(reasons.iter().any(|r| r.contains("Sizing up")), "{reasons:?}");
+            }
+            other => panic!("expected waiting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resumed_job_carries_prior_progress_through_to_done() {
+        // The world is ready to land the remaining `auth` segment; the
+        // resumed state remembers #100 already landed in 2 earlier rounds
+        // (before the restart).
+        let mut land_states = HashMap::new();
+        land_states.insert(1, ready_state());
+        let sim = Sim::new(World {
+            snapshot: single_stack(),
+            prs: vec![open_pr(1, "auth", "main")],
+            land_states,
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+        });
+
+        let initial = AutoLandState::resumed(waiting_record("auth").state);
+        let (state, _log) = run_from(&sim, initial, &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Done);
+        assert_eq!(state.rounds, 3, "rounds accumulate across the restart");
+        assert_eq!(
+            state
+                .merged
+                .iter()
+                .map(|m| m.number)
+                .collect::<Vec<_>>(),
+            vec![100, 1],
+            "the pre-restart merge stays first in the story"
+        );
     }
 }

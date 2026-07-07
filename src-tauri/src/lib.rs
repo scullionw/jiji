@@ -23,6 +23,13 @@ pub fn run() {
         .manage(AppState::new())
         .manage(ForgeState::new())
         .manage(AutoLandHost::new())
+        .setup(|app| {
+            // A job record that survived the last session loads before any
+            // surface asks, so the shell can offer "interrupted — resume?".
+            use tauri::Manager as _;
+            app.state::<AutoLandHost>().load_persisted(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::open_repo,
             commands::refresh_snapshot,
@@ -62,7 +69,8 @@ pub fn run() {
             forge::land_stack,
             autoland::autoland_start,
             autoland::autoland_stop,
-            autoland::autoland_state
+            autoland::autoland_state,
+            autoland::autoland_dismiss
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

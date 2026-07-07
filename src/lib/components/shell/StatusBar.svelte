@@ -2,7 +2,12 @@
   import { fly } from "svelte/transition";
   import Icon from "$lib/components/ui/Icon.svelte";
   import { drag } from "$lib/components/graph/dnd.svelte";
-  import { autolandChip, autolandStory } from "$lib/components/publish/autoland";
+  import {
+    autolandChip,
+    autolandStory,
+    autolandVisible,
+    isInterrupted,
+  } from "$lib/components/publish/autoland";
   import { motionMs } from "$lib/motion";
   import { app } from "$lib/state/app.svelte";
   import {
@@ -96,26 +101,32 @@
 
   <div class="fill"></div>
 
-  {#if autoland.job}
+  {#if autoland.job && autolandVisible(autoland.job, snapshot?.repoPath)}
     <!-- The activity chip: the auto-land job stays visible from every
-         section, and clicking it lands on the Publish job card. -->
-    {@const chip = autolandChip(autoland.job)}
+         section, and clicking it lands on the Publish job card. A record
+         restored from an earlier session wears the interrupted state; it
+         only renders while its own repo is open. -->
+    {@const status = autoland.job}
+    {@const job = status.record.state}
+    {@const chip = autolandChip(status)}
     <span class="al-wrap" in:fly={{ y: 6, duration: motionMs(150) }}>
       <button
         class="al-chip {chip.tone}"
-        data-autoland-chip={autoland.job.phase.kind}
-        title={autolandStory(autoland.job)}
+        data-autoland-chip={isInterrupted(status)
+          ? "interrupted"
+          : job.phase.kind}
+        title={autolandStory(status)}
         onclick={() => goToSection("publish")}
       >
         <span class="al-dot" class:pulse={chip.pulse}></span>
-        <span class="truncate">{autoland.stopping && !chip.dismissable ? `Auto-land ${autoland.job.headBookmark}: stopping…` : chip.label}</span>
+        <span class="truncate">{autoland.stopping && !chip.dismissable ? `Auto-land ${job.headBookmark}: stopping…` : chip.label}</span>
       </button>
       {#if chip.dismissable}
         <button
           class="al-x"
           data-autoland-dismiss
           title="Dismiss"
-          onclick={dismissAutoLand}
+          onclick={() => void dismissAutoLand()}
         >
           ×
         </button>
