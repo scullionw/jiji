@@ -32,7 +32,10 @@ export type UiIntent =
   | { kind: "view"; view: "graph" | "focus" }
   // Opens the stack's land plan card in Publish — the consequence-stating
   // panel that owns both Land and Auto-land-when-ready.
-  | { kind: "land"; bookmark: string };
+  | { kind: "land"; bookmark: string }
+  // Opens the stack's ship-to-trunk plan card in Publish (`head` is the
+  // stack's head change id — shipping needs no bookmark).
+  | { kind: "ship"; head: string };
 
 export type Section =
   | "workbench"

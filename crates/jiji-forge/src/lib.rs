@@ -17,6 +17,7 @@
 //! - [`comment`]: the stack-info comment GitHub readers see
 //! - [`land`]: the merge → fetch → reconcile landing engine
 //! - [`autoland`]: the supervised auto-land job loop over the land engine
+//! - [`ship`]: the direct-to-trunk shipping engine (no PR — move trunk, push)
 //! - [`template`]: the repo's PR template folded into new PR bodies
 //! - [`ci`]: the re-run-failed-CI review helper over GitHub Actions
 
@@ -30,6 +31,7 @@ pub mod land;
 pub mod pr;
 pub mod reconcile;
 pub mod remote;
+pub mod ship;
 pub mod submit;
 pub mod template;
 
@@ -54,6 +56,7 @@ pub use pr::{
     RepoPrState, ReviewDecision,
 };
 pub use remote::{detect_github_repo, no_github_remote, parse_github_url, ForgeProvider, ForgeRepo};
+pub use ship::{execute_ship, plan_ship, ShipAction, ShipOutcome, ShipPlan, ShipStep, ShipVcs};
 pub use submit::{
     execute_submit, plan_submit, ExistingComment, RepoForge, StackCommentSource, SubmitAction,
     SubmitForge, SubmitOutcome, SubmitPlan, SubmitSegment, SubmitStep, SubmitStepStatus,

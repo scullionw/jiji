@@ -9,6 +9,8 @@ import type { CiRerunReport } from "$lib/bindings/CiRerunReport";
 import type { ForgeStatus } from "$lib/bindings/ForgeStatus";
 import type { LandOutcome } from "$lib/bindings/LandOutcome";
 import type { LandPlan } from "$lib/bindings/LandPlan";
+import type { ShipOutcome } from "$lib/bindings/ShipOutcome";
+import type { ShipPlan } from "$lib/bindings/ShipPlan";
 import type { MutationOutcome } from "$lib/bindings/MutationOutcome";
 import type { PrSummary } from "$lib/bindings/PrSummary";
 import type { RepoPrState } from "$lib/bindings/RepoPrState";
@@ -269,6 +271,25 @@ export function landStack(
   plan: LandPlan,
 ): Promise<LandOutcome> {
   return invoke<LandOutcome>("land_stack", { headBookmark, plan });
+}
+
+// Plan shipping the stack under a change directly to trunk — no PR. The
+// backend fetches from the remote first (the spec's fetch-then-preview),
+// so this can record a fetch op and take a moment; the plan itself is the
+// confirm step, nothing else runs.
+export function shipPlan(headChange: string): Promise<ShipPlan> {
+  return invoke<ShipPlan>("ship_plan", { headChange });
+}
+
+// Execute a confirmed ship plan. The backend re-derives it first and
+// refuses with code `plan_stale` when the stack moved since the panel
+// rendered it; a remote trunk moved since the plan's fetch refuses at the
+// push step (force-with-lease) — re-running Ship is the retry.
+export function shipStack(
+  headChange: string,
+  plan: ShipPlan,
+): Promise<ShipOutcome> {
+  return invoke<ShipOutcome>("ship_stack", { headChange, plan });
 }
 
 // Queue the stack under a bookmark for auto-land: a supervised background

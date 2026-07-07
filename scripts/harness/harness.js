@@ -92,6 +92,13 @@
 //                        mark bookmarks synced, created PRs join the
 //                        fabricated open-PR state, text updates and stack
 //                        comments persist so a replan settles idle)
+//   &shipplan=<headId>   click that stack row in Ship to trunk and wait for
+//                        its plan (a JS twin of plan_ship; the stub's
+//                        remote never moves, so no fetch happens)
+//   &shipgo=1            click the plan card's Ship and wait for the
+//                        per-step results (the stubbed execute moves trunk
+//                        to the head, turns the chain immutable, marks
+//                        shipped PRs merged, respawns a shipped @)
 //   &lplan=<bookmark>    click that stack row in Land a stack and wait for
 //                        its land plan (a JS twin of plan_land over the
 //                        captured snapshot + &prs= state). The candidate's
@@ -213,7 +220,8 @@
 //                        &describe, …) then drive the opened panel. The
 //                        publish/auto-land command ids settle on their own
 //                        surface: publish.land.<bookmark> waits for the
-//                        land plan card, autoland.stop for the stopped job
+//                        land plan card, publish.ship.<head> for the ship
+//                        plan card, autoland.stop for the stopped job
 //                        card, autoland.resume for the card to go live
 //                        (pair with &alrec=; a running job for stop is
 //                        &lplan= + &alqueue=1, which run before the
@@ -1146,6 +1154,206 @@
   // job twin: the merged PR drops out of the open set, the fetch
   // fabricates the squash commit arriving on trunk, rebases reparent
   // live rows, and cleanup removes the landed bookmark and changes.
+  // A JS twin of jiji-forge's plan_ship, just enough for shots: walk first
+  // parents from the head to the immutable base, compare the base against
+  // the trunk bookmark's target, and mirror the Rust blockers/warnings the
+  // panel renders. The real command fetches first; the stub's remote never
+  // moves, so planning is immediate.
+  const shipPlanOf = (snap, headId) => {
+    const nodes = new Map(snap.nodes.map((n) => [n.id, n]));
+    const head = nodes.get(headId);
+    if (!head || head.kind === "immutable") return null;
+    const trunk = snap.bookmarks.find((b) => b.isTrunk);
+    if (!trunk) return null;
+    const remote = forgeRepoOf(snap)?.remote ?? "origin";
+    const prState = forgePrsOf(snap);
+    const blockers = [];
+    const warnings = [];
+    if (!trunk.isLocal)
+      blockers.push(
+        `\u{201c}${trunk.name}\u{201d} exists only on the remote here — create a ` +
+          `local \u{201c}${trunk.name}\u{201d} bookmark first`,
+      );
+    if ((snap.conflicts || []).some((c) => c.id === `bookmark-${trunk.name}`))
+      blockers.push(
+        `bookmark \u{201c}${trunk.name}\u{201d} is conflicted; repoint it before shipping`,
+      );
+    if (trunk.sync === "behind")
+      blockers.push(
+        `\u{201c}${trunk.name}\u{201d} is behind its remote — shipping now would ` +
+          `push a trunk missing those commits`,
+      );
+    if (trunk.sync === "diverged")
+      blockers.push(
+        `\u{201c}${trunk.name}\u{201d} and its remote have diverged — reconcile ` +
+          `them before shipping`,
+      );
+    if (trunk.sync === "localOnly")
+      warnings.push(`${remote} has no \u{201c}${trunk.name}\u{201d} yet — this push creates it`);
+    if (trunk.sync === "ahead")
+      warnings.push(
+        `\u{201c}${trunk.name}\u{201d} is already ahead of its remote — the push ` +
+          `includes that work too`,
+      );
+    const chain = [];
+    let base = null;
+    let cursor = head;
+    for (;;) {
+      chain.push(cursor);
+      const parent = nodes.get(cursor.parents[0]);
+      if (!parent) break;
+      if (parent.kind === "immutable") {
+        base = parent;
+        break;
+      }
+      cursor = parent;
+    }
+    chain.reverse();
+    if (!base)
+      blockers.push(
+        "the stack's base is outside this snapshot's view — refresh and try again",
+      );
+    for (const n of chain) {
+      if (!n.description)
+        blockers.push(`${n.changeId} has no description; describe it first`);
+      if (n.hasConflict)
+        blockers.push(`${n.changeId} has conflicts; resolve them first`);
+      if (n.isDivergent)
+        blockers.push(`${n.changeId} is divergent; resolve the divergence first`);
+    }
+    if (head.isEmpty)
+      warnings.push(
+        "the head change has no file changes — shipping records an empty commit on trunk",
+      );
+    for (const n of chain)
+      for (const name of n.bookmarks) {
+        const pr = prState.byBranch[name];
+        if (pr)
+          warnings.push(
+            `#${pr.number} (${name}) is open for this work — pushing the same ` +
+              `commits to \u{201c}${trunk.name}\u{201d} marks it merged on GitHub`,
+          );
+      }
+    const actions = [];
+    const atHead = trunk.target === head.id;
+    const onTrunk =
+      (base && base.id === trunk.target) ||
+      chain.some((n) => n.id === trunk.target);
+    if (base && !onTrunk)
+      actions.push({
+        kind: "rebaseOntoTrunk",
+        rootChange: chain[0].id,
+        moves: chain.length,
+      });
+    if (!atHead)
+      actions.push({ kind: "moveTrunk", bookmark: trunk.name, to: head.id });
+    if (!atHead || trunk.sync !== "synced")
+      actions.push({ kind: "pushTrunk", bookmark: trunk.name, remote });
+    if (chain.some((n) => n.id === snap.workingCopy))
+      actions.push({ kind: "newWorkingCopy", on: head.id });
+    return {
+      headChange: head.id,
+      headTitle: head.description.split("\n")[0] || "",
+      trunkBookmark: trunk.name,
+      remote,
+      changeIds: chain.map((n) => n.id),
+      actions,
+      blockers,
+      warnings,
+    };
+  };
+
+  // Executing a ship plan rewrites the live stub world: the rebase
+  // reparents the chain's root onto trunk, the trunk bookmark moves to
+  // the head and reads synced, the shipped chain turns immutable
+  // (dropping out of every workstream), open PRs whose branches shipped
+  // read merged, and a shipped working copy respawns as a fresh draft on
+  // the new trunk — so the refreshed graph, trunk chip, and badges follow
+  // the executed flow.
+  const executeShipTwin = (snap, plan) => {
+    return plan.actions.map((action) => {
+      const done = (detail) => ({ action, status: "done", detail });
+      switch (action.kind) {
+        case "rebaseOntoTrunk": {
+          const trunkBm = snap.bookmarks.find((b) => b.isTrunk);
+          const root = requireNode(snap, action.rootChange);
+          if (root && trunkBm) root.parents = [trunkBm.target];
+          return done(`Rebased ${action.rootChange} onto the fetched trunk`);
+        }
+        case "moveTrunk": {
+          const trunkBm = snap.bookmarks.find((b) => b.name === action.bookmark);
+          const old = trunkBm ? requireNode(snap, trunkBm.target) : null;
+          if (old)
+            old.bookmarks = old.bookmarks.filter((n) => n !== action.bookmark);
+          const head = requireNode(snap, action.to);
+          if (head && !head.bookmarks.includes(action.bookmark))
+            head.bookmarks.push(action.bookmark);
+          if (trunkBm) trunkBm.target = action.to;
+          // The chain becomes trunk ancestry: immutable, out of every
+          // workstream.
+          for (const id of plan.changeIds) {
+            const node = requireNode(snap, id);
+            if (node) node.kind = "immutable";
+          }
+          snap.workstreams = snap.workstreams
+            .map((stream) => ({
+              ...stream,
+              nodeIds: stream.nodeIds.filter(
+                (id) => !plan.changeIds.includes(id),
+              ),
+            }))
+            .filter((stream) => stream.nodeIds.length > 0);
+          return done(`Moved ${action.bookmark} to ${action.to}`);
+        }
+        case "pushTrunk": {
+          const trunkBm = snap.bookmarks.find((b) => b.name === action.bookmark);
+          if (trunkBm) {
+            trunkBm.sync = "synced";
+            trunkBm.remote = action.remote;
+          }
+          // Open PRs whose branches just landed on trunk read merged.
+          for (const id of plan.changeIds) {
+            const node = requireNode(snap, id);
+            (node?.bookmarks || []).forEach((name) =>
+              forge.landedBranches.add(name),
+            );
+          }
+          return done(`Pushed ${action.bookmark} to ${action.remote}`);
+        }
+        case "newWorkingCopy": {
+          const id = "zshipwcn";
+          snap.nodes.unshift({
+            id,
+            changeId: id,
+            commitId: "0a51de7",
+            description: "",
+            author: "you",
+            timestamp: "2026-07-01T12:00:00Z",
+            kind: "workingCopy",
+            parents: [action.on],
+            elidedParents: [],
+            bookmarks: [],
+            isEmpty: true,
+            hasConflict: false,
+            isDivergent: false,
+          });
+          snap.workingCopy = id;
+          snap.workstreams.unshift({
+            id: `ws-${id}`,
+            title: "no description yet",
+            nodeIds: [id],
+            bookmark: null,
+            isActive: true,
+            behindTrunk: 0,
+          });
+          return done(`Started a new change on ${action.on}`);
+        }
+        default:
+          return done("done");
+      }
+    });
+  };
+
   const executeLandTwin = (snap, plan) => {
     let landedSeq = 0;
     return plan.actions.map((action) => {
@@ -2352,6 +2560,29 @@
             failed: false,
           });
         }
+        // The ship-to-trunk workflow: the plan derives via a JS twin of
+        // plan_ship (the real command fetches first; the stub's remote
+        // never moves, so planning is immediate) and executing rewrites
+        // the live world — trunk moves to the head, the shipped chain
+        // reads immutable, shipped PRs read merged.
+        case "ship_plan": {
+          if (params.get("planwait")) return new Promise(() => {});
+          const plan = shipPlanOf(snap, args?.headChange);
+          if (!plan)
+            return reject(
+              "plan_failed",
+              `no change ${args?.headChange} in this snapshot — refresh and pick again`,
+            );
+          return Promise.resolve(plan);
+        }
+        case "ship_stack": {
+          const plan = shipPlanOf(snap, args?.headChange);
+          if (!plan) return reject("plan_failed", "the change is gone");
+          return Promise.resolve({
+            steps: executeShipTwin(snap, plan),
+            failed: false,
+          });
+        }
         // The auto-land job twin: starting a job derives the same land
         // plan and mirrors the Rust engine's first poll — blockers wait
         // (attention when they need the user), an actionable plan runs one
@@ -2709,6 +2940,23 @@
     steps.push(() => click("[data-land-go] .btn.primary:not(:disabled)"));
     steps.push(() => document.querySelector("[data-land-outcome]") !== null);
   }
+  // Ship-to-trunk flows (section=publish; needs only the detected repo,
+  // no forge= connection): click a stack row in the Ship group to derive
+  // its plan, then optionally ship and wait for the per-step results.
+  const shipStackParam = params.get("shipplan");
+  if (shipStackParam) {
+    steps.push(() => click(`[data-ship-stack="${shipStackParam}"]`));
+    steps.push(() =>
+      params.get("planwait")
+        ? document.querySelector('[data-ship-state="planning"]') !== null
+        : document.querySelector("[data-ship-plan]") !== null ||
+          document.querySelector("[data-ship-error]") !== null,
+    );
+  }
+  if (params.get("shipgo")) {
+    steps.push(() => click("[data-ship-go] .btn.primary:not(:disabled)"));
+    steps.push(() => document.querySelector("[data-ship-outcome]") !== null);
+  }
   // Auto-land flows: queue the derived plan (&lplan first) and wait for
   // the job card; &alstop clicks the running card's Stop.
   if (params.get("alqueue")) {
@@ -2848,6 +3096,13 @@
         () =>
           document.querySelector("[data-land-plan]") !== null ||
           document.querySelector("[data-land-error]") !== null,
+      );
+    }
+    if (paletteRun.startsWith("publish.ship.")) {
+      steps.push(
+        () =>
+          document.querySelector("[data-ship-plan]") !== null ||
+          document.querySelector("[data-ship-error]") !== null,
       );
     }
     if (paletteRun === "autoland.stop") {

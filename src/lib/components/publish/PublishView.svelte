@@ -3,6 +3,8 @@
   import type { LandOutcome } from "$lib/bindings/LandOutcome";
   import type { LandPlan } from "$lib/bindings/LandPlan";
   import type { PrSummary } from "$lib/bindings/PrSummary";
+  import type { ShipOutcome } from "$lib/bindings/ShipOutcome";
+  import type { ShipPlan } from "$lib/bindings/ShipPlan";
   import type { SubmitOutcome } from "$lib/bindings/SubmitOutcome";
   import type { SubmitPlan } from "$lib/bindings/SubmitPlan";
   import type { TokenSource } from "$lib/bindings/TokenSource";
@@ -37,6 +39,7 @@
     resumeBlocker,
   } from "./autoland";
   import { landActionRow, segmentChip } from "./land";
+  import { shipActionRow, shippableStacks } from "./ship";
   import {
     bookmarkTaken,
     rerunSummary,
@@ -277,15 +280,72 @@
     }
   }
 
-  // The command palette's "Land <bookmark>…" rows land here: open the
-  // stack's plan card, the same as clicking its row.
+  // The command palette's "Land <bookmark>…" and "Ship … to trunk…" rows
+  // land here: open the stack's plan card, the same as clicking its row.
   $effect(() => {
     const intent = app.intent;
     if (intent?.kind === "land") {
       consumeIntent();
       void loadLandPlan(intent.bookmark);
+    } else if (intent?.kind === "ship") {
+      consumeIntent();
+      void loadShipPlan(intent.head);
     }
   });
+
+  // The ship-to-trunk workflow: the same plan → confirm → execute shape,
+  // no PR — fetch (backend, during planning), rebase if trunk moved,
+  // point trunk at the stack, push. Offered for every workstream since
+  // shipping needs no bookmark; the backend needs only a GitHub remote,
+  // not a connection — the push authenticates like any git push.
+  const shipStacks = $derived(
+    app.snapshot ? shippableStacks(app.snapshot) : [],
+  );
+  let shipFor = $state<string | null>(null);
+  let ship = $state<ShipPlan | null>(null);
+  let shipLoading = $state(false);
+  let shipError = $state<string | null>(null);
+  let shipping = $state(false);
+  let shipOutcome = $state<ShipOutcome | null>(null);
+  let shipSeq = 0;
+
+  async function loadShipPlan(headChange: string) {
+    const seq = ++shipSeq;
+    shipFor = headChange;
+    ship = null;
+    shipOutcome = null;
+    shipError = null;
+    shipLoading = true;
+    try {
+      const answer = await api.shipPlan(headChange);
+      if (seq !== shipSeq) return;
+      ship = answer;
+    } catch (err) {
+      if (seq !== shipSeq) return;
+      shipError = errorMessage(err);
+    } finally {
+      if (seq === shipSeq) shipLoading = false;
+    }
+  }
+
+  async function shipStack() {
+    if (!ship || !shipFor || shipping || ship.blockers.length > 0) return;
+    if (ship.actions.length === 0) return;
+    shipping = true;
+    shipError = null;
+    try {
+      shipOutcome = await api.shipStack(shipFor, ship);
+      // The steps republished the snapshot mid-flow; pulling it once more
+      // keeps the flow self-contained (runMutation's posture), and the
+      // PR refresh follows a shipped stack's PRs turning merged.
+      const snapshot = await api.currentSnapshot();
+      if (snapshot) app.snapshot = snapshot;
+      await refreshForgePrs();
+    } catch (err) {
+      shipError = errorMessage(err);
+    }
+    shipping = false;
+  }
 
   async function landStack() {
     if (!land || !landFor || landing || land.blockers.length > 0) return;
@@ -1143,6 +1203,138 @@
           {/if}
         </section>
       {/if}
+    {/if}
+
+    {#if repo && shipStacks.length > 0}
+      <!-- Ship Now needs a GitHub remote but no connection: the push
+           authenticates like any git push, so this group renders even
+           while the section above is still offering the token flow. -->
+      <section class="group">
+        <div class="group-head">
+          <span class="group-label">Ship to trunk</span>
+        </div>
+        <p class="blurb quiet">
+          Push a stack straight to
+          {app.snapshot?.trunkBookmark || "trunk"} — no pull request. Jiji
+          fetches first so the plan reads against the current remote trunk,
+          rebases if trunk moved, then points
+          {app.snapshot?.trunkBookmark || "trunk"} at the stack and pushes.
+          If the remote moves again meanwhile, the push refuses cleanly and
+          shipping again is the retry.
+        </p>
+
+        <div class="stacks">
+          {#each shipStacks as stack (stack.workstreamId)}
+            <button
+              class="stack-row"
+              class:picked={shipFor === stack.headChange}
+              data-ship-stack={stack.headChange}
+              onclick={() => loadShipPlan(stack.headChange)}
+            >
+              <span class="stack-name mono">{stack.headChange.slice(0, 8)}</span>
+              <span class="stack-title">{stack.headTitle}</span>
+              <span class="stack-meta">
+                {stack.changeCount} change{stack.changeCount === 1
+                  ? ""
+                  : "s"}{stack.isActive ? " · active" : ""}
+              </span>
+            </button>
+          {/each}
+        </div>
+
+        {#if shipLoading}
+          <div class="plan" data-ship-state="planning" in:panelIn>
+            <p class="plan-head quiet">
+              Fetching from {repo.remote} and working out what shipping
+              needs…
+            </p>
+            <div class="plan-shimmer" aria-hidden="true">
+              <i style:width="48%"></i>
+              <i style:width="64%"></i>
+              <i style:width="37%"></i>
+            </div>
+          </div>
+        {:else if ship && shipOutcome}
+          <div
+            class="plan"
+            data-ship-outcome={shipOutcome.failed ? "failed" : "done"}
+          >
+            <p class="plan-head">
+              {shipOutcome.failed
+                ? "Shipping stopped partway — the steps below tell the story."
+                : `Shipped “${ship.headTitle}” to ${ship.trunkBookmark}.`}
+            </p>
+            <ul class="steps">
+              {#each shipOutcome.steps as step, index (index)}
+                <li class="step" data-ship-step={step.status}>
+                  <span class="step-glyph {step.status}">
+                    {stepGlyph[step.status]}
+                  </span>
+                  <span class="step-text">
+                    {shipActionRow(step.action).text}
+                    {#if step.detail}
+                      <span class="step-detail">{step.detail}</span>
+                    {/if}
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {:else if ship}
+          <div class="plan" class:busy={shipping} data-ship-plan={ship.headChange}>
+            <p class="plan-head">
+              Ship “{ship.headTitle}” ({ship.headChange.slice(0, 8)}) —
+              {ship.changeIds.length}
+              change{ship.changeIds.length === 1 ? " becomes" : "s become"}
+              {ship.trunkBookmark}.
+            </p>
+
+            {#if ship.actions.length === 0 && ship.blockers.length === 0}
+              <p class="blurb" data-ship-state="nothing-to-run">
+                Already shipped — {ship.trunkBookmark} is at this stack and
+                {ship.remote} agrees.
+              </p>
+            {:else}
+              <ul class="actions">
+                {#each ship.actions as action, index (index)}
+                  {@const row = shipActionRow(action)}
+                  <li class="action" data-ship-action={action.kind}>
+                    <span class="action-glyph {row.tone}">{row.glyph}</span>
+                    <span>{row.text}</span>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+
+            {#each ship.blockers as blocker (blocker)}
+              <p class="blocker" data-ship-blocker>{blocker}</p>
+            {/each}
+            {#each ship.warnings as warning (warning)}
+              <p class="warning" data-ship-warning>{warning}</p>
+            {/each}
+
+            {#if ship.actions.length > 0}
+              <div class="plan-go" data-ship-go>
+                <Button
+                  variant="primary"
+                  disabled={shipping || ship.blockers.length > 0}
+                  onclick={shipStack}
+                >
+                  {shipping
+                    ? "Shipping…"
+                    : `Ship to ${ship.trunkBookmark}`}
+                </Button>
+                {#if ship.blockers.length > 0}
+                  <span class="go-note">fix the blockers first</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+        {#if shipError}
+          <p class="error" data-ship-error>{shipError}</p>
+        {/if}
+      </section>
     {/if}
   </div>
   {/if}

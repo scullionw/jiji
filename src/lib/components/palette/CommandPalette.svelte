@@ -28,6 +28,7 @@
   } from "$lib/state/autoland.svelte";
   import { findNode } from "$lib/components/inspector/inspect";
   import { autolandVisible } from "$lib/components/publish/autoland";
+  import { shippableStacks } from "$lib/components/publish/ship";
   import { publishableStacks } from "$lib/components/publish/submit";
   import { paletteResults, type PaletteItem } from "./palette";
 
@@ -55,6 +56,17 @@
         ).map((s) => ({ bookmark: s.headBookmark, title: s.title }))
       : [],
   );
+  // Ship rows need only a detected GitHub remote (the push authenticates
+  // like any git push), matching the Publish group's own gate.
+  const paletteShipStacks = $derived(
+    forge.status?.repo != null && app.snapshot
+      ? shippableStacks(app.snapshot).map((s) => ({
+          head: s.headChange,
+          title: s.headTitle,
+          changeCount: s.changeCount,
+        }))
+      : [],
+  );
   const autolandJob = $derived(
     autoland.job && autolandVisible(autoland.job, app.snapshot?.repoPath)
       ? autoland.job
@@ -70,6 +82,7 @@
         registered: license.registered,
         themes,
         landableStacks,
+        shippableStacks: paletteShipStacks,
         autolandJob,
       },
       query,

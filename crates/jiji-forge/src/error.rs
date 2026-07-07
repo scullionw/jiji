@@ -23,6 +23,8 @@ pub enum ForgeError {
     Plan(String),
     #[error("Cannot land this stack: {0}")]
     Land(String),
+    #[error("Cannot ship this stack: {0}")]
+    Ship(String),
 }
 
 impl ForgeError {
@@ -38,6 +40,7 @@ impl ForgeError {
             ForgeError::Keychain(_) => "keychain_failed",
             ForgeError::Plan(_) => "plan_failed",
             ForgeError::Land(_) => "plan_failed",
+            ForgeError::Ship(_) => "plan_failed",
         }
     }
 }

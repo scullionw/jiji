@@ -10,11 +10,11 @@
 use std::sync::Mutex;
 
 use jiji_forge::{
-    detect_github_repo, execute_land, execute_submit, no_github_remote, plan_land, plan_submit,
-    pr_template_candidates, resolve_token, CiRerunReport, ForgeAuth, ForgeError, ForgeRepo,
-    ForgeStatus, GitHubClient, KeychainTokenStore, LandOutcome, LandPlan, LandRepoForge, LandVcs,
-    PrSummary, PrTemplate, RepoForge, RepoPrState, SubmitOutcome, SubmitPlan, SubmitVcs,
-    TokenSource, TokenStore as _,
+    detect_github_repo, execute_land, execute_ship, execute_submit, no_github_remote, plan_land,
+    plan_ship, plan_submit, pr_template_candidates, resolve_token, CiRerunReport, ForgeAuth,
+    ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandOutcome, LandPlan,
+    LandRepoForge, LandVcs, PrSummary, PrTemplate, RepoForge, RepoPrState, ShipOutcome, ShipPlan,
+    ShipVcs, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
 };
 use tauri::{AppHandle, State};
 
@@ -318,6 +318,45 @@ impl LandVcs for HostVcs<'_> {
     }
 }
 
+/// The ship executor's jj half: the shared paths again, plus the two
+/// mutations shipping adds (moving the trunk bookmark, respawning a
+/// shipped working copy).
+impl ShipVcs for HostVcs<'_> {
+    fn snapshot(&self) -> Result<jiji_core::snapshot::RepoSnapshot, jiji_core::BackendError> {
+        LandVcs::snapshot(self)
+    }
+
+    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, jiji_core::BackendError> {
+        LandVcs::rebase_onto_trunk(self, root_change)
+    }
+
+    fn move_bookmark(&self, name: &str, to_change: &str) -> Result<String, jiji_core::BackendError> {
+        self.state
+            .mutate(self.app, |backend, path| {
+                backend.move_bookmark(path, name, to_change)
+            })
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+
+    fn push_bookmarks(
+        &self,
+        bookmarks: &[String],
+        remote: &str,
+    ) -> Result<String, jiji_core::BackendError> {
+        SubmitVcs::push_bookmarks(self, bookmarks, remote)
+    }
+
+    fn new_change(&self, parent_change: &str) -> Result<String, jiji_core::BackendError> {
+        self.state
+            .mutate(self.app, |backend, path| {
+                backend.new_change(path, parent_change)
+            })
+            .map(|outcome| outcome.summary)
+            .map_err(|err| jiji_core::BackendError::MutationFailed(err.message))
+    }
+}
+
 /// Execute a confirmed submit plan: one batched push, PR creations
 /// bottom-up, then base retargets. The plan is re-derived against the
 /// current snapshot and fresh PR state first, and refused when it no
@@ -450,4 +489,74 @@ pub fn land_stack(
         state: &state,
     };
     execute_land(&fresh, &vcs, &forge_side).map_err(Into::into)
+}
+
+/// Open-PR facts for a ship plan's marks-it-merged warning, when a token
+/// resolves. Shipping itself needs no GitHub API — the push authenticates
+/// through git — so no token (or a failed fetch of PR state) degrades to
+/// a plan without the warning rather than a refusal.
+fn ship_pr_facts(repo: &ForgeRepo) -> Option<RepoPrState> {
+    let resolved = resolve_token(&token_store(Some(repo))).ok().flatten()?;
+    let client = GitHubClient::for_repo(repo, &resolved.token).ok()?;
+    let report = client.open_prs(&repo.owner, &repo.name).ok()?;
+    Some(RepoPrState::new(report, &repo.owner))
+}
+
+/// Plan shipping the stack under a change directly to trunk. The spec's
+/// fetch-first shape: `jj git fetch` from the detected repo's remote runs
+/// before planning, so the plan previews against current remote trunk
+/// (a fetch that changes nothing records nothing; a real import publishes
+/// like any mutation) and the push's force-with-lease expectation is
+/// pinned freshly — trunk moving *after* this fetch is exactly what the
+/// push step refuses.
+#[tauri::command(async)]
+pub fn ship_plan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    head_change: String,
+) -> Result<ShipPlan, CommandError> {
+    let repo = detected_repo(&state).ok_or_else(no_github_remote)?;
+    let remotes = vec![repo.remote.clone()];
+    state.mutate(&app, |backend, path| {
+        backend.git_fetch(path, Some(&remotes))
+    })?;
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let prs = ship_pr_facts(&repo);
+    plan_ship(&snapshot, prs.as_ref(), &repo.remote, &head_change).map_err(Into::into)
+}
+
+/// Execute a confirmed ship plan. The plan is re-derived against the
+/// current snapshot first and refused when its actions no longer match
+/// what the user confirmed (the stack moved under the panel — submit's
+/// never-clobber posture). Deliberately no second fetch: the plan's fetch
+/// set the lease, and re-fetching here could shift the very plan the user
+/// just read — a remote moved since is the push step's honest refusal,
+/// and re-running Ship is the retry.
+#[tauri::command(async)]
+pub fn ship_stack(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    head_change: String,
+    plan: ShipPlan,
+) -> Result<ShipOutcome, CommandError> {
+    let snapshot = state
+        .current_snapshot_clone()
+        .ok_or_else(|| CommandError::new("no_repo_open", "No repository is currently open"))?;
+    let repo = detected_repo(&state).ok_or_else(no_github_remote)?;
+    // PR facts feed warnings only, never actions — skip the network call.
+    let fresh = plan_ship(&snapshot, None, &repo.remote, &head_change)?;
+    if fresh.actions != plan.actions {
+        return Err(CommandError::new(
+            "plan_stale",
+            "The stack changed since this plan was made; review the updated plan and \
+             ship again",
+        ));
+    }
+    let vcs = HostVcs {
+        app: &app,
+        state: &state,
+    };
+    execute_ship(&fresh, &vcs).map_err(Into::into)
 }

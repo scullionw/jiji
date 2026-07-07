@@ -77,6 +77,9 @@ export interface PaletteContext {
   /** Publish's landable stack heads — empty until the forge connection is
    * verified (the land plan the rows open needs GitHub). */
   landableStacks: { bookmark: string; title: string }[];
+  /** Publish's shippable stack heads — empty until a GitHub remote is
+   * detected (shipping needs no token, so no login gate). */
+  shippableStacks: { head: string; title: string; changeCount: number }[];
   /** The auto-land job as the open repo sees it; the component passes
    * null when the record belongs to another repo. */
   autolandJob: AutoLandStatus | null;
@@ -310,11 +313,27 @@ function buildItems(ctx: PaletteContext): PaletteItem[] {
         group: "Publish",
         title: `Land ${stack.bookmark}…`,
         hint: stack.title,
-        keywords: "auto-land queue merge ship publish stack pull request",
+        keywords: "auto-land queue merge publish stack pull request",
         icon: "publish",
         action: {
           type: "intent",
           intent: { kind: "land", bookmark: stack.bookmark },
+        },
+      });
+    }
+    for (const stack of ctx.shippableStacks) {
+      items.push({
+        id: `publish.ship.${stack.head}`,
+        group: "Publish",
+        title: `Ship “${stack.title}” to trunk…`,
+        hint: `${stack.head.slice(0, 8)} · ${stack.changeCount} change${
+          stack.changeCount === 1 ? "" : "s"
+        }`,
+        keywords: "ship now push trunk direct no pr main",
+        icon: "publish",
+        action: {
+          type: "intent",
+          intent: { kind: "ship", head: stack.head },
         },
       });
     }

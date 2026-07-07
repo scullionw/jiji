@@ -83,6 +83,7 @@ function ctx(overrides: Partial<PaletteContext> = {}): PaletteContext {
     registered: false,
     themes: [],
     landableStacks: [],
+    shippableStacks: [],
     autolandJob: null,
     ...overrides,
   };
@@ -250,6 +251,22 @@ describe("paletteResults publish and auto-land", () => {
     });
     // The component passes no stacks before the connection is verified.
     expect(ids(stackContext())).not.toContain("publish.land.feature");
+  });
+
+  it("offers a ship row per shippable stack, carrying the ship intent", () => {
+    const context = {
+      ...stackContext(),
+      shippableStacks: [{ head: "mnop", title: "feat: work", changeCount: 2 }],
+    };
+    const results = paletteResults(context, "ship");
+    const row = results.find((item) => item.id === "publish.ship.mnop");
+    expect(row?.action).toEqual({
+      type: "intent",
+      intent: { kind: "ship", head: "mnop" },
+    });
+    expect(row?.title).toContain("feat: work");
+    // The component passes no ship stacks without a detected GitHub remote.
+    expect(ids(stackContext())).not.toContain("publish.ship.mnop");
   });
 
   it("offers stop only while the job is live", () => {

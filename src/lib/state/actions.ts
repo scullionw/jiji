@@ -263,10 +263,12 @@ export function closePalette(): void {
 }
 
 // Every intent switches to the section whose surface owns it — the
-// workbench for the change/diff panels, Publish for the land plan — so
-// the owning surface mounts (if it wasn't) and consumes the intent.
+// workbench for the change/diff panels, Publish for the land and ship
+// plans — so the owning surface mounts (if it wasn't) and consumes the
+// intent.
 export function sendIntent(intent: UiIntent): void {
-  app.section = intent.kind === "land" ? "publish" : "workbench";
+  app.section =
+    intent.kind === "land" || intent.kind === "ship" ? "publish" : "workbench";
   app.intent = intent;
 }
 

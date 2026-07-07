@@ -76,6 +76,8 @@ pub fn run() {
             forge::submit_stack,
             forge::land_plan,
             forge::land_stack,
+            forge::ship_plan,
+            forge::ship_stack,
             autoland::autoland_start,
             autoland::autoland_stop,
             autoland::autoland_state,
