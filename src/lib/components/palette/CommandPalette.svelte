@@ -20,7 +20,15 @@
     undoLastMutation,
   } from "$lib/state/actions";
   import { fetchUpstreamNow } from "$lib/state/upstream.svelte";
+  import { forge } from "$lib/state/forge.svelte";
+  import {
+    autoland,
+    startAutoLand,
+    stopAutoLand,
+  } from "$lib/state/autoland.svelte";
   import { findNode } from "$lib/components/inspector/inspect";
+  import { autolandVisible } from "$lib/components/publish/autoland";
+  import { publishableStacks } from "$lib/components/publish/submit";
   import { paletteResults, type PaletteItem } from "./palette";
 
   let query = $state("");
@@ -33,6 +41,25 @@
       ? (findNode(app.snapshot, app.selectedNodeId) ?? null)
       : null,
   );
+  // Land rows need a verified connection (badges' rule — the plan they
+  // open asks GitHub); the job rows follow the record's repo like the
+  // Publish job card does.
+  const forgeReady = $derived(
+    forge.status?.repo != null && forge.status?.auth.login != null,
+  );
+  const landableStacks = $derived(
+    forgeReady && app.snapshot
+      ? publishableStacks(
+          app.snapshot,
+          new Set(Object.keys(forge.prs?.byBranch ?? {})),
+        ).map((s) => ({ bookmark: s.headBookmark, title: s.title }))
+      : [],
+  );
+  const autolandJob = $derived(
+    autoland.job && autolandVisible(autoland.job, app.snapshot?.repoPath)
+      ? autoland.job
+      : null,
+  );
   const items = $derived(
     paletteResults(
       {
@@ -42,6 +69,8 @@
         canUndo: app.lastMutation?.outcome.operationId != null,
         registered: license.registered,
         themes,
+        landableStacks,
+        autolandJob,
       },
       query,
     ),
@@ -111,6 +140,12 @@
         break;
       case "theme":
         selectTheme(action.id);
+        break;
+      case "autolandStop":
+        void runQuiet(() => stopAutoLand());
+        break;
+      case "autolandResume":
+        void runQuiet(() => startAutoLand(action.bookmark));
         break;
     }
   }

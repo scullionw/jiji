@@ -71,10 +71,22 @@ impl AutoLandPrs for crate::land::LandRepoForge<'_> {
 /// Cross-thread stop flag with an interruptible wait: `stop()` wakes a
 /// sleeping job immediately instead of letting it doze through the rest of
 /// its poll interval (jjpr chunks its sleep to poll an `AtomicBool`; a
-/// condvar gives the same behavior without the latency).
+/// condvar gives the same behavior without the latency). `nudge()` wakes
+/// the same sleep without ending the job — how a host asks for a fresh
+/// poll right now (say, its window regaining focus) instead of letting the
+/// user stare at up-to-30-seconds-stale state. A nudge is pending until a
+/// wait consumes it, so one landing mid-round shortens the round's
+/// following sleep rather than vanishing; an extra poll is always safe —
+/// every poll re-derives the plan from fresh facts.
+#[derive(Default)]
+struct SignalState {
+    stopped: bool,
+    nudged: bool,
+}
+
 #[derive(Default)]
 pub struct StopSignal {
-    stopped: Mutex<bool>,
+    state: Mutex<SignalState>,
     bell: Condvar,
 }
 
@@ -84,23 +96,32 @@ impl StopSignal {
     }
 
     pub fn stop(&self) {
-        *self.stopped.lock().expect("stop signal lock poisoned") = true;
+        self.state.lock().expect("stop signal lock poisoned").stopped = true;
+        self.bell.notify_all();
+    }
+
+    /// Ask the job to poll again as soon as it is between rounds. Never
+    /// stops or fails anything; a job that is already awake polls once
+    /// more promptly.
+    pub fn nudge(&self) {
+        self.state.lock().expect("stop signal lock poisoned").nudged = true;
         self.bell.notify_all();
     }
 
     pub fn is_stopped(&self) -> bool {
-        *self.stopped.lock().expect("stop signal lock poisoned")
+        self.state.lock().expect("stop signal lock poisoned").stopped
     }
 
-    /// Sleep up to `duration`, waking early on `stop()`. Answers whether
-    /// the job was stopped.
+    /// Sleep up to `duration`, waking early on `stop()` or `nudge()` (the
+    /// pending nudge is consumed). Answers whether the job was stopped.
     fn wait(&self, duration: Duration) -> bool {
-        let stopped = self.stopped.lock().expect("stop signal lock poisoned");
-        let (stopped, _) = self
+        let state = self.state.lock().expect("stop signal lock poisoned");
+        let (mut state, _) = self
             .bell
-            .wait_timeout_while(stopped, duration, |stopped| !*stopped)
+            .wait_timeout_while(state, duration, |state| !state.stopped && !state.nudged)
             .expect("stop signal lock poisoned");
-        *stopped
+        state.nudged = false;
+        state.stopped
     }
 }
 
@@ -581,6 +602,7 @@ mod tests {
     use jiji_core::BackendError;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn node(
         id: &str,
@@ -879,6 +901,49 @@ mod tests {
             poll_interval: Duration::ZERO,
             max_consecutive_errors: 10,
         }
+    }
+
+    #[test]
+    fn nudge_wakes_the_wait_without_stopping() {
+        let signal = Arc::new(StopSignal::new());
+        let waker = Arc::clone(&signal);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.nudge();
+        });
+        let started = std::time::Instant::now();
+        let stopped = signal.wait(Duration::from_secs(30));
+        handle.join().unwrap();
+        assert!(!stopped, "a nudge must not read as a stop");
+        assert!(!signal.is_stopped());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the nudge should wake the wait long before the timeout"
+        );
+    }
+
+    #[test]
+    fn pending_nudge_is_consumed_by_one_wait() {
+        let signal = StopSignal::new();
+        // A nudge landing while the job is mid-round (not waiting) makes
+        // the round's following sleep instant instead of vanishing.
+        signal.nudge();
+        let started = std::time::Instant::now();
+        assert!(!signal.wait(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Consumed: the next wait sleeps its full duration again.
+        let started = std::time::Instant::now();
+        assert!(!signal.wait(Duration::from_millis(40)));
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn stop_wins_over_a_pending_nudge() {
+        let signal = StopSignal::new();
+        signal.nudge();
+        signal.stop();
+        assert!(signal.wait(Duration::from_secs(30)));
+        assert!(signal.is_stopped());
     }
 
     /// Drive a job to its end, logging every published state. The safety

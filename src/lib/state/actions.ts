@@ -262,10 +262,11 @@ export function closePalette(): void {
   app.paletteOpen = false;
 }
 
-// Every intent targets a workbench surface, so the section switches along;
+// Every intent switches to the section whose surface owns it — the
+// workbench for the change/diff panels, Publish for the land plan — so
 // the owning surface mounts (if it wasn't) and consumes the intent.
 export function sendIntent(intent: UiIntent): void {
-  app.section = "workbench";
+  app.section = intent.kind === "land" ? "publish" : "workbench";
   app.intent = intent;
 }
 
@@ -283,11 +284,9 @@ export function jumpToChange(id: string): void {
   if (owner) app.focusedWorkstreamId = owner.id;
 }
 
-// Palette-launched mutations have no panel to render errors inline, so
+// Palette-launched actions have no panel to render errors inline, so
 // failures land in the status bar's error slot (like the breadcrumb Undo).
-export async function runQuiet(
-  call: () => Promise<MutationOutcome>,
-): Promise<void> {
+export async function runQuiet(call: () => Promise<unknown>): Promise<void> {
   try {
     await call();
   } catch (error) {

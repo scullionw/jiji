@@ -30,6 +30,15 @@ pub fn run() {
             app.state::<AutoLandHost>().load_persisted(app);
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // Coming back to the app is the moment stale job state hurts:
+            // nudge a watching auto-land job to poll now rather than
+            // finish dozing through its interval.
+            if matches!(event, tauri::WindowEvent::Focused(true)) {
+                use tauri::Manager as _;
+                window.state::<AutoLandHost>().poke_active();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::open_repo,
             commands::refresh_snapshot,

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import type { AutoLandPhase } from "$lib/bindings/AutoLandPhase";
+import type { AutoLandStatus } from "$lib/bindings/AutoLandStatus";
 import type { BookmarkState } from "$lib/bindings/BookmarkState";
 import type { GraphNode } from "$lib/bindings/GraphNode";
 import type { NodeKind } from "$lib/bindings/NodeKind";
@@ -80,9 +82,40 @@ function ctx(overrides: Partial<PaletteContext> = {}): PaletteContext {
     canUndo: false,
     registered: false,
     themes: [],
+    landableStacks: [],
+    autolandJob: null,
     ...overrides,
   };
 }
+
+function jobStatus(
+  phase: AutoLandPhase,
+  live: boolean,
+  headBookmark = "feature",
+): AutoLandStatus {
+  return {
+    live,
+    record: {
+      version: 1,
+      repoPath: "/tmp/repo",
+      savedAtMs: BigInt(0),
+      state: {
+        headBookmark,
+        phase,
+        rounds: 0,
+        merged: [],
+        segments: [],
+        lastOutcome: null,
+      },
+    },
+  };
+}
+
+const watching: AutoLandPhase = {
+  kind: "waiting",
+  attention: false,
+  reasons: ["waiting on checks"],
+};
 
 // A stack on trunk: wc → mid → base(main).
 function stackContext(): PaletteContext {
@@ -200,6 +233,65 @@ describe("paletteResults availability", () => {
       },
     };
     expect(ids(withRemote)).toContain("repo.fetch");
+  });
+});
+
+describe("paletteResults publish and auto-land", () => {
+  it("offers a land row per landable stack, carrying the land intent", () => {
+    const context = {
+      ...stackContext(),
+      landableStacks: [{ bookmark: "feature", title: "ws" }],
+    };
+    const results = paletteResults(context, "");
+    const row = results.find((item) => item.id === "publish.land.feature");
+    expect(row?.action).toEqual({
+      type: "intent",
+      intent: { kind: "land", bookmark: "feature" },
+    });
+    // The component passes no stacks before the connection is verified.
+    expect(ids(stackContext())).not.toContain("publish.land.feature");
+  });
+
+  it("offers stop only while the job is live", () => {
+    const live = { ...stackContext(), autolandJob: jobStatus(watching, true) };
+    expect(ids(live)).toContain("autoland.stop");
+    expect(ids(live)).not.toContain("autoland.resume");
+    expect(ids(stackContext())).not.toContain("autoland.stop");
+  });
+
+  it("offers resume for an interrupted job whose bookmark still exists", () => {
+    const interrupted = {
+      ...stackContext(),
+      autolandJob: jobStatus(watching, false),
+    };
+    const items = ids(interrupted);
+    expect(items).toContain("autoland.resume");
+    expect(items).not.toContain("autoland.stop");
+    const row = paletteResults(interrupted, "").find(
+      (item) => item.id === "autoland.resume",
+    );
+    expect(row?.action).toEqual({
+      type: "autolandResume",
+      bookmark: "feature",
+    });
+  });
+
+  it("withholds resume when the head bookmark is gone or the job ended", () => {
+    // The stack moved on: resuming would park immediately, so no row —
+    // the Publish card owns telling that story.
+    const gone = {
+      ...stackContext(),
+      autolandJob: jobStatus(watching, false, "vanished"),
+    };
+    expect(ids(gone)).not.toContain("autoland.resume");
+    // Terminal records are dismissable history, not a resumable job.
+    const done = {
+      ...stackContext(),
+      autolandJob: jobStatus({ kind: "done" }, false),
+    };
+    const items = ids(done);
+    expect(items).not.toContain("autoland.resume");
+    expect(items).not.toContain("autoland.stop");
   });
 });
 

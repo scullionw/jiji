@@ -3,6 +3,7 @@
 // actions; nothing here touches Svelte or app state (context comes in as a
 // plain value so tests can drive every shape).
 
+import type { AutoLandStatus } from "$lib/bindings/AutoLandStatus";
 import type { GraphNode } from "$lib/bindings/GraphNode";
 import type { RepoSnapshot } from "$lib/bindings/RepoSnapshot";
 import type { IconName } from "$lib/components/ui/icons";
@@ -11,6 +12,10 @@ import {
   actionAvailability,
   resolveCompareFrom,
 } from "$lib/components/inspector/inspect";
+import {
+  isInterrupted,
+  resumeBlocker,
+} from "$lib/components/publish/autoland";
 
 // What runs when a row is picked. `intent` rows hand off to the surface
 // that owns the matching UI (plan/confirm panels, layout, view mode) — the
@@ -27,7 +32,9 @@ export type PaletteAction =
   | { type: "section"; section: Section }
   | { type: "goto"; id: string }
   | { type: "mode"; mode: "system" | "light" | "dark" }
-  | { type: "theme"; id: string };
+  | { type: "theme"; id: string }
+  | { type: "autolandStop" }
+  | { type: "autolandResume"; bookmark: string };
 
 export interface PaletteItem {
   /** Stable id, used as the render key and by the visual harness. */
@@ -67,6 +74,12 @@ export interface PaletteContext {
   /** Themes are a supporter perk; unregistered copies get no theme rows. */
   registered: boolean;
   themes: PaletteThemeDef[];
+  /** Publish's landable stack heads — empty until the forge connection is
+   * verified (the land plan the rows open needs GitHub). */
+  landableStacks: { bookmark: string; title: string }[];
+  /** The auto-land job as the open repo sees it; the component passes
+   * null when the record belongs to another repo. */
+  autolandJob: AutoLandStatus | null;
 }
 
 const SECTIONS: { section: Section; label: string; icon: IconName }[] = [
@@ -256,6 +269,54 @@ function buildItems(ctx: PaletteContext): PaletteItem[] {
           action: { type: "intent", intent: { kind: "layout", layout: "split" } },
         },
       );
+    }
+    // The auto-land job and the land-a-stack routes (the M5 gap: queue
+    // and stop without the mouse). Stop and resume are the job card's
+    // one-click actions; the stack rows hand off to Publish's land plan
+    // card — the consequence-stating panel owning Land and Auto-land —
+    // exactly like a Change row opens its plan panel.
+    const job = ctx.autolandJob;
+    if (job?.live) {
+      items.push({
+        id: "autoland.stop",
+        group: "Publish",
+        title: "Stop auto-land job",
+        hint: job.record.state.headBookmark,
+        keywords: "cancel halt watch queue auto-land landing",
+        icon: "close",
+        action: { type: "autolandStop" },
+      });
+    } else if (
+      job &&
+      isInterrupted(job) &&
+      resumeBlocker(job, snapshot.bookmarks) === null
+    ) {
+      items.push({
+        id: "autoland.resume",
+        group: "Publish",
+        title: "Resume auto-land job",
+        hint: `${job.record.state.headBookmark} — interrupted`,
+        keywords: "continue restart watch queue auto-land landing",
+        icon: "refresh",
+        action: {
+          type: "autolandResume",
+          bookmark: job.record.state.headBookmark,
+        },
+      });
+    }
+    for (const stack of ctx.landableStacks) {
+      items.push({
+        id: `publish.land.${stack.bookmark}`,
+        group: "Publish",
+        title: `Land ${stack.bookmark}…`,
+        hint: stack.title,
+        keywords: "auto-land queue merge ship publish stack pull request",
+        icon: "publish",
+        action: {
+          type: "intent",
+          intent: { kind: "land", bookmark: stack.bookmark },
+        },
+      });
     }
     for (const [index, entry] of SECTIONS.entries()) {
       items.push({

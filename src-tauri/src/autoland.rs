@@ -96,6 +96,23 @@ impl AutoLandHost {
         }
     }
 
+    /// Ask the active job to poll now instead of waiting out the rest of
+    /// its interval — called when the window regains focus, so the user
+    /// coming back to the app sees fresh job state instead of up to a
+    /// poll-interval of staleness. A no-op without a live job.
+    pub fn poke_active(&self) {
+        if let Some(job) = self
+            .job
+            .lock()
+            .expect("auto-land job lock poisoned")
+            .as_ref()
+        {
+            if !job.thread.is_finished() {
+                job.stop.nudge();
+            }
+        }
+    }
+
     /// Whether a job thread is currently running.
     fn job_alive(&self) -> bool {
         self.job

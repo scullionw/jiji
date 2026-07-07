@@ -15,7 +15,7 @@
   import { panelIn } from "$lib/motion";
   import { fromNow } from "$lib/time";
   import { app } from "$lib/state/app.svelte";
-  import { fetchPr, jumpToChange } from "$lib/state/actions";
+  import { consumeIntent, fetchPr, jumpToChange } from "$lib/state/actions";
   import {
     autoland,
     dismissAutoLand,
@@ -276,6 +276,16 @@
       if (seq === landSeq) landLoading = false;
     }
   }
+
+  // The command palette's "Land <bookmark>…" rows land here: open the
+  // stack's plan card, the same as clicking its row.
+  $effect(() => {
+    const intent = app.intent;
+    if (intent?.kind === "land") {
+      consumeIntent();
+      void loadLandPlan(intent.bookmark);
+    }
+  });
 
   async function landStack() {
     if (!land || !landFor || landing || land.blockers.length > 0) return;

@@ -15,8 +15,8 @@ export interface MutationBreadcrumb {
 // A one-shot request from the command palette to the surface that owns the
 // matching UI: ChangeHeader opens its plan/confirm panels (so the palette
 // never duplicates them), DiffView owns the layout, WorkbenchView the view
-// mode. The owner calls `consumeIntent` after acting; intents it does not
-// own it leaves alone.
+// mode, PublishView the land plan card. The owner calls `consumeIntent`
+// after acting; intents it does not own it leaves alone.
 export type UiIntent =
   | { kind: "describe" }
   | { kind: "bookmark" }
@@ -29,7 +29,10 @@ export type UiIntent =
   // panel opens for picking.
   | { kind: "compare"; mode?: CompareMode }
   | { kind: "layout"; layout: DiffLayout }
-  | { kind: "view"; view: "graph" | "focus" };
+  | { kind: "view"; view: "graph" | "focus" }
+  // Opens the stack's land plan card in Publish — the consequence-stating
+  // panel that owns both Land and Auto-land-when-ready.
+  | { kind: "land"; bookmark: string };
 
 export type Section =
   | "workbench"

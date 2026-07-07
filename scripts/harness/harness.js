@@ -210,7 +210,14 @@
 //   &prun=<commandId>    click that palette row (data-command, e.g.
 //                        change.rebase or goto.<id>) and wait for the
 //                        palette to close; panel params (&dest, &confirm,
-//                        &describe, …) then drive the opened panel
+//                        &describe, …) then drive the opened panel. The
+//                        publish/auto-land command ids settle on their own
+//                        surface: publish.land.<bookmark> waits for the
+//                        land plan card, autoland.stop for the stopped job
+//                        card, autoland.resume for the card to go live
+//                        (pair with &alrec=; a running job for stop is
+//                        &lplan= + &alqueue=1, which run before the
+//                        palette steps)
 //   &describe=<text>     type into the open editor and save (stubbed
 //                        describe_change mutates the captured snapshot)
 //   &action=new|edit     run that action on the selection (stubbed mutation)
@@ -2834,6 +2841,30 @@
   if (paletteRun) {
     steps.push(() => click(`.palette-row[data-command="${paletteRun}"]`));
     steps.push(() => !document.querySelector(".palette-input"));
+    // Palette commands that kick off async work settle on their surface,
+    // so shots don't race the plan load or the stubbed job engine.
+    if (paletteRun.startsWith("publish.land.")) {
+      steps.push(
+        () =>
+          document.querySelector("[data-land-plan]") !== null ||
+          document.querySelector("[data-land-error]") !== null,
+      );
+    }
+    if (paletteRun === "autoland.stop") {
+      steps.push(
+        () =>
+          document.querySelector('[data-autoland-job="stopped"]') !== null,
+      );
+    }
+    if (paletteRun === "autoland.resume") {
+      steps.push(() => {
+        const card = document.querySelector("[data-autoland-job]");
+        return (
+          card !== null &&
+          card.getAttribute("data-autoland-job") !== "interrupted"
+        );
+      });
+    }
   }
   const compareTo = params.get("compare");
   if (compareTo) {
