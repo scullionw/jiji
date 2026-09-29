@@ -1,0 +1,528 @@
+<script lang="ts">
+  import { tick } from "svelte";
+  import Icon from "$lib/components/ui/Icon.svelte";
+  import type { BookmarkState } from "$lib/bindings/BookmarkState";
+  import { errorMessage } from "$lib/api";
+  import { bookmarkKey } from "$lib/components/bookmarks/bookmarks";
+  import { stackPosition, SYNC_LABEL } from "$lib/components/inspector/inspect";
+  import { resolveFocusedWorkstream } from "$lib/components/graph/graph";
+  import { deleteBookmark, renameBookmark } from "$lib/state/actions";
+  import { app } from "$lib/state/app.svelte";
+
+  // Parent renders this overview only when a snapshot exists and nothing
+  // is selected; a selection puts the diff surface in this pane instead.
+  const snapshot = $derived(app.snapshot!);
+  const focused = $derived(
+    resolveFocusedWorkstream(snapshot, app.focusedWorkstreamId),
+  );
+  const workspace = $derived(
+    snapshot.workspaces.find((w) => w.isCurrent) ?? snapshot.workspaces[0],
+  );
+  const trunk = $derived(snapshot.bookmarks.find((b) => b.isTrunk));
+
+  // Jumping to a workstream selects its head, which can be in another
+  // lane; refocus so the selection is actually visible in the graph.
+  function jumpTo(id: string) {
+    const owner = stackPosition(snapshot, id)?.workstream;
+    if (owner && owner.id !== focused?.id) {
+      app.focusedWorkstreamId = owner.id;
+    }
+    app.selectedNodeId = id;
+  }
+
+  const hasNode = (id: string) => snapshot.nodes.some((n) => n.id === id);
+
+  // Inline bookmark management on the list: rename swaps the row for an
+  // input, delete for a one-line confirm stating what happens remotely.
+  // One row edits at a time; errors render under the list.
+  let bmEdit = $state<{
+    key: string;
+    name: string;
+    mode: "rename" | "delete";
+  } | null>(null);
+  let bmDraft = $state("");
+  let bmError = $state<string | null>(null);
+  let bmBusy = $state(false);
+  let bmInput = $state<HTMLInputElement | undefined>();
+
+  function startRename(bookmark: BookmarkState) {
+    bmEdit = {
+      key: bookmarkKey(bookmark),
+      name: bookmark.name,
+      mode: "rename",
+    };
+    bmDraft = bookmark.name;
+    bmError = null;
+    tick().then(() => bmInput?.focus());
+  }
+
+  function startDelete(bookmark: BookmarkState) {
+    bmEdit = {
+      key: bookmarkKey(bookmark),
+      name: bookmark.name,
+      mode: "delete",
+    };
+    bmError = null;
+  }
+
+  function cancelEdit() {
+    bmEdit = null;
+    bmError = null;
+  }
+
+  async function runEdit(action: () => Promise<unknown>) {
+    if (bmBusy) return;
+    bmBusy = true;
+    bmError = null;
+    try {
+      await action();
+      bmEdit = null;
+    } catch (error) {
+      bmError = errorMessage(error);
+    } finally {
+      bmBusy = false;
+    }
+  }
+
+  function saveRename() {
+    const edit = bmEdit;
+    const next = bmDraft.trim();
+    if (!edit || !next || next === edit.name) return;
+    runEdit(() => renameBookmark(edit.name, next));
+  }
+
+  function confirmDelete() {
+    const edit = bmEdit;
+    if (!edit) return;
+    runEdit(() => deleteBookmark(edit.name));
+  }
+
+  function onEditKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      saveRename();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      cancelEdit();
+    }
+  }
+</script>
+
+<div class="inspector">
+  <!-- The working state at a glance: the sidebar owns the repo's identity,
+       so this header carries only the standing facts. -->
+  <header class="repo-head">
+    <h3 class="truncate">{snapshot.repoName}</h3>
+    <div class="facts">
+      {#if trunk}
+        <span class="fact" title="Trunk target">
+          <Icon name="branch" size={11} />
+          <span class="mono">
+            {trunk.name}{trunk.remote ? `@${trunk.remote}` : ""}
+          </span>
+        </span>
+      {/if}
+      {#if workspace}
+        <span class="fact" title="Current workspace">
+          <Icon name="workspaces" size={11} />
+          {workspace.name}
+        </span>
+      {/if}
+      <span class="fact" title="Backend">
+        <span class="mono">{snapshot.backend}</span>
+      </span>
+    </div>
+  </header>
+
+  <div class="cards">
+    {#if snapshot.workstreams.length > 0}
+      <section class="card">
+        <h4>
+          Workstreams
+          <span class="count mono">{snapshot.workstreams.length}</span>
+        </h4>
+        <div class="ws-list">
+          {#each snapshot.workstreams as ws, i (ws.id)}
+            <button
+              class="ws-row"
+              class:current={ws.id === focused?.id}
+              style:--lane={`var(--lane-${i % 6})`}
+              onclick={() => ws.nodeIds.length > 0 && jumpTo(ws.nodeIds[0])}
+            >
+              <i class="ws-dot" class:active={ws.isActive}></i>
+              <span class="ws-title truncate">{ws.title}</span>
+              {#if ws.bookmark}
+                <span class="ref chip"><span class="truncate">{ws.bookmark}</span></span>
+              {/if}
+              <span class="ws-meta">
+                {ws.nodeIds.length}{#if ws.behindTrunk > 0}<span
+                    class="ws-behind"
+                  >
+                    ↓{ws.behindTrunk}</span
+                  >{/if}
+              </span>
+            </button>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    <section class="card">
+      <h4>
+        Bookmarks
+        <span class="count mono">{snapshot.bookmarks.length}</span>
+      </h4>
+      {#each snapshot.bookmarks as bookmark (bookmarkKey(bookmark))}
+        {@const sync = SYNC_LABEL[bookmark.sync] ?? {
+          text: bookmark.sync,
+          tone: "muted",
+        }}
+        {#if bmEdit?.key === bookmarkKey(bookmark) && bmEdit.mode === "rename"}
+          <div class="row bm-editing">
+            <input
+              class="field bm-input mono"
+              bind:this={bmInput}
+              bind:value={bmDraft}
+              spellcheck="false"
+              disabled={bmBusy}
+              onkeydown={onEditKeydown}
+            />
+            <button
+              class="btn primary bm-go"
+              onclick={saveRename}
+              disabled={bmBusy || !bmDraft.trim() || bmDraft.trim() === bookmark.name}
+            >
+              Rename
+            </button>
+            <button class="btn bm-cancel" onclick={cancelEdit} disabled={bmBusy}>Cancel</button>
+          </div>
+        {:else if bmEdit?.key === bookmarkKey(bookmark) && bmEdit.mode === "delete"}
+          <div class="row bm-editing">
+            <span class="bm-question truncate">
+              Delete {bookmark.name}?
+              {bookmark.remote
+                ? `Removed from ${bookmark.remote} on the next push.`
+                : "It only exists locally."}
+            </span>
+            <button class="btn danger solid bm-go" onclick={confirmDelete} disabled={bmBusy}>
+              Delete
+            </button>
+            <button class="btn bm-cancel" onclick={cancelEdit} disabled={bmBusy}>Cancel</button>
+          </div>
+        {:else}
+          <div class="row bm-row">
+            {#if hasNode(bookmark.target)}
+              <button
+                class="bm-name"
+                title="Go to {bookmark.target}"
+                onclick={() => jumpTo(bookmark.target)}
+              >
+                <span class="value mono truncate">{bookmark.name}</span>
+              </button>
+            {:else}
+              <span class="bm-name">
+                <span class="value mono truncate">{bookmark.name}</span>
+              </span>
+            {/if}
+            <span class="sync {sync.tone}">{sync.text}</span>
+            {#if bookmark.isLocal && !bookmark.isTrunk}
+              <span class="bm-actions">
+                <button
+                  class="icon-btn bm-icon"
+                  title="Rename {bookmark.name}"
+                  onclick={() => startRename(bookmark)}
+                >
+                  <Icon name="edit" size={11} />
+                </button>
+                <button
+                  class="icon-btn bm-icon danger"
+                  title="Delete {bookmark.name}"
+                  onclick={() => startDelete(bookmark)}
+                >
+                  <Icon name="trash" size={11} />
+                </button>
+              </span>
+            {/if}
+          </div>
+        {/if}
+      {/each}
+      {#if bmError}
+        <p class="bm-error" title={bmError}>{bmError}</p>
+      {/if}
+    </section>
+  </div>
+
+  <p class="select-hint">
+    <span class="kbd">↑</span><span class="kbd">↓</span>
+    Select a change in the graph to review its diff
+  </p>
+</div>
+
+<style>
+  /* The repo overview lives in the wide pane only while nothing is
+     selected; cap the column so it reads well at full width. */
+  .inspector {
+    padding: var(--sp-5) var(--sp-6) var(--sp-6);
+    max-width: 920px;
+    margin-inline: auto;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .repo-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-4);
+    margin-bottom: var(--sp-5);
+    min-width: 0;
+  }
+
+  .repo-head h3 {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-title);
+    font-weight: 600;
+    color: var(--clr-text-1);
+  }
+
+  .facts {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--sp-3);
+    flex-shrink: 0;
+  }
+
+  .fact {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  .fact :global(svg) {
+    color: var(--clr-text-3);
+  }
+
+  /* Sections side by side when the pane is wide, stacked when the diff
+     split squeezes it. */
+  .cards {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--sp-6);
+    align-items: start;
+  }
+
+  @container detail-pane (min-width: 780px) {
+    .cards {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .card {
+    min-width: 0;
+  }
+
+  h4 {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: var(--text-s);
+    font-weight: 600;
+    color: var(--clr-text-2);
+    padding-bottom: 6px;
+    margin-bottom: var(--sp-1);
+    border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .count {
+    font-size: var(--text-xs);
+    font-weight: 400;
+    color: var(--clr-text-3);
+  }
+
+  .ws-list {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .ws-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
+    height: 28px;
+    text-align: left;
+    padding: 0 var(--sp-2);
+    margin: 0 calc(-1 * var(--sp-2));
+    width: calc(100% + 2 * var(--sp-2));
+    border-radius: var(--radius-s);
+    transition: background var(--t-fast) var(--ease-out);
+  }
+
+  .ws-row:hover {
+    background: var(--clr-bg-hover);
+  }
+
+  .ws-row.current {
+    background: var(--clr-accent-dim);
+  }
+
+  .ws-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid var(--lane, var(--clr-accent));
+  }
+
+  .ws-dot.active {
+    border-color: var(--clr-working-copy);
+    background: var(--clr-working-copy);
+  }
+
+  .ws-title {
+    font-size: var(--text-m);
+    color: var(--clr-text-1);
+    min-width: 0;
+    flex: 1;
+  }
+
+  .ws-behind {
+    color: var(--clr-warn);
+  }
+
+  .chip {
+    flex-shrink: 1;
+    min-width: 0;
+    max-width: 11em;
+  }
+
+  .ws-meta {
+    flex-shrink: 0;
+    font-size: var(--text-s);
+    color: var(--clr-text-3);
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: 28px;
+    font-size: var(--text-m);
+    min-width: 0;
+  }
+
+  .value {
+    color: var(--clr-text-1);
+    min-width: 0;
+  }
+
+  .mono {
+    font-size: var(--text-s);
+  }
+
+  .bm-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--clr-text-3);
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+  }
+
+  button.bm-name:hover .value {
+    color: var(--clr-accent-strong);
+  }
+
+  /* Rename/delete reveal on row hover, like quiet contextual controls. */
+  .bm-actions {
+    display: inline-flex;
+    gap: 1px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity var(--t-fast) var(--ease-out);
+  }
+
+  .bm-row:hover .bm-actions,
+  .bm-actions:focus-within {
+    opacity: 1;
+  }
+
+  .bm-icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .bm-icon.danger:hover {
+    background: var(--clr-danger-dim);
+    color: var(--clr-danger);
+  }
+
+  .bm-input {
+    flex: 1;
+    min-width: 0;
+    height: 24px;
+  }
+
+  .bm-question {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  .bm-go,
+  .bm-cancel {
+    height: 24px;
+    padding: 0 8px;
+    font-size: var(--text-xs);
+  }
+
+  .bm-error {
+    margin-top: var(--sp-1);
+    font-size: var(--text-xs);
+    color: var(--clr-danger);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sync {
+    flex-shrink: 0;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .sync.ok {
+    color: var(--clr-ok);
+  }
+
+  .sync.warn {
+    color: var(--clr-warn);
+  }
+
+  .sync.danger {
+    color: var(--clr-danger);
+  }
+
+  .select-hint {
+    margin-top: auto;
+    padding-top: var(--sp-8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    font-size: var(--text-s);
+    color: var(--clr-text-3);
+  }
+
+  .select-hint .kbd + .kbd {
+    margin-left: -4px;
+  }
+</style>

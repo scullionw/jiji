@@ -1,0 +1,47 @@
+[package]
+name = "jiji"
+version.workspace = true
+description = "A JJ-native desktop workbench for local repo history, diffs, and mutations."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "jiji-desktop"
+
+[[bin]]
+name = "jiji-desktop"
+path = "src/main.rs"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "jiji_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+jiji-core = { path = "../crates/jiji-core" }
+jiji-forge = { path = "../crates/jiji-forge" }
+jiji-cli = { path = "../crates/jiji-cli" }
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-clipboard-manager.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-log.workspace = true
+tauri-plugin-opener.workspace = true
+tauri-plugin-process.workspace = true
+tauri-plugin-shell.workspace = true
+tauri-plugin-store.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater.workspace = true
+tauri-plugin-window-state.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

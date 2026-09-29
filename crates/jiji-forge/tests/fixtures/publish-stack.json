@@ -1,0 +1,778 @@
+{
+  "snapshot": {
+    "repoPath": "/tmp/publish-repo",
+    "repoName": "repo",
+    "backend": "test",
+    "view": {
+      "kind": "workstreams"
+    },
+    "truncated": false,
+    "trunkBookmark": "develop",
+    "workingCopy": "wc",
+    "workspaces": [],
+    "nodes": [
+      {
+        "id": "base",
+        "changeId": "base",
+        "commitId": "commit-base",
+        "description": "Change base",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "immutable",
+        "parents": [],
+        "elidedParents": [],
+        "bookmarks": [
+          "develop"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c0",
+        "changeId": "c0",
+        "commitId": "commit-c0",
+        "description": "Change c0",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "base"
+        ],
+        "elidedParents": [],
+        "bookmarks": [
+          "ws/tu1"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c1",
+        "changeId": "c1",
+        "commitId": "commit-c1",
+        "description": "Change c1",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c0"
+        ],
+        "elidedParents": [],
+        "bookmarks": [
+          "ws/tu2"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c2",
+        "changeId": "c2",
+        "commitId": "commit-c2",
+        "description": "Change c2",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c1"
+        ],
+        "elidedParents": [],
+        "bookmarks": [
+          "ws/tu3-deps"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c3",
+        "changeId": "c3",
+        "commitId": "commit-c3",
+        "description": "Change c3",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c2"
+        ],
+        "elidedParents": [],
+        "bookmarks": [],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c4",
+        "changeId": "c4",
+        "commitId": "commit-c4",
+        "description": "Change c4",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c3"
+        ],
+        "elidedParents": [],
+        "bookmarks": [],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c5",
+        "changeId": "c5",
+        "commitId": "commit-c5",
+        "description": "Change c5",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c4"
+        ],
+        "elidedParents": [],
+        "bookmarks": [
+          "ws/tu3-identity"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "c6",
+        "changeId": "c6",
+        "commitId": "commit-c6",
+        "description": "Change c6",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "c5"
+        ],
+        "elidedParents": [],
+        "bookmarks": [
+          "ws/tu3-emission"
+        ],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "wc",
+        "changeId": "wc",
+        "commitId": "commit-wc",
+        "description": "",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "workingCopy",
+        "parents": [
+          "c6"
+        ],
+        "elidedParents": [],
+        "bookmarks": [],
+        "tags": [],
+        "isEmpty": true,
+        "hasConflict": false,
+        "isDivergent": false
+      },
+      {
+        "id": "scratch",
+        "changeId": "scratch",
+        "commitId": "commit-scratch",
+        "description": "Change scratch",
+        "author": "dev@example.com",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "kind": "mutable",
+        "parents": [
+          "base"
+        ],
+        "elidedParents": [],
+        "bookmarks": [],
+        "tags": [],
+        "isEmpty": false,
+        "hasConflict": false,
+        "isDivergent": false
+      }
+    ],
+    "bookmarks": [
+      {
+        "name": "develop",
+        "target": "base",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": true,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      },
+      {
+        "name": "ws/tu1",
+        "target": "c0",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": false,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      },
+      {
+        "name": "ws/tu2",
+        "target": "c1",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": false,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      },
+      {
+        "name": "ws/tu3-deps",
+        "target": "c2",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": false,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      },
+      {
+        "name": "ws/tu3-identity",
+        "target": "c5",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": false,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      },
+      {
+        "name": "ws/tu3-emission",
+        "target": "c6",
+        "remote": "origin",
+        "sync": "synced",
+        "isTrunk": false,
+        "isLocal": true,
+        "tracked": true,
+        "isMerged": false,
+        "targetDescription": "",
+        "targetAuthor": "",
+        "targetTimestamp": ""
+      }
+    ],
+    "workstreams": [
+      {
+        "id": "active",
+        "title": "Ws/tu3 emission",
+        "nodeIds": [
+          "wc",
+          "c6",
+          "c5",
+          "c4",
+          "c3",
+          "c2",
+          "c1",
+          "c0"
+        ],
+        "bookmark": "ws/tu3-emission",
+        "isActive": true,
+        "behindTrunk": 0
+      },
+      {
+        "id": "scratch",
+        "title": "Scratch",
+        "nodeIds": [
+          "scratch"
+        ],
+        "bookmark": null,
+        "isActive": false,
+        "behindTrunk": 0
+      }
+    ],
+    "gitRemotes": [
+      {
+        "name": "origin",
+        "url": "git@github.com:org/repo.git"
+      }
+    ],
+    "conflicts": [],
+    "operations": [],
+    "resolveTool": null
+  },
+  "prs": {
+    "report": {
+      "prs": [
+        {
+          "number": 753,
+          "title": "Update encoded predictions",
+          "url": "https://github.com/org/repo/pull/753",
+          "state": "open",
+          "isDraft": true,
+          "headBranch": "ws/tu1",
+          "headCommit": "commit-c0",
+          "headOwner": "org",
+          "baseBranch": "develop",
+          "body": null,
+          "review": "none",
+          "checks": "passing"
+        },
+        {
+          "number": 754,
+          "title": "Match new trips",
+          "url": "https://github.com/org/repo/pull/754",
+          "state": "open",
+          "isDraft": true,
+          "headBranch": "ws/tu2",
+          "headCommit": "commit-c1",
+          "headOwner": "org",
+          "baseBranch": "ws/tu1",
+          "body": null,
+          "review": "none",
+          "checks": "passing"
+        },
+        {
+          "number": 755,
+          "title": "Update dependencies",
+          "url": "https://github.com/org/repo/pull/755",
+          "state": "open",
+          "isDraft": true,
+          "headBranch": "ws/tu3-deps",
+          "headCommit": "commit-c2",
+          "headOwner": "org",
+          "baseBranch": "ws/tu2",
+          "body": null,
+          "review": "none",
+          "checks": "passing"
+        },
+        {
+          "number": 756,
+          "title": "Carry trip identity",
+          "url": "https://github.com/org/repo/pull/756",
+          "state": "open",
+          "isDraft": true,
+          "headBranch": "ws/tu3-identity",
+          "headCommit": "commit-c5",
+          "headOwner": "org",
+          "baseBranch": "ws/tu3-deps",
+          "body": null,
+          "review": "none",
+          "checks": "passing"
+        },
+        {
+          "number": 757,
+          "title": "Resolve trips on their own schedules",
+          "url": "https://github.com/org/repo/pull/757",
+          "state": "open",
+          "isDraft": true,
+          "headBranch": "ws/tu3-emission",
+          "headCommit": "commit-c6",
+          "headOwner": "org",
+          "baseBranch": "ws/tu3-identity",
+          "body": null,
+          "review": "none",
+          "checks": "passing"
+        }
+      ],
+      "truncated": false
+    },
+    "byBranch": {
+      "ws/tu1": {
+        "number": 753,
+        "title": "Update encoded predictions",
+        "url": "https://github.com/org/repo/pull/753",
+        "state": "open",
+        "isDraft": true,
+        "headBranch": "ws/tu1",
+        "headCommit": "commit-c0",
+        "headOwner": "org",
+        "baseBranch": "develop",
+        "body": null,
+        "review": "none",
+        "checks": "passing"
+      },
+      "ws/tu2": {
+        "number": 754,
+        "title": "Match new trips",
+        "url": "https://github.com/org/repo/pull/754",
+        "state": "open",
+        "isDraft": true,
+        "headBranch": "ws/tu2",
+        "headCommit": "commit-c1",
+        "headOwner": "org",
+        "baseBranch": "ws/tu1",
+        "body": null,
+        "review": "none",
+        "checks": "passing"
+      },
+      "ws/tu3-deps": {
+        "number": 755,
+        "title": "Update dependencies",
+        "url": "https://github.com/org/repo/pull/755",
+        "state": "open",
+        "isDraft": true,
+        "headBranch": "ws/tu3-deps",
+        "headCommit": "commit-c2",
+        "headOwner": "org",
+        "baseBranch": "ws/tu2",
+        "body": null,
+        "review": "none",
+        "checks": "passing"
+      },
+      "ws/tu3-identity": {
+        "number": 756,
+        "title": "Carry trip identity",
+        "url": "https://github.com/org/repo/pull/756",
+        "state": "open",
+        "isDraft": true,
+        "headBranch": "ws/tu3-identity",
+        "headCommit": "commit-c5",
+        "headOwner": "org",
+        "baseBranch": "ws/tu3-deps",
+        "body": null,
+        "review": "none",
+        "checks": "passing"
+      },
+      "ws/tu3-emission": {
+        "number": 757,
+        "title": "Resolve trips on their own schedules",
+        "url": "https://github.com/org/repo/pull/757",
+        "state": "open",
+        "isDraft": true,
+        "headBranch": "ws/tu3-emission",
+        "headCommit": "commit-c6",
+        "headOwner": "org",
+        "baseBranch": "ws/tu3-identity",
+        "body": null,
+        "review": "none",
+        "checks": "passing"
+      }
+    }
+  },
+  "stacks": [
+    {
+      "key": "ws/tu3-emission",
+      "title": "Resolve trips on their own schedules",
+      "headBookmark": "ws/tu3-emission",
+      "headChange": "c6",
+      "submitHead": {
+        "kind": "bookmark",
+        "name": "ws/tu3-emission"
+      },
+      "isActive": true,
+      "segments": [
+        {
+          "bookmark": "ws/tu1",
+          "title": "Update encoded predictions",
+          "base": "develop",
+          "changes": [
+            {
+              "id": "c0",
+              "changeId": "c0",
+              "commitId": "commit-c0",
+              "description": "Change c0",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "base"
+              ],
+              "elidedParents": [],
+              "bookmarks": [
+                "ws/tu1"
+              ],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": {
+            "number": 753,
+            "title": "Update encoded predictions",
+            "url": "https://github.com/org/repo/pull/753",
+            "state": "open",
+            "isDraft": true,
+            "headBranch": "ws/tu1",
+            "headCommit": "commit-c0",
+            "headOwner": "org",
+            "baseBranch": "develop",
+            "body": null,
+            "review": "none",
+            "checks": "passing"
+          }
+        },
+        {
+          "bookmark": "ws/tu2",
+          "title": "Match new trips",
+          "base": "ws/tu1",
+          "changes": [
+            {
+              "id": "c1",
+              "changeId": "c1",
+              "commitId": "commit-c1",
+              "description": "Change c1",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c0"
+              ],
+              "elidedParents": [],
+              "bookmarks": [
+                "ws/tu2"
+              ],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": {
+            "number": 754,
+            "title": "Match new trips",
+            "url": "https://github.com/org/repo/pull/754",
+            "state": "open",
+            "isDraft": true,
+            "headBranch": "ws/tu2",
+            "headCommit": "commit-c1",
+            "headOwner": "org",
+            "baseBranch": "ws/tu1",
+            "body": null,
+            "review": "none",
+            "checks": "passing"
+          }
+        },
+        {
+          "bookmark": "ws/tu3-deps",
+          "title": "Update dependencies",
+          "base": "ws/tu2",
+          "changes": [
+            {
+              "id": "c2",
+              "changeId": "c2",
+              "commitId": "commit-c2",
+              "description": "Change c2",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c1"
+              ],
+              "elidedParents": [],
+              "bookmarks": [
+                "ws/tu3-deps"
+              ],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": {
+            "number": 755,
+            "title": "Update dependencies",
+            "url": "https://github.com/org/repo/pull/755",
+            "state": "open",
+            "isDraft": true,
+            "headBranch": "ws/tu3-deps",
+            "headCommit": "commit-c2",
+            "headOwner": "org",
+            "baseBranch": "ws/tu2",
+            "body": null,
+            "review": "none",
+            "checks": "passing"
+          }
+        },
+        {
+          "bookmark": "ws/tu3-identity",
+          "title": "Carry trip identity",
+          "base": "ws/tu3-deps",
+          "changes": [
+            {
+              "id": "c3",
+              "changeId": "c3",
+              "commitId": "commit-c3",
+              "description": "Change c3",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c2"
+              ],
+              "elidedParents": [],
+              "bookmarks": [],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            },
+            {
+              "id": "c4",
+              "changeId": "c4",
+              "commitId": "commit-c4",
+              "description": "Change c4",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c3"
+              ],
+              "elidedParents": [],
+              "bookmarks": [],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            },
+            {
+              "id": "c5",
+              "changeId": "c5",
+              "commitId": "commit-c5",
+              "description": "Change c5",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c4"
+              ],
+              "elidedParents": [],
+              "bookmarks": [
+                "ws/tu3-identity"
+              ],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": {
+            "number": 756,
+            "title": "Carry trip identity",
+            "url": "https://github.com/org/repo/pull/756",
+            "state": "open",
+            "isDraft": true,
+            "headBranch": "ws/tu3-identity",
+            "headCommit": "commit-c5",
+            "headOwner": "org",
+            "baseBranch": "ws/tu3-deps",
+            "body": null,
+            "review": "none",
+            "checks": "passing"
+          }
+        },
+        {
+          "bookmark": "ws/tu3-emission",
+          "title": "Resolve trips on their own schedules",
+          "base": "ws/tu3-identity",
+          "changes": [
+            {
+              "id": "c6",
+              "changeId": "c6",
+              "commitId": "commit-c6",
+              "description": "Change c6",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "c5"
+              ],
+              "elidedParents": [],
+              "bookmarks": [
+                "ws/tu3-emission"
+              ],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": {
+            "number": 757,
+            "title": "Resolve trips on their own schedules",
+            "url": "https://github.com/org/repo/pull/757",
+            "state": "open",
+            "isDraft": true,
+            "headBranch": "ws/tu3-emission",
+            "headCommit": "commit-c6",
+            "headOwner": "org",
+            "baseBranch": "ws/tu3-identity",
+            "body": null,
+            "review": "none",
+            "checks": "passing"
+          }
+        }
+      ],
+      "base": "develop",
+      "changeCount": 7,
+      "prCount": 5,
+      "searchText": "resolve trips on their own schedules ws/tu3-emission ws/tu1 update encoded predictions #753 ws/tu2 match new trips #754 ws/tu3-deps update dependencies #755 ws/tu3-identity carry trip identity #756 ws/tu3-emission resolve trips on their own schedules #757",
+      "status": "draft"
+    },
+    {
+      "key": "scratch",
+      "title": "Change scratch",
+      "headBookmark": null,
+      "headChange": "scratch",
+      "submitHead": {
+        "kind": "change",
+        "change": "scratch"
+      },
+      "isActive": false,
+      "segments": [
+        {
+          "bookmark": null,
+          "title": "Change scratch",
+          "base": "develop",
+          "changes": [
+            {
+              "id": "scratch",
+              "changeId": "scratch",
+              "commitId": "commit-scratch",
+              "description": "Change scratch",
+              "author": "dev@example.com",
+              "timestamp": "2026-09-01T12:00:00Z",
+              "kind": "mutable",
+              "parents": [
+                "base"
+              ],
+              "elidedParents": [],
+              "bookmarks": [],
+              "tags": [],
+              "isEmpty": false,
+              "hasConflict": false,
+              "isDivergent": false
+            }
+          ],
+          "pr": null
+        }
+      ],
+      "base": "develop",
+      "changeCount": 1,
+      "prCount": 0,
+      "searchText": "change scratch   change scratch ",
+      "status": "local"
+    }
+  ]
+}

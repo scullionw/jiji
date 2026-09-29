@@ -1,0 +1,27 @@
+[package]
+name = "jiji-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Publish, review, and land Jujutsu PR stacks from the terminal."
+
+[[bin]]
+name = "jiji"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+jiji-core = { path = "../jiji-core" }
+jiji-forge = { path = "../jiji-forge" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+[dev-dependencies]
+gix.workspace = true
+jj-lib.workspace = true
+pollster.workspace = true
+tempfile.workspace = true

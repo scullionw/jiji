@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+errors=0
+warnings=0
+
+ok() {
+  printf 'ok: %s\n' "$1"
+}
+
+warn() {
+  warnings=$((warnings + 1))
+  printf 'warn: %s\n' "$1"
+}
+
+fail() {
+  errors=$((errors + 1))
+  printf 'blocker: %s\n' "$1"
+}
+
+need_file() {
+  if [[ -f "$1" ]]; then
+    ok "$1 exists"
+  else
+    fail "$1 is missing"
+  fi
+}
+
+need_command() {
+  if command -v "$1" >/dev/null; then
+    ok "$1 is available"
+  else
+    fail "$1 is not installed"
+  fi
+}
+
+need_command bun
+need_command cargo
+need_command jq
+need_command gh
+
+need_file .github/workflows/release-macos.yml
+need_file src-tauri/tauri.conf.json
+need_file src-tauri/icons/icon.icns
+need_file src-tauri/icons/icon.ico
+need_file src-tauri/icons/icon.png
+
+pkg_version="$(jq -r '.version' package.json)"
+tauri_version="$(jq -r '.version' src-tauri/tauri.conf.json)"
+cargo_version="$(awk -F '= *' '$1 == "version " || $1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+
+if [[ "$pkg_version" == "$tauri_version" && "$pkg_version" == "$cargo_version" ]]; then
+  ok "versions match at $pkg_version"
+else
+  fail "versions differ: package.json=$pkg_version, tauri.conf.json=$tauri_version, Cargo.toml=$cargo_version"
+fi
+
+workflow_args="$(grep -E 'args: ' .github/workflows/release-macos.yml || true)"
+if [[ "$workflow_args" == *"--bundles app,dmg"* ]]; then
+  ok "workflow builds app,dmg so updater artifacts can be signed"
+else
+  fail "workflow must build --bundles app,dmg; dmg alone does not emit updater artifacts"
+fi
+
+if grep -q 'includeUpdaterJson: true' .github/workflows/release-macos.yml; then
+  ok "workflow publishes latest.json"
+else
+  fail "workflow is missing includeUpdaterJson: true"
+fi
+
+repo="$(gh repo view --json owner,name -q '.owner.login + "/" + .name' 2>/dev/null || true)"
+if [[ -z "$repo" ]]; then
+  fail "gh cannot resolve the GitHub repository"
+else
+  ok "GitHub repo is $repo"
+
+  endpoint="$(jq -r '.plugins.updater.endpoints[0]' src-tauri/tauri.conf.json)"
+  expected_endpoint="https://github.com/$repo/releases/latest/download/latest.json"
+  if [[ "$endpoint" == "$expected_endpoint" ]]; then
+    ok "updater endpoint matches $repo"
+  else
+    fail "updater endpoint is $endpoint; expected $expected_endpoint"
+  fi
+
+  repo_json="$(gh repo view "$repo" --json isPrivate,defaultBranchRef 2>/dev/null || true)"
+  if [[ -n "$repo_json" ]]; then
+    if [[ "$(jq -r '.isPrivate' <<<"$repo_json")" == "true" ]]; then
+      fail "$repo is private; public downloads and update checks need a public release source"
+    else
+      ok "$repo is public"
+    fi
+
+    default_branch="$(jq -r '.defaultBranchRef.name // ""' <<<"$repo_json")"
+    if [[ -n "$default_branch" ]]; then
+      ok "default branch is $default_branch"
+    else
+      fail "$repo has no default branch yet"
+    fi
+  else
+    fail "gh cannot inspect $repo"
+  fi
+
+  secret_names="$(gh secret list --repo "$repo" 2>/dev/null | awk '{ print $1 }' || true)"
+  for secret in \
+    APPLE_CERTIFICATE \
+    APPLE_CERTIFICATE_PASSWORD \
+    APPLE_API_ISSUER \
+    APPLE_API_KEY \
+    APPLE_API_PRIVATE_KEY \
+    TAURI_SIGNING_PRIVATE_KEY
+  do
+    if grep -qx "$secret" <<<"$secret_names"; then
+      ok "GitHub secret $secret is set"
+    else
+      fail "GitHub secret $secret is missing"
+    fi
+  done
+
+  if grep -qx 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD' <<<"$secret_names"; then
+    ok "GitHub secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD is set"
+  else
+    warn "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set; this is only okay for an unencrypted updater key"
+  fi
+fi
+
+if [[ -f "$HOME/.tauri/jiji-updater.key.pub" ]]; then
+  local_pubkey="$(cat "$HOME/.tauri/jiji-updater.key.pub")"
+  config_pubkey="$(jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json)"
+  if [[ "$local_pubkey" == "$config_pubkey" ]]; then
+    ok "local updater public key matches tauri.conf.json"
+  else
+    fail "local updater public key does not match tauri.conf.json"
+  fi
+else
+  warn "$HOME/.tauri/jiji-updater.key.pub is not present on this machine"
+fi
+
+if security find-identity -v -p codesigning 2>/dev/null | grep -q 'Developer ID Application'; then
+  ok "Developer ID Application identity exists in the local keychain"
+else
+  warn "no local Developer ID Application identity found; CI can still sign if APPLE_CERTIFICATE is set"
+fi
+
+if [[ "$errors" -gt 0 ]]; then
+  printf '\nrelease preflight failed with %d blocker(s) and %d warning(s).\n' "$errors" "$warnings"
+  exit 1
+fi
+
+printf '\nrelease preflight passed with %d warning(s).\n' "$warnings"
