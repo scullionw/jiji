@@ -1,6 +1,6 @@
 {
   "name": "jiji",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A JJ-native desktop workbench for local repo history, diffs, and mutations.",
   "type": "module",
   "scripts": {

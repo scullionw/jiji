@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1 - 2026-10-06
+
+A cleaner Publish section, in the same flat style as the workbench.
+
+- A stack's header now matches a change's two bars: the title with a
+  Workbench button, then the stack's state, its pull requests and
+  changes, the branch it lands into, and whether it is your current
+  stack.
+- The landing order reads as one list: each row shows its PR number,
+  title, branch, checks and review, with "Next to land" or "Merged"
+  beside it, and the heading counts how many have merged.
+- Land and Update are a segmented control at the top of the action
+  column, beside a labelled More menu for shipping straight to trunk.
+- Stack list rows lead with the title, then the status and PR count.
+  Auto-land jobs are flat rows with a status dot that pulses while the
+  job runs.
+- Counts read correctly in the singular ("1 step", "1 change").
+
 ## 0.4.0 - 2026-09-28
 
 Everything since 0.1.0 in one release: a new look built around the diff,
