@@ -5,6 +5,11 @@
   import type { LandSegment } from "$lib/bindings/LandSegment";
   import type { PublishStack } from "./stacks";
 
+  // The stack as a ledger: one row per segment in landing order, the
+  // base branch at the top, a hairline rail threading the positions.
+  // Rows carry their PR's facts (number, checks, review) and open their
+  // changes inline; the land plan or job overlays each row's landing
+  // status (merged, next, stacked) when one is live.
   let {
     stack,
     landing = [],
@@ -16,86 +21,102 @@
     else next.add(key);
     expanded = next;
   }
+
+  const total = $derived(stack.segments.length);
+  const mergedCount = $derived(
+    landing.filter((segment) => segment.status.kind === "merged").length,
+  );
 </script>
 
 <section class="chain" aria-label="Stack in landing order" data-stack-chain>
-  <div class="chain-heading">
-    <span>Landing order</span><span>Base → head</span>
+  <div class="chain-head">
+    <span class="chain-title">Landing order</span>
+    <span class="chain-progress">
+      {#if stack.prCount}
+        {mergedCount} of {total} merged
+      {:else}
+        {total} segment{total === 1 ? "" : "s"}
+      {/if}
+    </span>
   </div>
-  <div class="base">
-    <span class="base-icon"><Icon name="branch" size={14} /></span><span
-      class="mono">{stack.base || "trunk"}</span
-    ><span class="base-label">target branch</span>
-  </div>
-  <ol>
+  <ol class="ledger">
+    <li class="base">
+      <span class="rail"
+        ><span class="pos base-pos"><Icon name="branch" size={11} /></span
+        ></span
+      >
+      <div class="base-body">
+        <span class="ref trunk"
+          ><span class="truncate">{stack.base || "trunk"}</span></span
+        >
+        <span class="base-label">target branch</span>
+      </div>
+    </li>
     {#each stack.segments as segment, index (segment.bookmark ?? index)}
       {@const key = segment.bookmark ?? String(index)}
       {@const planned = landing.find(
         (item) => item.bookmark === segment.bookmark,
       )}
-      {@const status = planned?.status.kind}
+      {@const status = planned?.status}
+      {@const mergedPr = status?.kind === "merged" ? status : null}
       {@const pr = planned?.pr ?? segment.pr}
-      {@const merged = status === "merged"}
-      {@const next = status === "landing" || status === "waiting"}
+      {@const merged = mergedPr != null}
+      {@const next = status?.kind === "landing" || status?.kind === "waiting"}
+      {@const open = expanded.has(key)}
       <li
-        data-publish-segment={segment.bookmark ?? "local"}
+        class="seg"
         class:next
         class:merged
+        data-publish-segment={segment.bookmark ?? "local"}
       >
-        <div class="rail">
-          <span class="position"
-            >{#if merged}<Icon name="check" size={13} />{:else}{index +
+        <span class="rail">
+          <span class="pos"
+            >{#if merged}<Icon name="check" size={11} />{:else}{index +
                 1}{/if}</span
           >
-        </div>
-        <article class="segment-card">
-          <div class="card-top">
-            <span class="pr-kind">
-              <Icon name="branch" size={13} />
-              {pr
-                ? merged
-                  ? "Merged"
-                  : pr.isDraft
-                    ? "Draft pull request"
-                    : "Pull request"
-                : "Unpublished"}
-            </span>
-            {#if next}<span class="next-label">Up next</span>{/if}
-            {#if pr}
+        </span>
+        <div class="seg-body">
+          <div class="seg-line">
+            {#if mergedPr}
               <button
-                class="pr-link mono"
+                class="pr-num mono"
+                title="Open pull request #{mergedPr.number} on GitHub"
+                onclick={() => openUrl(mergedPr.url)}>#{mergedPr.number}</button
+              >
+            {:else if pr}
+              <button
+                class="pr-num mono"
                 title="Open pull request #{pr.number} on GitHub"
-                onclick={() => openUrl(pr.url)}
-                >#{pr.number} <span>↗</span></button
+                onclick={() => openUrl(pr.url)}>#{pr.number}</button
               >
             {/if}
-          </div>
-          <h3>{pr?.title ?? segment.title}</h3>
-          <div class="branch-row">
-            <span
-              class="branch-name mono"
-              title={segment.bookmark ??
-                "Branch name is chosen when publishing"}
-              >{segment.bookmark ?? "New branch"}</span
-            >
-            {#if segment.changes.length}
-              <button
-                class="changes"
-                aria-expanded={expanded.has(key)}
-                onclick={() => toggle(key)}
-                >{segment.changes.length} change{segment.changes.length === 1
-                  ? ""
-                  : "s"}<Icon
-                  name={expanded.has(key) ? "chevronDown" : "chevronRight"}
-                  size={12}
-                /></button
-              >
+            <span class="seg-title">{pr?.title ?? segment.title}</span>
+            {#if merged}
+              <span class="seg-state ok">Merged</span>
+            {:else if next}
+              <span class="seg-state up-next">Next to land</span>
             {/if}
           </div>
-          {#if pr && !merged}
-            <div class="signals">
+          <div class="seg-meta">
+            {#if segment.bookmark}
+              <span class="ref" title={segment.bookmark}
+                ><span class="truncate">{segment.bookmark}</span></span
+              >
+            {:else}
+              <span
+                class="new-branch"
+                title="Branch name is chosen when publishing">new branch</span
+              >
+            {/if}
+            {#if pr && !merged}
+              {#if pr.isDraft}
+                <span class="signal muted"
+                  ><Icon name="edit" size={11} />Draft</span
+                >
+              {/if}
               {#if pr.checks !== "none"}
                 <span
+                  class="signal"
                   class:ok={pr.checks === "passing"}
                   class:danger={pr.checks === "failing"}
                   class:warn={pr.checks === "pending"}
@@ -106,7 +127,7 @@
                       : pr.checks === "failing"
                         ? "close"
                         : "operations"}
-                    size={12}
+                    size={11}
                   />
                   {pr.checks === "passing"
                     ? "Checks passed"
@@ -117,12 +138,13 @@
               {/if}
               {#if pr.review !== "none"}
                 <span
+                  class="signal"
                   class:ok={pr.review === "approved"}
                   class:danger={pr.review === "changesRequested"}
                 >
                   <Icon
-                    name={pr.review === "approved" ? "check" : "eye"}
-                    size={12}
+                    name={pr.review === "approved" ? "badgeCheck" : "eye"}
+                    size={11}
                   />
                   {pr.review === "approved"
                     ? "Approved"
@@ -131,24 +153,42 @@
                       : "Review needed"}
                 </span>
               {/if}
-            </div>
-          {/if}
-          {#if expanded.has(key)}
-            <div class="commits">
+            {:else if !pr && !merged}
+              <span class="signal muted">Not published</span>
+            {/if}
+            {#if segment.changes.length}
+              <button
+                class="changes-toggle"
+                aria-expanded={open}
+                onclick={() => toggle(key)}
+                >{segment.changes.length} change{segment.changes.length === 1
+                  ? ""
+                  : "s"}<Icon
+                  name={open ? "chevronDown" : "chevronRight"}
+                  size={11}
+                /></button
+              >
+            {/if}
+          </div>
+          {#if open}
+            <ul class="changes">
               {#each segment.changes as change (change.id)}
-                <button
-                  onclick={() => jumpToChange(change.id)}
-                  title="Review this change on the workbench"
-                  ><Icon name="commit" size={14} /><span
-                    >{change.description.split("\n")[0] ||
-                      "Untitled change"}</span
-                  ><span class="mono">{change.changeId.slice(0, 8)}</span
-                  ></button
-                >
+                <li>
+                  <button
+                    onclick={() => jumpToChange(change.id)}
+                    title="Review this change on the workbench"
+                    ><Icon name="commit" size={13} /><span class="truncate"
+                      >{change.description.split("\n")[0] ||
+                        "Untitled change"}</span
+                    ><span class="change-id mono"
+                      >{change.changeId.slice(0, 8)}</span
+                    ></button
+                  >
+                </li>
               {/each}
-            </div>
+            </ul>
           {/if}
-        </article>
+        </div>
       </li>
     {/each}
   </ol>
@@ -159,78 +199,78 @@
     min-width: 0;
   }
 
-  .chain-heading {
-    display: flex;
-    justify-content: space-between;
-    padding: 0 0 var(--sp-2);
-    color: var(--clr-text-3);
-    font-size: var(--text-xs);
-  }
-
-  .chain-heading > :first-child {
-    font-weight: 600;
-  }
-
-  .base {
+  /* The ledger's own toolbar: same height and hairline as the action
+     column's head beside it, so one line runs across the detail. */
+  .chain-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
-    gap: var(--sp-3);
-    height: 28px;
-    margin-bottom: var(--sp-2);
-    color: var(--clr-text-2);
+    justify-content: space-between;
+    height: var(--toolbar-h);
+    padding: 0 var(--sp-4);
+    border-bottom: 1px solid var(--clr-border-2);
+    background: var(--clr-bg-1);
     font-size: var(--text-s);
   }
 
-  .base-icon {
-    width: 24px;
-    display: grid;
-    place-items: center;
-    color: var(--clr-text-3);
+  .chain-title {
+    font-weight: 600;
+    color: var(--clr-text-2);
   }
 
-  .base-label {
-    color: var(--clr-text-3);
+  .chain-progress {
     font-size: var(--text-xs);
+    color: var(--clr-text-3);
   }
 
-  ol {
+  .ledger {
     list-style: none;
-    padding: 0;
     margin: 0;
+    padding: var(--sp-1) var(--sp-4) var(--sp-6);
   }
 
-  li {
+  .base,
+  .seg {
     position: relative;
     display: grid;
-    grid-template-columns: 24px minmax(0, 1fr);
-    gap: var(--sp-3);
-    padding-bottom: var(--sp-2);
+    grid-template-columns: 18px minmax(0, 1fr);
+    column-gap: var(--sp-3);
   }
 
+  /* The rail: one hairline threading every position marker, from the
+     base branch to the last segment. */
   .rail {
     position: relative;
     display: flex;
     justify-content: center;
-    padding-top: 14px;
+    align-items: flex-start;
   }
 
   .rail::before {
     content: "";
     position: absolute;
-    top: -30px;
-    bottom: -20px;
+    top: 0;
+    bottom: 0;
+    left: 50%;
     width: 1px;
     background: var(--clr-border-1);
   }
 
-  li:last-child .rail::before {
-    bottom: calc(100% - 26px);
+  .base .rail::before {
+    top: 50%;
   }
 
-  .position {
+  .seg:last-child .rail::before {
+    bottom: calc(100% - 20px);
+  }
+
+  .pos {
     position: relative;
-    width: 22px;
-    height: 22px;
+    z-index: 1;
+    width: 18px;
+    height: 18px;
     display: grid;
     place-items: center;
     border: 1px solid var(--clr-border-1);
@@ -238,167 +278,212 @@
     background: var(--clr-bg-1);
     color: var(--clr-text-3);
     font-family: var(--font-mono);
-    font-size: var(--text-xs);
+    font-size: 10px;
+    font-weight: 500;
+    line-height: 1;
   }
 
-  .next .position {
-    border-color: var(--clr-accent);
-    color: var(--clr-accent-contrast);
-    background: var(--clr-accent);
+  .base {
+    height: 34px;
+    align-items: center;
   }
 
-  .merged .position {
-    color: var(--clr-ok);
-    border-color: var(--clr-ok);
+  .base .rail {
+    align-items: center;
+    height: 100%;
   }
 
-  .segment-card {
-    min-width: 0;
-    padding: 10px 14px;
-    border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-l);
-  }
-
-  .next .segment-card {
-    border-color: color-mix(in srgb, var(--clr-accent) 45%, var(--clr-border-2));
-  }
-
-  .card-top {
+  .base-body {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    min-width: 0;
     font-size: var(--text-xs);
     color: var(--clr-text-3);
-    margin-bottom: 4px;
   }
 
-  .pr-kind {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-
-  .next-label {
-    font-size: var(--text-xs);
+  .ref.trunk {
+    max-width: 24em;
     color: var(--clr-accent-strong);
-    font-weight: 600;
+    background: var(--clr-accent-dim);
   }
 
-  .pr-link {
-    margin-left: auto;
-    color: var(--clr-accent-strong);
-    font-size: var(--text-s);
+  .seg .rail {
+    padding-top: 11px;
+  }
+
+  .seg-body {
+    min-width: 0;
+    padding: 10px 0;
+    border-top: 1px solid var(--clr-border-2);
+  }
+
+  .seg-line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    min-height: 20px;
+    line-height: 20px;
+  }
+
+  .pr-num {
     flex-shrink: 0;
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+    transition: color var(--t-fast) var(--ease-out);
   }
 
-  .pr-link span {
-    opacity: 0.65;
-  }
-
-  .pr-link:hover {
+  .pr-num:hover {
+    color: var(--clr-accent-strong);
     text-decoration: underline;
   }
 
-  h3 {
+  .seg-title {
+    flex: 1;
+    min-width: 0;
     font-size: var(--text-m);
-    line-height: 1.45;
-    font-weight: 600;
-    margin: 0 0 4px;
+    font-weight: 500;
     color: var(--clr-text-1);
     overflow-wrap: anywhere;
   }
 
-  .branch-row {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-3);
-    min-width: 0;
+  .next .seg-title {
+    font-weight: 600;
   }
 
-  .branch-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--clr-text-3);
+  .merged .seg-title {
+    font-weight: 400;
+    color: var(--clr-text-2);
+  }
+
+  .seg-state {
+    flex-shrink: 0;
     font-size: var(--text-xs);
+    font-weight: 600;
   }
 
-  .changes {
+  .seg-state.up-next {
+    color: var(--clr-accent-strong);
+  }
+
+  .seg-state.ok {
+    color: var(--clr-ok);
+  }
+
+  .next .pos {
+    border-color: var(--clr-accent);
+    background: var(--clr-accent);
+    color: var(--clr-accent-contrast);
+  }
+
+  .merged .pos {
+    border-color: color-mix(in srgb, var(--clr-ok) 55%, transparent);
+    color: var(--clr-ok);
+  }
+
+  .seg-meta {
     display: flex;
     align-items: center;
-    gap: 3px;
+    flex-wrap: wrap;
+    gap: 4px var(--sp-3);
+    min-height: 18px;
+    margin-top: 3px;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  .seg-meta .ref {
+    max-width: 22em;
+  }
+
+  .new-branch {
+    font-style: italic;
+  }
+
+  .signal {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+
+  .signal :global(svg) {
+    flex-shrink: 0;
+  }
+
+  .signal.ok {
+    color: var(--clr-ok);
+  }
+
+  .signal.warn {
+    color: var(--clr-warn);
+  }
+
+  .signal.danger {
+    color: var(--clr-danger);
+  }
+
+  .signal.muted {
+    color: var(--clr-text-3);
+  }
+
+  .changes-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
     margin-left: auto;
     white-space: nowrap;
     font-size: var(--text-xs);
     color: var(--clr-text-3);
+    transition: color var(--t-fast) var(--ease-out);
   }
 
-  .changes:hover {
+  .changes-toggle:hover,
+  .changes-toggle[aria-expanded="true"] {
     color: var(--clr-text-1);
   }
 
-  .signals {
-    display: flex;
-    gap: var(--sp-4);
-    flex-wrap: wrap;
-    margin-top: 6px;
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
-  }
-
-  .signals > span {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .ok {
-    color: var(--clr-ok);
-  }
-
-  .warn {
-    color: var(--clr-warn);
-  }
-
-  .danger {
-    color: var(--clr-danger);
-  }
-
-  .commits {
+  .changes {
+    list-style: none;
+    margin: var(--sp-2) 0 0;
+    padding: var(--sp-1) 0 0;
     border-top: 1px solid var(--clr-border-2);
-    margin-top: var(--sp-2);
-    padding-top: 2px;
   }
 
-  .commits button {
+  .changes button {
     display: flex;
     align-items: center;
-    text-align: left;
     gap: var(--sp-2);
     width: 100%;
-    height: 26px;
-    color: var(--clr-text-2);
+    height: 24px;
+    padding: 0 var(--sp-1);
+    border-radius: var(--radius-s);
+    text-align: left;
     font-size: var(--text-s);
+    color: var(--clr-text-2);
+    transition:
+      background var(--t-fast) var(--ease-out),
+      color var(--t-fast) var(--ease-out);
   }
 
-  .commits button:hover {
-    color: var(--clr-accent-strong);
+  .changes button:hover {
+    background: var(--clr-bg-hover);
+    color: var(--clr-text-1);
   }
 
-  .commits button > span:first-of-type {
+  .changes button :global(svg) {
+    flex-shrink: 0;
+    color: var(--clr-text-3);
+  }
+
+  .changes .truncate {
     flex: 1;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
-  .commits .mono {
-    color: var(--clr-text-3);
+  .change-id {
+    flex-shrink: 0;
     font-size: var(--text-xs);
-  }
-
-  .mono {
-    font-family: var(--font-mono);
+    color: var(--clr-text-3);
   }
 </style>

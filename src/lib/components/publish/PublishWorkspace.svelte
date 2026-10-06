@@ -587,7 +587,7 @@
     {#each steps as step, index (index)}
       <li data-step={step.status}>
         <span class="step-glyph {step.status}">{stepGlyph[step.status]}</span>
-        <div>
+        <div class="step-text">
           {step.text}{#if step.detail}<p>{step.detail}</p>{/if}
         </div>
       </li>
@@ -605,19 +605,15 @@
     data-stack-select={stack.key}
     aria-pressed={selectedKey === stack.key}
   >
-    <span class="stack-row-top"
-      ><Icon name={stack.prCount > 1 ? "listTree" : "branch"} size={14} /><span
-        >{stack.title}</span
-      >{#if stack.isActive}<i class="current-dot" title="Current stack"
-        ></i>{/if}</span
-    >
+    <span class="stack-row-title">{stack.title}</span>
+    {#if stack.isActive}<i class="current-dot" title="Current stack"></i>{/if}
     <span class="stack-row-meta"
-      ><span
+      ><span class="status-dot {summary.tone}"></span><span
+        >{summary.label}</span
+      ><span class="meta-sep"></span><span
         >{stack.prCount
           ? `${stack.prCount} PR${stack.prCount === 1 ? "" : "s"}`
           : `${stack.changeCount} change${stack.changeCount === 1 ? "" : "s"}`}</span
-      ><span class="status-dot {summary.tone}"></span><span
-        >{summary.label}</span
       ></span
     >
   </button>
@@ -645,8 +641,8 @@
 />
 
 <div class="publish-view">
-  <!-- One toolbar bar, like the workbench's: what this is, which view,
-     and the connection — then the whole height for the stacks. -->
+  <!-- The section's one toolbar, the same height and hairline as the
+     workbench's: what this is, which view, and the connection. -->
   <header class="page-bar">
     <h1>Publish</h1>
     <span class="repo mono" data-forge-repo>
@@ -674,7 +670,7 @@
         onclick={refreshSelected}><Icon name="refresh" size={14} /></button
       >
       <details class="connection" bind:open={connectionOpen}>
-        <summary
+        <summary class="btn ghost action"
           ><span class="status-dot" class:ok={connected}></span>{connected
             ? `@${auth?.login}`
             : "Connect GitHub"}<Icon name="chevronDown" size={12} /></summary
@@ -706,6 +702,7 @@
                 }}
               >
                 <input
+                  class="field"
                   type="password"
                   aria-label="GitHub personal access token"
                   placeholder="github_pat_…"
@@ -760,6 +757,9 @@
       </div>{/if}
 
     {#if jobStatuses.length > 0}
+      <!-- Auto-land jobs: one flat band per record, the live job first.
+         The status bar carries the same story as a chip; this is where
+         it is acted on. -->
       <div class="jobs">
         {#each jobStatuses as jobStatus (jobStatus.record.state.headBookmark)}
           {@const job = jobStatus.record.state}
@@ -767,15 +767,27 @@
           {@const blocker = interrupted
             ? resumeBlocker(jobStatus, snapshot.bookmarks)
             : null}
+          {@const tone = interrupted
+            ? "warn"
+            : job.phase.kind === "done"
+              ? "ok"
+              : job.phase.kind === "failed"
+                ? "danger"
+                : job.phase.kind === "stopped"
+                  ? "muted"
+                  : job.phase.kind === "waiting" && job.phase.attention
+                    ? "warn"
+                    : "accent"}
           <section
             class="job"
             data-autoland-job={interrupted ? "interrupted" : job.phase.kind}
           >
-            <div class="job-heading">
-              <Icon
-                name={job.phase.kind === "done" ? "check" : "operations"}
-                size={16}
-              /><strong
+            <div class="job-head">
+              <span
+                class="job-dot {tone}"
+                class:pulse={jobStatus.live && !isTerminalPhase(job.phase)}
+              ></span>
+              <strong class="job-title"
                 >{interrupted
                   ? "Interrupted"
                   : job.phase.kind === "done"
@@ -785,7 +797,10 @@
                       : job.phase.kind === "stopped"
                         ? "Stopped"
                         : "Auto-landing"}</strong
-              ><span class="mono job-name">{job.headBookmark}</span>
+              >
+              <span class="ref job-name"
+                ><span class="truncate">{job.headBookmark}</span></span
+              >
               <div class="job-buttons">
                 {#if interrupted}{#if !blocker}<span data-autoland-resume
                       ><Button
@@ -806,25 +821,30 @@
                   >{/if}
               </div>
             </div>
-            <p data-autoland-story>
+            <p class="job-story" data-autoland-story>
               {autolandStory(jobStatus)}{#if interrupted}{" "}
                 Last update {fromNow(Number(jobStatus.record.savedAtMs))}.{/if}
             </p>
             {#if job.options.bypass}<p
-                class="warning"
+                class="job-story warning"
                 data-autoland-options="bypass"
               >
                 {autolandOptionsStory(job.options)}
               </p>{/if}
-            {#if blocker}<p class="error" data-autoland-resume-blocker>
+            {#if blocker}<p class="job-story error" data-autoland-resume-blocker>
                 {blocker}
               </p>{/if}
-            {#if resumeError}<p class="error" data-autoland-resume-error>
+            {#if resumeError}<p class="job-story error" data-autoland-resume-error>
                 {resumeError}
               </p>{/if}
-            {#if job.lastOutcome}<details class="disclosure">
+            {#if job.lastOutcome}<details class="disclosure job-round">
                 <summary
-                  >Last round · {job.lastOutcome.steps.length} steps</summary
+                  >Last round <span
+                    >{job.lastOutcome.steps.length} step{job.lastOutcome
+                      .steps.length === 1
+                      ? ""
+                      : "s"}</span
+                  ></summary
                 >{@render resultSteps(
                   job.lastOutcome.steps.map((step) => ({
                     ...step,
@@ -841,7 +861,7 @@
       <div class="workspace">
         <aside class="stack-browser" aria-label="Stacks">
           <label class="stack-search"
-            ><Icon name="search" size={14} /><input
+            ><Icon name="search" size={13} /><input
               bind:this={searchInput}
               aria-label="Find a stack"
               placeholder="Find a stack…"
@@ -862,18 +882,17 @@
                 Finding pull requests…
               </div>{/if}
             {#if localStacks.length > 0}
+              {@const localOpen = showLocal || !publishedStacks.length || !!query}
               <button
-                class="local-heading"
-                aria-expanded={showLocal || !publishedStacks.length || !!query}
+                class="list-heading local-heading"
+                aria-expanded={localOpen}
                 onclick={() => (showLocal = !showLocal)}
-                ><Icon
-                  name={showLocal || !publishedStacks.length || query
-                    ? "chevronDown"
-                    : "chevronRight"}
-                  size={12}
-                />Local work <span>{filteredLocal.length}</span></button
+                >Local work <span>{filteredLocal.length}</span><Icon
+                  name={localOpen ? "chevronDown" : "chevronRight"}
+                  size={11}
+                /></button
               >
-              {#if showLocal || !publishedStacks.length || query}{#each filteredLocal as stack (stack.key)}{@render stackRow(
+              {#if localOpen}{#each filteredLocal as stack (stack.key)}{@render stackRow(
                     stack,
                   )}{/each}{/if}
             {/if}
@@ -882,11 +901,6 @@
               >
                 No matching stacks.
               </p>{/if}
-          </div>
-          <div class="browser-foot">
-            <Icon name="branch" size={13} /><span
-              >Stacks follow your bookmarks.</span
-            >
           </div>
         </aside>
 
@@ -898,135 +912,161 @@
                 status.record.state.headBookmark === selected.headBookmark &&
                 status.live,
             )}
+            <!-- The stack's header, two bars like a change's: the title
+               and its one verb, then where the stack stands. -->
             <header class="stack-header">
-              <div class="eyebrow">
-                {selected.isActive
-                  ? "Current stack"
-                  : selected.submitHead
-                    ? "Your stack"
-                    : "On GitHub"}<span class="pill {summary.tone}"
+              <div class="bar title-bar">
+                <h2 class="stack-title truncate" title={selected.title}>
+                  {selected.title}
+                </h2>
+                {#if selected.headChange}<button
+                    class="btn ghost action"
+                    title="Open this stack on the workbench"
+                    onclick={() =>
+                      selected?.headChange && jumpToChange(selected.headChange)}
+                    ><Icon name="workbench" size={14} />Workbench</button
+                  >{/if}
+              </div>
+              <div class="bar meta-bar">
+                <span class="fact state"
+                  ><span class="status-dot {summary.tone}"></span
                   >{summary.label}</span
                 >
-              </div>
-              <h2>{selected.title}</h2>
-              <div class="stack-subtitle">
-                <span
+                <span class="sep"></span>
+                <span class="fact"
                   >{selected.prCount} pull request{selected.prCount === 1
                     ? ""
                     : "s"}</span
-                >{#if selected.changeCount}<span
-                    >{selected.changeCount} changes</span
-                  >{/if}<span
-                  >into <strong class="mono"
-                    >{selected.base || snapshot.trunkBookmark}</strong
+                >
+                {#if selected.changeCount}<span class="fact"
+                    >{selected.changeCount} change{selected.changeCount === 1
+                      ? ""
+                      : "s"}</span
+                  >{/if}
+                <span class="fact"
+                  >into <span class="ref trunk"
+                    ><span class="truncate"
+                      >{selected.base || snapshot.trunkBookmark}</span
+                    ></span
                   ></span
                 >
-                {#if selected.headChange}<button
-                    class="text-button workbench-link"
-                    onclick={() =>
-                      selected?.headChange && jumpToChange(selected.headChange)}
-                    ><Icon name="workbench" size={13} />Workbench ↗</button
+                {#if selected.isActive}<span class="fact"
+                    ><i class="current-dot"></i>Current stack</span
+                  >{:else if !selected.submitHead}<span class="fact"
+                    >On GitHub only</span
                   >{/if}
               </div>
             </header>
             <div class="detail-body">
-              <StackChain
-                stack={selected}
-                landing={currentJob?.record.state.segments ??
-                  (landFor === selected.headBookmark
-                    ? (land?.segments ?? [])
-                    : [])}
-              />
+              <div class="chain-pane">
+                <StackChain
+                  stack={selected}
+                  landing={currentJob?.record.state.segments ??
+                    (landFor === selected.headBookmark
+                      ? (land?.segments ?? [])
+                      : [])}
+                />
+              </div>
               <aside class="action-column" aria-label="Stack actions">
-                {#if !connected}
-                  <div class="action-card">
-                    <Icon name="publish" size={23} />
+                <div class="column-head">
+                  {#if connected && selected.submitHead}
+                    <nav class="segmented" aria-label="Stack action">
+                      {#if selected.headBookmark && selected.prCount}<button
+                          class:active={mode === "land"}
+                          disabled={executing}
+                          data-land-stack={selected.headBookmark}
+                          onclick={() =>
+                            selected?.headBookmark &&
+                            loadLandPlan(selected.headBookmark)}>Land</button
+                        >{/if}
+                      <button
+                        class:active={mode === "publish"}
+                        disabled={executing}
+                        data-submit-stack={selected.key}
+                        onclick={() =>
+                          selected?.submitHead && loadPlan(selected.submitHead)}
+                        >{selected.prCount ? "Update" : "Publish"}</button
+                      >
+                    </nav>
+                    {#if selected.headChange}<details class="more-menu">
+                        <summary
+                          class="btn ghost action"
+                          class:on={mode === "ship"}
+                          aria-label="More stack actions"
+                          >More<Icon name="chevronDown" size={12} /></summary
+                        >
+                        <div
+                          class="action-menu popover"
+                          role="group"
+                          aria-label="More stack actions"
+                        >
+                          <button
+                            class="menu-item"
+                            disabled={executing}
+                            data-ship-stack={selected.headChange}
+                            onclick={() =>
+                              selected?.headChange &&
+                              loadShipPlan(selected.headChange)}
+                            ><Icon name="arrowUp" size={14} /><span
+                              class="menu-text"
+                              >Ship directly to {snapshot.trunkBookmark}</span
+                            ></button
+                          >
+                        </div>
+                      </details>{/if}
+                  {:else}
+                    <span class="column-label">Next step</span>
+                  {/if}
+                </div>
+                <div class="plan">
+                  {#if !connected}
                     <h3>Connect to publish</h3>
                     <p>Sign in to see checks, reviews, and landing options.</p>
-                    <Button
-                      variant="primary"
-                      onclick={() => (connectionOpen = true)}
-                      >Connect GitHub</Button
-                    >
-                  </div>
-                {:else if !selected.submitHead}
-                  <div class="action-card">
-                    <Icon name="branch" size={23} />
+                    <div class="primary-actions">
+                      <Button
+                        variant="primary"
+                        onclick={() => (connectionOpen = true)}
+                        >Connect GitHub</Button
+                      >
+                    </div>
+                  {:else if !selected.submitHead}
                     <h3>Bring this stack home</h3>
                     <p>
                       This stack is on GitHub. Fetch its head to review it
                       locally.
                     </p>
-                    <Button
-                      variant="primary"
-                      onclick={() => {
-                        const pr = selected?.segments.at(-1)?.pr;
-                        if (pr) {
-                          page = "review";
-                          openReviewPanel(pr);
-                        }
-                      }}>Fetch for review</Button
-                    >
-                  </div>
-                {:else}
-                  <div class="action-modes" aria-label="Stack action">
-                    {#if selected.headBookmark && selected.prCount}<button
-                        class:active={mode === "land"}
-                        disabled={executing}
-                        data-land-stack={selected.headBookmark}
-                        onclick={() =>
-                          selected?.headBookmark &&
-                          loadLandPlan(selected.headBookmark)}>Land</button
-                      >{/if}
-                    <button
-                      class:active={mode === "publish"}
-                      disabled={executing}
-                      data-submit-stack={selected.key}
-                      onclick={() =>
-                        selected?.submitHead && loadPlan(selected.submitHead)}
-                      >{selected.prCount ? "Update" : "Publish"}</button
-                    >
-                    {#if selected.headChange}<details class="more-menu">
-                        <summary aria-label="More stack actions">···</summary
-                        ><button
-                          disabled={executing}
-                          data-ship-stack={selected.headChange}
-                          onclick={() =>
-                            selected?.headChange &&
-                            loadShipPlan(selected.headChange)}
-                          >Ship directly to {snapshot.trunkBookmark}</button
-                        >
-                      </details>{/if}
-                  </div>
-                  {#if mode === "land"}
-                    <div
-                      class="action-card"
-                      data-land-plan={land?.headBookmark}
-                    >
-                      {#if currentJob}<span class="action-symbol"
-                          ><Icon name="operations" size={23} /></span
-                        >
+                    <div class="primary-actions">
+                      <Button
+                        variant="primary"
+                        onclick={() => {
+                          const pr = selected?.segments.at(-1)?.pr;
+                          if (pr) {
+                            page = "review";
+                            openReviewPanel(pr);
+                          }
+                        }}>Fetch for review</Button
+                      >
+                    </div>
+                  {:else if mode === "land"}
+                    <div class="plan-body" data-land-plan={land?.headBookmark}>
+                      {#if currentJob}
                         <h3>Landing in progress</h3>
                         <p>
                           Jiji is watching this stack. Each PR lands when its
                           requirements are met.
                         </p>
-                        <p class="quiet">Keep this repository open.</p>
+                        <p class="footnote">Keep this repository open.</p>
                       {:else if landLoading}<div
                           class="loading-plan"
                           data-land-state="planning"
                         >
-                          <span class="skeleton"></span>
                           <h3>Checking readiness…</h3>
                           <p>Reading checks and reviews from GitHub.</p>
+                          <span class="skeleton"></span><span
+                            class="skeleton short"
+                          ></span>
                         </div>
                       {:else if landOutcome}
-                        <span class="action-symbol"
-                          ><Icon
-                            name={landOutcome.failed ? "conflicts" : "check"}
-                            size={23}
-                          /></span
-                        >
                         <h3>
                           {landOutcome.failed
                             ? "Round interrupted"
@@ -1052,20 +1092,18 @@
                             })),
                           )}
                         </div>
-                        <Button onclick={() => landFor && loadLandPlan(landFor)}
-                          >Check again</Button
-                        >
+                        <div class="plan-actions">
+                          <Button
+                            onclick={() => landFor && loadLandPlan(landFor)}
+                            >Check again</Button
+                          >
+                        </div>
                       {:else if land}
-                        <span
-                          class="action-symbol"
-                          class:warn={land.blockers.length > 0}
-                          ><Icon
-                            name={land.blockers.length
-                              ? "operations"
-                              : "publish"}
-                            size={23}
-                          /></span
-                        >
+                        {@const candidate = land.segments.find(
+                          (segment) =>
+                            segment.status.kind === "landing" ||
+                            segment.status.kind === "waiting",
+                        )?.pr}
                         <h3>
                           {land.blockers.some((blocker) => !blocker.wait)
                             ? "Before this can land"
@@ -1073,35 +1111,32 @@
                               ? "Waiting on GitHub"
                               : "Land this stack"}
                         </h3>
-                        {@const candidate = land.segments.find(
-                          (segment) =>
-                            segment.status.kind === "landing" ||
-                            segment.status.kind === "waiting",
-                        )?.pr}
-                        {#if candidate?.review === "reviewRequired" && !land.options.bypass && land.blockers.length === 0}
-                          <p class="readiness-note">
-                            <Icon name="eye" size={13} />#{candidate.number} is waiting
-                            for review
-                          </p>
-                        {/if}
                         <p>
                           {selected.prCount > 1
                             ? `Land ${selected.prCount} pull requests in order, rebasing the stack as it goes.`
                             : `Merge into ${land.baseBranch} and clean up the local branch.`}
                         </p>
+                        {#if candidate?.review === "reviewRequired" && !land.options.bypass && land.blockers.length === 0}
+                          <p class="note warn">
+                            <Icon name="eye" size={12} />#{candidate.number} is waiting
+                            for review
+                          </p>
+                        {/if}
                         {#if selected.segments.some((segment) => segment.pr?.isDraft)}<p
-                            class="draft-note"
+                            class="note"
                           >
                             Draft PRs will be marked ready as they land.
                           </p>{/if}
-                        {#each land.blockers as blocker (blocker.message)}<p
-                            class="blocker"
-                            class:wait={blocker.wait}
-                            data-land-blocker={blocker.wait ? "wait" : "user"}
-                          >
-                            {blocker.message}
-                          </p>{/each}
-                        {#if land.options.bypass}<p class="warning">
+                        {#if land.blockers.length}<ul class="blockers">
+                            {#each land.blockers as blocker (blocker.message)}<li
+                                class="blocker"
+                                class:wait={blocker.wait}
+                                data-land-blocker={blocker.wait ? "wait" : "user"}
+                              >
+                                {blocker.message}
+                              </li>{/each}
+                          </ul>{/if}
+                        {#if land.options.bypass}<p class="note warn">
                             Bypass is on. This attempts to merge past checks,
                             reviews, and merge queues.
                           </p>{/if}
@@ -1128,7 +1163,7 @@
                               >{landing ? "Landing…" : manualLandLabel}</Button
                             >{/if}
                         </div>
-                        {#if jobActive}<p class="quiet">
+                        {#if jobActive}<p class="footnote">
                             Another stack is auto-landing. Stop it to start this
                             one.
                           </p>{:else if queueable}<p class="footnote">
@@ -1142,6 +1177,7 @@
                           <div class="settings-fields">
                             <label
                               >Merge method<select
+                                class="field"
                                 data-land-method
                                 disabled={executing}
                                 value={landMethod ?? "auto"}
@@ -1176,7 +1212,10 @@
                         {#if land.actions.length}<details class="disclosure">
                             <summary
                               >This round <span
-                                >{land.actions.length} steps</span
+                                >{land.actions.length} step{land.actions
+                                  .length === 1
+                                  ? ""
+                                  : "s"}</span
                               ></summary
                             >
                             <ol class="action-list">
@@ -1192,7 +1231,7 @@
                               >Notes <span>{land.warnings.length}</span
                               ></summary
                             >{#each land.warnings as warning (warning)}<p
-                                class="warning"
+                                class="note warn"
                                 data-land-warning
                               >
                                 {warning}
@@ -1202,25 +1241,30 @@
                       {#if landError}<p class="error" data-land-error>
                           {landError}
                         </p>
-                        <Button onclick={() => landFor && loadLandPlan(landFor)}
-                          >Try again</Button
-                        >{/if}
+                        <div class="plan-actions">
+                          <Button
+                            onclick={() => landFor && loadLandPlan(landFor)}
+                            >Try again</Button
+                          >
+                        </div>{/if}
                       {#if queueError}<p class="error" data-autoland-error>
                           {queueError}
                         </p>{/if}
                     </div>
                   {:else if mode === "publish"}
                     <div
-                      class="action-card"
+                      class="plan-body"
                       data-submit-plan={plan?.headBookmark}
                     >
                       {#if planLoading}<div
                           class="loading-plan"
                           data-submit-state="planning"
                         >
-                          <span class="skeleton"></span>
                           <h3>Checking for updates…</h3>
                           <p>Comparing your stack with GitHub.</p>
+                          <span class="skeleton"></span><span
+                            class="skeleton short"
+                          ></span>
                         </div>
                       {:else if outcome}<h3>
                           {outcome.failed
@@ -1242,41 +1286,36 @@
                             })),
                           )}
                         </div>
-                        <Button
-                          onclick={() =>
-                            selected?.submitHead &&
-                            loadPlan(selected.submitHead)}>Check again</Button
-                        >
+                        <div class="plan-actions">
+                          <Button
+                            onclick={() =>
+                              selected?.submitHead &&
+                              loadPlan(selected.submitHead)}>Check again</Button
+                          >
+                        </div>
                       {:else if plan}
-                        <span class="action-symbol"
-                          ><Icon
-                            name={plan.actions.length ? "publish" : "check"}
-                            size={23}
-                          /></span
-                        >
+                        {@const idle =
+                          !plan.actions.length && !plan.blockers.length}
                         <h3>
-                          {!plan.actions.length && !plan.blockers.length
+                          {idle
                             ? "All up to date"
                             : selected.prCount
                               ? "Update this stack"
                               : "Publish this stack"}
                         </h3>
-                        <p
-                          data-submit-state={!plan.actions.length &&
-                          !plan.blockers.length
-                            ? "up-to-date"
-                            : "ready"}
-                        >
-                          {!plan.actions.length && !plan.blockers.length
+                        <p data-submit-state={idle ? "up-to-date" : "ready"}>
+                          {idle
                             ? "Your local stack and GitHub are in sync."
                             : "Push your changes and keep the pull requests connected."}
                         </p>
-                        {#each plan.blockers as blocker (blocker)}<p
-                            class="blocker"
-                            data-submit-blocker
-                          >
-                            {blocker}
-                          </p>{/each}
+                        {#if plan.blockers.length}<ul class="blockers">
+                            {#each plan.blockers as blocker (blocker)}<li
+                                class="blocker"
+                                data-submit-blocker
+                              >
+                                {blocker}
+                              </li>{/each}
+                          </ul>{/if}
                         {#if plan.actions.length}<ol class="action-list">
                             {#each plan.actions as action, index (index)}<li
                                 data-submit-action={action.kind}
@@ -1320,7 +1359,7 @@
                               >Notes <span>{plan.warnings.length}</span
                               ></summary
                             >{#each plan.warnings as warning (warning)}<p
-                                class="warning"
+                                class="note warn"
                                 data-submit-warning
                               >
                                 {warning}
@@ -1330,17 +1369,25 @@
                       {#if planError}<p class="error" data-submit-error>
                           {planError}
                         </p>
-                        <Button
-                          onclick={() =>
-                            selected?.submitHead &&
-                            loadPlan(selected.submitHead)}>Try again</Button
-                        >{/if}
+                        <div class="plan-actions">
+                          <Button
+                            onclick={() =>
+                              selected?.submitHead &&
+                              loadPlan(selected.submitHead)}>Try again</Button
+                          >
+                        </div>{/if}
                     </div>
                   {:else}
-                    <div class="action-card" data-ship-plan={ship?.headChange}>
-                      {#if shipLoading}<div data-ship-state="planning">
+                    <div class="plan-body" data-ship-plan={ship?.headChange}>
+                      {#if shipLoading}<div
+                          class="loading-plan"
+                          data-ship-state="planning"
+                        >
                           <h3>Checking trunk…</h3>
                           <p>Fetching the latest remote state.</p>
+                          <span class="skeleton"></span><span
+                            class="skeleton short"
+                          ></span>
                         </div>
                       {:else if shipOutcome}<h3>
                           {shipOutcome.failed
@@ -1364,24 +1411,28 @@
                           Push this stack directly to trunk. This skips pull
                           request review.
                         </p>
-                        <ol class="action-list">
-                          {#each ship.actions as action, index (index)}<li
-                              data-ship-action={action.kind}
-                            >
-                              {shipActionRow(action).text}
-                            </li>{/each}
-                        </ol>
-                        {#each ship.blockers as blocker (blocker)}<p
-                            class="blocker"
-                            data-ship-blocker
-                          >
-                            {blocker}
-                          </p>{/each}{#each ship.warnings as warning (warning)}<p
-                            class="warning"
+                        {#if ship.blockers.length}<ul class="blockers">
+                            {#each ship.blockers as blocker (blocker)}<li
+                                class="blocker"
+                                data-ship-blocker
+                              >
+                                {blocker}
+                              </li>{/each}
+                          </ul>{/if}
+                        {#if ship.actions.length}<ol class="action-list">
+                            {#each ship.actions as action, index (index)}<li
+                                data-ship-action={action.kind}
+                              >
+                                {shipActionRow(action).text}
+                              </li>{/each}
+                          </ol>{/if}
+                        {#each ship.warnings as warning (warning)}<p
+                            class="note warn"
                             data-ship-warning
                           >
                             {warning}
-                          </p>{/each}{#if ship.actions.length}<div
+                          </p>{/each}
+                        {#if ship.actions.length}<div
                             class="primary-actions"
                             data-ship-go
                           >
@@ -1396,6 +1447,7 @@
                                 : `Ship to ${ship.trunkBookmark}`}</Button
                             >
                           </div>{:else if !ship.blockers.length}<p
+                            class="footnote"
                             data-ship-state="nothing-to-run"
                           >
                             Already shipped.
@@ -1405,7 +1457,7 @@
                         </p>{/if}
                     </div>
                   {/if}
-                {/if}
+                </div>
               </aside>
             </div>
           {:else}<EmptyState
@@ -1421,11 +1473,12 @@
       </div>
     {:else}
       <section class="review-page">
-        <div class="review-heading">
-          <div>
-            <h2>Pull requests</h2>
-            <p>Review the work coming into {snapshot.repoName}.</p>
-          </div>
+        <div class="review-bar">
+          <span class="review-count"
+            >{forge.prsLoading && !forge.prs
+              ? "Finding pull requests…"
+              : `${allReviewRows.length} open pull request${allReviewRows.length === 1 ? "" : "s"}`}</span
+          >
           <form
             class="lookup-row"
             onsubmit={(event) => {
@@ -1434,6 +1487,7 @@
             }}
           >
             <input
+              class="field"
               aria-label="Pull request number"
               placeholder="PR number"
               inputmode="numeric"
@@ -1445,14 +1499,17 @@
             >
           </form>
         </div>
-        {#if lookupError}<p class="error" data-review-lookup-error>
+        {#if lookupError}<p class="notice error" data-review-lookup-error>
             {lookupError}
           </p>{/if}
         {#if reviewFor}{@const pr = reviewFor}
-          <div class="review-panel" data-review-panel={pr.number}>
-            <h3>Fetch #{pr.number} for review</h3>
-            <p>{pr.title}</p>
+          <div class="review-panel tray" data-review-panel={pr.number}>
+            <div class="review-panel-head">
+              <h3>Fetch #{pr.number} for review</h3>
+              <p class="truncate" title={pr.title}>{pr.title}</p>
+            </div>
             <form
+              class="review-name-row"
               onsubmit={(event) => {
                 event.preventDefault();
                 fetchForReview();
@@ -1460,7 +1517,7 @@
             >
               <label for="review-bookmark">Local bookmark</label><input
                 id="review-bookmark"
-                class="mono"
+                class="field mono"
                 bind:value={reviewName}
                 disabled={reviewBusy}
                 data-review-name
@@ -1470,19 +1527,20 @@
                 >{reviewBusy ? "Fetching…" : "Fetch"}</Button
               ><button
                 type="button"
-                class="text-button"
+                class="btn ghost"
                 disabled={reviewBusy}
                 onclick={closeReviewPanel}>Cancel</button
               >
             </form>
-            {#if reviewNameTaken}<p class="warning" data-review-taken>
+            {#if reviewNameTaken}<p class="note warn" data-review-taken>
                 This bookmark already exists. Choose another name.
-              </p>{/if}{#if reviewError}<p class="error" data-review-error>
+              </p>{/if}{#if reviewError}<p class="note error" data-review-error>
                 {reviewError}
               </p>{/if}
           </div>{/if}
         {#if reviewDone}<p class="notice" data-review-done>
-            Fetched into <span class="mono">{reviewDone.bookmark}</span
+            Fetched into <span class="ref"
+              ><span class="truncate">{reviewDone.bookmark}</span></span
             >.{#if reviewDone.target}{@const target = reviewDone.target}<button
                 class="text-button"
                 onclick={() => jumpToChange(target)}>Open in workbench ↗</button
@@ -1499,38 +1557,40 @@
               class="review-row"
               data-review-pr={row.pr.number}
             >
-              <span class="review-icon"><Icon name="branch" size={17} /></span>
-              <div class="review-info">
-                <button class="review-title" onclick={() => openUrl(row.pr.url)}
-                  >{row.pr.title}</button
+              <span class="review-num mono">#{row.pr.number}</span>
+              <div class="review-main">
+                <button
+                  class="review-title"
+                  title="Open #{row.pr.number} on GitHub"
+                  onclick={() => openUrl(row.pr.url)}>{row.pr.title}</button
                 >
-                <div>
-                  <span class="mono">#{row.pr.number}</span><span
-                    >{row.pr.isDraft ? "Draft" : "Open"}</span
-                  ><span class="mono"
+                <span class="review-sub"
+                  ><span>{row.pr.isDraft ? "Draft" : "Open"}</span><span
+                    class="sep"
+                  ></span><span class="mono truncate"
                     >{row.headLabel} → {row.pr.baseBranch}</span
-                  >
-                </div>
+                  ></span
+                >
               </div>
-              <div class="review-signals">
-                {#if row.badge.checks}<span
-                    class={row.badge.checks.tone}
-                    title={row.badge.checks.label}
-                    >{row.badge.checks.glyph}</span
-                  >{/if}
+              {#if row.badge.checks}<span
+                  class="review-check {row.badge.checks.tone}"
+                  title={row.badge.checks.label}
+                  >{row.badge.checks.glyph}</span
+                >{/if}
+              <div class="review-actions">
+                {#if row.canRerun}<button
+                    class="btn ghost"
+                    data-review-rerun={row.pr.number}
+                    disabled={rerunBusyFor !== null}
+                    onclick={() => rerunCi(row.pr)}>Re-run CI</button
+                  >{/if}<button
+                  class="btn"
+                  data-review-fetch={row.pr.number}
+                  onclick={() => openReviewPanel(row.pr)}>Fetch for review</button
+                >
               </div>
-              {#if row.canRerun}<button
-                  class="text-button"
-                  data-review-rerun={row.pr.number}
-                  disabled={rerunBusyFor !== null}
-                  onclick={() => rerunCi(row.pr)}>Re-run CI</button
-                >{/if}<button
-                class="review-fetch"
-                data-review-fetch={row.pr.number}
-                onclick={() => openReviewPanel(row.pr)}>Fetch for review</button
-              >
             </article>{/each}
-          {#if !visibleReviewRows.length}<p class="quiet">
+          {#if !visibleReviewRows.length}<p class="list-loading">
               {forge.prsLoading
                 ? "Finding pull requests…"
                 : "No open pull requests."}
@@ -1553,8 +1613,8 @@
     container-type: inline-size;
   }
 
-  /* The section's one toolbar: same height and hairline as the
-     workbench's, so switching sections never moves the frame. */
+  /* ── Page bar ── the section's one toolbar: same height and hairline as
+     the workbench's, so switching sections never moves the frame. */
   .page-bar {
     flex-shrink: 0;
     display: flex;
@@ -1593,13 +1653,27 @@
   .header-actions {
     display: flex;
     align-items: center;
-    gap: var(--sp-2);
+    gap: var(--sp-1);
     margin-left: auto;
   }
 
   .tabs-note {
+    margin-right: var(--sp-1);
     font-size: var(--text-xs);
     color: var(--clr-text-3);
+  }
+
+  /* A toolbar verb: the change header's ghost button, 26px tall. */
+  .action {
+    height: 26px;
+    padding: 0 8px;
+    gap: 5px;
+    font-size: var(--text-s);
+  }
+
+  .action.on {
+    background: var(--clr-bg-hover);
+    color: var(--clr-text-1);
   }
 
   .connection {
@@ -1608,33 +1682,25 @@
   }
 
   .connection > summary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    height: 26px;
-    padding: 0 8px;
-    border-radius: var(--radius-m);
     list-style: none;
-    font-size: var(--text-s);
-    color: var(--clr-text-2);
     cursor: pointer;
-    transition: background var(--t-fast) var(--ease-out);
   }
 
-  .connection > summary:hover,
+  .connection > summary::-webkit-details-marker,
+  .more-menu > summary::-webkit-details-marker,
+  .disclosure > summary::-webkit-details-marker {
+    display: none;
+  }
+
   .connection[open] > summary {
     background: var(--clr-bg-hover);
     color: var(--clr-text-1);
   }
 
-  summary::-webkit-details-marker {
-    display: none;
-  }
-
   .connection-panel {
     position: absolute;
     right: 0;
-    top: calc(100% + 6px);
+    top: calc(100% + 4px);
     width: 330px;
     padding: var(--sp-4);
     font-size: var(--text-s);
@@ -1657,11 +1723,131 @@
     margin: var(--sp-3) 0;
   }
 
-  .connection-panel input {
+  .connection-panel .field {
     min-width: 0;
     flex: 1;
   }
 
+  /* ── Notices ── flat bands under the toolbar, never floating. */
+  .notice {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    min-height: 32px;
+    padding: var(--sp-1) var(--sp-4);
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+    background: var(--clr-bg-well);
+    border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .notice.error {
+    color: var(--clr-danger);
+  }
+
+  /* ── Auto-land jobs ── one band per record, the live job first. */
+  .jobs {
+    flex-shrink: 0;
+    max-height: 36%;
+    overflow: auto;
+    background: var(--clr-bg-well);
+    border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .job {
+    padding: var(--sp-2) var(--sp-4) var(--sp-3);
+    border-bottom: 1px solid var(--clr-border-2);
+  }
+
+  .job:last-child {
+    border-bottom: 0;
+  }
+
+  .job-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: 28px;
+  }
+
+  .job-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    color: var(--clr-text-3);
+  }
+
+  .job-dot.accent {
+    color: var(--clr-accent-strong);
+  }
+
+  .job-dot.ok {
+    color: var(--clr-ok);
+  }
+
+  .job-dot.warn {
+    color: var(--clr-warn);
+  }
+
+  .job-dot.danger {
+    color: var(--clr-danger);
+  }
+
+  .job-dot.pulse {
+    animation: job-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes job-pulse {
+    50% {
+      opacity: 0.3;
+    }
+  }
+
+  .job-title {
+    font-size: var(--text-m);
+    font-weight: 600;
+    color: var(--clr-text-1);
+  }
+
+  .job-name {
+    max-width: 24em;
+  }
+
+  .job-buttons {
+    margin-left: auto;
+    display: flex;
+    gap: var(--sp-2);
+    flex-shrink: 0;
+  }
+
+  /* Story lines hang from the title, past the dot. */
+  .job-story {
+    max-width: 80em;
+    margin: 0 0 0 15px;
+    font-size: var(--text-s);
+    line-height: 1.5;
+    color: var(--clr-text-2);
+  }
+
+  .job-story + .job-story {
+    margin-top: 2px;
+  }
+
+  .job-round {
+    margin-left: 15px;
+    border-top: 0;
+    padding-top: 2px;
+  }
+
+  /* In a full-width band the count stays beside its label. */
+  .job .job-round > summary > span {
+    margin-left: var(--sp-1);
+  }
+
+  /* ── Workspace ── the stack browser beside the stack's detail. */
   .workspace {
     display: grid;
     grid-template-columns: 240px minmax(0, 1fr);
@@ -1676,361 +1862,424 @@
     border-right: 1px solid var(--clr-border-2);
   }
 
+  /* The search sits in a toolbar-height bar, so its hairline meets the
+     stack header's title bar on the right. */
   .stack-search {
+    flex-shrink: 0;
     display: flex;
-    gap: var(--sp-2);
     align-items: center;
-    height: 32px;
-    margin: var(--sp-2);
-    padding: 0 var(--sp-2);
-    border: 1px solid var(--clr-border-1);
-    border-radius: var(--radius-m);
-    background: var(--clr-bg-well);
+    gap: var(--sp-2);
+    height: var(--toolbar-h);
+    padding: 0 var(--sp-3) 0 var(--sp-4);
+    border-bottom: 1px solid var(--clr-border-2);
     color: var(--clr-text-3);
-    transition: border-color var(--t-fast) var(--ease-out);
+    cursor: text;
   }
 
   .stack-search:focus-within {
-    border-color: var(--clr-accent);
+    color: var(--clr-text-2);
   }
 
-  .stack-search input:not([type="checkbox"]) {
+  .stack-search input {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    padding: 0;
     border: 0;
     background: transparent;
-    padding: 0;
-    min-width: 0;
-    width: 100%;
-    height: 26px;
     font-size: var(--text-s);
+    color: var(--clr-text-1);
   }
 
-  .stack-search input:not([type="checkbox"]):focus {
+  .stack-search input:focus {
     outline: none;
   }
 
+  .stack-search input::placeholder {
+    color: var(--clr-text-3);
+  }
+
   .stack-list {
-    padding: 0 var(--sp-2) var(--sp-5);
     flex: 1;
     min-height: 0;
     overflow: auto;
+    padding-bottom: var(--sp-5);
   }
 
-  .list-heading,
-  .local-heading {
+  .list-heading {
     display: flex;
-    gap: 6px;
     align-items: center;
+    gap: 5px;
+    width: 100%;
+    height: 28px;
+    margin-top: var(--sp-2);
+    padding: 0 var(--sp-3) 0 var(--sp-4);
     font-size: var(--text-xs);
     font-weight: 600;
     color: var(--clr-text-3);
-    padding: var(--sp-3) var(--sp-2) var(--sp-1);
-    width: 100%;
+    text-align: left;
   }
 
-  .list-heading span,
-  .local-heading span {
+  .list-heading > span {
     margin-left: auto;
     font-family: var(--font-mono);
     font-weight: 400;
   }
 
   .local-heading {
-    margin-top: var(--sp-3);
-    border-top: 1px solid var(--clr-border-2);
+    cursor: pointer;
+    transition: color var(--t-fast) var(--ease-out);
   }
 
+  .local-heading:hover {
+    color: var(--clr-text-1);
+  }
+
+  /* A stack row: the title, where it stands, and the current-stack mark
+     in the working-copy color. Selection fills the row and marks its
+     leading edge, like a graph row. */
   .stack-row {
-    width: 100%;
-    padding: 7px var(--sp-2);
-    border-radius: var(--radius-m);
+    position: relative;
     display: block;
+    width: 100%;
+    padding: 7px 26px 7px var(--sp-4);
     text-align: left;
-    margin-bottom: 1px;
     transition: background var(--t-fast) var(--ease-out);
   }
 
-  .stack-row:hover {
+  .stack-row:hover:not(:disabled) {
     background: var(--clr-bg-hover);
   }
 
   .stack-row.selected {
-    background: var(--clr-accent-dim);
+    background: color-mix(in srgb, var(--clr-accent) 12%, transparent);
+    box-shadow: inset 2px 0 0 var(--clr-accent);
   }
 
-  .stack-row-top {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--sp-2);
-    color: var(--clr-text-1);
-    font-size: var(--text-m);
-    line-height: 1.4;
+  .stack-row:disabled {
+    opacity: 0.5;
   }
 
-  .stack-row-top :global(svg) {
-    flex-shrink: 0;
-    margin-top: 2px;
-    color: var(--clr-text-3);
-  }
-
-  .stack-row-top > span {
+  .stack-row-title {
     display: -webkit-box;
     -webkit-line-clamp: 2;
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+    font-size: var(--text-m);
+    line-height: 1.4;
+    color: var(--clr-text-1);
+  }
+
+  .stack-row .current-dot {
+    position: absolute;
+    top: 13px;
+    right: var(--sp-3);
   }
 
   .stack-row-meta {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding-left: 22px;
-    color: var(--clr-text-3);
-    font-size: var(--text-xs);
     margin-top: 3px;
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
   }
 
   .status-dot {
+    display: inline-block;
+    flex-shrink: 0;
     width: 6px;
     height: 6px;
-    display: inline-block;
     border-radius: 50%;
     background: currentColor;
     color: var(--clr-text-3);
-    flex-shrink: 0;
+  }
+
+  .status-dot.ok {
+    color: var(--clr-ok);
+  }
+
+  .status-dot.warn {
+    color: var(--clr-warn);
+  }
+
+  .status-dot.danger {
+    color: var(--clr-danger);
   }
 
   .current-dot {
+    display: inline-block;
+    flex-shrink: 0;
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: var(--clr-working-copy);
-    flex-shrink: 0;
-    margin: 6px 0 0 auto;
   }
 
-  .browser-foot {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
-    padding: var(--sp-3) var(--sp-4);
-    border-top: 1px solid var(--clr-border-2);
+  .meta-sep {
+    flex-shrink: 0;
+    width: 1px;
+    height: 10px;
+    background: var(--clr-border-1);
   }
 
   .list-loading {
-    padding: var(--sp-3) var(--sp-2);
+    padding: var(--sp-3) var(--sp-4);
     font-size: var(--text-s);
     color: var(--clr-text-3);
   }
 
+  /* ── Stack detail ── a two-bar header, then the ledger and the action
+     column scrolling on their own. */
   .stack-detail {
+    display: flex;
+    flex-direction: column;
     min-width: 0;
-    overflow: auto;
-    padding: var(--sp-5) var(--sp-6) var(--sp-8);
+    min-height: 0;
   }
 
   .stack-header {
-    margin-bottom: var(--sp-5);
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--clr-border-2);
   }
 
-  .eyebrow {
+  .bar {
     display: flex;
-    gap: var(--sp-2);
     align-items: center;
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
-    margin-bottom: var(--sp-2);
+    gap: var(--sp-2);
+    min-width: 0;
+    padding: 0 var(--sp-2) 0 var(--sp-4);
   }
 
-  .pill {
-    height: 17px;
-    line-height: 17px;
-    padding: 0 5px;
-    border-radius: var(--radius-s);
-    background: color-mix(in srgb, var(--clr-text-1) 7%, transparent);
-    font-size: var(--text-xs);
+  .title-bar {
+    height: var(--toolbar-h);
+    border-bottom: 1px solid var(--clr-border-2);
   }
 
-  .pill.ok {
-    background: var(--clr-ok-dim);
-  }
-
-  .pill.warn {
-    background: var(--clr-warn-dim);
-  }
-
-  .pill.danger {
-    background: var(--clr-danger-dim);
-  }
-
-  h2 {
-    font-size: var(--text-title);
-    line-height: 1.35;
+  .stack-title {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    font-size: var(--text-l);
     font-weight: 600;
     color: var(--clr-text-1);
-    margin: 0 0 var(--sp-2);
-    max-width: 760px;
-    overflow-wrap: anywhere;
   }
 
-  .stack-subtitle {
-    display: flex;
-    align-items: center;
+  .meta-bar {
+    min-height: 30px;
+    padding-top: 3px;
+    padding-bottom: 3px;
     flex-wrap: wrap;
-    gap: 4px 14px;
+    gap: 4px var(--sp-3);
     font-size: var(--text-s);
     color: var(--clr-text-3);
   }
 
-  .stack-subtitle strong {
-    font-weight: 400;
+  .fact {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    min-width: 0;
+  }
+
+  .fact.state {
+    font-weight: 500;
     color: var(--clr-text-2);
   }
 
-  .workbench-link {
-    margin-left: auto;
+  .sep {
+    flex-shrink: 0;
+    width: 1px;
+    height: 12px;
+    background: var(--clr-border-1);
+  }
+
+  .ref.trunk {
+    max-width: 20em;
+    color: var(--clr-accent-strong);
+    background: var(--clr-accent-dim);
   }
 
   .detail-body {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 280px;
-    align-items: start;
-    gap: var(--sp-6);
+    grid-template-columns: minmax(0, 1fr) 300px;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .chain-pane {
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
   }
 
   .action-column {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    border-left: 1px solid var(--clr-border-2);
+  }
+
+  /* The column's head: the mode switch at the ledger head's height, so
+     their hairlines meet. */
+  .column-head {
     position: sticky;
     top: 0;
-    min-width: 0;
-  }
-
-  .action-modes {
+    z-index: 2;
+    flex-shrink: 0;
     display: flex;
-    gap: var(--sp-4);
-    align-items: flex-end;
-    height: 30px;
-    margin-bottom: var(--sp-3);
+    align-items: center;
+    gap: var(--sp-2);
+    height: var(--toolbar-h);
+    padding: 0 var(--sp-2) 0 var(--sp-3);
     border-bottom: 1px solid var(--clr-border-2);
+    background: var(--clr-bg-1);
   }
 
-  .action-modes > button {
-    height: 100%;
-    color: var(--clr-text-3);
+  .column-label {
+    padding-left: var(--sp-1);
     font-size: var(--text-s);
-    font-weight: 500;
-    border-bottom: 2px solid transparent;
-    margin-bottom: -1px;
-    transition: color var(--t-fast) var(--ease-out);
-  }
-
-  .action-modes > button:hover:not(:disabled) {
-    color: var(--clr-text-1);
-  }
-
-  .action-modes > button.active {
-    color: var(--clr-text-1);
-    border-bottom-color: var(--clr-accent);
+    font-weight: 600;
+    color: var(--clr-text-2);
   }
 
   .more-menu {
-    margin-left: auto;
     position: relative;
-    align-self: center;
+    margin-left: auto;
   }
 
-  .more-menu summary {
+  .more-menu > summary {
     list-style: none;
     cursor: pointer;
-    display: grid;
-    place-items: center;
-    width: 24px;
-    height: 22px;
-    border-radius: var(--radius-s);
-    line-height: 1;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: var(--clr-text-3);
   }
 
-  .more-menu summary:hover,
-  .more-menu[open] summary {
+  .more-menu[open] > summary {
     background: var(--clr-bg-hover);
     color: var(--clr-text-1);
   }
 
-  .more-menu > button {
+  .action-menu {
     position: absolute;
-    z-index: 3;
     top: calc(100% + 4px);
     right: 0;
-    white-space: nowrap;
-    height: 30px;
-    padding: 0 var(--sp-3);
-    background: var(--clr-bg-2);
-    border: 1px solid var(--clr-border-1);
-    border-radius: var(--radius-m);
-    box-shadow: var(--shadow-popover);
+    z-index: 8;
+    display: flex;
+    flex-direction: column;
+    min-width: 220px;
+    padding: var(--sp-1);
+  }
+
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    height: 28px;
+    padding: 0 var(--sp-2);
+    border-radius: var(--radius-s);
     font-size: var(--text-m);
+    color: var(--clr-text-1);
+    text-align: left;
+    white-space: nowrap;
+    transition: background var(--t-fast) var(--ease-out);
   }
 
-  .more-menu > button:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--clr-text-1) 6%, var(--clr-bg-2));
-  }
-
-  /* The plan: a bordered panel stating what the next step will do. */
-  .action-card {
-    border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-l);
-    padding: var(--sp-4) var(--sp-4) var(--sp-1);
-  }
-
-  .action-card > :global(svg) {
+  .menu-item :global(svg) {
     color: var(--clr-text-3);
-    margin-bottom: var(--sp-2);
   }
 
-  .action-symbol {
-    display: inline-flex;
-    color: var(--clr-accent-strong);
-    margin-bottom: var(--sp-2);
+  .menu-item:hover:not(:disabled) {
+    background: var(--clr-bg-hover);
   }
 
-  .action-symbol.warn {
-    color: var(--clr-warn);
+  .menu-item:disabled {
+    opacity: 0.5;
   }
 
-  .action-symbol :global(svg) {
-    width: 18px;
-    height: 18px;
+  /* ── The plan ── what the next step will do, stated plainly: a heading,
+     a sentence, the blockers, the verb. Sections below fold on hairlines. */
+  .plan {
+    padding: var(--sp-4) var(--sp-4) var(--sp-6);
   }
 
   h3 {
-    font-size: var(--text-l);
+    margin: 0 0 4px;
+    font-size: var(--text-m);
     font-weight: 600;
-    margin: 0 0 6px;
+    color: var(--clr-text-1);
   }
 
-  .action-card p {
+  .plan p {
+    margin: 0 0 var(--sp-3);
     font-size: var(--text-s);
     line-height: 1.55;
     color: var(--clr-text-2);
-    margin: 0 0 var(--sp-3);
     overflow-wrap: anywhere;
   }
 
-  .action-card .draft-note {
-    color: var(--clr-text-3);
-    font-size: var(--text-xs);
-  }
-
-  .action-card .readiness-note {
+  .plan p.note,
+  .plan p.footnote,
+  .review-panel p.note {
     display: flex;
     gap: 6px;
-    align-items: center;
-    color: var(--clr-warn);
+    align-items: flex-start;
+    margin-bottom: var(--sp-2);
     font-size: var(--text-xs);
+    line-height: 1.5;
+    color: var(--clr-text-3);
+  }
+
+  .plan p.note :global(svg) {
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .plan p.note.warn,
+  .review-panel p.note.warn {
+    color: var(--clr-warn);
+  }
+
+  .review-panel p.note.error {
+    color: var(--clr-danger);
+  }
+
+  .plan p.footnote {
+    margin: 0 0 var(--sp-3);
+  }
+
+  /* Blockers: a list, not alerts. The dot carries the tone — needs you
+     (danger) or clears by itself (warn). */
+  .blockers {
+    list-style: none;
+    margin: 0 0 var(--sp-3);
+    padding: 0;
+  }
+
+  .blocker {
+    position: relative;
+    padding: 4px 0 4px 14px;
+    font-size: var(--text-s);
+    line-height: 1.5;
+    color: var(--clr-text-1);
+    overflow-wrap: anywhere;
+  }
+
+  .blocker::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 10px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--clr-danger);
+  }
+
+  .blocker.wait::before {
+    background: var(--clr-warn);
   }
 
   .primary-actions {
@@ -2047,28 +2296,25 @@
     font-size: var(--text-m);
   }
 
-  .action-card .footnote {
-    font-size: var(--text-xs);
-    line-height: 1.5;
-    color: var(--clr-text-3);
-    text-align: center;
-    margin-bottom: var(--sp-4);
+  .plan-actions {
+    margin: var(--sp-2) 0 var(--sp-4);
   }
 
   .disclosure {
+    padding: var(--sp-1) 0;
     border-top: 1px solid var(--clr-border-2);
     font-size: var(--text-s);
-    padding: var(--sp-2) 0;
   }
 
   .disclosure > summary {
     display: flex;
     gap: 6px;
     align-items: center;
-    height: 24px;
+    height: 28px;
     list-style: none;
     cursor: pointer;
     color: var(--clr-text-2);
+    transition: color var(--t-fast) var(--ease-out);
   }
 
   .disclosure > summary:hover {
@@ -2088,78 +2334,74 @@
   }
 
   .disclosure > summary > span {
-    color: var(--clr-text-3);
     margin-left: auto;
     font-size: var(--text-xs);
-  }
-
-  .disclosure > p,
-  .disclosure > ol,
-  .disclosure > pre {
-    margin-top: var(--sp-2);
+    color: var(--clr-text-3);
   }
 
   .settings-fields {
-    padding-top: var(--sp-2);
-    color: var(--clr-text-2);
+    padding: var(--sp-1) 0 var(--sp-2);
     font-size: var(--text-s);
+    color: var(--clr-text-2);
   }
 
   .settings-fields label {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 5px;
     margin-bottom: var(--sp-3);
   }
 
   .settings-fields .checkbox-label {
     flex-direction: row;
     align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-1);
   }
 
   .settings-fields input[type="checkbox"] {
+    margin: 0;
     accent-color: var(--clr-accent);
   }
 
-  select,
-  input:not([type="checkbox"]) {
-    background: var(--clr-bg-well);
-    border: 1px solid var(--clr-border-1);
-    border-radius: var(--radius-m);
-    color: var(--clr-text-1);
-    padding: 0 var(--sp-2);
-    font-size: var(--text-s);
-    height: 28px;
-    transition: border-color var(--t-fast) var(--ease-out);
+  select.field {
+    width: 100%;
   }
 
-  select:focus,
-  input:not([type="checkbox"]):focus {
-    outline: none;
-    border-color: var(--clr-accent);
-  }
-
-  input::placeholder {
-    color: var(--clr-text-3);
-  }
-
+  /* Numbered plan steps, the numbers in a mono column. */
   .action-list {
-    padding-left: 18px;
-    margin: var(--sp-3) 0;
+    list-style: none;
+    counter-reset: step;
+    margin: var(--sp-2) 0 var(--sp-3);
+    padding: 0;
     font-size: var(--text-s);
-    color: var(--clr-text-2);
     line-height: 1.5;
+    color: var(--clr-text-2);
   }
 
   .action-list li {
-    margin-bottom: 6px;
-    padding-left: 2px;
+    position: relative;
+    padding: 3px 0 3px 22px;
+    counter-increment: step;
     overflow-wrap: anywhere;
   }
 
+  .action-list li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 3px;
+    width: 14px;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--clr-text-3);
+  }
+
+  /* Executed steps: the glyph says what happened to each. */
   .steps {
     list-style: none;
-    margin: var(--sp-3) 0;
+    margin: var(--sp-2) 0 var(--sp-3);
     padding: 0;
     font-size: var(--text-s);
     color: var(--clr-text-2);
@@ -2167,19 +2409,17 @@
 
   .steps li {
     display: flex;
-    gap: 7px;
+    gap: var(--sp-2);
+    padding: 3px 0;
     line-height: 1.5;
-    margin-bottom: 6px;
-  }
-
-  .steps p {
-    font-size: var(--text-xs);
-    color: var(--clr-text-3);
-    margin: 2px 0;
   }
 
   .step-glyph {
     flex-shrink: 0;
+    width: 14px;
+    text-align: center;
+    font-family: var(--font-mono);
+    color: var(--clr-text-3);
   }
 
   .step-glyph.done {
@@ -2190,48 +2430,28 @@
     color: var(--clr-danger);
   }
 
-  .action-card .blocker,
-  .blocker {
-    color: var(--clr-danger);
-    padding: var(--sp-2) 10px;
-    background: color-mix(in srgb, var(--clr-danger) 7%, transparent);
-    border-radius: var(--radius-m);
-    font-size: var(--text-s);
-    line-height: 1.5;
+  .step-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
-  .action-card .blocker.wait {
-    color: var(--clr-warn);
-    background: color-mix(in srgb, var(--clr-warn) 8%, transparent);
-  }
-
-  .action-card .warning,
-  .warning,
-  .warn {
-    color: var(--clr-warn);
-  }
-
-  .action-card .error,
-  .error,
-  .danger {
-    color: var(--clr-danger);
-  }
-
-  .ok {
-    color: var(--clr-ok);
-  }
-
-  .status-dot.ok {
-    color: var(--clr-ok);
-  }
-
-  .quiet,
-  .muted {
+  .steps p {
+    margin: 1px 0 0;
+    font-size: var(--text-xs);
     color: var(--clr-text-3);
   }
 
-  .mono {
-    font-family: var(--font-mono);
+  .plan p.error,
+  .error {
+    color: var(--clr-danger);
+  }
+
+  .warning {
+    color: var(--clr-warn);
+  }
+
+  .quiet {
+    color: var(--clr-text-3);
   }
 
   .text-button {
@@ -2250,71 +2470,11 @@
     text-decoration: underline;
   }
 
-  .notice {
-    display: flex;
-    flex-shrink: 0;
-    gap: var(--sp-3);
-    align-items: center;
-    padding: var(--sp-2) var(--sp-4);
-    font-size: var(--text-s);
-    border-bottom: 1px solid var(--clr-border-2);
-  }
-
-  .notice.error {
-    background: color-mix(in srgb, var(--clr-danger) 7%, transparent);
-  }
-
-  .jobs {
-    padding: var(--sp-3) var(--sp-4);
-    border-bottom: 1px solid var(--clr-border-2);
-    max-height: 32%;
-    overflow: auto;
-    flex-shrink: 0;
-  }
-
-  .job {
-    padding: var(--sp-3) var(--sp-4);
-    background: color-mix(in srgb, var(--clr-accent) 7%, transparent);
-    border: 1px solid color-mix(in srgb, var(--clr-accent) 25%, transparent);
-    border-radius: var(--radius-l);
-    margin-bottom: var(--sp-2);
-  }
-
-  .job:last-child {
-    margin-bottom: 0;
-  }
-
-  .job-heading {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
-    color: var(--clr-accent-strong);
-    font-size: var(--text-m);
-  }
-
-  .job-name {
-    color: var(--clr-text-2);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: var(--text-s);
-  }
-
-  .job-buttons {
-    margin-left: auto;
-    display: flex;
-    gap: var(--sp-2);
-    flex-shrink: 0;
-  }
-
-  .job p {
-    font-size: var(--text-s);
-    line-height: 1.55;
-    color: var(--clr-text-2);
-    margin: var(--sp-2) 0 0;
-  }
-
   pre {
+    margin: var(--sp-1) 0 var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    border-radius: var(--radius-m);
+    background: var(--clr-bg-well);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     font: var(--text-xs) / 1.6 var(--font-mono);
@@ -2323,12 +2483,16 @@
 
   .skeleton {
     display: block;
-    width: 24px;
-    height: 24px;
-    border-radius: var(--radius-m);
+    width: 100%;
+    height: 10px;
+    margin: var(--sp-2) 0;
+    border-radius: var(--radius-s);
     background: color-mix(in srgb, var(--clr-text-1) 8%, transparent);
-    margin-bottom: var(--sp-3);
     animation: pulse 1.3s ease-in-out infinite alternate;
+  }
+
+  .skeleton.short {
+    width: 62%;
   }
 
   @keyframes pulse {
@@ -2337,128 +2501,172 @@
     }
   }
 
+  /* ── Pull requests ── a toolbar, then one row per open PR. */
   .review-page {
-    padding: var(--sp-5) var(--sp-6) var(--sp-8);
     flex: 1;
     min-height: 0;
-    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
-  .review-heading {
+  .review-bar {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: var(--sp-5);
-    margin-bottom: var(--sp-4);
+    gap: var(--sp-3);
+    height: var(--toolbar-h);
+    padding: 0 var(--sp-2) 0 var(--sp-4);
+    border-bottom: 1px solid var(--clr-border-2);
   }
 
-  .review-heading h2 {
-    margin-bottom: 2px;
-  }
-
-  .review-heading p {
-    color: var(--clr-text-3);
+  .review-count {
     font-size: var(--text-s);
-    margin: 0;
+    font-weight: 600;
+    color: var(--clr-text-2);
   }
 
   .lookup-row {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    margin-left: auto;
   }
 
-  .lookup-row input {
+  .lookup-row .field {
     width: 110px;
+    height: 26px;
+  }
+
+  .review-list {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
   }
 
   .review-row {
     display: flex;
     align-items: center;
     gap: var(--sp-3);
-    padding: var(--sp-3) 0;
+    min-height: 44px;
+    padding: 5px var(--sp-3) 5px var(--sp-4);
     border-bottom: 1px solid var(--clr-border-2);
+    transition: background var(--t-fast) var(--ease-out);
   }
 
-  .review-icon {
+  .review-row:hover {
+    background: var(--clr-bg-hover);
+  }
+
+  .review-num {
+    flex-shrink: 0;
+    width: 44px;
+    font-size: var(--text-s);
     color: var(--clr-text-3);
   }
 
-  .review-info {
+  .review-main {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
   }
 
   .review-title {
-    font-size: var(--text-m);
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
     text-align: left;
+    font-size: var(--text-m);
     color: var(--clr-text-1);
-    line-height: 1.45;
+    transition: color var(--t-fast) var(--ease-out);
   }
 
   .review-title:hover {
     color: var(--clr-accent-strong);
   }
 
-  .review-info > div {
+  .review-sub {
     display: flex;
-    gap: var(--sp-3);
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
     font-size: var(--text-xs);
     color: var(--clr-text-3);
-    margin-top: 3px;
-  }
-
-  .review-info > div > :last-child {
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
-  .review-signals {
+  .review-check {
+    flex-shrink: 0;
+    width: 16px;
+    text-align: center;
     font-size: var(--text-s);
   }
 
-  .review-fetch {
-    height: 26px;
-    font-size: var(--text-s);
-    font-weight: 500;
-    border: 1px solid var(--clr-border-1);
-    border-radius: var(--radius-m);
-    padding: 0 10px;
-    white-space: nowrap;
-    color: var(--clr-text-1);
-    background: var(--clr-bg-3);
-    transition: background var(--t-fast) var(--ease-out);
+  .review-check.ok {
+    color: var(--clr-ok);
   }
 
-  .review-fetch:hover {
-    background: color-mix(in srgb, var(--clr-bg-3) 92%, var(--clr-text-1));
+  .review-check.warn {
+    color: var(--clr-warn);
   }
 
+  .review-check.danger {
+    color: var(--clr-danger);
+  }
+
+  .review-actions {
+    flex-shrink: 0;
+    display: flex;
+    gap: var(--sp-1);
+  }
+
+  /* The fetch panel: a tray under the toolbar, like a change's panels. */
   .review-panel {
-    border: 1px solid var(--clr-border-2);
-    border-radius: var(--radius-l);
-    padding: var(--sp-4);
-    margin-bottom: var(--sp-4);
+    flex-shrink: 0;
+    padding: var(--sp-3) var(--sp-4);
+    border-top: 0;
+    border-bottom: 1px solid var(--clr-border-2);
     background: var(--clr-bg-well);
   }
 
-  .review-panel p {
-    color: var(--clr-text-2);
-    font-size: var(--text-s);
-    margin: 2px 0 var(--sp-3);
-  }
-
-  .review-panel form {
+  .review-panel-head {
     display: flex;
+    align-items: baseline;
     gap: var(--sp-2);
-    align-items: center;
-    font-size: var(--text-s);
+    min-width: 0;
+    margin-bottom: var(--sp-2);
   }
 
-  button:disabled {
-    opacity: 0.45;
-    cursor: default;
+  .review-panel-head h3 {
+    flex-shrink: 0;
+    margin: 0;
+  }
+
+  .review-panel-head p {
+    min-width: 0;
+    margin: 0;
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  .review-name-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: var(--text-s);
+    color: var(--clr-text-2);
+  }
+
+  .review-name-row .field {
+    width: 220px;
+  }
+
+  .review-panel p.note {
+    margin: var(--sp-2) 0 0;
   }
 
   @container (max-width: 1000px) {
@@ -2466,13 +2674,8 @@
       grid-template-columns: 210px minmax(0, 1fr);
     }
 
-    .stack-detail {
-      padding: var(--sp-5);
-    }
-
     .detail-body {
-      gap: var(--sp-5);
-      grid-template-columns: minmax(0, 1fr) 240px;
+      grid-template-columns: minmax(0, 1fr) 264px;
     }
   }
 
@@ -2481,17 +2684,30 @@
       grid-template-columns: 180px minmax(0, 1fr);
     }
 
+    /* Narrow: the action column folds above the ledger and the detail
+       scrolls as one. */
     .detail-body {
-      grid-template-columns: minmax(0, 1fr);
+      display: flex;
+      flex-direction: column;
+      overflow: auto;
+    }
+
+    .chain-pane,
+    .action-column {
+      flex-shrink: 0;
+      min-height: auto;
+      overflow: visible;
     }
 
     .action-column {
-      position: static;
-      grid-row: 1;
+      order: -1;
+      border-left: 0;
+      border-bottom: 1px solid var(--clr-border-2);
     }
 
-    .stack-detail {
-      padding: var(--sp-4);
+    .column-head,
+    .chain-pane :global(.chain-head) {
+      position: static;
     }
 
     .tabs-note,
@@ -2499,30 +2715,18 @@
       display: none;
     }
 
-    .stack-subtitle {
-      gap: 4px 10px;
-    }
-
-    .workbench-link {
-      margin-left: 0;
-    }
-
-    .review-heading {
-      align-items: flex-start;
-      flex-direction: column;
-    }
-
-    .job-heading {
+    .job-head {
       flex-wrap: wrap;
     }
 
-    .job-name {
-      max-width: 180px;
+    .review-name-row {
+      flex-wrap: wrap;
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .skeleton {
+    .skeleton,
+    .job-dot.pulse {
       animation: none;
     }
   }
