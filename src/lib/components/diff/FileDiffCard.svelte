@@ -29,7 +29,7 @@
     type FindSpan,
   } from "./find";
   import { fileHighlighter, plainSpans, type HighlightSpan } from "./highlight";
-  import { observeViewport, rowOffsets, visibleRange } from "$lib/viewport";
+  import { leadingOverscan, observeViewport, rowOffsets, visibleRange } from "$lib/viewport";
 
   let {
     file,
@@ -77,8 +77,9 @@
   // is every placeholder — scroll geometry never shifts as blocks mount.
   // ~64 rows is ~1.2k px — one block mounts in well under a frame. The
   // window is recomputed synchronously from the block divs' own rects, so
-  // content is in place when the frame paints — no observer latency, no
-  // blank flashes mid-drag.
+  // content is in place when the frame paints. Scrolling is async: the
+  // compositor keeps moving while this frame runs, so the margin grows
+  // ahead of a fast scroll by what the content covers in ~100ms.
   const BLOCK_ROWS = 64;
   const OVERSCAN_PX = 1200;
 
@@ -248,20 +249,23 @@
     (rows) => rows.length + rows.filter((row) => "gap" in row).length / 2,
   ));
 
-  function updateWindow(view?: { top: number; height: number }): void {
+  function updateWindow(view?: { top: number; height: number; velocity: number }): void {
     const el = layout === "split" ? paneEls.l : linesEl;
     if (!el || !linesEl) return;
     const scroller = el.closest<HTMLElement>(".scroller");
     const viewport = view ?? {
       top: scroller?.getBoundingClientRect().top ?? 0,
       height: scroller?.clientHeight ?? window.innerHeight,
+      velocity: 0,
     };
     const style = getComputedStyle(linesEl);
     const rowH = parseFloat(style.lineHeight) || 19.2;
     const padding = el === linesEl ? parseFloat(style.paddingTop) || 0 : 0;
     const top = viewport.top - el.getBoundingClientRect().top - padding;
+    const overscan = leadingOverscan(viewport.velocity, OVERSCAN_PX, 100, 3 * viewport.height);
     const { start, end } = visibleRange(
-      blockOffsets, top / rowH, viewport.height / rowH, OVERSCAN_PX / rowH,
+      blockOffsets, top / rowH, viewport.height / rowH,
+      { before: overscan.before / rowH, after: overscan.after / rowH },
     );
     for (const i of mounted) if (i < start || i >= end) mounted.delete(i);
     for (let i = start; i < end; i++) mounted.add(i);

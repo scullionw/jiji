@@ -908,11 +908,13 @@
 
   /* ── The diff body ── */
 
+  /* overflow-anchor: the cards are windowed; see DiffView's scroller. */
   .scroller {
     flex: 1;
     min-width: 0;
     min-height: 0;
     overflow-y: auto;
+    overflow-anchor: none;
   }
 
   .empty {

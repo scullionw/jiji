@@ -62,4 +62,32 @@ describe("shared scroll observation", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(disconnect).toHaveBeenCalledOnce();
   });
+
+  it("reports the scroll velocity from one paint to the next, and rest after a pause", () => {
+    const element = document.createElement("div");
+    let scrollTop = 0;
+    Object.defineProperty(element, "scrollTop", { get: () => scrollTop, configurable: true });
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const listener = vi.fn();
+    const stop = observeViewport(element, listener);
+    paint();
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ velocity: 0 }));
+    now += 16;
+    scrollTop = 160;
+    element.dispatchEvent(new Event("scroll"));
+    paint();
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ velocity: 10 }));
+    now += 16;
+    scrollTop = 80;
+    element.dispatchEvent(new Event("scroll"));
+    paint();
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ velocity: -5 }));
+    now += 1000;
+    scrollTop = 1080;
+    element.dispatchEvent(new Event("scroll"));
+    paint();
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ velocity: 0 }));
+    stop();
+  });
 });

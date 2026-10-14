@@ -9,7 +9,7 @@
   import { laneBudget } from "./lanes.svelte";
   import { gutterWidth, nodeRowHeight, ELISION_ROW_HEIGHT, type GraphModel } from "./graph";
   import { density } from "./density.svelte";
-  import { observeViewport, rowOffsets, visibleRange } from "$lib/viewport";
+  import { leadingOverscan, observeViewport, rowOffsets, visibleRange } from "$lib/viewport";
 
   let {
     model,
@@ -49,18 +49,25 @@
   let element = $state<HTMLDivElement>();
   let top = $state(0);
   let height = $state(800);
+  let velocity = $state(0);
   const windowed = $derived(model.rows.length > 80 && scroller !== undefined);
   const offsets = $derived(rowOffsets(model.rows, (row) =>
     row.type === "node" ? nodeRowHeight(density.mode) : ELISION_ROW_HEIGHT,
   ));
   const totalHeight = $derived(offsets[offsets.length - 1]);
-  const range = $derived(visibleRange(offsets, top, height, 300));
+  // A viewport of rows stays mounted above and below, and more ahead
+  // while a fling is under way: the compositor scrolls on without
+  // waiting for this frame, so what it reveals must already be there.
+  const range = $derived(
+    visibleRange(offsets, top, height, leadingOverscan(velocity, height, 100, 3 * height)),
+  );
 
   $effect(() => {
     if (!scroller || !element || !windowed) return;
     return observeViewport(scroller, (view) => {
       top = view.top - element!.getBoundingClientRect().top;
       height = view.height;
+      velocity = view.velocity;
     });
   });
 

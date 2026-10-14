@@ -951,11 +951,17 @@
     background: var(--clr-accent);
   }
 
+  /* Windowed content: rows above the viewport come and go as blocks
+     mount, and WebKit's scroll anchoring answers each swap by moving the
+     scroll position a whole block (measured: ~1150px leaps mid-fling,
+     landing the viewport on still-empty placeholders). Anchoring is for
+     documents that reflow; this one has exact placeholder heights. */
   .scroller {
     flex: 1;
     min-width: 0;
     min-height: 0;
     overflow-y: auto;
+    overflow-anchor: none;
   }
 
   .empty {

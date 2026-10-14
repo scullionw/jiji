@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rowOffsets, visibleRange } from "./viewport";
+import { leadingOverscan, rowOffsets, visibleRange } from "./viewport";
 
 describe("viewport windowing", () => {
   it("includes only intersecting rows at exact boundaries", () => {
@@ -35,5 +35,27 @@ describe("viewport windowing", () => {
       expect(range.end - range.start).toBeLessThan(50);
       expect(range.end).toBeGreaterThan(range.start);
     }
+  });
+
+  it("takes a different margin on each side", () => {
+    const offsets = rowOffsets([30, 18, 52, 30], (height) => height);
+    expect(visibleRange(offsets, 48, 52, { before: 0, after: 0 })).toEqual({ start: 2, end: 3 });
+    expect(visibleRange(offsets, 48, 52, { before: 1, after: 0 })).toEqual({ start: 1, end: 3 });
+    expect(visibleRange(offsets, 48, 52, { before: 0, after: 1 })).toEqual({ start: 2, end: 4 });
+  });
+});
+
+describe("leading overscan", () => {
+  it("keeps the base margin both ways at rest", () => {
+    expect(leadingOverscan(0, 300)).toEqual({ before: 300, after: 300 });
+  });
+
+  it("extends the side the scroll is heading to by the distance covered in the lead time", () => {
+    expect(leadingOverscan(9, 300, 100)).toEqual({ before: 300, after: 1200 });
+    expect(leadingOverscan(-9, 300, 100)).toEqual({ before: 1200, after: 300 });
+  });
+
+  it("caps the lead so a wild velocity cannot mount everything", () => {
+    expect(leadingOverscan(100, 300, 100, 2400)).toEqual({ before: 300, after: 2700 });
   });
 });

@@ -550,10 +550,12 @@
     border-bottom: 1px solid var(--clr-border-2);
   }
 
+  /* overflow-anchor: the graph is windowed; see DiffView's scroller. */
   .scroller {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    overflow-anchor: none;
     outline: none;
   }
 

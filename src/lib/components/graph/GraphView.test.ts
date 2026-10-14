@@ -47,14 +47,15 @@ describe("large history rendering", () => {
       model: model(1000), lanes: new Map(), emphasized: null,
       selectedIds: new Set(["change0"]), activeId: "change0", scroller, onselect: vi.fn(),
     });
-    // A viewport plus overscan of 1,000 rows: dozens mounted, not all.
-    expect(view.container.querySelectorAll("[data-node-id]").length).toBeLessThan(60);
+    // Of 1,000 rows, the viewport plus a viewport's margin each side is
+    // mounted (~90 at 28px rows), not all.
+    expect(view.container.querySelectorAll("[data-node-id]").length).toBeLessThan(100);
     expect(view.container.querySelector('[data-node-id="change900"]')).toBeNull();
     await view.rerender({ selectedIds: new Set(["change900"]), activeId: "change900" });
     await waitFor(() => {
       expect(view.container.querySelector('[data-node-id="change900"]')?.getAttribute("aria-pressed")).toBe("true");
     });
-    expect(view.container.querySelectorAll("[data-node-id]").length).toBeLessThan(60);
+    expect(view.container.querySelectorAll("[data-node-id]").length).toBeLessThan(100);
     expect(scroller.scrollTop).toBe(901 * nodeRowHeight("compact") - 820);
   });
 
