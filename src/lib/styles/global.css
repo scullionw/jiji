@@ -18,7 +18,9 @@ body {
   line-height: 1.45;
   color: var(--clr-text-1);
   background: var(--clr-bg-0);
-  -webkit-font-smoothing: antialiased;
+  /* Default font smoothing, never `antialiased`: on macOS that switches
+     off the system's stem darkening, so every glyph renders a weight
+     lighter than native text and the whole UI reads washed out. */
   text-rendering: optimizeLegibility;
   /* Numbers line up in every meta column, timestamp and counter. */
   font-variant-numeric: tabular-nums;

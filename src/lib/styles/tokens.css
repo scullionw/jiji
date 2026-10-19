@@ -12,6 +12,12 @@
      bg-2  surfaces that sit above a pane: popovers, menus, file headers
      bg-3  controls: buttons, active segments, ref labels
 
+   Text steps hold their contrast on every surface from bg-0 to bg-2:
+   text-2 at 8:1 or better, text-3 at 5.5:1 or better. text-3 carries
+   real information (line numbers, metadata, comments), so it is the
+   quiet step, never a faded one. Light palettes keep semantic hues used
+   as text at 4.5:1 or better on their frame.
+
    Structure (type, spacing, radii, motion) lives once on :root. Color comes
    from theme palettes: Midnight is the base on :root (it matches the window
    background the app boots with) and every other theme overrides it under
@@ -38,8 +44,8 @@
   --clr-border-2: rgb(255 255 255 / 0.06);
 
   --clr-text-1: #e9eaf0;
-  --clr-text-2: #a3a6b3;
-  --clr-text-3: #7b7e8b;
+  --clr-text-2: #afb2bf;
+  --clr-text-3: #9093a0;
 
   --clr-accent: #7078ee;
   --clr-accent-strong: #a6abff;
@@ -71,14 +77,14 @@
      mark scan anchors (keywords, strings, types) and everything else stays
      plain text. The light set is the :where() group at the end (kept
      low-specificity so a theme block can override any --syn-* token). */
-  --syn-kw: #c392dc;
+  --syn-kw: #d2a0eb;
   --syn-str: #9fc17e;
   --syn-const: #d9a86b;
   --syn-type: #6fc0d0;
-  --syn-fn: #82aee8;
+  --syn-fn: #89b6f0;
   --syn-prop: #9cb4d6;
   --syn-comment: var(--clr-text-3);
-  --syn-meta: #cc9f7c;
+  --syn-meta: #d7aa86;
 
   /* Diff surfaces — a dedicated add/remove pair per scheme. Line fills are
      translucent over the pane; gutter fills are opaque mixes so line
@@ -87,7 +93,7 @@
   --diff-add-bg: rgb(56 170 90 / 0.14);
   --diff-add-gutter: color-mix(in srgb, rgb(56 170 90) 22%, var(--clr-bg-1));
   --diff-add-word: rgb(56 170 90 / 0.36);
-  --diff-del-fg: #f0736b;
+  --diff-del-fg: #fb7c74;
   --diff-del-bg: rgb(236 84 74 / 0.13);
   --diff-del-gutter: color-mix(in srgb, rgb(236 84 74) 20%, var(--clr-bg-1));
   --diff-del-word: rgb(236 84 74 / 0.36);
@@ -177,8 +183,8 @@
   --clr-border-2: rgb(255 255 255 / 0.065);
 
   --clr-text-1: #ececec;
-  --clr-text-2: #a4a4a4;
-  --clr-text-3: #7e7e7e;
+  --clr-text-2: #b3b3b3;
+  --clr-text-3: #949494;
 
   --clr-accent: #7d9fc8;
   --clr-accent-strong: #a8c1df;
@@ -207,8 +213,8 @@
   --clr-border-2: rgb(160 190 255 / 0.075);
 
   --clr-text-1: #dde6f5;
-  --clr-text-2: #95a3bd;
-  --clr-text-3: #76839c;
+  --clr-text-2: #a2b1cb;
+  --clr-text-3: #8492ab;
 
   --clr-accent: #3eb3dc;
   --clr-accent-strong: #74cdee;
@@ -244,8 +250,8 @@
   --clr-border-2: rgb(190 230 200 / 0.065);
 
   --clr-text-1: #e3ebe3;
-  --clr-text-2: #9eac9f;
-  --clr-text-3: #798779;
+  --clr-text-2: #a8b6a9;
+  --clr-text-3: #889788;
 
   --clr-accent: #6fbf80;
   --clr-accent-strong: #97d6a3;
@@ -274,8 +280,8 @@
   --clr-border-2: rgb(255 220 180 / 0.06);
 
   --clr-text-1: #ede7df;
-  --clr-text-2: #ab9f93;
-  --clr-text-3: #887e73;
+  --clr-text-2: #bbafa3;
+  --clr-text-3: #9b9085;
 
   --clr-accent: #e2844f;
   --clr-accent-strong: #f1a67a;
@@ -308,18 +314,18 @@
   --clr-border-2: rgb(20 22 40 / 0.08);
 
   --clr-text-1: #1b1c22;
-  --clr-text-2: #53565f;
-  --clr-text-3: #6e717b;
+  --clr-text-2: #454851;
+  --clr-text-3: #5d606a;
 
   --clr-accent: #4e54d6;
   --clr-accent-strong: #3b40c2;
   --clr-accent-dim: rgb(78 84 214 / 0.1);
   --clr-accent-contrast: #ffffff;
 
-  --clr-working-copy: #0d8a6e;
-  --clr-working-copy-dim: rgb(13 138 110 / 0.1);
-  --clr-ok: #1f8a4c;
-  --clr-warn: #9a6700;
+  --clr-working-copy: #007c61;
+  --clr-working-copy-dim: rgb(0 124 97 / 0.1);
+  --clr-ok: #077e41;
+  --clr-warn: #966300;
   --clr-danger: #cf2d2d;
 
   --clr-scrollbar: rgb(20 22 40 / 0.18);
@@ -344,19 +350,19 @@
   --clr-border-2: rgb(80 60 30 / 0.085);
 
   --clr-text-1: #221d16;
-  --clr-text-2: #62594c;
-  --clr-text-3: #766d5f;
+  --clr-text-2: #4c4337;
+  --clr-text-3: #645b4e;
 
-  --clr-accent: #b75a37;
+  --clr-accent: #aa4f2c;
   --clr-accent-strong: #9d4a2b;
-  --clr-accent-dim: rgb(183 90 55 / 0.1);
+  --clr-accent-dim: rgb(170 79 44 / 0.1);
   --clr-accent-contrast: #ffffff;
 
-  --clr-working-copy: #0e8a78;
-  --clr-working-copy-dim: rgb(14 138 120 / 0.1);
-  --clr-ok: #4a8f43;
-  --clr-warn: #9a6e10;
-  --clr-danger: #c03e30;
+  --clr-working-copy: #007766;
+  --clr-working-copy-dim: rgb(0 119 102 / 0.1);
+  --clr-ok: #33782c;
+  --clr-warn: #8d6100;
+  --clr-danger: #bd3c2e;
 
   --clr-scrollbar: rgb(80 60 30 / 0.2);
   --clr-scrollbar-hover: rgb(80 60 30 / 0.34);
@@ -380,19 +386,19 @@
   --clr-border-2: rgb(20 60 110 / 0.085);
 
   --clr-text-1: #16202c;
-  --clr-text-2: #4f6075;
-  --clr-text-3: #627184;
+  --clr-text-2: #38485c;
+  --clr-text-3: #516072;
 
-  --clr-accent: #1f6fc5;
+  --clr-accent: #1b6cc2;
   --clr-accent-strong: #185aa2;
-  --clr-accent-dim: rgb(31 111 197 / 0.1);
+  --clr-accent-dim: rgb(27 108 194 / 0.1);
   --clr-accent-contrast: #ffffff;
 
-  --clr-working-copy: #0c8a80;
-  --clr-working-copy-dim: rgb(12 138 128 / 0.1);
-  --clr-ok: #2c9356;
-  --clr-warn: #a06f10;
-  --clr-danger: #cd3d3d;
+  --clr-working-copy: #007970;
+  --clr-working-copy-dim: rgb(0 121 112 / 0.1);
+  --clr-ok: #027c41;
+  --clr-warn: #936200;
+  --clr-danger: #c63638;
 
   --clr-scrollbar: rgb(20 60 110 / 0.18);
   --clr-scrollbar-hover: rgb(20 60 110 / 0.32);
@@ -417,19 +423,19 @@
   --clr-border-2: rgb(30 70 40 / 0.085);
 
   --clr-text-1: #1a211b;
-  --clr-text-2: #556257;
-  --clr-text-3: #687369;
+  --clr-text-2: #3d493f;
+  --clr-text-3: #566157;
 
-  --clr-accent: #2a7c4d;
+  --clr-accent: #277a4b;
   --clr-accent-strong: #216640;
-  --clr-accent-dim: rgb(42 124 77 / 0.1);
+  --clr-accent-dim: rgb(39 122 75 / 0.1);
   --clr-accent-contrast: #ffffff;
 
-  --clr-working-copy: #0d7f9b;
-  --clr-working-copy-dim: rgb(13 127 155 / 0.1);
-  --clr-ok: #379152;
-  --clr-warn: #a06f10;
-  --clr-danger: #c63f38;
+  --clr-working-copy: #007591;
+  --clr-working-copy-dim: rgb(0 117 145 / 0.1);
+  --clr-ok: #1c7b3e;
+  --clr-warn: #926200;
+  --clr-danger: #c23b35;
 
   --clr-scrollbar: rgb(30 70 40 / 0.18);
   --clr-scrollbar-hover: rgb(30 70 40 / 0.32);
@@ -453,19 +459,19 @@
   --clr-border-2: rgb(90 40 60 / 0.085);
 
   --clr-text-1: #251c1f;
-  --clr-text-2: #675a5f;
-  --clr-text-3: #7a6b70;
+  --clr-text-2: #4f4247;
+  --clr-text-3: #685a5f;
 
   --clr-accent: #ad3564;
   --clr-accent-strong: #922a53;
   --clr-accent-dim: rgb(173 53 100 / 0.1);
   --clr-accent-contrast: #ffffff;
 
-  --clr-working-copy: #0f8a7c;
-  --clr-working-copy-dim: rgb(15 138 124 / 0.1);
-  --clr-ok: #3a8f53;
-  --clr-warn: #a26d0e;
-  --clr-danger: #c93a32;
+  --clr-working-copy: #00786b;
+  --clr-working-copy-dim: rgb(0 120 107 / 0.1);
+  --clr-ok: #227a40;
+  --clr-warn: #946000;
+  --clr-danger: #c5362f;
 
   --clr-scrollbar: rgb(90 40 60 / 0.18);
   --clr-scrollbar-hover: rgb(90 40 60 / 0.32);
@@ -492,19 +498,19 @@
   --diff-file-head: color-mix(in srgb, var(--clr-bg-0) 45%, var(--clr-bg-1));
 
   --syn-kw: #8039a8;
-  --syn-str: #3f7a1c;
-  --syn-const: #9a5f08;
-  --syn-type: #0f6a80;
-  --syn-fn: #2b5cb5;
-  --syn-prop: #475f88;
+  --syn-str: #2c6700;
+  --syn-const: #864c00;
+  --syn-type: #006278;
+  --syn-fn: #2656af;
+  --syn-prop: #435a83;
   --syn-comment: var(--clr-text-3);
-  --syn-meta: #935f26;
+  --syn-meta: #814e11;
 
-  --diff-add-fg: #1a7f37;
+  --diff-add-fg: #00671f;
   --diff-add-bg: rgb(46 164 79 / 0.12);
   --diff-add-gutter: color-mix(in srgb, rgb(46 164 79) 18%, var(--clr-bg-1));
   --diff-add-word: rgb(46 164 79 / 0.3);
-  --diff-del-fg: #c42b2b;
+  --diff-del-fg: #b1101a;
   --diff-del-bg: rgb(230 70 60 / 0.1);
   --diff-del-gutter: color-mix(in srgb, rgb(230 70 60) 15%, var(--clr-bg-1));
   --diff-del-word: rgb(230 70 60 / 0.26);

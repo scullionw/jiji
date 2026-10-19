@@ -37,9 +37,9 @@ export const themes: ThemeDef[] = [
   { id: "moss", label: "Moss", scheme: "dark", swatch: { bg: "#111713", accent: "#6fbf80" } },
   { id: "ember", label: "Ember", scheme: "dark", swatch: { bg: "#181413", accent: "#e2844f" } },
   { id: "paper", label: "Paper", scheme: "light", swatch: { bg: "#fcfcfd", accent: "#4e54d6" } },
-  { id: "linen", label: "Linen", scheme: "light", swatch: { bg: "#fbf8f3", accent: "#b75a37" } },
-  { id: "glacier", label: "Glacier", scheme: "light", swatch: { bg: "#f8fafc", accent: "#1f6fc5" } },
-  { id: "meadow", label: "Meadow", scheme: "light", swatch: { bg: "#f9fbf8", accent: "#2a7c4d" } },
+  { id: "linen", label: "Linen", scheme: "light", swatch: { bg: "#fbf8f3", accent: "#aa4f2c" } },
+  { id: "glacier", label: "Glacier", scheme: "light", swatch: { bg: "#f8fafc", accent: "#1b6cc2" } },
+  { id: "meadow", label: "Meadow", scheme: "light", swatch: { bg: "#f9fbf8", accent: "#277a4b" } },
   { id: "dawn", label: "Dawn", scheme: "light", swatch: { bg: "#fcf8f9", accent: "#ad3564" } },
 ];
 
