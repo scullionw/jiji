@@ -17,7 +17,7 @@ use jiji_core::snapshot::{
     FileStatus,
 };
 
-use crate::highlight::{lang_for_path, HighlightJob, Mark};
+use crate::diff::highlight::{lang_for_path, HighlightJob, Mark};
 
 pub type LineId = u32;
 
@@ -28,6 +28,12 @@ pub const GAP_H: f32 = 27.;
 /// 30px file header plus its bottom hairline.
 pub const HEADER_H: f32 = 31.;
 pub const NOTE_H: f32 = 34.;
+/// An image comparison: the picture boxes, their captions and padding.
+pub const IMAGE_H: f32 = 300.;
+/// The tallest a picture draws inside its box.
+pub const IMAGE_MAX_H: f32 = 220.;
+pub const REGION_H: f32 = 26.;
+pub const SIDE_H: f32 = 22.;
 /// `.lines { padding: 2px 0 }`.
 pub const PAD_H: f32 = 2.;
 const TAB: usize = 4;
@@ -116,6 +122,14 @@ impl Line {
     }
 
     /// The file's own text for a range of the painted text.
+    /// The whole line as it is in the file (tabs intact).
+    pub fn source_text(&self) -> &str {
+        match &self.source {
+            Some(source) => source,
+            None => &self.text,
+        }
+    }
+
     pub fn source_slice(&self, range: Range<usize>) -> Cow<'_, str> {
         match &self.source {
             None => Cow::Borrowed(&self.text[range]),
@@ -156,6 +170,7 @@ pub struct Cell {
     pub kind: Kind,
 }
 
+#[derive(Clone)]
 pub enum Row {
     FileHeader {
         file: u32,
@@ -184,6 +199,17 @@ pub enum Row {
         text: SharedString,
         danger: bool,
     },
+    /// An image file's two sides as pictures, in one tall row.
+    Image {
+        file: u32,
+    },
+    /// The heading of one conflict region, or of one side within it.
+    Region {
+        text: SharedString,
+        /// A side's caption ("vs base", its label); `None` on the region's
+        /// own heading.
+        side: Option<SharedString>,
+    },
 }
 
 impl Row {
@@ -194,6 +220,9 @@ impl Row {
             Row::Gap { .. } => GAP_H,
             Row::Line { .. } | Row::Split { .. } => LINE_H,
             Row::Note { .. } => NOTE_H,
+            Row::Image { .. } => IMAGE_H,
+            Row::Region { side: None, .. } => REGION_H,
+            Row::Region { .. } => SIDE_H,
         }
     }
 }
@@ -254,9 +283,56 @@ impl Layout {
             None => self.height(),
         }
     }
+
+    /// This layout with the bodies of collapsed files left out: their
+    /// headers stay, so the file list still reads top to bottom.
+    pub fn collapsing(&self, collapsed: &[bool]) -> Layout {
+        let mut out = Layout::new();
+        for (file, &start) in self.file_rows.iter().enumerate() {
+            let end = self
+                .file_rows
+                .get(file + 1)
+                .copied()
+                .unwrap_or(self.rows.len());
+            out.file_rows.push(out.rows.len());
+            let end = if collapsed.get(file).copied().unwrap_or(false) {
+                start + 1
+            } else {
+                end
+            };
+            for row in &self.rows[start..end] {
+                out.push(row.clone());
+            }
+        }
+        out
+    }
+
+    /// The first row showing `line`, on either side.
+    pub fn row_of_line(&self, file: usize, line: LineId) -> Option<usize> {
+        let start = *self.file_rows.get(file)?;
+        let end = self
+            .file_rows
+            .get(file + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
+        (start..end).find(|&row| match &self.rows[row] {
+            Row::Line { line: id, .. } => *id == line,
+            Row::Split { left, right } => {
+                left.is_some_and(|cell| cell.line == line)
+                    || right.is_some_and(|cell| cell.line == line)
+            }
+            _ => false,
+        })
+    }
 }
 
 pub struct FileModel {
+    /// Repo-relative path, `/`-separated.
+    pub path: SharedString,
+    /// The file's lines in `DiffDoc::lines`.
+    pub lines: Range<LineId>,
+    /// How many conflict regions the file holds (conflicted files only).
+    pub regions: u32,
     pub dir: SharedString,
     pub name: SharedString,
     pub status: FileStatus,
@@ -266,6 +342,44 @@ pub struct FileModel {
     pub removed: u32,
     /// The file's widest line, in columns: sizes its horizontal pan range.
     pub max_cols: u32,
+    /// An image file's sides, old then new; a missing side means the file
+    /// was added or removed.
+    pub images: Option<[Option<ImageSide>; 2]>,
+}
+
+/// One side of an image comparison.
+pub struct ImageSide {
+    /// The picture, when the side is small enough to carry inline and in
+    /// a format that can be drawn.
+    pub image: Option<std::sync::Arc<gpui::Image>>,
+    /// The side's full byte size, already phrased.
+    pub size: String,
+}
+
+fn image_side(content: &jiji_core::snapshot::ImageContent) -> ImageSide {
+    use base64::Engine as _;
+    let format = match content.mime.as_str() {
+        "image/png" => Some(gpui::ImageFormat::Png),
+        "image/jpeg" => Some(gpui::ImageFormat::Jpeg),
+        "image/webp" => Some(gpui::ImageFormat::Webp),
+        "image/gif" => Some(gpui::ImageFormat::Gif),
+        "image/svg+xml" => Some(gpui::ImageFormat::Svg),
+        "image/bmp" => Some(gpui::ImageFormat::Bmp),
+        "image/tiff" => Some(gpui::ImageFormat::Tiff),
+        _ => None,
+    };
+    let image = format
+        .zip(content.data.as_ref())
+        .and_then(|(format, data)| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
+        });
+    ImageSide {
+        image,
+        size: format_bytes(content.size),
+    }
 }
 
 pub struct DiffDoc {
@@ -290,6 +404,20 @@ struct Numbered {
 }
 
 impl DiffDoc {
+    /// A document with nothing in it: the surface before its first diff.
+    pub fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            lines: Vec::new(),
+            unified: Layout::new(),
+            split: Layout::new(),
+            digits: 2,
+            added: 0,
+            removed: 0,
+            jobs: Vec::new(),
+        }
+    }
+
     pub fn build(diff: &ChangeDiff) -> Self {
         let mut doc = Self {
             files: Vec::with_capacity(diff.files.len()),
@@ -350,7 +478,7 @@ impl DiffDoc {
                     }
                     if *truncated {
                         doc.note(
-                            "Diff truncated: this file exceeds the per-file budget",
+                            "Diff truncated — this file changes more lines than Jiji renders",
                             false,
                         );
                     }
@@ -361,25 +489,39 @@ impl DiffDoc {
                 } => {
                     doc.push_conflict(sections, &mut job);
                     if *truncated {
-                        doc.note("Conflict truncated", false);
+                        doc.note(
+                            "Conflict truncated — this file holds more conflict content than Jiji renders",
+                            false,
+                        );
                     }
                 }
                 FileDiffContent::Image { .. } => {
-                    doc.note("Image diff (not rendered in this spike)", false)
+                    doc.push_both(|| Row::Image { file: index as u32 }, false)
                 }
                 FileDiffContent::Binary { old_size, new_size } => {
                     doc.note(&binary_note(*old_size, *new_size), false)
                 }
-                FileDiffContent::TooLarge => doc.note("File too large to diff", false),
-                FileDiffContent::Omitted => {
-                    doc.note("Diff omitted: the change exceeds the diff budget", false)
-                }
+                FileDiffContent::TooLarge => doc.note("Too large to diff", false),
+                FileDiffContent::Omitted => doc.note(
+                    "Not shown — this change is larger than Jiji renders at once",
+                    false,
+                ),
             }
             doc.added += added;
             doc.removed += removed;
             let max_cols = doc.lines[first_line..].iter().map(|line| line.cols).max();
-            doc.files
-                .push(file_model(file, added, removed, max_cols.unwrap_or(0)));
+            let mut model = file_model(file, added, removed, max_cols.unwrap_or(0));
+            if let FileDiffContent::Image { old, new } = &file.content {
+                model.images = Some([old.as_ref().map(image_side), new.as_ref().map(image_side)]);
+            }
+            model.lines = first_line as LineId..doc.lines.len() as LineId;
+            if let FileDiffContent::Conflict { sections, .. } = &file.content {
+                model.regions = sections
+                    .iter()
+                    .filter(|section| matches!(section, ConflictSection::Region { .. }))
+                    .count() as u32;
+            }
+            doc.files.push(model);
             if let Some(job) = job.filter(|job| !job.hunks.is_empty()) {
                 doc.jobs.push(job);
             }
@@ -457,6 +599,11 @@ impl DiffDoc {
             context: None,
             lines: lines.to_vec(),
         };
+        let total = sections
+            .iter()
+            .filter(|section| matches!(section, ConflictSection::Region { .. }))
+            .count();
+        let mut ordinal = 0;
         for section in sections {
             match section {
                 ConflictSection::Resolved { lines } => {
@@ -474,12 +621,36 @@ impl DiffDoc {
                     );
                 }
                 ConflictSection::Region { sides } => {
+                    ordinal += 1;
+                    let heading = SharedString::from(format!("Conflict {ordinal} of {total}"));
+                    self.push_both(
+                        || Row::Region {
+                            text: heading.clone(),
+                            side: None,
+                        },
+                        false,
+                    );
                     for (index, side) in sides.iter().enumerate() {
-                        let label = match &side.label {
-                            Some(label) => format!("Conflict side #{}: {label}", index + 1),
-                            None => format!("Conflict side #{}", index + 1),
+                        // Two-sided regions order their sides exactly as
+                        // the take verbs' "ours" and "theirs".
+                        let name = match (sides.len(), index) {
+                            (2, 0) => "Side #1 · ours".to_owned(),
+                            (2, 1) => "Side #2 · theirs".to_owned(),
+                            _ => format!("Side #{}", index + 1),
                         };
-                        self.note(&label, true);
+                        let caption = match &side.label {
+                            Some(label) => format!("vs base · {label}"),
+                            None => "vs base".to_owned(),
+                        };
+                        let (name, caption) =
+                            (SharedString::from(name), SharedString::from(caption));
+                        self.push_both(
+                            || Row::Region {
+                                text: name.clone(),
+                                side: Some(caption.clone()),
+                            },
+                            false,
+                        );
                         let numbered = self.number_hunk(&pseudo(&side.lines), false, job);
                         self.push_lines(&numbered);
                     }
@@ -509,6 +680,9 @@ fn file_model(file: &FileDiff, added: u32, removed: u32, max_cols: u32) -> FileM
         None => ("", file.path.as_str()),
     };
     FileModel {
+        path: file.path.clone().into(),
+        lines: 0..0,
+        regions: 0,
         dir: dir.to_owned().into(),
         name: name.to_owned().into(),
         status: file.status,
@@ -517,6 +691,7 @@ fn file_model(file: &FileDiff, added: u32, removed: u32, max_cols: u32) -> FileM
         added,
         removed,
         max_cols,
+        images: None,
     }
 }
 

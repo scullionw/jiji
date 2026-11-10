@@ -1,261 +1,151 @@
-//! Spike: Jiji's diff view on GPUI instead of the webview.
+//! Jiji: a jj-native desktop workbench, on GPUI.
 //!
-//! Loads one change's diff (or a comparison between two changes) straight
-//! from `jiji-core` — no IPC, no serialization — and renders it with
-//! windowing, unified and split layouts, syntax highlighting, selection
-//! and copy. See README.md for what this is meant to answer.
+//! With arguments this binary is the `jiji` command line (the installed
+//! launcher forwards to it); without, it is the app.
 
+mod app;
 mod capture;
-mod highlight;
-mod model;
+mod diff;
+mod host;
+mod logic;
+mod script;
+mod shell;
+mod store;
 mod theme;
-mod view;
-
-use std::path::PathBuf;
-use std::process::ExitCode;
-use std::time::Instant;
+mod ui;
+mod views;
 
 use gpui::{
-    point, prelude::*, px, size, App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions,
+    point, prelude::*, px, size, App, Application, Bounds, SharedString, TitlebarOptions,
     WindowBounds, WindowOptions,
 };
-use jiji_core::snapshot::ChangeDiff;
-use jiji_core::{JjBackend, RepoBackend};
 
-use crate::model::DiffDoc;
-use crate::view::{BenchPlan, DiffView, Options, Step};
+use crate::app::AppModel;
+use crate::shell::Shell;
+use crate::store::Store;
 
-const USAGE: &str = "\
-Usage: jiji-gpui [REPO] [OPTIONS]
+struct Logger;
 
-Renders one change's diff from a jj repository in a GPUI window.
-
-Arguments:
-  [REPO]             Workspace root of a jj repository [default: .]
-
-Options:
-  -c, --change <ID>  Change to show: a change-id prefix or a commit id
-                     [default: the working copy]
-      --from <ID>    Compare from this change's tree instead of the parent
-      --split        Start in the side-by-side layout
-      --repeat <N>   Repeat the diff's files N times (stress the windowing)
-      --bench        Sweep the diff at 9000 and 18000 px/s and print frame
-                     timings; add --exit to quit when done
-      --background   Do not take focus on launch (for scripted runs); the
-                     window floats above others so it keeps painting
-      --script <OPS> Drive the view without the pointer, then leave it open.
-                     Steps separated by ';', coordinates in window points:
-                     scroll=Y  pan=X  split  unified  drag=X0,Y0,X1,Y1
-                     click=X,Y  double=X,Y  triple=X,Y  key=KEYSTROKE
-                     print (what cmd-c would copy)  shot=PATH (window to
-                     PNG)  quit
-  -h, --help         Print help
-
-Keys: s layout · ]/[ next/previous file · space/shift-space page ·
-      cmd-up/down ends · cmd-a select all · cmd-c copy · b benchmark ·
-      f frame stats";
-
-struct Args {
-    repo: PathBuf,
-    change: Option<String>,
-    from: Option<String>,
-    split: bool,
-    repeat: usize,
-    bench: bool,
-    exit: bool,
-    background: bool,
-    script: Vec<Step>,
-}
-
-fn parse_script(script: &str) -> Result<Vec<Step>, String> {
-    let mut steps = Vec::new();
-    for op in script.split(';').map(str::trim).filter(|op| !op.is_empty()) {
-        let (name, value) = op.split_once('=').unwrap_or((op, ""));
-        match name {
-            "shot" if !value.is_empty() => {
-                steps.push(Step::Shot(PathBuf::from(value)));
-                continue;
-            }
-            "key" if !value.is_empty() => {
-                steps.push(Step::Key(value.to_owned()));
-                continue;
-            }
-            _ => {}
-        }
-        let numbers: Vec<f32> = value
-            .split(',')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                part.trim()
-                    .parse()
-                    .map_err(|_| format!("bad number in `{op}`"))
-            })
-            .collect::<Result<_, _>>()?;
-        steps.push(match (name, numbers.as_slice()) {
-            ("scroll", [y]) => Step::Scroll(*y),
-            ("pan", [x]) => Step::Pan(*x),
-            ("split", []) => Step::Split(true),
-            ("unified", []) => Step::Split(false),
-            ("drag", [x0, y0, x1, y1]) => Step::Drag(*x0, *y0, *x1, *y1),
-            ("click", [x, y]) => Step::Click(1, *x, *y),
-            ("double", [x, y]) => Step::Click(2, *x, *y),
-            ("triple", [x, y]) => Step::Click(3, *x, *y),
-            ("print", []) => Step::Print,
-            ("quit", []) => Step::Quit,
-            _ => return Err(format!("unknown script step `{op}`")),
-        });
+impl log::Log for Logger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
     }
-    Ok(steps)
-}
 
-fn parse_args() -> Result<Args, String> {
-    let mut args = Args {
-        repo: PathBuf::from("."),
-        change: None,
-        from: None,
-        split: false,
-        repeat: 1,
-        bench: false,
-        exit: false,
-        background: false,
-        script: Vec::new(),
-    };
-    let mut input = std::env::args().skip(1);
-    while let Some(arg) = input.next() {
-        let mut value = |name: &str| input.next().ok_or(format!("{name} needs a value"));
-        match arg.as_str() {
-            "-h" | "--help" => return Err(String::new()),
-            "-c" | "--change" => args.change = Some(value("--change")?),
-            "--from" => args.from = Some(value("--from")?),
-            "--split" => args.split = true,
-            "--repeat" => {
-                args.repeat = value("--repeat")?
-                    .parse()
-                    .ok()
-                    .filter(|n| *n >= 1)
-                    .ok_or("--repeat needs a positive number")?
-            }
-            "--bench" => args.bench = true,
-            "--exit" => args.exit = true,
-            "--background" => args.background = true,
-            "--script" => args.script = parse_script(&value("--script")?)?,
-            flag if flag.starts_with('-') => return Err(format!("unknown option {flag}")),
-            path => args.repo = PathBuf::from(path),
+    fn log(&self, record: &log::Record) {
+        // GPUI and its dependencies are chatty at info; keep theirs to
+        // warnings.
+        let ours = record.target().starts_with("jiji");
+        if self.enabled(record.metadata()) && (ours || record.level() <= log::Level::Warn) {
+            eprintln!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
-    Ok(args)
+
+    fn flush(&self) {}
 }
 
-fn load(args: &Args) -> Result<(ChangeDiff, String), String> {
-    let backend = JjBackend::default();
-    let repo = args
-        .repo
-        .canonicalize()
-        .map_err(|err| format!("{}: {err}", args.repo.display()))?;
-    let change = match &args.change {
-        Some(change) => change.clone(),
-        None => {
-            backend
-                .open(&repo)
-                .map_err(|err| err.to_string())?
-                .working_copy
+/// SF Mono when it is installed (it ships with Xcode and Terminal, not
+/// with the system), else Menlo, which every Mac has.
+fn mono_font(cx: &App) -> SharedString {
+    let names = cx.text_system().all_font_names();
+    for candidate in ["SF Mono", "SFMono-Regular"] {
+        if names.iter().any(|name| name == candidate) {
+            return candidate.into();
         }
-    };
-    let diff = match &args.from {
-        Some(from) => backend.compare_diff(&repo, from, &change),
-        None => backend.change_diff(&repo, &change),
     }
-    .map_err(|err| err.to_string())?;
-    let short = |id: &str| id.chars().take(8).collect::<String>();
-    let name = repo
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let title = match &args.from {
-        Some(from) => format!("{name} · {} → {}", short(from), short(&change)),
-        None => format!("{name} · {}", short(&change)),
-    };
-    Ok((diff, title))
+    "Menlo".into()
 }
 
-fn main() -> ExitCode {
-    let launched = Instant::now();
-    let args = match parse_args() {
-        Ok(args) => args,
-        Err(message) if message.is_empty() => {
-            println!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Err(message) => {
-            eprintln!("jiji-gpui: {message}\n\n{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let started = Instant::now();
-    let mut args = args;
-    let (mut diff, title) = match load(&args) {
-        Ok(loaded) => loaded,
-        Err(message) => {
-            eprintln!("jiji-gpui: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let loaded = started.elapsed();
-    if args.repeat > 1 {
-        let files = diff.files.clone();
-        for _ in 1..args.repeat {
-            diff.files.extend(files.iter().cloned());
-        }
+fn main() {
+    if std::env::args_os().nth(1).is_some() {
+        std::process::exit(jiji_cli::run(std::env::args_os()));
     }
-    let built = Instant::now();
-    let doc = DiffDoc::build(&diff);
-    drop(diff);
-    eprintln!(
-        "jiji-gpui: {} files, {} lines (+{} −{}); diff loaded in {:.0?}, rows built in {:.1?} \
-         ({} unified, {} split)",
-        doc.files.len(),
-        doc.lines.len(),
-        doc.added,
-        doc.removed,
-        loaded,
-        built.elapsed(),
-        doc.unified.rows.len(),
-        doc.split.rows.len(),
-    );
+    let _ = log::set_logger(&Logger).map(|()| log::set_max_level(log::LevelFilter::Info));
 
-    let options = Options {
-        split: args.split,
-        bench: args.bench.then(|| BenchPlan {
-            speeds: vec![9_000., 18_000.],
-            exit: args.exit,
-        }),
-        script: std::mem::take(&mut args.script),
-        launched,
+    // Development switches ride the environment so argv stays the CLI's:
+    //   JIJI_OPEN=<path>      open this repository at launch
+    //   JIJI_SCRIPT=<steps>   drive the window (see script.rs)
+    //   JIJI_BACKGROUND=1     never take focus; float so it keeps painting
+    let open_at_launch = std::env::var("JIJI_OPEN").ok();
+    let script = match std::env::var("JIJI_SCRIPT").ok().map(|s| script::parse(&s)) {
+        Some(Ok(steps)) => steps,
+        Some(Err(err)) => {
+            eprintln!("jiji: {err}");
+            std::process::exit(2);
+        }
+        None => Vec::new(),
     };
-    let background = args.background;
+    let background = std::env::var("JIJI_BACKGROUND").as_deref() == Ok("1");
 
-    Application::new().run(move |cx: &mut App| {
-        let context = Some("DiffView");
-        cx.bind_keys([
-            KeyBinding::new("cmd-c", view::CopySelection, context),
-            KeyBinding::new("cmd-a", view::SelectAll, context),
-            KeyBinding::new("s", view::ToggleLayout, context),
-            KeyBinding::new("space", view::PageDown, context),
-            KeyBinding::new("pagedown", view::PageDown, context),
-            KeyBinding::new("shift-space", view::PageUp, context),
-            KeyBinding::new("pageup", view::PageUp, context),
-            KeyBinding::new("cmd-up", view::ScrollTop, context),
-            KeyBinding::new("home", view::ScrollTop, context),
-            KeyBinding::new("cmd-down", view::ScrollBottom, context),
-            KeyBinding::new("end", view::ScrollBottom, context),
-            KeyBinding::new("]", view::NextFile, context),
-            KeyBinding::new("[", view::PrevFile, context),
-            KeyBinding::new("b", view::RunBench, context),
-            KeyBinding::new("f", view::ToggleHud, context),
-            KeyBinding::new("cmd-q", view::Quit, None),
-            KeyBinding::new("cmd-w", view::Quit, None),
-        ]);
-        cx.on_action(|_: &view::Quit, cx| cx.quit());
+    let application = Application::new().with_assets(ui::icon::Assets);
+    // Folders arriving through Launch Services — the `jiji` launcher's
+    // `open -b`, or a drop on the Dock icon.
+    application.on_open_urls(|urls| {
+        let paths: Vec<std::path::PathBuf> = urls
+            .iter()
+            .filter_map(|url| url.strip_prefix("file://"))
+            .map(|path| std::path::PathBuf::from(percent_decode(path)))
+            .collect();
+        if !paths.is_empty() {
+            PENDING_OPEN.lock().unwrap().extend(paths);
+        }
+    });
+    application.run(move |cx: &mut App| {
+        ui::input::bind_keys(cx);
+        shell::bind_keys(cx);
+        views::workbench::bind_keys(cx);
+        views::bind_keys(cx);
+        views::palette::bind_keys(cx);
+        views::publish::bind_keys(cx);
+        views::search::bind_keys(cx);
+        diff::view::bind_keys(cx);
+        shell::register_app_actions(cx);
+        cx.set_menus(shell::menus());
+
+        let store = Store::open();
+        let geometry = store.window();
+        let model = AppModel::install(store, mono_font(cx), cx);
+        if let Some(path) = open_at_launch {
+            model.update(cx, |model, cx| model.open_repo_at(path, cx));
+        }
+
+        let default_size = size(px(1280.), px(820.));
+        let bounds = match geometry {
+            Some(saved) if saved.width >= 400. && saved.height >= 300. => Bounds::new(
+                point(px(saved.x), px(saved.y)),
+                size(px(saved.width), px(saved.height)),
+            ),
+            _ => Bounds::centered(None, default_size, cx),
+        };
+        let fullscreen = geometry.is_some_and(|saved| saved.fullscreen);
+        let options = WindowOptions {
+            window_bounds: Some(if fullscreen {
+                WindowBounds::Fullscreen(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
+            }),
+            window_min_size: Some(size(px(980.), px(640.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Jiji".into()),
+                appears_transparent: true,
+                // Centers the traffic lights in the 32px title bar.
+                traffic_light_position: Some(point(px(13.), px(9.))),
+            }),
+            focus: !background,
+            ..Default::default()
+        };
+        let window = cx
+            .open_window(options, |window, cx| cx.new(|cx| Shell::new(window, cx)))
+            .expect("the main window opens");
+        if background {
+            let _ = window.update(cx, |_, window, _| capture::float_without_focus(window));
+        } else {
+            cx.activate(true);
+        }
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -263,32 +153,59 @@ fn main() -> ExitCode {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Jiji · GPUI diff spike".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(13.), px(12.))),
-                }),
-                focus: !background,
-                window_min_size: Some(size(px(980.), px(640.))),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(|cx| DiffView::new(doc, title.into(), options, window, cx));
-                window.focus(&view.focus_handle(cx));
-                if background {
-                    capture::float_without_focus(window);
+        // Drain folders handed over before (and after) the window existed.
+        let weak = model.downgrade();
+        cx.spawn(async move |cx| loop {
+            let pending: Vec<_> = PENDING_OPEN.lock().unwrap().drain(..).collect();
+            if !pending.is_empty() {
+                let delivered = weak.update(cx, |model, cx| model.open_paths(pending, cx));
+                if delivered.is_err() {
+                    break;
                 }
-                view
-            },
-        )
-        .expect("the window opens");
-        if !background {
-            cx.activate(true);
+                let _ = cx.update(|cx| cx.activate(true));
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+        })
+        .detach();
+
+        if !script.is_empty() {
+            script::run(script, window.into(), cx);
         }
     });
-    ExitCode::SUCCESS
+}
+
+/// Paths the OS asked this app to open; drained on the main thread.
+static PENDING_OPEN: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut ix = 0;
+    while ix < bytes.len() {
+        if bytes[ix] == b'%' && ix + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&text[ix + 1..ix + 3], 16) {
+                out.push(byte);
+                ix += 3;
+                continue;
+            }
+        }
+        out.push(bytes[ix]);
+        ix += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_urls_decode_to_paths() {
+        assert_eq!(percent_decode("/Users/me/My%20Repo"), "/Users/me/My Repo");
+        assert_eq!(percent_decode("/plain/path"), "/plain/path");
+        assert_eq!(percent_decode("/odd%"), "/odd%");
+        assert_eq!(percent_decode("/caf%C3%A9"), "/café");
+    }
 }

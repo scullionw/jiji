@@ -1,78 +1,76 @@
 # jiji-gpui
 
-A spike: Jiji's diff view rendered with [GPUI](https://www.gpui.rs) instead of
-the webview, to judge whether a Rust-only frontend is worth pursuing. It calls
-`jiji-core` directly (no IPC, no serialization) and draws the diff as one
-custom-painted element.
+Jiji's desktop app as a Rust-only program: the same `jiji-core`,
+`jiji-forge` and `jiji-cli` crates the Tauri app uses, with the interface
+drawn by [GPUI](https://www.gpui.rs) instead of a webview. No IPC, no
+serialization boundary, no JavaScript — views call the backend directly and
+paint from the snapshot it returns.
 
 It is its own Cargo workspace with its own lockfile and `target/`, so the
-shipping app's build, lockfile and CI never see GPUI. Deleting this directory
-removes the spike.
+Tauri app's build, lockfile and CI never see GPUI. The binary is
+`jiji-desktop`, like the Tauri one, and it reads and writes the same data
+directory (`~/Library/Application Support/com.lauf.jiji`), so recents, saved
+views, the licence and auto-land records carry over.
 
 ## Run
 
 ```sh
 cd crates/jiji-gpui
-cargo run --release -- ~/Dev/some-jj-repo                  # the working copy's diff
-cargo run --release -- . --change 87f92aea9                # one change (change-id prefix or commit id)
-cargo run --release -- . --from 4cef44d39 --change c015172af --split
+cargo run                         # the app; debug builds count as registered
+cargo run --release
+scripts/bundle.sh                 # target/release/bundle/Jiji GPUI.app
+JIJI_BUNDLE_RELEASE=1 scripts/bundle.sh   # Jiji.app + the updater archive
 ```
 
-| Key | |
+With arguments the binary is the `jiji` CLI (`jiji-desktop publish …`), so
+the app's own switches are environment variables:
+
+| Variable | |
 |---|---|
-| `s` | unified ↔ split |
-| `]` / `[` | next / previous file |
-| `space` / `shift-space` | page down / up |
-| `cmd-up` / `cmd-down` | top / bottom |
-| `cmd-a`, `cmd-c` | select all, copy |
-| `b` | run the scroll benchmark |
-| `f` | toggle the frame stats in the toolbar |
-
-Drag selects text (one side at a time in the split layout), double-click a
-word, triple-click a line, shift-click extends. Dragging past the top or bottom
-edge scrolls. Sideways scrolling pans the file under the pointer.
-
-## What is here
-
-- Windowing over a flat row model (`model.rs`, a port of `diff.ts`): fixed row
-  heights, a prefix sum, a binary search. Nothing off screen is shaped or
-  painted.
-- Unified and split layouts, the split aligned on the backend's similarity
-  pairs, with intraline word emphasis.
-- Syntax highlighting with tree-sitter (`highlight.rs`), per hunk side like the
-  webview's lezer pass, on background threads: Rust, TypeScript/TSX,
-  JavaScript, JSON, CSS, HTML, Python, Markdown, YAML, TOML, Svelte.
-- Selection and copy, pinned file headers, per-file horizontal pan, overlay
-  scroll thumbs, the Midnight palette from `tokens.css`.
-
-## What is not
-
-Collapsing files, the file tree, find-in-diff, the context menu, image diffs,
-the split (jj split) panel, themes other than Midnight, and everything outside
-the diff view. Conflicted files render as plain full-width sections.
+| `JIJI_OPEN=<path>` | open this repository at launch |
+| `JIJI_DATA_DIR=<dir>` | keep preferences, recents and licence here instead of the shared directory — set it for any test run |
+| `JIJI_MOCK_BACKEND=1` | serve the mock snapshot (needs a directory containing `.jj`) |
+| `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
+| `JIJI_BACKGROUND=1` | float the window without taking focus (for scripted runs) |
+| `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
 
 ## Scripted runs
 
-For checking the view without the pointer or the keyboard:
+`JIJI_SCRIPT` takes `;`-separated steps and delivers them to the app's own
+window as native events, in-process — the pointer, the keyboard focus and
+(unless a step copies) the clipboard stay the user's:
 
 ```sh
-jiji-gpui . --change 87f92aea9 --background \
-  --script "key=s;scroll=5200;drag=900,93,1000,450;print;shot=/tmp/split.png;quit"
-jiji-gpui . --change 4cef44d39 --bench --exit --background
+JIJI_DATA_DIR=/tmp/jiji-test JIJI_BACKGROUND=1 JIJI_OPEN=~/Dev/some-repo \
+JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png;quit" \
+  target/debug/jiji-desktop
 ```
 
-`--script` steps call the same handlers real input reaches, in window
-coordinates; `print` writes what `cmd-c` would copy to stdout and `shot=`
-writes the window to a PNG from inside the process (`screencapture` needs
-Screen Recording permission; an app reading its own window does not).
-`--background` does not take focus; the window floats instead, because GPUI
-stops painting a window that is fully covered. `--bench` sweeps the diff at
-9000 and 18000 px/s and prints frame intervals, paint time and whole-process
-CPU per frame. `--repeat N` multiplies the diff to stress the windowing.
+`click`, `dclick`, `rclick`, `move`, `drag`, `press`/`hold`/`release` (a drag
+in parts), `scroll`, `key`, `type`, `wait`, `shot`, `resize`, `quit`;
+prefixes `shift-`, `alt-`, `cmd-`. Coordinates are window points;
+screenshots are at the display's scale.
 
-## Build notes
+## Layout
 
-- `gpui` is built with `runtime_shaders`, so no Xcode Metal Toolchain component
-  is needed; shaders compile at launch.
-- macOS only as written (`capture.rs` is AppKit FFI for the scripted-run
-  helpers; the rest is portable GPUI).
+| | |
+|---|---|
+| `host/` | The backend the views call: repo sessions and their watchers, the forge workflows (publish, land, ship, auto-land), the CLI launcher, editor and terminal hand-offs, licensing, updates. Blocking; views run it on the background executor. |
+| `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
+| `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
+| `diff/` | The diff surface: a flat row model, tree-sitter highlighting, and one custom-painted element that windows, selects, finds and scrolls. |
+| `ui/` | Buttons, inputs (with IME), popovers, scrollbars, icons, the ellipsizing text element. |
+| `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings. |
+| `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
+| `theme.rs`, `store.rs` | The ten palettes; the persisted preferences. |
+
+## Differences from the Tauri app
+
+- Section headings do not pin while their lists scroll.
+- Lines in the annotate pane clip instead of scrolling sideways.
+- An operation's description shows on one line (the full text is its
+  tooltip), and a row of effect chips clips rather than wraps.
+- Bookmark rows always reserve room for their hover actions.
+- No layout or panel transitions.
+- The in-app updater downloads and verifies releases like the Tauri one, but
+  no release pipeline builds this bundle yet.

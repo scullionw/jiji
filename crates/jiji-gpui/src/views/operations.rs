@@ -1,0 +1,608 @@
+//! Operations: everything that has happened to the repository, newest
+//! first, with restore and revert as plan-then-confirm actions.
+
+use std::collections::HashSet;
+
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight,
+    MouseButton, MouseDownEvent, ScrollHandle, SharedString, Window,
+};
+use jiji_core::snapshot::{OpEffectKind, OperationItem};
+
+use super::ConfirmPlan;
+use crate::app::{app, AppModel};
+use crate::logic::ops::{clock_time, group_operations, is_root_op, now, ops_since, TimelineRow};
+use crate::shell::Dismiss;
+use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::{
+    btn, consequences, h_flex, icon, plan_actions, plan_panel, plan_title, scrollbar,
+    section_header, tooltip, truncated, v_flex, IconName,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpAction {
+    Restore,
+    Revert,
+}
+
+pub struct OperationsView {
+    app: Entity<AppModel>,
+    focus: FocusHandle,
+    /// Keys (first op id) of the snapshot runs the user opened.
+    expanded: HashSet<String>,
+    /// One open plan panel across the whole timeline.
+    confirm: Option<(String, OpAction)>,
+    acting: bool,
+    error: Option<String>,
+    scroll: ScrollHandle,
+}
+
+impl Focusable for OperationsView {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl OperationsView {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let app = app(cx);
+        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        Self {
+            app,
+            focus: cx.focus_handle(),
+            expanded: HashSet::new(),
+            confirm: None,
+            acting: false,
+            error: None,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    fn toggle(
+        &mut self,
+        op_id: &str,
+        action: OpAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.error = None;
+        let same = self
+            .confirm
+            .as_ref()
+            .is_some_and(|(open, kind)| open == op_id && *kind == action);
+        self.confirm = (!same).then(|| (op_id.to_owned(), action));
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn run_confirmed(&mut self, cx: &mut Context<Self>) {
+        let Some((op_id, action)) = self.confirm.clone() else {
+            return;
+        };
+        if self.acting {
+            return;
+        }
+        self.acting = true;
+        self.error = None;
+        cx.notify();
+        let task = self.app.update(cx, |model, cx| {
+            model.mutate(cx, move |backend, path| match action {
+                OpAction::Restore => backend.restore_operation(path, &op_id),
+                OpAction::Revert => backend.revert_operation(path, &op_id),
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.acting = false;
+                match result {
+                    Ok(_) => this.confirm = None,
+                    Err(error) => this.error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.confirm.take().is_some() {
+            self.error = None;
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// The timeline rail: a continuous line the glyphs sit on, jj op log
+    /// style. `stub` is how far the upper segment reaches down.
+    fn rail(
+        &self,
+        up: bool,
+        down: bool,
+        stub: f32,
+        glyph: AnyElement,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let t = theme(cx);
+        let line = Theme::fade(t.text3, 0.38);
+        let mut rail = div()
+            .relative()
+            .flex_shrink_0()
+            .w(px(22.))
+            .flex()
+            .justify_center();
+        if up {
+            rail = rail.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(10.25))
+                    .w(px(1.5))
+                    .h(px(stub))
+                    .bg(line),
+            );
+        }
+        if down {
+            rail = rail.child(
+                div()
+                    .absolute()
+                    .top(px(21.))
+                    .bottom_0()
+                    .left(px(10.25))
+                    .w(px(1.5))
+                    .bg(line),
+            );
+        }
+        rail.child(glyph)
+    }
+
+    fn render_confirm(
+        &self,
+        op: &OperationItem,
+        action: OpAction,
+        restore_count: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let context = format!(
+            "\u{201c}{}\u{201d}",
+            if op.description.is_empty() {
+                "root()"
+            } else {
+                &op.description
+            }
+        );
+        let (title, lines, go) = match action {
+            OpAction::Restore => (
+                "Restore the repo to this point",
+                vec![
+                    match restore_count {
+                        Some(count) if count > 0 => format!(
+                            "{count} later operation{} unwind{} — the repo returns to exactly \
+                             the state this operation left it in.",
+                            if count == 1 { "" } else { "s" },
+                            if count == 1 { "s" } else { "" }
+                        ),
+                        _ => "Everything recorded after this operation is unwound — the repo \
+                              returns to exactly the state it left."
+                            .to_owned(),
+                    },
+                    "Files on disk follow the restored working copy.".to_owned(),
+                    "Nothing is lost: this records a new operation, and every undone operation \
+                     stays in this log."
+                        .to_owned(),
+                ],
+                if self.acting {
+                    "Restoring…"
+                } else {
+                    "Restore"
+                },
+            ),
+            OpAction::Revert => (
+                "Revert this operation",
+                vec![
+                    if op.is_current {
+                        "This is the latest operation, so reverting it is a plain undo.".to_owned()
+                    } else {
+                        "Only this operation is backed out — everything recorded after it stays."
+                            .to_owned()
+                    },
+                    "Nothing is lost: reverting records a new operation, and reverting that \
+                     brings this one back."
+                        .to_owned(),
+                ],
+                if self.acting {
+                    "Reverting…"
+                } else {
+                    "Revert"
+                },
+            ),
+        };
+        plan_panel(cx)
+            .mt(px(8.))
+            .mb(px(4.))
+            .child(plan_title(title, context, cx))
+            .child(consequences(lines, cx))
+            .child(plan_actions(
+                "⌘↵ to confirm",
+                self.error.as_deref(),
+                [
+                    btn("op-cancel", "Cancel")
+                        .disabled(self.acting)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm = None;
+                            this.error = None;
+                            cx.notify();
+                        })),
+                    btn("op-go", go)
+                        .primary()
+                        .disabled(self.acting)
+                        .on_click(cx.listener(|this, _, _, cx| this.run_confirmed(cx))),
+                ],
+                cx,
+            ))
+    }
+
+    fn render_op(
+        &self,
+        op: &OperationItem,
+        index: usize,
+        (up, down): (bool, bool),
+        ops: &[OperationItem],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = theme(cx);
+        let clock = now();
+        let quiet = op.is_snapshot && !op.is_current;
+        // The root operation is the state before the repo existed: nothing
+        // to revert, and restoring to it would empty the repo.
+        let actionable = !is_root_op(op);
+        // Restoring to the current operation is a no-op; reverting it is
+        // undo.
+        let can_restore = actionable && !op.is_current;
+        let confirm = self
+            .confirm
+            .as_ref()
+            .filter(|(open, _)| *open == op.id)
+            .map(|(_, action)| *action);
+        let group = SharedString::from(format!("op-{}", op.id));
+
+        let glyph = if op.is_current {
+            div()
+                .mt(px(3.))
+                .bg(t.bg1)
+                .font_family(t.mono.clone())
+                .text_size(px(13.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(t.accent_strong)
+                .child("@")
+                .into_any_element()
+        } else {
+            let size = if quiet { 6. } else { 8. };
+            div()
+                .mt(px(if quiet { 13. } else { 12. }))
+                .size(px(size))
+                .rounded(px(size / 2.))
+                .border(px(1.5))
+                .border_color(if quiet {
+                    Theme::fade(t.text3, 0.55)
+                } else {
+                    Theme::blend(t.text3, 0.8, t.text2)
+                })
+                .bg(t.bg1)
+                .into_any_element()
+        };
+
+        // One line: a wrapping description next to the row's spacer would
+        // be squeezed to nothing. The full text is a hover away.
+        let mut desc = div()
+            .id(("op-desc", index))
+            .min_w(px(40.))
+            .flex_shrink()
+            .text_size(px(TEXT_M))
+            .text_color(t.text1);
+        if op.description.is_empty() {
+            desc = desc
+                .font_family(t.mono.clone())
+                .text_size(px(TEXT_S))
+                .text_color(t.text3)
+                .child("root()");
+        } else {
+            if op.is_current {
+                desc = desc.font_weight(FontWeight::SEMIBOLD);
+            }
+            if quiet {
+                desc = desc.text_color(t.text3);
+            }
+            desc = desc
+                .tooltip(tooltip(op.description.clone()))
+                .child(truncated(op.description.clone()));
+        }
+        let mut head = h_flex().gap(px(8.)).min_w_0().min_h(px(22.)).child(desc);
+        if op.is_current {
+            head = head.child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(17.))
+                    .px(px(5.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(RADIUS_S))
+                    .bg(t.accent_dim)
+                    .text_size(px(TEXT_XS))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.accent_strong)
+                    .child("current"),
+            );
+        }
+        head = head.child(div().flex_1());
+        if actionable {
+            // Time-travel actions are hover-revealed so the journal stays
+            // calm; an open panel keeps its row's on screen.
+            let mut actions = h_flex().flex_shrink_0().gap(px(4.));
+            if confirm.is_none() {
+                actions = actions
+                    .opacity(0.)
+                    .group_hover(group.clone(), |style| style.opacity(1.));
+            }
+            if can_restore {
+                let id = op.id.clone();
+                actions = actions.child(
+                    btn(("op-restore", index), "Restore")
+                        .small()
+                        .icon(IconName::Restore)
+                        .armed(confirm == Some(OpAction::Restore))
+                        .tooltip("Restore the repo to this point")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle(&id, OpAction::Restore, window, cx)
+                        })),
+                );
+            }
+            let id = op.id.clone();
+            actions = actions.child(
+                btn(("op-revert", index), "Revert")
+                    .small()
+                    .icon(IconName::Undo)
+                    .armed(confirm == Some(OpAction::Revert))
+                    .tooltip(if op.is_current {
+                        "Undo this operation"
+                    } else {
+                        "Back out just this operation"
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle(&id, OpAction::Revert, window, cx)
+                    })),
+            );
+            head = head.child(actions);
+        }
+
+        // One line, clipped: a wrapping row here makes the layout engine
+        // size the whole column at its narrowest.
+        let mut meta = h_flex()
+            .overflow_hidden()
+            .gap(px(8.))
+            .mt(px(if quiet { 0. } else { 1. }))
+            .text_size(px(TEXT_S))
+            .text_color(t.text3)
+            .child(
+                div()
+                    .id(("op-id", index))
+                    .font_family(t.mono.clone())
+                    .text_color(t.text2)
+                    .tooltip(tooltip(op.id.clone()))
+                    .child(op.id.chars().take(8).collect::<String>()),
+            )
+            .child(
+                div()
+                    .id(("op-time", index))
+                    .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
+                    .child(clock_time(&op.timestamp, clock)),
+            )
+            .child(div().max_w(px(180.)).child(truncated(op.user.clone())));
+        let chip = || {
+            h_flex()
+                .gap(px(4.))
+                .h(px(17.))
+                .px(px(5.))
+                .rounded(px(RADIUS_S))
+                .bg(Theme::fade(t.text1, 0.06))
+                .text_size(px(TEXT_XS))
+                .text_color(t.text2)
+                .whitespace_nowrap()
+        };
+        for effect in &op.effects {
+            let lead = match effect.kind {
+                OpEffectKind::WorkingCopy => div()
+                    .font_family(t.mono.clone())
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(t.working_copy)
+                    .child("@")
+                    .into_any_element(),
+                OpEffectKind::RemoteBookmark => {
+                    icon(IconName::Bookmark, 9., t.accent).into_any_element()
+                }
+                OpEffectKind::Bookmark => icon(IconName::Bookmark, 9., t.text3).into_any_element(),
+            };
+            meta = meta.child(chip().child(lead).child(effect.label.clone()));
+        }
+        if op.more_effects > 0 {
+            meta = meta.child(
+                chip()
+                    .text_color(t.text3)
+                    .child(format!("+{} more", op.more_effects)),
+            );
+        }
+
+        let mut body = v_flex()
+            .flex_1()
+            .min_w_0()
+            .pt(px(6.))
+            .pb(px(7.))
+            .child(head)
+            .child(meta);
+        if let Some(action) = confirm {
+            body = body.child(self.render_confirm(op, action, ops_since(ops, &op.id), cx));
+        }
+        let id = op.id.clone();
+        div()
+            .id(("op-row", index))
+            .group(group)
+            .flex()
+            .flex_row()
+            .gap(px(8.))
+            .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                app(cx).update(cx, |model, cx| {
+                    model.open_operation_menu(&id, event.position, cx)
+                });
+            })
+            .child(self.rail(up, down, 11., glyph, cx))
+            .child(body)
+            .into_any_element()
+    }
+}
+
+impl Render for OperationsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme(cx);
+        let Some(snapshot) = self.app.read(cx).snapshot().cloned() else {
+            return div().into_any_element();
+        };
+        let ops = &snapshot.operations;
+        let groups = group_operations(ops, now());
+        let mut column = v_flex()
+            .w_full()
+            .max_w(px(800.))
+            .mx_auto()
+            .pt(px(24.))
+            .px(px(24.))
+            .pb(px(32.))
+            .child(section_header(
+                IconName::Operations,
+                "Operations",
+                "Everything that has happened to this repository, newest first. Every entry is a \
+                 complete repo state: restore the repo to any point, or revert a single operation \
+                 — time travel is just another operation, so it can always be undone again.",
+                cx,
+            ));
+        let mut index = 0;
+        for group in &groups {
+            column = column.child(
+                h_flex()
+                    .gap(px(12.))
+                    .pt(px(12.))
+                    .pb(px(4.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(TEXT_S))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text2)
+                            .child(group.label.clone()),
+                    )
+                    .child(div().flex_1().h(px(1.)).bg(t.border2)),
+            );
+            let last = group.rows.len().saturating_sub(1);
+            for (i, row) in group.rows.iter().enumerate() {
+                let (up, down) = (i > 0, i < last);
+                match row {
+                    TimelineRow::Op(op) => {
+                        column = column.child(self.render_op(op, index, (up, down), ops, cx));
+                        index += 1;
+                    }
+                    TimelineRow::Snapshots(run) => {
+                        let key = run[0].id.clone();
+                        let expanded = self.expanded.contains(&key);
+                        // Collapsed snapshot runs read like jj's elided
+                        // revisions rows.
+                        let glyph = div()
+                            .mt(px(4.))
+                            .bg(t.bg1)
+                            .font_family(t.mono.clone())
+                            .text_size(px(TEXT_S))
+                            .text_color(t.text3)
+                            .child("~")
+                            .into_any_element();
+                        column = column.child(
+                            div()
+                                .id(SharedString::from(format!("op-run-{key}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .rounded(px(RADIUS_S))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(t.bg_hover))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.expanded.remove(&key) {
+                                        this.expanded.insert(key.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(self.rail(up, down || expanded, 7., glyph, cx).h(px(28.)))
+                                .child(
+                                    div()
+                                        .py(px(5.))
+                                        .text_size(px(TEXT_S))
+                                        .text_color(t.text3)
+                                        .child(format!("{} working-copy snapshots", run.len())),
+                                )
+                                .child(icon(
+                                    if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                    11.,
+                                    t.text3,
+                                )),
+                        );
+                        if expanded {
+                            for (j, op) in run.iter().enumerate() {
+                                let below = j < run.len() - 1 || down;
+                                column =
+                                    column.child(self.render_op(op, index, (true, below), ops, cx));
+                                index += 1;
+                            }
+                        } else {
+                            index += run.len();
+                        }
+                    }
+                }
+            }
+        }
+        if ops.len() >= 50 {
+            column = column.child(
+                div()
+                    .mt(px(16.))
+                    .pl(px(30.))
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .child("Showing the 50 most recent operations."),
+            );
+        }
+        let mut root = div()
+            .id("operations")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .on_action(cx.listener(|this, _: &ConfirmPlan, _, cx| this.run_confirmed(cx)));
+        root = root.key_context(if self.confirm.is_some() {
+            "Operations PlanPanel"
+        } else {
+            "Operations"
+        });
+        root.child(
+            div()
+                .id("operations-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .child(column),
+        )
+        .child(scrollbar("operations-scrollbar", &self.scroll))
+        .into_any_element()
+    }
+}

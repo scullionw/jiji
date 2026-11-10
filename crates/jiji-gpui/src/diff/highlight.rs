@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use gpui::SharedString;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
-use crate::model::{Kind, LineId};
+use crate::diff::model::{Kind, LineId};
 
 /// The app's restrained class set: hues mark scan anchors, everything else
 /// stays plain text.

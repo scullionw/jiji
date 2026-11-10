@@ -1,14 +1,20 @@
 [package]
 name = "jiji-gpui"
-version = "0.0.0"
+# Kept in step with the workspace's version by hand: this crate is its own
+# workspace root, so it cannot inherit it.
+version = "0.4.1"
 edition = "2021"
 license = "FSL-1.1-MIT"
 publish = false
-description = "Spike: Jiji's diff view rendered with GPUI instead of the webview."
+description = "Jiji: a jj-native desktop workbench, on GPUI."
 
-# Its own workspace root on purpose: the spike keeps a separate lockfile and
-# target dir so the shipping app's Cargo.lock, CI and release builds never
-# see GPUI. Delete this directory to remove the spike entirely.
+[[bin]]
+name = "jiji-desktop"
+path = "src/main.rs"
+
+# Its own workspace root on purpose: a separate lockfile and target dir, so
+# the Tauri app's Cargo.lock, CI and release builds never see GPUI while
+# both shells exist side by side.
 [workspace]
 
 [dependencies]
@@ -16,9 +22,21 @@ description = "Spike: Jiji's diff view rendered with GPUI instead of the webview
 # time, so building needs no Xcode Metal Toolchain component.
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 jiji-core = { path = "../jiji-core" }
-# getrusage, for the benchmark's whole-process CPU cost per frame.
+jiji-forge = { path = "../jiji-forge" }
+jiji-cli = { path = "../jiji-cli" }
+
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures = "0.3"
+log = "0.4"
+minisign-verify = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-segmentation = "1"
+# getrusage, for the diff benchmark's whole-process CPU cost per frame.
 libc = "0.2"
-# Only to reach the NSWindow for --script's `shot=` self-capture.
+# Only to reach the NSWindow for scripted runs' `shot=` self-capture.
 raw-window-handle = "0.6"
 
 tree-sitter = "0.27"
