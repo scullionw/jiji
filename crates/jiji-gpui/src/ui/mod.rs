@@ -15,26 +15,42 @@ pub mod tooltip;
 pub mod truncate;
 mod wrap;
 
-use gpui::{div, prelude::*, px, App, Div, Hsla};
+use std::sync::Arc;
+
+use gpui::{div, prelude::*, px, App, Div, FontFeatures, Hsla};
 
 pub use self::button::{btn, checkbox, icon_btn, kbd, segmented, Btn};
 pub use self::icon::{icon, IconName};
 pub use self::input::{InputEvent, TextInput};
 pub use self::page::{
-    consequences, empty_state, group_head, page_bar, page_filter, page_notice, plan_actions,
-    plan_panel, plan_title, tray, PAGE_PAD,
+    all_clear, consequences, empty_state, group_head, page_bar, page_filter, page_notice,
+    plan_actions, plan_panel, plan_title, tray, PAGE_PAD,
 };
 pub use self::pinned::pinned;
 pub use self::popover::{menu_label, menu_row, popover, popover_layer, PopoverState};
 pub use self::scroll::{scrollbar, vertical_only, wheel_first, AxisLock, ScrollY};
 pub use self::text::{
-    label_box, ref_label, rich, tag, text_width, text_width_in, trunk_label, LABEL_H,
+    diffstat, label_box, middot, ref_label, rich, tag, text_width, text_width_in, trunk_label,
+    LABEL_H,
 };
 pub use self::time::{absolute_time, from_now, short_age};
 pub use self::tooltip::{tooltip, tooltip_guard};
 pub use self::truncate::truncated;
 pub use self::wrap::wrapped;
 use crate::theme::theme;
+
+/// Figures that line up: every digit one width, so ages, counts and times
+/// in a column hold still as they change.
+pub trait Tabular: Styled {
+    fn tabular(mut self) -> Self {
+        self.text_style()
+            .get_or_insert_with(Default::default)
+            .font_features = Some(FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
+        self
+    }
+}
+
+impl<E: Styled> Tabular for E {}
 
 pub fn h_flex() -> Div {
     div().flex().flex_row().items_center()

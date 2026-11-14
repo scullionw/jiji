@@ -17,7 +17,7 @@ use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, empty_state, group_head, h_flex, icon, page_bar, scrollbar, tooltip, truncated, v_flex,
+    all_clear, btn, group_head, h_flex, icon, page_bar, scrollbar, tooltip, truncated, v_flex,
     wrapped, IconName, PAGE_PAD,
 };
 
@@ -506,12 +506,10 @@ impl Render for ConflictsView {
         let groups = group_conflicts(&snapshot);
         if groups.is_empty() {
             return root
-                .child(empty_state(
-                    IconName::Conflicts,
+                .child(all_clear(
                     "No conflicts",
-                    "Rewrites and syncs that collide land here as first-class items instead of \
-                     blocking your work. Nothing needs attention right now.",
-                    Some("everything applies cleanly".into()),
+                    "Everything applies cleanly. Rewrites and syncs that collide land here as \
+                     items to resolve, never as a blocked command.",
                     cx,
                 ))
                 .into_any_element();
@@ -544,20 +542,7 @@ impl Render for ConflictsView {
         root.child(
             v_flex()
                 .size_full()
-                .child(
-                    page_bar("Conflicts", Some(total.to_string()), cx).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .pl(px(4.))
-                            .text_size(px(TEXT_S))
-                            .text_color(t.text3)
-                            .child(truncated(
-                                "jj never blocks on a conflict: what collided is recorded, and \
-                             other work goes on.",
-                            )),
-                    ),
-                )
+                .child(page_bar("Conflicts", Some(total.to_string()), cx))
                 .child(
                     div()
                         .relative()

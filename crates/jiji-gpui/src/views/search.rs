@@ -393,7 +393,8 @@ impl Render for Search {
             .flex()
             .justify_center()
             .items_start()
-            .pt(px(f32::from(viewport.height) * 0.12))
+            // Like the palette: out of the title bar's command field.
+            .pt(px(4.))
             .bg(Theme::fade(t.bg0, 0.3))
             .occlude()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {

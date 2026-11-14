@@ -16,8 +16,8 @@ use super::{ShownDiff, WorkbenchView};
 use crate::app::WorkbenchMode;
 use crate::logic::graph::{
     emphasized_stream, full_lanes_for, gutter_width, lane_of, lane_tier, rail_x,
-    resolve_focused_workstream, row_bookmarks, sync_glyph, ElisionRow, GraphModel, GraphRow,
-    LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT, RAIL_CORNER,
+    resolve_focused_workstream, row_bookmarks, row_gutter_width, sync_glyph, ElisionRow,
+    GraphModel, GraphRow, LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT, RAIL_CORNER,
 };
 use crate::logic::inspect::summary_of;
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
@@ -28,7 +28,7 @@ use crate::ui::ScrollY as _;
 use crate::ui::{
     absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, label_box, lead_bar,
     menu_label, popover, popover_layer, ref_label, scrollbar, segmented, short_age, tag, tooltip,
-    truncated, v_flex, IconName,
+    truncated, v_flex, IconName, Tabular as _,
 };
 use crate::views::menu;
 
@@ -267,9 +267,9 @@ impl RowStyle<'_> {
 
     /// How much of a row its labels may take. The title keeps what it
     /// needs, up to half the row; ids, author and age keep theirs.
-    fn label_room(&self, node: &GraphNode, title: &str) -> f32 {
+    fn label_room(&self, node: &GraphNode, title: &str, gutter: f32) -> f32 {
         let classic = self.density == RowDensity::Classic;
-        let mut text = self.width - self.gutter - ROW_GAP - ROW_PAD;
+        let mut text = self.width - gutter - ROW_GAP - ROW_PAD;
         if !classic {
             let ids = if node.is_divergent { 19. } else { 8. };
             let age = 30. + if self.authors { 82. } else { 0. };
@@ -605,24 +605,23 @@ impl WorkbenchView {
 
     // ── The lens picker ──
 
-    fn trigger_label(&self) -> String {
-        let count = self.snapshot.workstreams.len();
+    /// The pane's title: the lens it shows (a custom lens wears its saved
+    /// name when it has one), and on the default lens how many
+    /// workstreams it holds.
+    fn trigger_label(&self) -> (String, Option<usize>) {
         match &self.snapshot.view {
-            // The trigger reads as the pane label: the workstream count on
-            // the default lens, the lens name on any other — a custom lens
-            // wears its saved name when it has one.
-            SnapshotView::Workstreams => match count {
-                0 => "No workstreams".into(),
-                1 => "1 workstream".into(),
-                n => format!("{n} workstreams"),
-            },
-            SnapshotView::Custom { revset } => self
-                .view_menu
-                .saved
-                .iter()
-                .find(|view| &view.revset == revset)
-                .map_or_else(|| "Custom revset".to_owned(), |view| view.name.clone()),
-            other => view_label(other).to_owned(),
+            SnapshotView::Workstreams => {
+                ("Workstreams".into(), Some(self.snapshot.workstreams.len()))
+            }
+            SnapshotView::Custom { revset } => (
+                self.view_menu
+                    .saved
+                    .iter()
+                    .find(|view| &view.revset == revset)
+                    .map_or_else(|| "Custom revset".to_owned(), |view| view.name.clone()),
+                None,
+            ),
+            other => (view_label(other).to_owned(), None),
         }
     }
 
@@ -729,21 +728,31 @@ impl WorkbenchView {
         let t = theme(cx);
         let open = self.view_menu.popover.is_open();
         let lensed = self.snapshot.view != SnapshotView::Workstreams;
+        let (label, count) = self.trigger_label();
         let mut trigger = h_flex()
             .id("view-menu")
-            .gap(px(4.))
-            .h(px(24.))
-            .px(px(6.))
+            .gap(px(6.))
+            .h(px(26.))
+            .px(px(8.))
             .min_w_0()
             .rounded(px(RADIUS_M))
-            .text_size(px(TEXT_S))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(if lensed { t.accent_strong } else { t.text2 })
+            .text_size(px(TEXT_M))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(if lensed { t.accent_strong } else { t.text1 })
             .cursor_pointer()
-            .hover(|style| style.bg(t.bg_hover).text_color(t.text1))
+            .hover(|style| style.bg(t.bg_hover))
             .tooltip(tooltip("Change what the graph shows"))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_menu(cx)))
-            .child(div().min_w_0().child(truncated(self.trigger_label())))
+            .child(div().min_w_0().child(truncated(label)))
+            .children(count.map(|count| {
+                div()
+                    .flex_shrink_0()
+                    .font_weight(FontWeight::NORMAL)
+                    .text_size(px(TEXT_S))
+                    .text_color(t.text3)
+                    .tabular()
+                    .child(count.to_string())
+            }))
             .child(icon(IconName::ChevronDown, 12., t.text3));
         if open {
             trigger = trigger.bg(t.bg_hover);
@@ -1049,6 +1058,8 @@ impl WorkbenchView {
             );
         }
         let base_rail = Theme::blend(t.text3, 0.5, t.bg1);
+        // The row's own rails set its gutter: text hugs the tree.
+        let gutter_w = row_gutter_width(row.last_column(), style.full);
         let gutter = gutter_canvas(
             GutterPaint {
                 rails,
@@ -1066,7 +1077,7 @@ impl WorkbenchView {
                 base_fill: Theme::blend(t.text3, 0.8, t.bg1),
                 mono: t.mono.clone(),
             },
-            style.gutter,
+            gutter_w,
             height,
         );
 
@@ -1147,7 +1158,7 @@ impl WorkbenchView {
         // does not fit is counted, never clipped.
         let bookmarks = row_bookmarks(style.snapshot, row);
         let mut labels = RowLabels::new(
-            style.label_room(node, title),
+            style.label_room(node, title, gutter_w),
             bookmarks.len() + node.tags.len(),
         );
         if is_compare_base && labels.fits(62.) {
@@ -1302,6 +1313,7 @@ impl WorkbenchView {
                     .min_w(px(24.))
                     .flex()
                     .justify_end()
+                    .tabular()
                     .child(short_age(&node.timestamp)),
             );
         // What pushes the meta to the row's far edge. (A spacer, not an
@@ -1477,7 +1489,7 @@ impl WorkbenchView {
                 }
             },
         )
-        .w(px(style.gutter))
+        .w(px(row_gutter_width(row.last_column(), full)))
         .h(px(ELISION_ROW_HEIGHT))
         .flex_shrink_0();
         h_flex()

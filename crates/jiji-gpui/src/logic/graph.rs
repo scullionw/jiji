@@ -69,6 +69,30 @@ pub enum GraphRow {
     Elision(ElisionRow),
 }
 
+impl NodeRow {
+    /// The rightmost column this row draws in: its node, and every rail
+    /// that enters, leaves or crosses it.
+    pub fn last_column(&self) -> usize {
+        [&self.edges_in, &self.edges_out, &self.pass_through]
+            .into_iter()
+            .flatten()
+            .map(|rail| rail.col)
+            .fold(self.column, usize::max)
+    }
+}
+
+impl ElisionRow {
+    /// The rightmost column this row draws in.
+    pub fn last_column(&self) -> usize {
+        self.marks
+            .iter()
+            .chain(&self.pass_through)
+            .map(|rail| rail.col)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GraphModel {
     pub rows: Vec<GraphRow>,
@@ -661,6 +685,13 @@ pub fn gutter_width(column_count: usize, full: usize) -> f32 {
     rail_x(column_count.saturating_sub(1), full) + GUTTER_PAD
 }
 
+/// The gutter one row needs: its own rails, not the widest row's. Text
+/// hugs the tree the way `jj log` prints it, so a lone stack's titles
+/// start beside their rail however wide deep history runs.
+pub fn row_gutter_width(last_column: usize, full: usize) -> f32 {
+    gutter_width(last_column + 1, full)
+}
+
 /// How many lanes get full spacing in a pane this wide drawing this many
 /// columns: the most that still leaves the text its reserve, counting the
 /// narrow band the rest would need. Every lane draws full when they all
@@ -860,5 +891,40 @@ mod tests {
         // Overflow lanes share the narrow band's last slot.
         assert_eq!(rail_x(40, 4), rail_x(4 + NARROW_LANES - 1, 4));
         assert_eq!(gutter_width(1, 6), 2. * GUTTER_PAD);
+    }
+
+    #[test]
+    fn a_row_gutter_covers_only_its_own_rails() {
+        let rail = |col| Rail {
+            col,
+            lane: None,
+            elided: false,
+        };
+        let lone = NodeRow {
+            node: 0,
+            column: 0,
+            stream: None,
+            lane: None,
+            edges_in: vec![rail(0)],
+            edges_out: vec![rail(0)],
+            pass_through: Vec::new(),
+            is_working_copy: false,
+            is_stack_head: false,
+            behind_trunk: 0,
+            bookmarks: Vec::new(),
+        };
+        assert_eq!(lone.last_column(), 0);
+        assert_eq!(row_gutter_width(lone.last_column(), 6), gutter_width(1, 6));
+        // A rail crossing two lanes over widens the row to reach it.
+        let crossed = ElisionRow {
+            marks: vec![rail(1)],
+            continues: true,
+            pass_through: vec![rail(0), rail(2)],
+        };
+        assert_eq!(crossed.last_column(), 2);
+        assert_eq!(
+            row_gutter_width(crossed.last_column(), 6),
+            gutter_width(3, 6)
+        );
     }
 }

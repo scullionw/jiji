@@ -150,7 +150,9 @@ impl DiffState {
 fn status_glyph(status: FileStatus, theme: &Theme) -> (&'static str, gpui::Hsla) {
     match status {
         FileStatus::Added => ("A", theme.add_fg),
-        FileStatus::Modified => ("M", theme.warn),
+        // The usual case stays quiet; color marks the files that came or
+        // went.
+        FileStatus::Modified => ("M", theme.text3),
         FileStatus::Removed => ("D", theme.del_fg),
         FileStatus::Renamed => ("R", theme.accent_strong),
         FileStatus::Copied => ("C", theme.accent_strong),

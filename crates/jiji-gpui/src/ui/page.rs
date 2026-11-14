@@ -3,17 +3,35 @@
 
 use gpui::{div, prelude::*, px, App, Div, Entity, FontWeight, SharedString, Window};
 
-use super::{h_flex, icon, truncated, v_flex, Btn, IconName, TextInput};
-use crate::theme::{theme, Theme, RADIUS_M, ROW_H, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use super::{h_flex, icon, truncated, v_flex, Btn, IconName, Tabular as _, TextInput};
+use crate::theme::{theme, Theme, RADIUS_M, ROW_H, TEXT_M, TEXT_S, TOOLBAR_H};
 
 /// The gutter a page's bar, bands and rows share.
 pub const PAGE_PAD: f32 = 16.;
 
-/// A quiet placeholder for a surface with nothing on it: the glyph in
-/// tertiary ink, one line of what, one of why, and the jj command that
-/// would change it.
+/// A quiet placeholder for a surface with nothing on it: the glyph on a
+/// hairline tile, one line of what, one of why, and — when a jj command
+/// would change it — that command, as you would type it.
 pub fn empty_state(
     glyph: IconName,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    hint: Option<SharedString>,
+    cx: &App,
+) -> Div {
+    let t = theme(cx);
+    placeholder(icon(glyph, 18., t.text3), title, body, hint, cx)
+}
+
+/// [`empty_state`] for a surface whose emptiness is good news: the tile
+/// carries a check in the ok tone.
+pub fn all_clear(title: impl Into<SharedString>, body: impl Into<SharedString>, cx: &App) -> Div {
+    let t = theme(cx);
+    placeholder(icon(IconName::Check, 18., t.ok), title, body, None, cx)
+}
+
+fn placeholder(
+    glyph: gpui::Svg,
     title: impl Into<SharedString>,
     body: impl Into<SharedString>,
     hint: Option<SharedString>,
@@ -24,34 +42,61 @@ pub fn empty_state(
         .size_full()
         .items_center()
         .justify_center()
-        .gap(px(6.))
         .p(px(32.))
-        .child(div().mb(px(8.)).child(icon(glyph, 20., t.text3)))
         .child(
             div()
-                .text_size(px(TEXT_M))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(40.))
+                .mb(px(14.))
+                .rounded(px(crate::theme::RADIUS_L))
+                .bg(t.bg2)
+                .border_1()
+                .border_color(t.border1)
+                .child(glyph),
+        )
+        .child(
+            div()
+                .text_size(px(crate::theme::TEXT_HEAD - 1.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(t.text1)
                 .child(title.into()),
         )
         .child(
             div()
-                .max_w(px(380.))
-                .text_size(px(TEXT_S))
+                .mt(px(6.))
+                .max_w(px(400.))
+                .text_size(px(TEXT_M))
                 .line_height(gpui::relative(1.55))
                 .text_color(t.text2)
                 .text_center()
                 .child(body.into()),
         );
     if let Some(hint) = hint {
-        el = el.child(
-            div()
-                .mt(px(8.))
-                .text_size(px(TEXT_XS))
+        // A jj command reads as one, in a hairline box; anything else is
+        // a quiet footnote.
+        el = el.child(if hint.starts_with("jj ") {
+            h_flex()
+                .mt(px(16.))
+                .h(px(24.))
+                .px(px(8.))
+                .gap(px(6.))
+                .rounded(px(RADIUS_M))
+                .border_1()
+                .border_color(t.border1)
                 .font_family(t.mono.clone())
+                .text_size(px(TEXT_S))
+                .text_color(t.text2)
+                .child(div().text_color(t.text3).child("$"))
+                .child(hint)
+        } else {
+            div()
+                .mt(px(14.))
+                .text_size(px(TEXT_S))
                 .text_color(t.text3)
-                .child(hint),
-        );
+                .child(hint)
+        });
     }
     el
 }
@@ -71,7 +116,7 @@ pub fn page_bar(title: impl Into<SharedString>, count: Option<String>, cx: &App)
         .child(
             div()
                 .flex_shrink_0()
-                .text_size(px(TEXT_M))
+                .text_size(px(crate::theme::TEXT_L))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(t.text1)
                 .child(title.into()),
@@ -80,9 +125,10 @@ pub fn page_bar(title: impl Into<SharedString>, count: Option<String>, cx: &App)
         bar = bar.child(
             div()
                 .flex_shrink_0()
-                .font_family(t.mono.clone())
-                .text_size(px(TEXT_XS))
+                .ml(px(-4.))
+                .text_size(px(TEXT_S))
                 .text_color(t.text3)
+                .tabular()
                 .child(count),
         );
     }
@@ -141,9 +187,9 @@ pub fn group_head(
         head = head.child(
             div()
                 .flex_shrink_0()
-                .font_family(t.mono.clone())
-                .text_size(px(TEXT_XS))
+                .ml(px(-2.))
                 .text_color(t.text3)
+                .tabular()
                 .child(count.to_string()),
         );
     }

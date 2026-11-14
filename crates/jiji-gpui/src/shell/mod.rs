@@ -213,10 +213,8 @@ pub struct Shell {
     breadcrumb_at: Option<Instant>,
     breadcrumb_timer: Option<Task<()>>,
     settings_menu: PopoverState,
-    theme_menu: PopoverState,
     license_error: Option<String>,
     license_busy: bool,
-    license_replacing: bool,
     cli_error: Option<String>,
     license_input: Entity<crate::ui::TextInput>,
     palette: Option<AnyView>,
@@ -292,10 +290,8 @@ impl Shell {
             breadcrumb_at: None,
             breadcrumb_timer: None,
             settings_menu: PopoverState::default(),
-            theme_menu: PopoverState::default(),
             license_error: None,
             license_busy: false,
-            license_replacing: false,
             cli_error: None,
             license_input,
             palette: None,
@@ -394,9 +390,13 @@ impl Shell {
                 this.license_busy = false;
                 match result {
                     Ok(()) => {
-                        this.license_replacing = false;
                         this.license_input
                             .update(cx, |input, cx| input.set_text("", cx));
+                        // The key took: Settings opens in the panel's
+                        // place, its footer naming the licence and its
+                        // palettes now unlocked.
+                        this.app.update(cx, |m, cx| m.close_registration(cx));
+                        this.settings_menu.open();
                     }
                     Err(message) => this.license_error = Some(message),
                 }
@@ -428,9 +428,8 @@ impl Shell {
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_menu.is_open() || self.theme_menu.is_open() {
+        if self.settings_menu.is_open() {
             self.settings_menu.close();
-            self.theme_menu.close();
             cx.notify();
             return;
         }

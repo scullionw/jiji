@@ -77,6 +77,12 @@ One look, stated once so new surfaces keep it. The tokens are in
 - **One toolbar line.** Every pane's first bar is `TOOLBAR_H` tall, so a
   single hairline runs the window's width: the graph head, the change
   header, a section's page bar, the repo overview.
+- **The title bar is the way in.** The window's center line carries the
+  command field (⌘K), the one entry to every command and search; the
+  palette and history search open out of it, their search line where the
+  field was. Beside it, trunk's state and the fetch age read quietly, and
+  one Settings control holds appearance, integrations and the licence.
+  An unregistered copy adds a single Register control. Nothing else.
 - **The accent is a bar.** What is current carries a two-pixel accent
   bar — the section in the rail, the repo's tab, the selected row
   (`ui::lead_bar`) — and sits on the neutral `selected` fill. Hue stays
@@ -92,12 +98,27 @@ One look, stated once so new surfaces keep it. The tokens are in
 - **Labels fit or are counted.** A graph row gives its title what it
   needs, up to half the row; refs truncate into the rest, and whatever
   cannot is a closing "+N" that names them on hover. Nothing clips.
+- **The graph hugs its rails.** A row's text starts after its own rails
+  (`row_gutter_width`), the way `jj log` prints it — a lone stack's titles
+  sit beside their rail however wide deep history runs below.
+- **Color marks the exception.** A modified file's `M` stays quiet; the
+  files that came, went or moved carry their hue. A "+a −r" count closes
+  with the five-block diffstat (`ui::diffstat`), the split read before
+  the numbers are.
 - **A section is a page bar and a ledger** (`ui::page_bar`,
   `ui::group_head`, `ui::page_notice`, `ui::tray`): the name and count
   on the toolbar line with the page's filter and acts, pinned group
   bands, then full-width rows in columns. No centered reading column,
-  no opening paragraph — what a group is for is said once, in its band
-  or under it.
+  no opening paragraph or lede in the bar — what a group is for is said
+  once, in its band or under it.
+- **Empty is a state, not an absence.** `ui::empty_state`: the glyph on a
+  hairline tile, a title, one sentence, and the jj command that would
+  change it, as you would type it. Good news (`ui::all_clear`) carries a
+  check in the ok tone.
+- **Figures line up.** Counts, ages, times and line numbers use tabular
+  figures (`ui::Tabular`) or the mono face, so columns hold still as they
+  change. Ids are always mono; a change id's unique prefix carries the
+  weight.
 - **Text keeps its floors.** text2 at 8:1 or better and text3 at 5.5:1
   on bg0–bg2; hierarchy comes from weight, size and the three steps,
   never from fading. Sentence case, no letter-spaced caps.
@@ -105,8 +126,13 @@ One look, stated once so new surfaces keep it. The tokens are in
 ## Differences from the Tauri app
 
 - The look above: the Tauri app still has filled ref chips, accent-tinted
-  selection, a 32px title bar with chip tabs, and section pages as a
-  centered column under a heading and a paragraph.
+  selection, a 32px title bar with chip tabs and a row of icon buttons
+  (search, palette, licence, settings, theme), a fixed-width graph
+  gutter, and section pages as a centered column under a heading and a
+  paragraph.
+- The status line names the newest operation that did something (not
+  the working-copy snapshot every look at the repo records), with its
+  age; the backend names itself only when it is not jj-lib.
 - A graph row counts the refs it has no room for ("+2") where the Tauri
   app lets them run off the row.
 - The change header's meta bar never wraps: facts leave by pane width, as

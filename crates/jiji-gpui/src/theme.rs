@@ -35,7 +35,7 @@ pub const TEXT_S: f32 = 12.;
 pub const TEXT_M: f32 = 13.;
 pub const TEXT_L: f32 = 14.;
 /// The title of what a pane is about.
-pub const TEXT_HEAD: f32 = 15.;
+pub const TEXT_HEAD: f32 = 16.;
 pub const TEXT_XL: f32 = 20.;
 
 pub const RADIUS_S: f32 = 4.;

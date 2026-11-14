@@ -24,7 +24,8 @@ use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, checkbox, empty_state, group_head, h_flex, page_bar, page_filter, page_notice, scrollbar,
-    short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent, TextInput, PAGE_PAD,
+    short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent, Tabular as _,
+    TextInput, PAGE_PAD,
 };
 use crate::views::menu;
 
@@ -353,31 +354,37 @@ impl BookmarksView {
 
         // One line, in columns: the name and its states, the change it
         // points at, then who moved it last and when.
-        let mut name = h_flex().w(px(name_w)).flex_shrink_0().gap(px(6.)).child(
-            div()
-                .min_w_0()
-                .flex_shrink()
-                .font_family(t.mono.clone())
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(t.text1)
-                .when(can_jump, |el| {
-                    el.group_hover(group.clone(), |style| style.text_color(t.accent_strong))
-                })
-                .child(truncated(bookmark.name.clone())),
-        );
+        // Where the bookmark stands against its remote leads the row, in a
+        // column of its own, so the states scan down the page.
+        let sync = div()
+            .id(SharedString::from(format!("sync-{key}")))
+            .w(px(12.))
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .text_size(px(TEXT_XS))
+            .text_color(t.tone(tone))
+            .tooltip(tooltip(sync_text))
+            .child(glyph);
+        let mut name = h_flex()
+            .w(px(name_w))
+            .flex_shrink_0()
+            .gap(px(8.))
+            .child(sync)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_shrink()
+                    .font_family(t.mono.clone())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.text1)
+                    .when(can_jump, |el| {
+                        el.group_hover(group.clone(), |style| style.text_color(t.accent_strong))
+                    })
+                    .child(truncated(bookmark.name.clone())),
+            );
         if bookmark.is_trunk {
             name = name.child(tag("trunk", t.accent_strong));
-        }
-        if !glyph.is_empty() {
-            name = name.child(
-                div()
-                    .id(SharedString::from(format!("sync-{key}")))
-                    .flex_shrink_0()
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.tone(tone))
-                    .tooltip(tooltip(sync_text))
-                    .child(glyph),
-            );
         }
         if !bookmark.is_local && bookmark.tracked {
             name = name.child(tag("tracked", t.text3));
@@ -432,7 +439,7 @@ impl BookmarksView {
             .group(group.clone())
             .h(px(BOOKMARK_ROW_H))
             .gap(px(12.))
-            .pl(px(PAGE_PAD))
+            .pl(px(PAGE_PAD - 4.))
             .pr(px(12.))
             .text_size(px(TEXT_S))
             .border_b_1()
@@ -619,18 +626,13 @@ impl BookmarksView {
                     .max_w(px(META_W - 42.))
                     .child(truncated(bookmark.target_author.clone())),
             )
-            .child(
-                div()
-                    .w(px(32.))
-                    .flex()
-                    .justify_end()
-                    .font_family(t.mono.clone())
-                    .child(if bookmark.target_timestamp.is_empty() {
-                        String::new()
-                    } else {
-                        short_age(&bookmark.target_timestamp)
-                    }),
-            );
+            .child(div().w(px(32.)).flex().justify_end().tabular().child(
+                if bookmark.target_timestamp.is_empty() {
+                    String::new()
+                } else {
+                    short_age(&bookmark.target_timestamp)
+                },
+            ));
         row.child(
             h_flex()
                 .relative()

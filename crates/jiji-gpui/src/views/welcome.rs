@@ -5,10 +5,13 @@ use gpui::{div, prelude::*, px, Context, Entity, FontWeight, Render, ScrollHandl
 
 use crate::app::{app, AppModel};
 use crate::theme::{
-    theme, RADIUS_L, RADIUS_M, RADIUS_S, STATUSBAR_H, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS, TITLEBAR_H,
+    theme, RADIUS_L, RADIUS_M, RADIUS_S, STATUSBAR_H, TEXT_L, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS,
+    TITLEBAR_H,
 };
 use crate::ui::ScrollY as _;
-use crate::ui::{btn, h_flex, icon, kbd, scrollbar, tooltip, truncated, v_flex, IconName};
+use crate::ui::{
+    btn, h_flex, icon, kbd, scrollbar, tooltip, truncated, v_flex, IconName, Tabular as _,
+};
 
 pub struct WelcomeView {
     app: Entity<AppModel>,
@@ -78,46 +81,47 @@ impl Render for WelcomeView {
         let open_app = self.app.clone();
         let palette_app = self.app.clone();
         let mut stage = v_flex()
-            .w(px(580.))
+            .w(px(600.))
             .max_w_full()
-            .gap(px(22.))
+            .gap(px(24.))
             .px(px(24.))
             .pt(px(32.))
             .pb(px(96.))
             .child(
-                h_flex()
-                    .gap(px(12.))
+                v_flex()
+                    .gap(px(14.))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(40.))
-                            .rounded(px(10.))
-                            .bg(t.bg3)
+                            .size(px(48.))
+                            .rounded(px(12.))
+                            .bg(t.bg2)
                             .border_1()
                             .border_color(t.border1)
-                            .child(icon(IconName::Logo, 25., t.accent_strong)),
+                            .child(icon(IconName::Logo, 30., t.accent_strong)),
                     )
                     .child(
                         v_flex()
-                            .gap(px(1.))
+                            .gap(px(4.))
                             .child(
                                 div()
-                                    .text_size(px(TEXT_XL))
+                                    .text_size(px(TEXT_XL + 6.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .line_height(gpui::relative(1.2))
+                                    .line_height(gpui::relative(1.15))
                                     .child("Jiji"),
                             )
                             .child(
                                 h_flex()
-                                    .gap(px(4.))
+                                    .gap(px(5.))
+                                    .text_size(px(TEXT_L))
                                     .text_color(t.text2)
                                     .child("A workbench for")
                                     .child(
                                         div()
                                             .font_family(t.mono.clone())
-                                            .text_size(px(TEXT_S))
+                                            .text_size(px(TEXT_M))
                                             .text_color(t.text1)
                                             .child("jj"),
                                     )
@@ -166,7 +170,7 @@ impl Render for WelcomeView {
         if !recents.is_empty() {
             // A plain list: rows reach a little past the column on both
             // sides, so their text keeps the column's edge.
-            let mut list = v_flex().mx(px(-8.));
+            let mut list = v_flex().mx(px(-10.));
             for (ix, repo) in recents.into_iter().enumerate() {
                 let group = format!("recent-{ix}");
                 let open_app = self.app.clone();
@@ -175,10 +179,10 @@ impl Render for WelcomeView {
                 let row = h_flex()
                     .id(("recent", ix))
                     .group(group.clone())
-                    .h(px(30.))
-                    .pl(px(8.))
+                    .h(px(32.))
+                    .pl(px(10.))
                     .pr(px(4.))
-                    .gap(px(12.))
+                    .gap(px(10.))
                     .rounded(px(RADIUS_M))
                     .cursor_pointer()
                     .hover(|style| style.bg(t.bg_hover))
@@ -186,6 +190,10 @@ impl Render for WelcomeView {
                         let path = open_path.clone();
                         open_app.update(cx, |m, cx| m.open_repo_at(path, cx))
                     })
+                    .child(
+                        icon(IconName::Folder, 14., t.text3)
+                            .group_hover(group.clone(), |style| style.text_color(t.accent_strong)),
+                    )
                     .child(
                         div()
                             .flex_shrink_0()
@@ -208,6 +216,7 @@ impl Render for WelcomeView {
                             .flex_shrink_0()
                             .text_size(px(TEXT_XS))
                             .text_color(t.text3)
+                            .tabular()
                             .child(from_now(repo.last_opened_at)),
                     )
                     .child(
@@ -236,14 +245,14 @@ impl Render for WelcomeView {
                 v_flex()
                     .child(
                         div()
-                            .pb(px(6.))
+                            .pb(px(8.))
                             .mb(px(4.))
                             .border_b_1()
                             .border_color(t.border2)
-                            .text_size(px(TEXT_XS))
+                            .text_size(px(TEXT_S))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text3)
-                            .child("Recent"),
+                            .text_color(t.text2)
+                            .child("Recent repositories"),
                     )
                     .child(list),
             );

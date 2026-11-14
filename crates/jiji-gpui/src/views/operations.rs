@@ -12,14 +12,15 @@ use jiji_core::snapshot::{OpEffectKind, OperationItem};
 use super::ConfirmPlan;
 use crate::app::{app, AppModel};
 use crate::logic::ops::{clock_time, group_operations, is_root_op, now, ops_since, TimelineRow};
-use crate::logic::text::short_id;
+use crate::logic::text::{abbreviate_hashes, short_id, short_user_host};
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, consequences, group_head, h_flex, icon, label_box, page_bar, plan_actions, plan_panel,
-    plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped, IconName, PAGE_PAD,
+    plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped, IconName, Tabular as _,
+    PAGE_PAD,
 };
 
 /// The clock gutter down the journal's leading edge.
@@ -173,9 +174,9 @@ impl OperationsView {
         let context = format!(
             "\u{201c}{}\u{201d}",
             if op.description.is_empty() {
-                "root()"
+                "root()".to_owned()
             } else {
-                &op.description
+                abbreviate_hashes(&op.description)
             }
         );
         let (title, lines, go) = match action {
@@ -321,7 +322,7 @@ impl OperationsView {
             if quiet {
                 desc = desc.text_color(t.text3);
             }
-            desc = desc.child(wrapped(op.description.clone()));
+            desc = desc.child(wrapped(abbreviate_hashes(&op.description)));
         }
         let mut head = h_flex().gap(px(8.)).min_w_0().min_h(px(22.)).child(desc);
         if op.is_current {
@@ -383,7 +384,13 @@ impl OperationsView {
                     .tooltip(tooltip(op.id.clone()))
                     .child(short_id(&op.id, 8).to_owned()),
             )
-            .child(div().max_w(px(220.)).child(truncated(op.user.clone())));
+            .child(
+                div()
+                    .id(("op-user", index))
+                    .max_w(px(220.))
+                    .tooltip(tooltip(op.user.clone()))
+                    .child(truncated(short_user_host(&op.user).to_owned())),
+            );
         let chip = || label_box(t.text2, t.border2).gap(px(4.));
         for effect in &op.effects {
             let lead = match effect.kind {
@@ -429,8 +436,8 @@ impl OperationsView {
             .pt(px(9.))
             .flex()
             .justify_end()
-            .font_family(t.mono.clone())
-            .text_size(px(TEXT_XS))
+            .tabular()
+            .text_size(px(TEXT_S))
             .text_color(if quiet { t.text3 } else { t.text2 })
             .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
             .child(clock_time(&op.timestamp, clock));
@@ -569,20 +576,7 @@ impl Render for OperationsView {
         root.child(
             v_flex()
                 .size_full()
-                .child(
-                    page_bar("Operations", Some(ops.len().to_string()), cx).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .pl(px(4.))
-                            .text_size(px(TEXT_S))
-                            .text_color(t.text3)
-                            .child(truncated(
-                                "Every entry is a whole repo state — restore to any point, or \
-                                 revert one operation. Time travel is an operation too.",
-                            )),
-                    ),
-                )
+                .child(page_bar("Operations", Some(ops.len().to_string()), cx))
                 .child(
                     div()
                         .relative()

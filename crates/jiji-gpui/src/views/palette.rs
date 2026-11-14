@@ -421,7 +421,10 @@ impl Render for Palette {
             .flex()
             .justify_center()
             .items_start()
-            .pt(px(f32::from(viewport.height) * 0.12))
+            // The palette opens out of the title bar's command field: its
+            // search line lands where the field was, on the window's
+            // center line.
+            .pt(px(4.))
             .bg(Theme::fade(t.bg0, 0.3))
             .occlude()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {

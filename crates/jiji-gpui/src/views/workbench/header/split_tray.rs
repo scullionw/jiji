@@ -441,7 +441,7 @@ impl WorkbenchView {
             let (dir, name) = split_path(&file.path);
             let (glyph, hue) = match file.status {
                 jiji_core::snapshot::FileStatus::Added => ("A", t.add_fg),
-                jiji_core::snapshot::FileStatus::Modified => ("M", t.warn),
+                jiji_core::snapshot::FileStatus::Modified => ("M", t.text3),
                 jiji_core::snapshot::FileStatus::Removed => ("D", t.del_fg),
                 _ => ("R", t.accent_strong),
             };

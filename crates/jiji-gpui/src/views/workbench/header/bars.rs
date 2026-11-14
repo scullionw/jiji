@@ -5,6 +5,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Corner, FontWeight, Hsla, W
 use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot};
 
 use super::{title_or_none, Confirm, Tray};
+use crate::logic::graph::lane_of;
 use crate::logic::inspect::{
     bookmarks_at, children_of, find_node, move_direction, resolve_compare_from, split_path,
     stack_position, summary_of, sync_label, ChangeActions, CompareMode, MoveDirection,
@@ -14,8 +15,8 @@ use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_HEAD, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, from_now, h_flex, icon, icon_btn, label_box, popover, popover_layer, scrollbar, tag,
-    text_width, tooltip, truncated, v_flex, IconName, LABEL_H,
+    btn, diffstat, from_now, h_flex, icon, icon_btn, label_box, middot, popover, popover_layer,
+    scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Tabular as _, LABEL_H,
 };
 use crate::views::workbench::WorkbenchView;
 
@@ -419,109 +420,133 @@ impl WorkbenchView {
             pane > STACK_NOTE_PANE,
             pane > IDENTITY_PANE,
         );
-        let mut facts = h_flex().flex_1().min_w_0().overflow_hidden().gap(px(8.));
+        // The facts read in groups — who it is, who made it when, what
+        // state it is in, where it sits — a quiet dot between groups.
+        let mut who: Vec<AnyElement> = Vec::new();
+        let mut when: Vec<AnyElement> = Vec::new();
+        let mut state: Vec<AnyElement> = Vec::new();
+        let mut place: Vec<AnyElement> = Vec::new();
         if node.is_divergent {
-            facts = facts
-                .child(
-                    h_flex()
-                        .id("fact-ids")
-                        .flex_shrink_0()
-                        .font_family(mono.clone())
-                        .text_color(t.danger)
-                        .tooltip(tooltip(
-                            "Divergent change: several visible commits share this change id",
-                        ))
-                        .child(node.change_id.clone())
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("??")),
-                )
-                .child(
-                    // A divergent copy is told apart by its commit id, so
-                    // this one stays at every width.
+            who.push(
+                h_flex()
+                    .id("fact-ids")
+                    .flex_shrink_0()
+                    .font_family(mono.clone())
+                    .text_color(t.danger)
+                    .tooltip(tooltip(
+                        "Divergent change: several visible commits share this change id",
+                    ))
+                    .child(node.change_id.clone())
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("??"))
+                    .into_any_element(),
+            );
+            // A divergent copy is told apart by its commit id, so this one
+            // stays at every width.
+            who.push(
+                div()
+                    .id("fact-commit")
+                    .flex_shrink_0()
+                    .font_family(mono.clone())
+                    .tooltip(tooltip("This copy's commit id"))
+                    .child(node.commit_id.clone())
+                    .into_any_element(),
+            );
+        } else {
+            who.push(
+                h_flex()
+                    .id("fact-ids")
+                    .flex_shrink_0()
+                    .font_family(mono.clone())
+                    .text_color(t.text2)
+                    .tooltip(tooltip("Change id"))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text1)
+                            .child(short_id(&node.id, 2).to_owned()),
+                    )
+                    .child(node.id.chars().skip(2).collect::<String>())
+                    .into_any_element(),
+            );
+            if identity {
+                who.push(
                     div()
                         .id("fact-commit")
                         .flex_shrink_0()
                         .font_family(mono.clone())
-                        .tooltip(tooltip("This copy's commit id"))
-                        .child(node.commit_id.clone()),
+                        .tooltip(tooltip(format!("Commit id {}", node.commit_id)))
+                        .child(short_id(&node.commit_id, 8).to_owned())
+                        .into_any_element(),
                 );
-        } else {
-            facts = facts
-                .child(
-                    h_flex()
-                        .id("fact-ids")
-                        .flex_shrink_0()
-                        .font_family(mono.clone())
-                        .text_color(t.text2)
-                        .tooltip(tooltip("Change id"))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(t.text1)
-                                .child(short_id(&node.id, 2).to_owned()),
-                        )
-                        .child(node.id.chars().skip(2).collect::<String>()),
-                )
-                .when(identity, |facts| {
-                    facts.child(
-                        div()
-                            .id("fact-commit")
-                            .flex_shrink_0()
-                            .font_family(mono.clone())
-                            .tooltip(tooltip(format!("Commit id {}", node.commit_id)))
-                            .child(short_id(&node.commit_id, 8).to_owned()),
-                    )
-                });
+            }
         }
         match node.kind {
-            NodeKind::WorkingCopy => facts = facts.child(tag("working copy", t.working_copy)),
-            NodeKind::Immutable => facts = facts.child(tag("immutable", t.text3)),
+            NodeKind::WorkingCopy => {
+                who.push(tag("working copy", t.working_copy).into_any_element())
+            }
+            NodeKind::Immutable => who.push(tag("immutable", t.text3).into_any_element()),
             NodeKind::Mutable => {}
         }
-        facts = facts
-            .when(identity, |facts| {
-                facts.child(
-                    div()
-                        .flex_shrink_0()
-                        .max_w(px(160.))
-                        .child(truncated(node.author.clone())),
-                )
-            })
-            .child(
+        if identity {
+            when.push(
                 div()
-                    .id("fact-age")
                     .flex_shrink_0()
-                    .tooltip(tooltip(format!(
-                        "{} · {}",
-                        node.author,
-                        crate::ui::absolute_time(&node.timestamp)
-                    )))
-                    .child(from_now(&node.timestamp)),
+                    .max_w(px(160.))
+                    .text_color(t.text2)
+                    .child(truncated(node.author.clone()))
+                    .into_any_element(),
             );
+        }
+        when.push(
+            div()
+                .id("fact-age")
+                .flex_shrink_0()
+                .tooltip(tooltip(format!(
+                    "{} · {}",
+                    node.author,
+                    crate::ui::absolute_time(&node.timestamp)
+                )))
+                .child(from_now(&node.timestamp))
+                .into_any_element(),
+        );
         if node.is_empty {
-            facts = facts.child(div().flex_shrink_0().child("empty"));
+            state.push(div().flex_shrink_0().child("empty").into_any_element());
         }
         if node.has_conflict {
-            facts = facts.child(
+            state.push(
                 label_box(t.danger, Theme::fade(t.danger, 0.42))
                     .gap(px(4.))
                     .child(icon(IconName::Conflicts, 11., t.danger))
-                    .child("conflicts"),
+                    .child("conflicts")
+                    .into_any_element(),
             );
         }
         let prs = self.app.read(cx).forge.prs.clone();
         for (ix, mark) in bookmarks_at(snapshot, &node.id).into_iter().enumerate() {
-            facts = facts.children(self.bookmark_facts(mark, ix, prs.as_deref(), cx));
+            state.extend(self.bookmark_facts(mark, ix, prs.as_deref(), cx));
         }
         if let Some(position) = stack_position(snapshot, &node.id).filter(|_| stack_note) {
             let (at, of) = (position.index + 1, position.workstream.node_ids.len());
             let title = position.workstream.title.clone();
-            facts = facts.child(
-                div()
+            // The workstream's lane hue, so the note reads as the lane it
+            // names in the graph.
+            let hue = t.lane(lane_of(snapshot, &position.workstream.id).unwrap_or(0));
+            place.push(
+                h_flex()
                     .id("fact-stack")
                     .flex_shrink_0()
-                    .max_w(px(280.))
+                    .gap(px(5.))
+                    .max_w(px(300.))
                     .tooltip(tooltip(format!("{at} of {of} in \u{201c}{title}\u{201d}")))
-                    .child(truncated(format!("{at}/{of} in {title}"))),
+                    .child(crate::ui::dot(hue, 6.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .tabular()
+                            .child(format!("{at} of {of} in")),
+                    )
+                    .child(div().min_w_0().text_color(t.text2).child(truncated(title)))
+                    .into_any_element(),
             );
         }
         let relation = |key: usize, id: &str, role: &'static str, glyph: IconName| {
@@ -537,7 +562,7 @@ impl WorkbenchView {
                 .id(("relation", key))
                 .flex_shrink_0()
                 .gap(px(2.))
-                .h(px(18.))
+                .h(px(20.))
                 .px(px(4.))
                 .rounded(px(RADIUS_S))
                 .text_size(px(TEXT_XS))
@@ -552,17 +577,31 @@ impl WorkbenchView {
                         .text_color(t.text2)
                         .child(short_id(id, 4).to_owned()),
                 )
+                .into_any_element()
         };
         if relations {
             let mut key = 0;
             for child in children_of(snapshot, &node.id) {
-                facts = facts.child(relation(key, &child.id, "child", IconName::ArrowUp));
+                place.push(relation(key, &child.id, "child", IconName::ArrowUp));
                 key += 1;
             }
             for parent in &node.parents {
-                facts = facts.child(relation(key, parent, "parent", IconName::ArrowDown));
+                place.push(relation(key, parent, "parent", IconName::ArrowDown));
                 key += 1;
             }
+        }
+
+        let mut facts = h_flex().flex_1().min_w_0().overflow_hidden().gap(px(8.));
+        let mut first = true;
+        for group in [who, when, state, place] {
+            if group.is_empty() {
+                continue;
+            }
+            if !first {
+                facts = facts.child(middot(cx));
+            }
+            first = false;
+            facts = facts.children(group);
         }
 
         h_flex()
@@ -796,13 +835,20 @@ impl WorkbenchView {
         let mut button = h_flex()
             .id("files-button")
             .gap(px(6.))
-            .h(px(22.))
+            .h(px(24.))
             .px(px(7.))
             .rounded(px(RADIUS_S))
             .text_color(t.text2)
+            .tabular()
             .child(counted(count, "file"))
             .children(stat("+", added, t.add_fg))
-            .children(stat("−", removed, t.del_fg));
+            .children(stat("−", removed, t.del_fg))
+            // The blocks are the first thing a narrow pane gives up: the
+            // change's own facts need the room more.
+            .when(
+                added + removed > 0 && self.diff_width > IDENTITY_PANE,
+                |el| el.child(diffstat(added, removed, cx)),
+            );
         if count == 0 {
             button = button.opacity(0.6);
         } else {
@@ -824,7 +870,7 @@ impl WorkbenchView {
             for (index, file) in files.iter().enumerate() {
                 let (glyph, hue) = match file.status {
                     jiji_core::snapshot::FileStatus::Added => ("A", t.add_fg),
-                    jiji_core::snapshot::FileStatus::Modified => ("M", t.warn),
+                    jiji_core::snapshot::FileStatus::Modified => ("M", t.text3),
                     jiji_core::snapshot::FileStatus::Removed => ("D", t.del_fg),
                     _ => ("R", t.accent_strong),
                 };

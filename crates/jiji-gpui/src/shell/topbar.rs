@@ -1,10 +1,11 @@
-//! The title bar: the window's one horizontal strip of chrome. Repo tabs
-//! on the left (after the traffic lights), where trunk stands and when the
-//! remote was last checked, then the window's controls and their popovers
-//! (registration, settings, theme).
+//! The title bar: the window's one strip of chrome. Repo tabs on the left
+//! (after the traffic lights), the command field on the window's center
+//! line, then where trunk stands, when the remote was last checked, and
+//! the window's one Settings control.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Corner, FontWeight, MouseButton, SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, Corner, Div, FontWeight, MouseButton, SharedString,
+    Window,
 };
 use jiji_core::snapshot::SyncState;
 
@@ -15,8 +16,8 @@ use crate::theme::{
     theme, theme_defs, Scheme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::{
-    btn, h_flex, icon, icon_btn, input::field, menu_label, popover, popover_layer, segmented,
-    tooltip, v_flex, IconName,
+    btn, h_flex, icon, icon_btn, input::field, kbd, menu_label, popover, popover_layer, segmented,
+    tooltip, v_flex, IconName, Tabular as _,
 };
 
 /// "just now", "3m ago", "2h ago" — minutes-granular like the chip's
@@ -93,47 +94,50 @@ fn sync_text(sync: SyncState) -> &'static str {
     }
 }
 
+/// The command field's width at a window width: it gives way before the
+/// tabs and the controls on either side of it do.
+fn command_field_width(window_width: f32) -> f32 {
+    if window_width >= 1280. {
+        360.
+    } else if window_width >= 1120. {
+        300.
+    } else {
+        240.
+    }
+}
+
 impl Shell {
     pub(super) fn render_topbar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let t = theme(cx);
         let width: f32 = window.viewport_size().width.into();
         // Native fullscreen hides the traffic lights, so the bar gives
         // their clearance back.
-        let lights = if window.is_fullscreen() { 8. } else { 76. };
+        let lights = if window.is_fullscreen() { 12. } else { 78. };
         let model = self.app.read(cx);
         let has_repo = model.snapshot().is_some();
         let workbench = has_repo && model.section() == Section::Workbench;
         let graph_collapsed = model.graph_collapsed;
+        let registered = model.license.registered;
 
-        let mut bar = h_flex()
-            .id("titlebar")
-            .h(px(TITLEBAR_H))
-            .flex_shrink_0()
-            .gap(px(12.))
-            .pr(px(8.))
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    window.titlebar_double_click();
-                }
-            })
-            .child(div().w(px(lights)).flex_shrink_0())
-            .child(self.render_tabs(cx));
-
-        if width > 1020. {
-            bar = bar.children(self.render_sync(width > 1180., cx));
-        }
+        // The command field rides the window's center line, whatever the
+        // tabs and controls beside it measure; the tabs stop short of it.
+        let field_w = command_field_width(width);
+        let field_left = ((width - field_w) / 2.).round();
+        let tabs_room = (field_left - lights - 20.).max(96.);
 
         let app = self.app.clone();
-        let mut actions = h_flex().flex_shrink_0().gap(px(2.));
+        let mut controls = h_flex().flex_shrink_0().gap(px(2.));
+        if let Some(sync) = self.render_sync(width >= 1180., cx) {
+            controls = controls.child(sync).child(div().w(px(6.)));
+        }
         if workbench {
             // The graph pane's toggle lives up here so it stays reachable
             // while the pane itself is off screen.
             let app = app.clone();
-            actions = actions.child(
+            controls = controls.child(
                 icon_btn(
                     "toggle-graph",
                     if graph_collapsed {
@@ -142,7 +146,7 @@ impl Shell {
                         IconName::PanelClose
                     },
                 )
-                .size(24., 15.)
+                .size(26., 15.)
                 .tooltip(format!(
                     "{} graph panel (⌘⇧B)",
                     if graph_collapsed { "Show" } else { "Hide" }
@@ -150,32 +154,80 @@ impl Shell {
                 .on_click(move |_, _, cx| app.update(cx, |m, cx| m.toggle_graph_panel(cx))),
             );
         }
-        if has_repo {
-            let app = app.clone();
-            actions = actions.child(
-                icon_btn("search-history", IconName::Search)
-                    .size(24., 15.)
-                    .tooltip("Search history (⌘⇧F)")
-                    .on_click(move |_, _, cx| app.update(cx, |m, cx| m.open_search("", cx))),
-            );
+        if !registered {
+            controls = controls.child(self.render_license(window, cx));
         }
-        actions = actions
-            .child({
-                let app = app.clone();
-                icon_btn("palette", IconName::Command)
-                    .size(24., 15.)
-                    .tooltip("Command palette (⌘K)")
-                    .on_click(move |_, _, cx| app.update(cx, |m, cx| m.toggle_palette(cx)))
+        controls = controls.child(self.render_settings(window, cx));
+
+        h_flex()
+            .id("titlebar")
+            .relative()
+            .h(px(TITLEBAR_H))
+            .flex_shrink_0()
+            .pr(px(8.))
+            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                if event.click_count == 2 {
+                    window.titlebar_double_click();
+                }
             })
-            .child(div().w(px(1.)).h(px(14.)).mx(px(6.)).bg(t.border1))
-            .child(self.render_license(window, cx))
-            .child(self.render_settings(cx))
-            .child(self.render_theme_menu(cx));
-        bar.child(actions)
+            .child(div().w(px(lights)).flex_shrink_0())
+            .child(
+                div()
+                    .h_full()
+                    .min_w_0()
+                    .max_w(px(tabs_room))
+                    .child(self.render_tabs(cx)),
+            )
+            .child(div().flex_1())
+            .child(controls)
+            .child(self.render_command_field(field_left, field_w, has_repo, cx))
     }
 
-    /// The open repos, one tab each — living in the title bar's flexible
-    /// middle.
+    /// The one way into everything the app can do or find: it opens the
+    /// command palette, and wears its shortcut.
+    fn render_command_field(
+        &self,
+        left: f32,
+        width: f32,
+        has_repo: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme(cx);
+        let open = self.app.read(cx).palette_open;
+        let app = self.app.clone();
+        let label = if has_repo {
+            "Search or run a command"
+        } else {
+            "Run a command"
+        };
+        h_flex()
+            .id("command-field")
+            .absolute()
+            .top(px(((TITLEBAR_H - 26.) / 2.).floor()))
+            .left(px(left))
+            .w(px(width))
+            .h(px(26.))
+            .gap(px(8.))
+            .pl(px(10.))
+            .pr(px(4.))
+            .rounded(px(RADIUS_M))
+            .border_1()
+            .border_color(if open { t.accent } else { t.border2 })
+            .bg(t.btn_bg)
+            .text_size(px(TEXT_S))
+            .text_color(t.text3)
+            .cursor_pointer()
+            .hover(|style| style.bg(t.btn_hover).border_color(t.border1))
+            // Its presses are its own: a double click here is two
+            // presses on a control, not a title bar zoom.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, _, cx| app.update(cx, |m, cx| m.toggle_palette(cx)))
+            .child(icon(IconName::Search, 13., t.text3))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(kbd("⌘K", cx))
+    }
+
+    /// The open repos, one tab each.
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let model = self.app.read(cx);
@@ -203,20 +255,18 @@ impl Shell {
                 .relative()
                 .h_full()
                 .min_w_0()
-                .max_w(px(180.))
-                .child(div().truncate().child(title.label.clone()).when_some(
-                    title.hint,
-                    |el, hint| {
-                        el.child(
-                            div()
-                                .ml(px(5.))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(t.text3)
-                                .child(hint),
-                        )
-                    },
-                ));
-            label = label.flex().flex_row();
+                .max_w(px(200.))
+                .child(div().truncate().child(title.label.clone()))
+                .when_some(title.hint, |el, hint| {
+                    el.child(
+                        div()
+                            .ml(px(5.))
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(t.text3)
+                            .child(hint),
+                    )
+                });
             if active {
                 label = label.child(
                     div()
@@ -239,8 +289,12 @@ impl Shell {
                 .h_full()
                 .pl(px(10.))
                 .pr(px(4.))
-                .text_size(px(TEXT_S))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(px(TEXT_M))
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
                 .whitespace_nowrap()
                 .cursor_pointer()
                 .tooltip(tooltip(path.unwrap_or_else(|| "New tab".into())))
@@ -278,17 +332,18 @@ impl Shell {
         }
         let app = self.app.clone();
         strip = strip.child(
-            div().ml(px(4.)).child(
+            div().ml(px(2.)).child(
                 icon_btn("new-tab", IconName::Plus)
                     .size(22., 13.)
                     .tooltip("New tab (⌘T)")
                     .on_click(move |_, _, cx| app.update(cx, |m, cx| m.new_tab(cx))),
             ),
         );
-        h_flex().flex_1().min_w_0().h_full().child(strip)
+        h_flex().min_w_0().h_full().child(strip)
     }
 
-    /// Where trunk stands and when the remote was last checked.
+    /// Where trunk stands and when the remote was last checked: two quiet
+    /// readouts, the full story on hover, a fetch one click away.
     fn render_sync(&self, show_trunk: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = theme(cx);
         let model = self.app.read(cx);
@@ -311,7 +366,7 @@ impl Shell {
         }
         let mut row = h_flex()
             .flex_shrink_0()
-            .gap(px(12.))
+            .gap(px(2.))
             .text_size(px(TEXT_S))
             .text_color(t.text3);
         if let Some(trunk) = trunk.filter(|_| show_trunk) {
@@ -320,24 +375,27 @@ impl Shell {
                 None => trunk.name.clone(),
             };
             let state = sync_text(trunk.sync);
+            let synced = trunk.sync == SyncState::Synced;
             row = row.child(
                 h_flex()
                     .id("trunk")
-                    .gap(px(5.))
+                    .gap(px(6.))
+                    .h(px(24.))
+                    .px(px(6.))
                     .tooltip(tooltip(format!("Trunk: {name} — {state}")))
-                    .child(icon(IconName::Branch, 12., t.text3))
+                    .child(icon(IconName::Branch, 13., t.text3))
                     .child(
                         div()
                             .font_family(t.mono.clone())
                             .text_size(px(TEXT_XS))
                             .text_color(t.text2)
-                            .child(name),
+                            .child(trunk.name.clone()),
                     )
-                    .child(
-                        div()
-                            .when(trunk.sync != SyncState::Synced, |el| el.text_color(t.warn))
-                            .child(state),
-                    ),
+                    .child(if synced {
+                        icon(IconName::Check, 12., t.ok).into_any_element()
+                    } else {
+                        div().text_color(t.warn).child(state).into_any_element()
+                    }),
             );
         }
         if let Some((label, tone, title)) = chip {
@@ -348,16 +406,21 @@ impl Shell {
             } else {
                 t.text3
             };
-            // The upstream check: always visible, never loud.
+            // The checked age stands alone: the icon says what was checked.
+            let label = label
+                .strip_prefix("Checked ")
+                .map(str::to_owned)
+                .unwrap_or(label);
             let mut el = h_flex()
                 .id("upstream-chip")
                 .gap(px(5.))
-                .h(px(22.))
+                .h(px(24.))
                 .px(px(6.))
                 .rounded(px(RADIUS_M))
                 .text_color(color)
+                .tabular()
                 .tooltip(tooltip(title))
-                .child(icon(IconName::Refresh, 11., color))
+                .child(icon(IconName::Refresh, 12., color))
                 .child(label);
             if !busy {
                 el = el
@@ -372,48 +435,52 @@ impl Shell {
 
     // ── Registration ──
 
+    /// The unregistered copy's standing offer: a quiet Register control
+    /// with its panel. A registered copy keeps its licence in Settings.
     fn render_license(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx);
-        let model = self.app.read(cx);
-        let registered = model.license.registered;
-        let open = model.registration_open;
-        let plan = match model.license.plan.as_str() {
-            "solo" => "Solo",
-            "personal" => "Personal",
-            _ => "Licensed",
-        };
-        let display_key = model.license.display_key.clone();
+        let open = self.app.read(cx).registration_open;
         let app = self.app.clone();
-        let toggle = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
-            app.update(cx, |m, cx| {
-                if m.registration_open {
-                    m.close_registration(cx)
-                } else {
-                    m.open_registration(cx)
-                }
-            });
-        };
-        let trigger: AnyElement = if registered {
-            icon_btn("license", IconName::BadgeCheck)
-                .size(24., 15.)
-                .on(open)
-                .tooltip("License")
-                .on_click(toggle)
-                .into_any_element()
-        } else {
+        let anchor = div().relative().child(
             btn("register", "Register")
                 .ghost()
                 .icon(IconName::Key)
                 .on(open)
                 .tooltip("Register Jiji")
-                .on_click(toggle)
-                .into_any_element()
-        };
-        let anchor = div().relative().child(trigger);
+                .on_click(move |_, _, cx| {
+                    app.update(cx, |m, cx| {
+                        if m.registration_open {
+                            m.close_registration(cx)
+                        } else {
+                            m.open_registration(cx)
+                        }
+                    });
+                }),
+        );
         if !open {
             return anchor;
         }
+        let panel = self.license_panel(window, cx);
+        anchor.child(self.license_layer(panel, cx))
+    }
 
+    fn license_layer(&self, panel: Div, cx: &mut Context<Self>) -> impl IntoElement {
+        let app = self.app.clone();
+        popover_layer(
+            Corner::TopRight,
+            30.,
+            panel,
+            cx.listener(move |this, _, _, cx| {
+                this.license_error = None;
+                app.update(cx, |m, cx| m.close_registration(cx));
+            }),
+        )
+    }
+
+    /// The registration panel: the key field and where to buy one, or —
+    /// for a registered copy replacing its key — the field alone.
+    fn license_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let t = theme(cx);
+        let registered = self.app.read(cx).license.registered;
         let mut panel = popover(cx)
             .w(px(320.))
             .p(px(14.))
@@ -426,190 +493,144 @@ impl Shell {
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(text)
         };
-        let link = |id: &'static str, text: &'static str| {
-            div()
-                .id(id)
-                .text_size(px(TEXT_S))
-                .text_color(t.accent_strong)
-                .cursor_pointer()
-                .hover(|style| style.text_color(t.text1))
-                .child(text)
-        };
-        if registered && !self.license_replacing {
-            panel = panel
-                .child(
-                    h_flex()
-                        .gap(px(10.))
-                        .items_start()
-                        .child(icon(IconName::BadgeCheck, 16., t.ok))
-                        .child(
-                            v_flex()
-                                .gap(px(2.))
-                                .child(title("Thanks for supporting Jiji"))
-                                .child(
-                                    h_flex()
-                                        .gap(px(4.))
-                                        .text_size(px(TEXT_S))
-                                        .text_color(t.text2)
-                                        .child(format!("{plan} license ·"))
-                                        .child(
-                                            div().font_family(t.mono.clone()).child(display_key),
-                                        ),
-                                ),
-                        ),
-                )
-                .child(
-                    link("license-replace", "Replace license key").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.license_replacing = true;
-                            cx.notify();
-                        },
-                    )),
-                );
-        } else {
-            let busy = self.license_busy;
-            let empty = self.license_input.read(cx).text().trim().is_empty();
-            panel =
-                panel
-                    .child(title(if registered {
-                        "Replace your key"
-                    } else {
-                        "Support Jiji"
-                    }))
+        let busy = self.license_busy;
+        let empty = self.license_input.read(cx).text().trim().is_empty();
+        panel = panel
+            .child(title(if registered {
+                "Replace your key"
+            } else {
+                "Support Jiji"
+            }))
+            .child(
+                div()
+                    .text_size(px(TEXT_S))
+                    .line_height(gpui::relative(1.5))
+                    .text_color(t.text2)
                     .child(
-                        div()
-                            .text_size(px(TEXT_S))
-                            .line_height(gpui::relative(1.5))
-                            .text_color(t.text2)
-                            .child(
-                                "Jiji and every jj feature are free. A one-time license unlocks \
-                             all ten themes and funds development.",
-                            ),
+                        "Jiji and every jj feature are free. A one-time license unlocks \
+                         all ten themes and funds development.",
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .child(
+                        field(&self.license_input, window, cx)
+                            .flex_1()
+                            .font_family(t.mono.clone()),
                     )
                     .child(
-                        h_flex()
-                            .gap(px(6.))
-                            .child(
-                                field(&self.license_input, window, cx)
-                                    .flex_1()
-                                    .font_family(t.mono.clone()),
-                            )
-                            .child(
-                                btn(
-                                    "license-submit",
-                                    if busy { "Checking…" } else { "Register" },
-                                )
-                                .primary()
-                                .disabled(busy || empty)
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.activate_license(window, cx),
-                                )),
-                            ),
-                    );
-            if let Some(error) = &self.license_error {
-                panel = panel.child(
+                        btn(
+                            "license-submit",
+                            if busy { "Checking…" } else { "Register" },
+                        )
+                        .primary()
+                        .disabled(busy || empty)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.activate_license(window, cx)),
+                        ),
+                    ),
+            );
+        if let Some(error) = &self.license_error {
+            panel = panel.child(
+                div()
+                    .text_size(px(TEXT_S))
+                    .text_color(t.danger)
+                    .child(error.clone()),
+            );
+        }
+        if registered {
+            let app = self.app.clone();
+            return panel.child(
+                div()
+                    .id("license-cancel")
+                    .text_size(px(TEXT_S))
+                    .text_color(t.accent_strong)
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(t.text1))
+                    .child("Cancel")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.license_error = None;
+                        app.update(cx, |m, cx| m.close_registration(cx));
+                    })),
+            );
+        }
+        let buy = |id: &'static str, name: &'static str, price: String, url: &'static str| {
+            v_flex()
+                .id(id)
+                .flex_1()
+                .gap(px(1.))
+                .px(px(10.))
+                .py(px(7.))
+                .rounded(px(RADIUS_M))
+                .border_1()
+                .border_color(t.border1)
+                .bg(t.btn_bg)
+                .cursor_pointer()
+                .hover(|style| style.bg(t.btn_hover))
+                .on_click(move |_, _, cx| cx.open_url(url))
+                .child(
                     div()
                         .text_size(px(TEXT_S))
-                        .text_color(t.danger)
-                        .child(error.clone()),
-                );
-            }
-            if registered {
-                panel = panel.child(link("license-cancel", "Cancel").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.license_replacing = false;
-                        this.license_error = None;
-                        cx.notify();
-                    },
-                )));
-            } else {
-                let buy =
-                    |id: &'static str, name: &'static str, price: String, url: &'static str| {
-                        v_flex()
-                            .id(id)
-                            .flex_1()
-                            .gap(px(1.))
-                            .px(px(10.))
-                            .py(px(7.))
-                            .rounded(px(RADIUS_M))
-                            .border_1()
-                            .border_color(t.border1)
-                            .bg(t.btn_bg)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(t.btn_hover))
-                            .on_click(move |_, _, cx| cx.open_url(url))
-                            .child(
-                                div()
-                                    .text_size(px(TEXT_S))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(TEXT_XS))
-                                    .text_color(t.text3)
-                                    .child(price),
-                            )
-                    };
-                panel = panel
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .text_size(px(TEXT_XS))
-                            .text_color(t.text3)
-                            .child(div().flex_1().h(px(1.)).bg(t.border2))
-                            .child("No key yet?")
-                            .child(div().flex_1().h(px(1.)).bg(t.border2)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .child(buy(
-                                "buy-solo",
-                                "Solo",
-                                format!("{SOLO_PRICE} · 1 device"),
-                                SOLO_CHECKOUT_URL,
-                            ))
-                            .child(buy(
-                                "buy-personal",
-                                "Personal",
-                                format!("{PERSONAL_PRICE} · 5 devices"),
-                                PERSONAL_CHECKOUT_URL,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(TEXT_XS))
-                            .text_color(t.text3)
-                            .child("Secure checkout via Polar. Your key arrives by email."),
-                    );
-            }
-        }
-        let app = self.app.clone();
-        anchor.child(popover_layer(
-            Corner::TopRight,
-            30.,
-            panel,
-            cx.listener(move |this, _, _, cx| {
-                this.license_error = None;
-                this.license_replacing = false;
-                app.update(cx, |m, cx| m.close_registration(cx));
-            }),
-        ))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(TEXT_XS))
+                        .text_color(t.text3)
+                        .child(price),
+                )
+        };
+        panel
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .child(div().flex_1().h(px(1.)).bg(t.border2))
+                    .child("No key yet?")
+                    .child(div().flex_1().h(px(1.)).bg(t.border2)),
+            )
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .child(buy(
+                        "buy-solo",
+                        "Solo",
+                        format!("{SOLO_PRICE} · 1 device"),
+                        SOLO_CHECKOUT_URL,
+                    ))
+                    .child(buy(
+                        "buy-personal",
+                        "Personal",
+                        format!("{PERSONAL_PRICE} · 5 devices"),
+                        PERSONAL_CHECKOUT_URL,
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .child("Secure checkout via Polar. Your key arrives by email."),
+            )
     }
 
     // ── Settings ──
 
-    /// App-level preferences, popover-sized: the machine integrations
-    /// (which editor and terminal menus launch, the jiji command) and the
-    /// upstream check cadence.
-    fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Everything the app remembers per device, in one panel: how it looks,
+    /// what its menus launch, how often it checks upstream, the `jiji`
+    /// command, and the licence.
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let open = self.settings_menu.is_open();
+        let model = self.app.read(cx);
+        // A registered copy replacing its key does so from here.
+        let replacing = model.license.registered && model.registration_open;
         let anchor = div().relative().child(
             icon_btn("settings", IconName::Settings)
-                .size(24., 15.)
-                .on(open)
+                .size(26., 15.)
+                .on(open || replacing)
                 .tooltip("Settings")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings_menu.toggle();
@@ -617,6 +638,10 @@ impl Shell {
                     cx.notify();
                 })),
         );
+        if replacing {
+            let panel = self.license_panel(window, cx);
+            return anchor.child(self.license_layer(panel, cx));
+        }
         if !open {
             return anchor;
         }
@@ -635,6 +660,11 @@ impl Shell {
         let interval = model.upstream.interval_minutes;
         let cli = model.cli.status.clone();
         let installing = model.cli.installing;
+        let (registered, plan, display_key) = (
+            model.license.registered,
+            model.license.plan.clone(),
+            model.license.display_key.clone(),
+        );
 
         let row =
             |id: gpui::ElementId, label: SharedString, hint: Option<SharedString>, on: bool| {
@@ -664,20 +694,19 @@ impl Shell {
                 .text_color(t.text3)
                 .child(text)
         };
+        let section = || v_flex().p(px(4.)).border_t_1().border_color(t.border2);
 
-        let mut panel = popover(cx)
-            .w(px(264.))
-            .p(px(4.))
-            .flex()
-            .flex_col()
-            .child(menu_label("Preferred editor", cx));
+        let mut panel = popover(cx).w(px(288.)).flex().flex_col();
+        panel = panel.child(self.render_appearance(cx));
+
+        let mut launch = section().child(menu_label("Preferred editor", cx));
         if editors.is_empty() {
-            panel = panel.child(note(
+            launch = launch.child(note(
                 "No editor command-line tools found on this machine.".into(),
             ));
         } else {
             let app = self.app.clone();
-            panel = panel.child(
+            launch = launch.child(
                 row(
                     "editor-last".into(),
                     "Last used".into(),
@@ -689,7 +718,7 @@ impl Shell {
             for (ix, editor) in editors.iter().enumerate() {
                 let app = self.app.clone();
                 let id = editor.id;
-                panel = panel.child(
+                launch = launch.child(
                     row(
                         ("editor", ix).into(),
                         editor.label.into(),
@@ -703,11 +732,11 @@ impl Shell {
             }
         }
         if !terminals.is_empty() {
-            panel = panel.child(menu_label("Terminal", cx));
+            launch = launch.child(menu_label("Terminal", cx));
             for (ix, terminal) in terminals.iter().enumerate() {
                 let app = self.app.clone();
                 let id = terminal.id;
-                panel = panel.child(
+                launch = launch.child(
                     row(
                         ("terminal", ix).into(),
                         terminal.label.into(),
@@ -720,8 +749,10 @@ impl Shell {
                 );
             }
         }
+        panel = panel.child(launch);
+
         let app = self.app.clone();
-        panel = panel.child(menu_label("Check upstream", cx)).child(
+        let mut machine = section().child(menu_label("Check upstream", cx)).child(
             div().px(px(8.)).pb(px(6.)).child(segmented(
                 "upstream-interval",
                 UPSTREAM_INTERVALS
@@ -737,34 +768,33 @@ impl Shell {
             )),
         );
         if let Some(cli) = cli {
-            panel = panel.child(menu_label("Command line", cx));
+            machine = machine.child(menu_label("Command line", cx));
             if cli.installed {
                 let path = cli.path.unwrap_or_default();
-                panel =
-                    panel.child(
-                        h_flex()
-                            .gap(px(8.))
-                            .px(px(8.))
-                            .pb(px(6.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(TEXT_XS))
-                                    .text_color(t.text3)
-                                    .child(format!("Installed at {path}")),
-                            )
-                            .child(btn("cli-uninstall", "Uninstall").danger().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    let task = this.app.update(cx, |m, cx| m.uninstall_cli(cx));
-                                    this.run_cli(task, cx);
-                                }),
-                            )),
-                    );
+                machine = machine.child(
+                    h_flex()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .pb(px(6.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(TEXT_XS))
+                                .text_color(t.text3)
+                                .child(format!("Installed at {path}")),
+                        )
+                        .child(btn("cli-uninstall", "Uninstall").small().danger().on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let task = this.app.update(cx, |m, cx| m.uninstall_cli(cx));
+                                this.run_cli(task, cx);
+                            }),
+                        )),
+                );
             } else if let Some(conflict) = cli.conflict {
-                panel = panel.child(note(format!("Another jiji occupies {conflict}.")));
+                machine = machine.child(note(format!("Another jiji occupies {conflict}.")));
             } else {
-                panel = panel.child(
+                machine = machine.child(
                     div().px(px(8.)).pb(px(6.)).flex().flex_col().child(
                         btn(
                             "cli-install",
@@ -783,7 +813,7 @@ impl Shell {
                 );
             }
             if let Some(error) = &self.cli_error {
-                panel = panel.child(
+                machine = machine.child(
                     div()
                         .px(px(8.))
                         .pb(px(6.))
@@ -793,22 +823,50 @@ impl Shell {
                 );
             }
         }
-        panel = panel.child(
-            h_flex()
-                .gap(px(4.))
-                .px(px(8.))
-                .py(px(6.))
-                .border_t_1()
-                .border_color(t.border2)
-                .text_size(px(TEXT_XS))
-                .text_color(t.text3)
-                .child("Jiji")
+        panel = panel.child(machine);
+
+        // The footer: who this copy belongs to, and which build it is.
+        let mut footer = h_flex()
+            .gap(px(6.))
+            .h(px(34.))
+            .px(px(12.))
+            .border_t_1()
+            .border_color(t.border2)
+            .text_size(px(TEXT_XS))
+            .text_color(t.text3);
+        if registered {
+            let plan = match plan.as_str() {
+                "solo" => "Solo license",
+                "personal" => "Personal license",
+                _ => "Licensed",
+            };
+            let app = self.app.clone();
+            footer = footer
+                .child(icon(IconName::BadgeCheck, 13., t.ok))
+                .child(div().text_color(t.text2).child(plan))
                 .child(
                     div()
-                        .font_family(t.mono.clone())
-                        .child(crate::host::update::CURRENT_VERSION),
-                ),
+                        .id("license-replace")
+                        .text_color(t.accent_strong)
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(t.text1))
+                        .tooltip(tooltip(format!("Key {display_key}")))
+                        .child("Replace key…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings_menu.close();
+                            app.update(cx, |m, cx| m.open_registration(cx));
+                        })),
+                );
+        }
+        footer = footer.child(div().flex_1()).child(
+            h_flex().gap(px(4.)).child("Jiji").child(
+                div()
+                    .font_family(t.mono.clone())
+                    .child(crate::host::update::CURRENT_VERSION),
+            ),
         );
+        panel = panel.child(footer);
+
         anchor.child(popover_layer(
             Corner::TopRight,
             30.,
@@ -818,6 +876,103 @@ impl Shell {
                 cx.notify();
             }),
         ))
+    }
+
+    /// Settings' first section: the mode, and a swatch per palette — or,
+    /// before registration, what unlocks them.
+    fn render_appearance(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = theme(cx);
+        let model = self.app.read(cx);
+        let mode = model.theme_mode();
+        let registered = model.license.registered;
+        let pref = model.theme_pref();
+        let mut section = v_flex().p(px(4.)).child(menu_label("Appearance", cx));
+        if !registered {
+            let app = self.app.clone();
+            return section.child(
+                h_flex()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .pb(px(8.))
+                    .child(icon(IconName::Lock, 14., t.text3))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(TEXT_S))
+                            .line_height(gpui::relative(1.4))
+                            .text_color(t.text2)
+                            .child("Ten palettes come with a license."),
+                    )
+                    .child(btn("unlock-themes", "Unlock").small().on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.settings_menu.close();
+                            app.update(cx, |m, cx| m.open_registration(cx));
+                            cx.notify();
+                        },
+                    ))),
+            );
+        }
+        let app = self.app.clone();
+        section = section.child(div().px(px(8.)).pb(px(4.)).child(segmented(
+            "theme-mode",
+            vec![
+                (ThemeMode::System, "System".into(), Some(IconName::SunMoon)),
+                (ThemeMode::Light, "Light".into(), Some(IconName::Sun)),
+                (ThemeMode::Dark, "Dark".into(), Some(IconName::Moon)),
+            ],
+            &mode,
+            cx,
+            move |mode, _, cx| {
+                let mode = *mode;
+                app.update(cx, |m, cx| m.set_theme_mode(mode, cx));
+            },
+        )));
+        let defs = theme_defs();
+        for (label, scheme, current) in [
+            ("Dark", Scheme::Dark, pref.dark.as_str()),
+            ("Light", Scheme::Light, pref.light.as_str()),
+        ] {
+            let mut swatches = h_flex().gap(px(6.));
+            for def in defs.iter().filter(|def| def.scheme == scheme) {
+                let selected = def.id == current;
+                let app = self.app.clone();
+                let id = def.id;
+                swatches = swatches.child(
+                    div()
+                        .id(SharedString::from(format!("swatch-{id}")))
+                        .flex()
+                        .items_end()
+                        .w(px(40.))
+                        .h(px(26.))
+                        .p(px(4.))
+                        .rounded(px(RADIUS_S))
+                        .bg(def.bg)
+                        .border_1()
+                        .border_color(if selected { t.accent } else { t.border1 })
+                        .when(selected, |el| el.border_2())
+                        .cursor_pointer()
+                        .tooltip(tooltip(def.label))
+                        .on_click(move |_, _, cx| app.update(cx, |m, cx| m.select_theme(id, cx)))
+                        .child(div().w(px(14.)).h(px(3.)).rounded(px(2.)).bg(def.accent)),
+                );
+            }
+            section = section.child(
+                h_flex()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .child(
+                        div()
+                            .w(px(34.))
+                            .flex_shrink_0()
+                            .text_size(px(TEXT_XS))
+                            .text_color(t.text3)
+                            .child(label),
+                    )
+                    .child(swatches),
+            );
+        }
+        section.child(div().h(px(4.)))
     }
 
     fn run_cli(&mut self, task: gpui::Task<crate::host::HostResult<()>>, cx: &mut Context<Self>) {
@@ -831,147 +986,6 @@ impl Shell {
             }
         })
         .detach();
-    }
-
-    // ── Theme ──
-
-    fn render_theme_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx);
-        let open = self.theme_menu.is_open();
-        let model = self.app.read(cx);
-        let mode = model.theme_mode();
-        let registered = model.license.registered;
-        let pref = model.theme_pref();
-        let glyph = match mode {
-            ThemeMode::System => IconName::SunMoon,
-            ThemeMode::Light => IconName::Sun,
-            ThemeMode::Dark => IconName::Moon,
-        };
-        let anchor = div().relative().child(
-            icon_btn("theme", glyph)
-                .size(24., 15.)
-                .on(open)
-                .tooltip("Theme")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.theme_menu.toggle();
-                    cx.notify();
-                })),
-        );
-        if !open {
-            return anchor;
-        }
-        let mut panel = popover(cx).w(px(252.)).p(px(8.)).flex().flex_col();
-        if registered {
-            let app = self.app.clone();
-            panel = panel.child(h_flex().child(segmented(
-                "theme-mode",
-                vec![
-                    (ThemeMode::System, "System".into(), None),
-                    (ThemeMode::Light, "Light".into(), None),
-                    (ThemeMode::Dark, "Dark".into(), None),
-                ],
-                &mode,
-                cx,
-                move |mode, _, cx| {
-                    let mode = *mode;
-                    app.update(cx, |m, cx| m.set_theme_mode(mode, cx));
-                },
-            )));
-            let defs = theme_defs();
-            for (label, scheme, current) in [
-                ("Dark", Scheme::Dark, pref.dark.as_str()),
-                ("Light", Scheme::Light, pref.light.as_str()),
-            ] {
-                let mut swatches = h_flex().flex_wrap().gap(px(6.));
-                for def in defs.iter().filter(|def| def.scheme == scheme) {
-                    let selected = def.id == current;
-                    let app = self.app.clone();
-                    let id = def.id;
-                    swatches = swatches.child(
-                        v_flex()
-                            .id(SharedString::from(format!("swatch-{id}")))
-                            .w(px(42.))
-                            .gap(px(3.))
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(move |_, _, cx| {
-                                app.update(cx, |m, cx| m.select_theme(id, cx))
-                            })
-                            .child(
-                                div()
-                                    .w(px(40.))
-                                    .h(px(26.))
-                                    .flex()
-                                    .items_end()
-                                    .p(px(4.))
-                                    .rounded(px(RADIUS_S))
-                                    .bg(def.bg)
-                                    .border_1()
-                                    .border_color(if selected { t.accent } else { t.border1 })
-                                    .child(
-                                        div().w(px(14.)).h(px(3.)).rounded(px(2.)).bg(def.accent),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .max_w_full()
-                                    .truncate()
-                                    .text_size(px(10.))
-                                    .text_color(if selected { t.text1 } else { t.text3 })
-                                    .child(def.label),
-                            ),
-                    );
-                }
-                panel = panel
-                    .child(menu_label(label, cx).px(px(2.)))
-                    .child(swatches);
-            }
-        } else {
-            let app = self.app.clone();
-            panel = panel.child(
-                v_flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .p(px(10.))
-                    .child(icon(IconName::Lock, 16., t.text3))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Themes come with a license"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(TEXT_S))
-                            .line_height(gpui::relative(1.5))
-                            .text_color(t.text2)
-                            .text_center()
-                            .child(
-                                "Jiji ships in ten palettes. A one-time license unlocks them \
-                                 all and keeps development going.",
-                            ),
-                    )
-                    .child(
-                        div().mt(px(4.)).child(
-                            btn("unlock-themes", "Unlock themes")
-                                .primary()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.theme_menu.close();
-                                    app.update(cx, |m, cx| m.open_registration(cx));
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
-            );
-        }
-        anchor.child(popover_layer(
-            Corner::TopRight,
-            30.,
-            panel,
-            cx.listener(|this, _, _, cx| {
-                this.theme_menu.close();
-                cx.notify();
-            }),
-        ))
     }
 }
 
@@ -1009,5 +1023,11 @@ mod tests {
         assert_eq!(checked_age_label(1000, 500), "just now");
         assert_eq!(checked_age_label(0, 59_999), "just now");
         assert_eq!(checked_age_label(0, 61 * 60_000), "1h ago");
+    }
+
+    #[test]
+    fn the_command_field_narrows_before_anything_else() {
+        assert!(command_field_width(1440.) > command_field_width(1200.));
+        assert!(command_field_width(1200.) > command_field_width(980.));
     }
 }

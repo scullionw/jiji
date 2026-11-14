@@ -27,6 +27,7 @@ use crate::diff::model::{
     DiffDoc, FileModel, Kind, Layout, Line, LineId, Row, GAP_H, HEADER_H, IMAGE_H, IMAGE_MAX_H,
     LINE_H, NOTE_H, REGION_H, SIDE_H,
 };
+use crate::logic::text::{diffstat_blocks, Block};
 use crate::theme::{theme, Theme};
 use crate::ui::{AxisLock, IconName};
 
@@ -2119,7 +2120,7 @@ impl HeaderPaint<'_> {
         // A/M/D/R in the status's hue — a letter, not a tile.
         let (letter, hue) = match file.status {
             FileStatus::Added => ("A", theme.add_fg),
-            FileStatus::Modified => ("M", theme.warn),
+            FileStatus::Modified => ("M", theme.text3),
             FileStatus::Removed => ("D", theme.del_fg),
             FileStatus::Renamed => ("R", theme.accent_strong),
             FileStatus::Copied => ("C", theme.accent_strong),
@@ -2241,6 +2242,31 @@ impl HeaderPaint<'_> {
             )
             .ok();
             right = f32::from(button.left()) - 10.;
+        }
+        // The five-block diffstat closes the line, the counts to its left.
+        if file.added + file.removed > 0 {
+            const BLOCK: f32 = 7.;
+            const GAP: f32 = 1.5;
+            let top = y + ((height - BLOCK) / 2.).round();
+            right -= 5. * BLOCK + 4. * GAP;
+            for (ix, block) in diffstat_blocks(file.added, file.removed)
+                .into_iter()
+                .enumerate()
+            {
+                let x = right + ix as f32 * (BLOCK + GAP);
+                window.paint_quad(
+                    fill(
+                        rect(x, top, x + BLOCK, top + BLOCK),
+                        match block {
+                            Block::Added => theme.add_fg,
+                            Block::Removed => theme.del_fg,
+                            Block::Unchanged => theme.border1,
+                        },
+                    )
+                    .corner_radii(px(1.5)),
+                );
+            }
+            right -= 10.;
         }
         for (count, sign, color) in [
             (file.removed, "−", theme.del_fg),

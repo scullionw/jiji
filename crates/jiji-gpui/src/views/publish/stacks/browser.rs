@@ -10,7 +10,7 @@ use crate::logic::text::plural_s;
 use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    dot, h_flex, icon, kbd, lead_bar, scrollbar, tooltip, truncated, v_flex, IconName,
+    dot, h_flex, icon, kbd, lead_bar, scrollbar, tooltip, truncated, v_flex, IconName, Tabular as _,
 };
 use crate::views::publish::PublishView;
 
@@ -49,25 +49,49 @@ impl PublishView {
                 plural_s(stack.change_count as usize)
             )
         };
-        let mut row = v_flex()
-            .id(SharedString::from(format!("stack-{}", stack.key)))
-            .relative()
-            .flex_shrink_0()
-            .py(px(7.))
-            .pl(px(16.))
-            .pr(px(12.))
-            .child(title)
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .mt(px(3.))
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .child(dot(t.tone(tone), 6.))
-                    .child(label)
-                    .child(div().w(px(1.)).h(px(9.)).bg(t.border1))
-                    .child(count),
-            );
+        let id = SharedString::from(format!("stack-{}", stack.key));
+        let mut row = if stack.pr_count == 0 {
+            // Local work is all one state — the group says it — so a row
+            // is the title and how much is in it.
+            h_flex()
+                .id(id)
+                .relative()
+                .flex_shrink_0()
+                .h(px(30.))
+                .gap(px(10.))
+                .pl(px(16.))
+                .pr(px(14.))
+                .child(title.flex_1())
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(TEXT_XS))
+                        .text_color(t.text3)
+                        .tabular()
+                        .child(stack.change_count.to_string()),
+                )
+                .tooltip(tooltip(count))
+        } else {
+            v_flex()
+                .id(id)
+                .relative()
+                .flex_shrink_0()
+                .py(px(7.))
+                .pl(px(16.))
+                .pr(px(12.))
+                .child(title)
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .mt(px(3.))
+                        .text_size(px(TEXT_XS))
+                        .text_color(t.text3)
+                        .child(dot(t.tone(tone), 6.))
+                        .child(label)
+                        .child(div().w(px(1.)).h(px(9.)).bg(t.border1))
+                        .child(count),
+                )
+        };
         row = if selected {
             row.bg(t.selected).child(lead_bar(cx))
         } else {

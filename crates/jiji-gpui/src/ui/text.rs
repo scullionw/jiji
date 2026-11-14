@@ -4,6 +4,7 @@
 use gpui::{div, prelude::*, px, App, Div, FontWeight, Hsla, SharedString, Window};
 
 use super::{icon, truncated, IconName};
+use crate::logic::text::{diffstat_blocks, Block};
 use crate::theme::{theme, Theme, FONT_UI, RADIUS_S, TEXT_XS};
 
 /// The height every label riding a row shares.
@@ -54,6 +55,34 @@ pub fn label_box(ink: Hsla, line: Hsla) -> Div {
         .text_size(px(TEXT_XS))
         .line_height(px(LABEL_H - 2.))
         .whitespace_nowrap()
+}
+
+/// The quiet mark between groups of facts on one line.
+pub fn middot(cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_color(Theme::fade(theme(cx).text3, 0.7))
+        .child("·")
+}
+
+/// The five-block diffstat beside a "+a −r" count: the split between
+/// lines added and removed, read before the numbers are.
+pub fn diffstat(added: u32, removed: u32, cx: &App) -> Div {
+    let t = theme(cx);
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(1.5));
+    for block in diffstat_blocks(added, removed) {
+        row = row.child(div().size(px(7.)).rounded(px(1.5)).bg(match block {
+            Block::Added => t.add_fg,
+            Block::Removed => t.del_fg,
+            Block::Unchanged => t.border1,
+        }));
+    }
+    row
 }
 
 /// A sentence with inline emphasis: `**strong**` reads in full ink and

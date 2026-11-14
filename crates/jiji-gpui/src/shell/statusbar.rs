@@ -8,9 +8,9 @@ use super::Shell;
 use crate::app::Section;
 use crate::logic::autoland::{self, ChipTone};
 use crate::logic::inspect::Tone;
-use crate::logic::text::short_id;
+use crate::logic::text::{abbreviate_hashes, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, STATUSBAR_H, TEXT_XS};
-use crate::ui::{dot, h_flex, icon, tooltip, IconName};
+use crate::ui::{dot, h_flex, icon, tooltip, IconName, Tabular as _};
 
 impl Shell {
     pub(super) fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -138,10 +138,26 @@ impl Shell {
                 };
                 bar = bar.child(undo);
             }
-        } else if let Some(op) = snapshot.as_ref().and_then(|s| s.operations.first()) {
+        } else if let Some(op) = snapshot.as_ref().and_then(|s| {
+            // Every look at the repo snapshots the working copy, so the
+            // newest operation is nearly always that; the line names the
+            // newest one that did something.
+            s.operations
+                .iter()
+                .find(|op| !op.is_snapshot)
+                .or(s.operations.first())
+        }) {
             bar = bar
                 .child(dot(quiet_dot, 6.))
-                .child(msg(op.description.clone()));
+                .child(msg(abbreviate_hashes(&op.description)))
+                .child(
+                    div()
+                        .id("status-op-age")
+                        .flex_shrink_0()
+                        .tabular()
+                        .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
+                        .child(crate::ui::from_now(&op.timestamp)),
+                );
             if snapshot.as_ref().is_some_and(|s| s.backend == "mock") {
                 bar = bar.child(div().flex_shrink_0().text_color(t.warn).child("mock data"));
             }
@@ -240,7 +256,8 @@ impl Shell {
             bar = bar.child(el);
         }
 
-        if let Some(snapshot) = &snapshot {
+        // The backend names itself only when it is not the usual one.
+        if let Some(snapshot) = snapshot.as_ref().filter(|s| s.backend != "jj-lib") {
             bar = bar.child(
                 div()
                     .id("backend")

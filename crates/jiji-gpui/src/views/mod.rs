@@ -77,8 +77,9 @@ impl Render for Placeholder {
         div().size_full().child(empty_state(
             IconName::Workspaces,
             self.section.label(),
-            "Workspace switching and stale-workspace recovery will live here.",
-            Some("arrives in a later milestone".into()),
+            "Switching between this repository's workspaces, and recovering a stale one, \
+             arrive here in a later release.",
+            Some("jj workspace list".into()),
             cx,
         ))
     }
