@@ -8,6 +8,7 @@ use super::Shell;
 use crate::app::Section;
 use crate::logic::autoland::{self, ChipTone};
 use crate::logic::inspect::Tone;
+use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, RADIUS_S, STATUSBAR_H, TEXT_XS};
 use crate::ui::{dot, h_flex, icon, tooltip, IconName};
 
@@ -110,7 +111,7 @@ impl Shell {
                         .flex_shrink_0()
                         .font_family(t.mono.clone())
                         .text_color(t.text3)
-                        .child(op.chars().take(8).collect::<String>()),
+                        .child(short_id(op, 8).to_owned()),
                 );
             }
             bar = bar.child(dot(t.accent, 6.)).child(link);

@@ -16,4 +16,5 @@ pub mod publish;
 pub mod search;
 pub mod split;
 pub mod stacks;
+pub mod text;
 pub mod tree;

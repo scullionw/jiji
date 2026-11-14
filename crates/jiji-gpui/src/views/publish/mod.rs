@@ -23,15 +23,14 @@ use jiji_forge::{
 
 use crate::app::{app, AppEvent, AppModel, ForgePhase, UiIntent};
 use crate::logic::autoland::{is_interrupted, live_job, resume_blocker, story, visible_jobs};
-use crate::logic::inspect::Tone;
 use crate::logic::publish::{
     autoland_options_story, job_title, job_tone, land_action_text, review_rows,
 };
 use crate::shell::Dismiss;
-use crate::theme::{theme, Theme, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::theme::{theme, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::{
-    btn, dot, empty_state, floating, h_flex, icon, icon_btn, input::field, popover, ref_label,
-    segmented, v_flex, IconName, InputEvent, PopoverState, SwallowClicks, TextInput,
+    btn, dot, empty_state, h_flex, icon, icon_btn, input::field, popover, popover_layer, ref_label,
+    segmented, v_flex, IconName, InputEvent, PopoverState, TextInput,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,15 +149,6 @@ fn token_source_label(source: TokenSource) -> &'static str {
         TokenSource::Keychain => "stored in your keychain",
         TokenSource::Environment => "from GITHUB_TOKEN",
         TokenSource::GhCli => "from the gh CLI",
-    }
-}
-
-pub(super) fn tone_color(t: &Theme, tone: Tone) -> Hsla {
-    match tone {
-        Tone::Ok => t.ok,
-        Tone::Warn => t.warn,
-        Tone::Danger => t.danger,
-        Tone::Muted => t.text3,
     }
 }
 
@@ -835,10 +825,15 @@ impl PublishView {
             })),
         );
         if self.connection.is_open() {
-            connection = connection.child(div().absolute().top(px(30.)).right_0().child(floating(
+            connection = connection.child(popover_layer(
                 Corner::TopRight,
+                30.,
                 self.render_connection(window, cx),
-            )));
+                cx.listener(|this, _, _, cx| {
+                    this.connection.close();
+                    cx.notify();
+                }),
+            ));
         }
         h_flex()
             .flex_shrink_0()
@@ -912,15 +907,7 @@ impl PublishView {
                 .child(text)
         };
         let body = |text: String| div().mt(px(4.)).mb(px(10.)).text_color(t.text2).child(text);
-        let mut panel = popover(cx)
-            .swallow_clicks()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.connection.close();
-                cx.notify();
-            }))
-            .w(px(330.))
-            .p(px(16.))
-            .text_size(px(TEXT_S));
+        let mut panel = popover(cx).w(px(330.)).p(px(16.)).text_size(px(TEXT_S));
         panel = if matches!(
             phase,
             ForgePhase::Idle | ForgePhase::Loading | ForgePhase::Verifying
@@ -991,7 +978,7 @@ impl PublishView {
         let blocker = interrupted
             .then(|| resume_blocker(status, &snapshot.bookmarks))
             .flatten();
-        let color = job_tone(status).map_or(t.accent_strong, |tone| tone_color(&t, tone));
+        let color = job_tone(status).map_or(t.accent_strong, |tone| t.tone(tone));
         let job_active = self.job_active(cx);
         let stopping = self.app.read(cx).autoland.stopping;
         let dismiss = |cx: &mut Context<Self>| {

@@ -15,8 +15,8 @@ use crate::theme::{
     theme, theme_defs, Scheme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::{
-    btn, floating, h_flex, icon, icon_btn, input::field, menu_label, popover, segmented, tooltip,
-    v_flex, IconName, SwallowClicks,
+    btn, h_flex, icon, icon_btn, input::field, menu_label, popover, popover_layer, segmented,
+    tooltip, v_flex, IconName,
 };
 
 /// "just now", "3m ago", "2h ago" — minutes-granular like the chip's
@@ -396,7 +396,7 @@ impl Shell {
                 .on_click(toggle)
                 .into_any_element()
         };
-        let mut anchor = div().relative().child(trigger);
+        let anchor = div().relative().child(trigger);
         if !open {
             return anchor;
         }
@@ -406,8 +406,7 @@ impl Shell {
             .p(px(14.))
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .swallow_clicks();
+            .gap(px(10.));
         let title = |text: &'static str| {
             div()
                 .text_size(px(TEXT_M))
@@ -574,19 +573,16 @@ impl Shell {
             }
         }
         let app = self.app.clone();
-        let panel = panel.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-            this.license_error = None;
-            this.license_replacing = false;
-            app.update(cx, |m, cx| m.close_registration(cx));
-        }));
-        anchor = anchor.child(
-            div()
-                .absolute()
-                .top(px(28.))
-                .right_0()
-                .child(floating(Corner::TopRight, panel)),
-        );
-        anchor
+        anchor.child(popover_layer(
+            Corner::TopRight,
+            28.,
+            panel,
+            cx.listener(move |this, _, _, cx| {
+                this.license_error = None;
+                this.license_replacing = false;
+                app.update(cx, |m, cx| m.close_registration(cx));
+            }),
+        ))
     }
 
     // ── Settings ──
@@ -597,7 +593,7 @@ impl Shell {
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let open = self.settings_menu.is_open();
-        let mut anchor = div().relative().child(
+        let anchor = div().relative().child(
             icon_btn("settings", IconName::Settings)
                 .size(24., 15.)
                 .on(open)
@@ -661,11 +657,6 @@ impl Shell {
             .p(px(4.))
             .flex()
             .flex_col()
-            .swallow_clicks()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.settings_menu.close();
-                cx.notify();
-            }))
             .child(menu_label("Preferred editor", cx));
         if editors.is_empty() {
             panel = panel.child(note(
@@ -805,14 +796,15 @@ impl Shell {
                         .child(crate::host::update::CURRENT_VERSION),
                 ),
         );
-        anchor = anchor.child(
-            div()
-                .absolute()
-                .top(px(28.))
-                .right_0()
-                .child(floating(Corner::TopRight, panel)),
-        );
-        anchor
+        anchor.child(popover_layer(
+            Corner::TopRight,
+            28.,
+            panel,
+            cx.listener(|this, _, _, cx| {
+                this.settings_menu.close();
+                cx.notify();
+            }),
+        ))
     }
 
     fn run_cli(&mut self, task: gpui::Task<crate::host::HostResult<()>>, cx: &mut Context<Self>) {
@@ -842,7 +834,7 @@ impl Shell {
             ThemeMode::Light => IconName::Sun,
             ThemeMode::Dark => IconName::Moon,
         };
-        let mut anchor = div().relative().child(
+        let anchor = div().relative().child(
             icon_btn("theme", glyph)
                 .size(24., 15.)
                 .on(open)
@@ -855,16 +847,7 @@ impl Shell {
         if !open {
             return anchor;
         }
-        let mut panel = popover(cx)
-            .w(px(252.))
-            .p(px(8.))
-            .flex()
-            .flex_col()
-            .swallow_clicks()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.theme_menu.close();
-                cx.notify();
-            }));
+        let mut panel = popover(cx).w(px(252.)).p(px(8.)).flex().flex_col();
         if registered {
             let app = self.app.clone();
             panel = panel.child(h_flex().child(segmented(
@@ -967,14 +950,15 @@ impl Shell {
                     ),
             );
         }
-        anchor = anchor.child(
-            div()
-                .absolute()
-                .top(px(28.))
-                .right_0()
-                .child(floating(Corner::TopRight, panel)),
-        );
-        anchor
+        anchor.child(popover_layer(
+            Corner::TopRight,
+            28.,
+            panel,
+            cx.listener(|this, _, _, cx| {
+                this.theme_menu.close();
+                cx.notify();
+            }),
+        ))
     }
 }
 

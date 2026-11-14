@@ -14,7 +14,9 @@ use jiji_core::snapshot::{HistorySearch, SearchHit};
 use crate::app::{app, AppModel};
 use crate::logic::inspect::summary_of;
 use crate::logic::search::{file_hit_label, search_status, HitTone, MIN_QUERY_LENGTH};
+use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, RADIUS_M, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::ScrollY as _;
 use crate::ui::{
     icon, kbd, popover, scrollbar, short_age, truncated, IconName, InputEvent, TextInput,
 };
@@ -197,7 +199,7 @@ impl Search {
                     .font_family(t.mono.clone())
                     .text_size(px(TEXT_S))
                     .text_color(t.text2)
-                    .child(hit.id.chars().take(8).collect::<String>()),
+                    .child(short_id(&hit.id, 8).to_owned()),
             )
             .child(div().flex_1().min_w_0().child(truncated(title.to_owned())))
             .child(
@@ -287,7 +289,7 @@ impl Render for Search {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .scroll_y()
             .track_scroll(&self.scroll)
             .p(px(8.));
         for index in 0..self.hits().len() {

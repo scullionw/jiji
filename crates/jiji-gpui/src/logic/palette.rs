@@ -10,6 +10,7 @@ use super::autoland::{is_interrupted, resume_blocker};
 use super::graph::RowDensity;
 use super::inspect::{action_availability, resolve_compare_from, summary_of, CompareMode};
 use crate::app::{DiffLayout, Section, ThemeMode, UiIntent, WorkbenchMode, SECTIONS};
+use crate::logic::text::short_id;
 use crate::store::RecentRepo;
 use crate::theme::Scheme;
 use crate::ui::IconName;
@@ -190,10 +191,6 @@ fn title_of(node: &GraphNode) -> &str {
     }
 }
 
-fn short(id: &str, len: usize) -> &str {
-    &id[..id.len().min(len)]
-}
-
 fn item(
     id: impl Into<String>,
     group: &'static str,
@@ -214,7 +211,7 @@ fn build_items(ctx: &PaletteContext) -> Vec<PaletteItem> {
 
     if let (Some(snapshot), Some(selected)) = (ctx.snapshot, ctx.selected) {
         let avail = action_availability(snapshot, selected);
-        let id4 = short(&selected.id, 4);
+        let id4 = short_id(&selected.id, 4);
         let at = format!("{id4} \u{201c}{}\u{201d}", title_of(selected));
         if avail.describe {
             items.push(
@@ -610,7 +607,7 @@ fn build_items(ctx: &PaletteContext) -> Vec<PaletteItem> {
                 )
                 .hint(format!(
                     "{} · {count} change{}",
-                    short(head, 8),
+                    short_id(head, 8),
                     if *count == 1 { "" } else { "s" }
                 ))
                 .keywords("ship now push trunk direct no pr main"),
@@ -940,7 +937,7 @@ pub fn goto_matches(
         items.push(PaletteItem {
             id: format!("goto.{}", node.id),
             group: "Go to",
-            title: short(&node.id, 8).to_owned(),
+            title: short_id(&node.id, 8).to_owned(),
             hint: Some(hint.join(" · ")),
             keywords: "",
             icon: None,
@@ -1140,7 +1137,7 @@ mod tests {
             .iter()
             .find(|n| !n.bookmarks.is_empty())
             .unwrap();
-        let by_id = goto_matches(&snapshot, None, &tokens_of(short(&node.id, 4)));
+        let by_id = goto_matches(&snapshot, None, &tokens_of(short_id(&node.id, 4)));
         assert!(by_id
             .iter()
             .any(|item| item.action == PaletteAction::Goto(node.id.clone())));
@@ -1149,7 +1146,7 @@ mod tests {
             .iter()
             .any(|item| item.action == PaletteAction::Goto(node.id.clone())));
         // The selection itself is not a place to go.
-        let skipping = goto_matches(&snapshot, Some(&node.id), &tokens_of(short(&node.id, 4)));
+        let skipping = goto_matches(&snapshot, Some(&node.id), &tokens_of(short_id(&node.id, 4)));
         assert!(skipping
             .iter()
             .all(|item| item.action != PaletteAction::Goto(node.id.clone())));

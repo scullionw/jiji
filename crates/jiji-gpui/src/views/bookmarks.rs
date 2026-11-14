@@ -16,10 +16,12 @@ use jiji_core::{BackendError, RepoBackend};
 use crate::app::{app, AppModel};
 use crate::logic::bookmarks::{bookmark_key, group_bookmarks, merged_bookmarks};
 use crate::logic::graph::sync_glyph;
-use crate::logic::inspect::Tone;
+use crate::logic::text::short_id;
 use crate::shell::topbar::checked_age_label;
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_S, TEXT_XS};
+use crate::ui::pinned;
+use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, checkbox, empty_state, h_flex, icon, scrollbar, section_header, short_age, tooltip,
     truncated, v_flex, IconName, InputEvent, TextInput,
@@ -382,12 +384,7 @@ impl BookmarksView {
                     .id(SharedString::from(format!("sync-{key}")))
                     .flex_shrink_0()
                     .text_size(px(TEXT_XS))
-                    .text_color(match tone {
-                        Tone::Ok => t.ok,
-                        Tone::Warn => t.warn,
-                        Tone::Danger => t.danger,
-                        _ => t.text3,
-                    })
+                    .text_color(t.tone(tone))
                     .tooltip(tooltip(sync_text))
                     .child(glyph),
             );
@@ -408,7 +405,7 @@ impl BookmarksView {
                     .flex_shrink_0()
                     .font_family(t.mono.clone())
                     .text_color(t.text2)
-                    .child(bookmark.target.chars().take(8).collect::<String>()),
+                    .child(short_id(&bookmark.target, 8).to_owned()),
             )
             .child(div().min_w(px(40.)).flex_shrink().child(truncated(
                 if bookmark.target_description.is_empty() {
@@ -660,29 +657,30 @@ impl BookmarksView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme(cx);
-        let mut group = v_flex().mb(px(20.)).child(
-            h_flex()
-                .gap(px(8.))
-                .pt(px(12.))
-                .px(px(8.))
-                .pb(px(4.))
-                .border_b_1()
-                .border_color(t.border2)
-                .child(
-                    div()
-                        .text_size(px(TEXT_S))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.text2)
-                        .child(label.to_owned()),
-                )
-                .child(
-                    div()
-                        .font_family(t.mono.clone())
-                        .text_size(px(TEXT_XS))
-                        .text_color(t.text3)
-                        .child(bookmarks.len().to_string()),
-                ),
-        );
+        // The heading stays put while its group scrolls under it.
+        let heading = h_flex()
+            .gap(px(8.))
+            .pt(px(12.))
+            .px(px(8.))
+            .pb(px(4.))
+            .bg(t.bg1)
+            .border_b_1()
+            .border_color(t.border2)
+            .child(
+                div()
+                    .text_size(px(TEXT_S))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.text2)
+                    .child(label.to_owned()),
+            )
+            .child(
+                div()
+                    .font_family(t.mono.clone())
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .child(bookmarks.len().to_string()),
+            );
+        let mut group = div();
         if let Some(blurb) = blurb {
             group = group.child(
                 div()
@@ -696,7 +694,7 @@ impl BookmarksView {
         for bookmark in bookmarks {
             group = group.child(self.render_row(bookmark, snapshot, cx));
         }
-        group
+        div().mb(px(20.)).child(pinned(heading, group))
     }
 }
 
@@ -728,7 +726,8 @@ impl Render for BookmarksView {
         }
         let query = self.filter.read(cx).text().to_owned();
         let groups = group_bookmarks(&snapshot.bookmarks, &query);
-        let mut column = v_flex()
+        // Block flow: see the Operations page's column.
+        let mut column = div()
             .w_full()
             .max_w(px(800.))
             .mx_auto()
@@ -799,7 +798,7 @@ impl Render for BookmarksView {
             div()
                 .id("bookmarks-scroll")
                 .size_full()
-                .overflow_y_scroll()
+                .scroll_y()
                 .track_scroll(&self.scroll)
                 .child(column),
         )

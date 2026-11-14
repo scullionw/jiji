@@ -59,18 +59,42 @@ screenshots are at the display's scale.
 | `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
 | `diff/` | The diff surface: a flat row model, tree-sitter highlighting, and one custom-painted element that windows, selects, finds and scrolls. |
-| `ui/` | Buttons, inputs (with IME), popovers, scrollbars, icons, the ellipsizing text element. |
+| `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. |
 | `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings. |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
 | `theme.rs`, `store.rs` | The ten palettes; the persisted preferences. |
 
 ## Differences from the Tauri app
 
-- Section headings do not pin while their lists scroll.
-- Lines in the annotate pane clip instead of scrolling sideways.
-- An operation's description shows on one line (the full text is its
-  tooltip), and a row of effect chips clips rather than wraps.
+- The change header's meta bar never wraps: facts leave by pane width, as
+  they do there, and whatever still overruns clips. The header's verbs
+  keep their labels below the Tauri breakpoint whenever the title leaves
+  room for them.
+- A diff file's sideways scroll thumb shows only while the pointer is over
+  that file, so it never covers another file's last line.
+- The annotate pane pans sideways by swipe; it draws no horizontal thumb.
 - Bookmark rows always reserve room for their hover actions.
 - No layout or panel transitions.
 - The in-app updater downloads and verifies releases like the Tauri one, but
   no release pipeline builds this bundle yet.
+
+## GPUI notes
+
+Things this code works around, so the next change does not rediscover them:
+
+- **Page columns are block flow, not flex columns.** A flex column asked
+  for its height (which a scroller always does) sizes each row before
+  stretching it to the column's width. Rows whose content wraps are then
+  measured unwrapped and squeezed, and groups sit at their content's
+  width. `div()` stacks the same rows and measures them at full width.
+- **A hover style that sets a text color replaces the element's whole text
+  style** while it applies — size, weight and family fall back to the
+  parent's. Elements that shape text at paint time (`ui::truncated`,
+  `ui::wrapped`) keep the face they were laid out in.
+- **A tooltip waiting out its delay is never cancelled by a click**, and a
+  visible one is retired only when the pointer next moves. `ui::tooltip`
+  guards against both; `ui::popover_layer` puts a layer under an open
+  panel so its trigger cannot raise a tooltip over it.
+- **A purely sideways swipe scrolls a vertical-only scroller.** Use
+  `.scroll_y()` (or `ui::vertical_only` for a `uniform_list`), never
+  `.overflow_y_scroll()` directly.

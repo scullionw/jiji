@@ -16,6 +16,7 @@ use crate::logic::palette::{
     ThemeChoice,
 };
 use crate::theme::{theme, theme_defs, Theme, RADIUS_M, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::ScrollY as _;
 use crate::ui::{icon, kbd, popover, scrollbar, truncated, IconName, InputEvent, TextInput};
 use crate::views::workbench::VIEW_PRESETS;
 
@@ -333,7 +334,7 @@ impl Render for Palette {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .scroll_y()
             .track_scroll(&self.scroll)
             .pt(px(4.))
             .px(px(8.))

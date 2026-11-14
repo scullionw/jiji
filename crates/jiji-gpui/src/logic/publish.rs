@@ -10,6 +10,7 @@ use jiji_forge::{
 use super::autoland::is_interrupted;
 use super::inspect::Tone;
 use super::pr::{pr_badge, PrBadge};
+use crate::logic::text::plural_s;
 
 /// A stack's one-word standing and the tone of its dot.
 pub fn stack_summary(status: StackStatus) -> (&'static str, Tone) {
@@ -21,14 +22,6 @@ pub fn stack_summary(status: StackStatus) -> (&'static str, Tone) {
         StackStatus::ChecksRunning => ("Checks running", Tone::Warn),
         StackStatus::InReview => ("In review", Tone::Warn),
         StackStatus::Published => ("Published", Tone::Ok),
-    }
-}
-
-fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
     }
 }
 
@@ -55,7 +48,7 @@ fn rebase_text(root: &str, moves: u32, onto: &str) -> String {
         format!(
             "Rebase {root} and its {} descendant{} onto {onto}",
             moves - 1,
-            plural(moves as usize - 1)
+            plural_s(moves as usize - 1)
         )
     }
 }

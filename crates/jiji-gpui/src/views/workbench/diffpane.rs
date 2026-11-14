@@ -19,11 +19,13 @@ use crate::app::{DiffKey, DiffLayout, UiIntent};
 use crate::diff::view::{DiffEvent, ResolveOffer};
 use crate::logic::conflicts::{can_resolve, merge_tool_label};
 use crate::logic::inspect::{range_compare_from, resolve_compare_from, CompareMode};
+use crate::logic::text::short_id;
 use crate::logic::tree::{active_row_key, build_tree_rows, visible_tree_rows, TreeFile, TreeRow};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::ui::ScrollY as _;
 use crate::ui::{
     bounds_probe, empty_state, h_flex, icon, icon_btn, popover, scrollbar, segmented, tooltip,
-    truncated, v_flex, IconName, InputEvent, SwallowClicks, TextInput,
+    truncated, v_flex, IconName, InputEvent, TextInput,
 };
 
 const TREE_MIN: f32 = 160.;
@@ -602,8 +604,8 @@ impl WorkbenchView {
         let head = range.first().cloned().unwrap_or_default();
         let root = range.last().cloned().unwrap_or_default();
         let from = range_compare_from(&self.snapshot, range).unwrap_or_default();
-        let from_short: String = from.chars().take(8).collect();
-        let root_short: String = root.chars().take(8).collect();
+        let from_short = short_id(&from, 8);
+        let root_short = short_id(&root, 8);
         let id = |id: &str| {
             let (lead, rest) = short(id);
             h_flex()
@@ -986,7 +988,7 @@ impl WorkbenchView {
                         this.tree_key(TreeKey::Activate, cx)
                     }))
                     .size_full()
-                    .overflow_y_scroll()
+                    .scroll_y()
                     .track_scroll(&self.diff.tree_scroll)
                     .child(list),
             )
@@ -1022,7 +1024,6 @@ impl WorkbenchView {
             .h(px(32.))
             .pl(px(10.))
             .pr(px(4.))
-            .swallow_clicks()
             .child(icon(IconName::Search, 12., t.text3))
             .child(
                 div()
@@ -1102,17 +1103,15 @@ impl WorkbenchView {
             Some(range) => self.render_range_header(range, cx),
             None => self.render_change_header(&node_id, window, cx),
         };
-        let pane_width: f32 = self.diff.bounds.get().size.width.into();
         // Below these widths the tree would squeeze the diff into a ribbon
         // (side-by-side needs room for two columns of code); it steps
         // aside.
-        let narrow = pane_width > 0.
-            && pane_width
-                < if self.diff.layout == DiffLayout::Split {
-                    1040.
-                } else {
-                    760.
-                };
+        let narrow = self.diff_width
+            < if self.diff.layout == DiffLayout::Split {
+                1040.
+            } else {
+                760.
+            };
         let current = self.diff.current().cloned();
         // What the body renders. While a switch's fetch is in flight the
         // previous diff stays on screen (dimmed) instead of blanking to
@@ -1244,7 +1243,7 @@ impl WorkbenchView {
         surface_area = surface_area.child(right);
         // A reading pane over the diff takes its place while open.
         let over = if range.is_none() {
-            match self.render_annotate(cx) {
+            match self.render_annotate(window, cx) {
                 Some(pane) => Some(pane),
                 None => self.render_evolution(window, cx),
             }

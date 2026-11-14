@@ -19,16 +19,18 @@ use crate::logic::graph::{
     resolve_focused_workstream, row_bookmarks, sync_glyph, ElisionRow, GraphModel, GraphRow,
     LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT, RAIL_CORNER,
 };
-use crate::logic::inspect::{summary_of, Tone};
+use crate::logic::inspect::summary_of;
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
+use crate::logic::text::counted;
 use crate::store::SavedView;
 use crate::theme::{
     theme, Theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H,
 };
+use crate::ui::ScrollY as _;
 use crate::ui::{
-    absolute_time, btn, empty_state, floating, h_flex, icon, icon_btn, input::field, menu_label,
-    popover, ref_label, scrollbar, segmented, short_age, tooltip, truncated, v_flex, IconName,
-    SwallowClicks,
+    absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, menu_label, popover,
+    popover_layer, ref_label, scrollbar, segmented, short_age, tooltip, truncated, v_flex,
+    IconName,
 };
 use crate::views::menu;
 
@@ -124,6 +126,9 @@ pub fn rename_saved_view(
     )
 }
 
+/// Panes this wide or narrower leave authors out of the rows.
+const AUTHOR_MIN_PANE: f32 = 560.;
+
 /// Everything a row needs to draw itself, shared by a whole pass.
 struct RowStyle<'a> {
     snapshot: &'a RepoSnapshot,
@@ -137,6 +142,8 @@ struct RowStyle<'a> {
     prs: Option<std::sync::Arc<RepoPrState>>,
     /// The comparison on the diff surface, when one is.
     comparison: Option<&'a ShownDiff>,
+    /// Whether the pane has room for authors beside the descriptions.
+    authors: bool,
 }
 
 impl RowStyle<'_> {
@@ -410,15 +417,6 @@ fn chip(
     el.child(text.into())
 }
 
-fn tone_color(theme: &Theme, tone: Tone) -> Hsla {
-    match tone {
-        Tone::Ok => theme.ok,
-        Tone::Warn => theme.warn,
-        Tone::Danger => theme.danger,
-        Tone::Muted => theme.text3,
-    }
-}
-
 impl WorkbenchView {
     // ── Pane head ──
 
@@ -492,7 +490,7 @@ impl WorkbenchView {
                     div()
                         .id("graph-scroller")
                         .size_full()
-                        .overflow_y_scroll()
+                        .scroll_y()
                         .track_scroll(&self.scroll)
                         .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
                         .child(body),
@@ -646,7 +644,7 @@ impl WorkbenchView {
         if open {
             trigger = trigger.bg(t.bg_hover);
         }
-        let mut anchor = div().relative().min_w_0().child(trigger);
+        let anchor = div().relative().min_w_0().child(trigger);
         if !open {
             return anchor;
         }
@@ -694,11 +692,6 @@ impl WorkbenchView {
             .p(px(4.))
             .flex()
             .flex_col()
-            .swallow_clicks()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.view_menu.popover.close();
-                cx.notify();
-            }))
             .child(menu_label("Show", cx));
         for (ix, (view, label, desc)) in VIEW_PRESETS.iter().enumerate() {
             let target = view.clone();
@@ -852,14 +845,15 @@ impl WorkbenchView {
                     .child(error.clone()),
             );
         }
-        anchor = anchor.child(
-            div()
-                .absolute()
-                .top(px(28.))
-                .left_0()
-                .child(floating(Corner::TopLeft, panel)),
-        );
-        anchor
+        anchor.child(popover_layer(
+            Corner::TopLeft,
+            28.,
+            panel,
+            cx.listener(|this, _, _, cx| {
+                this.view_menu.popover.close();
+                cx.notify();
+            }),
+        ))
     }
 
     // ── Rows ──
@@ -883,6 +877,7 @@ impl WorkbenchView {
             density: self.density,
             prs: self.app.read(cx).forge.prs.clone(),
             comparison: self.shown.as_ref().filter(|shown| shown.from.is_some()),
+            authors: width > AUTHOR_MIN_PANE,
         }
     }
 
@@ -1105,7 +1100,7 @@ impl WorkbenchView {
                 label = label.child(
                     div()
                         .text_size(px(10.))
-                        .text_color(tone_color(t, tone))
+                        .text_color(t.tone(tone))
                         .child(glyph),
                 );
             }
@@ -1129,7 +1124,7 @@ impl WorkbenchView {
                     el = el.child(
                         div()
                             .text_size(px(10.))
-                            .text_color(tone_color(t, glyph.tone))
+                            .text_color(t.tone(glyph.tone))
                             .child(glyph.glyph),
                     );
                 }
@@ -1166,7 +1161,8 @@ impl WorkbenchView {
             );
         }
 
-        // The description owns the row; long author names give way first.
+        // The description owns the row: long author names give way first,
+        // and in a squeezed pane the author leaves for the tooltip.
         let meta = h_flex()
             .id(("meta", key))
             .flex_shrink_0()
@@ -1178,8 +1174,16 @@ impl WorkbenchView {
                 node.author,
                 absolute_time(&node.timestamp)
             )))
-            .child(div().max_w(px(76.)).child(truncated(node.author.clone())))
-            .child(short_age(&node.timestamp));
+            .when(style.authors, |meta| {
+                meta.child(div().max_w(px(76.)).child(truncated(node.author.clone())))
+            })
+            .child(
+                div()
+                    .min_w(px(24.))
+                    .flex()
+                    .justify_end()
+                    .child(short_age(&node.timestamp)),
+            );
         // What pushes the meta to the row's far edge. (A spacer, not an
         // auto margin: the layout engine drops a row's gaps when an auto
         // margin absorbs free space.)
@@ -1521,14 +1525,13 @@ impl WorkbenchView {
         let base = self.rows(&focus.graph.rows[split_at..], split_at, &style, cx);
         let gutter = style.gutter;
         let slot = lane_of(&snapshot, &lane.id).unwrap_or(0);
-        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
 
         let mut meta = h_flex()
             .flex_shrink_0()
             .gap(px(4.))
             .text_size(px(TEXT_S))
             .text_color(t.text3)
-            .child(plural(lane.node_ids.len(), "change"));
+            .child(counted(lane.node_ids.len(), "change"));
         if focus.behind_trunk > 0 {
             meta = meta.child(
                 div()
@@ -1599,7 +1602,7 @@ impl WorkbenchView {
                         .child(format!(
                             "{} is {} ahead of this base",
                             snapshot.trunk_bookmark,
-                            plural(focus.behind_trunk as usize, "change")
+                            counted(focus.behind_trunk as usize, "change")
                         )),
                 );
             }

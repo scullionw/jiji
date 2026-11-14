@@ -95,6 +95,7 @@ fn main() {
         }
     });
     application.run(move |cx: &mut App| {
+        ui::tooltip::init(cx);
         ui::input::bind_keys(cx);
         shell::bind_keys(cx);
         views::workbench::bind_keys(cx);

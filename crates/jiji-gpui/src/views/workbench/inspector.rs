@@ -2,23 +2,21 @@
 //! with inline bookmark rename and delete. A selection puts the diff
 //! surface in this pane instead.
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 use gpui::{
-    div, prelude::*, px, AnyElement, Bounds, Context, Entity, FontWeight, MouseButton, Pixels,
-    ScrollHandle, SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton, ScrollHandle,
+    SharedString, Window,
 };
 use jiji_core::snapshot::{BookmarkState, RepoSnapshot};
 
 use super::WorkbenchView;
 use crate::logic::bookmarks::bookmark_key;
 use crate::logic::graph::resolve_focused_workstream;
-use crate::logic::inspect::{find_node, sync_label, Tone};
+use crate::logic::inspect::{find_node, sync_label};
 use crate::theme::{theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_TITLE, TEXT_XS};
+use crate::ui::ScrollY as _;
 use crate::ui::{
-    bounds_probe, btn, h_flex, icon, icon_btn, input::field, kbd, ref_label, scrollbar, tooltip,
-    truncated, v_flex, IconName, InputEvent, TextInput,
+    btn, h_flex, icon, icon_btn, input::field, kbd, ref_label, scrollbar, tooltip, truncated,
+    v_flex, IconName, InputEvent, TextInput,
 };
 use crate::views::menu;
 
@@ -36,7 +34,6 @@ pub(super) struct InspectorState {
     error: Option<String>,
     busy: bool,
     scroll: ScrollHandle,
-    bounds: Rc<Cell<Bounds<Pixels>>>,
 }
 
 impl InspectorState {
@@ -47,7 +44,6 @@ impl InspectorState {
             error: None,
             busy: false,
             scroll: ScrollHandle::new(),
-            bounds: Rc::default(),
         }
     }
 }
@@ -352,7 +348,7 @@ impl WorkbenchView {
                                 app.update(cx, |model, cx| model.jump_to_change(&id, cx))
                             });
                     }
-                    let mut row = row
+                    let row = row
                         .id(("inspector-bm", index))
                         .group(group.clone())
                         .on_mouse_down(
@@ -364,49 +360,43 @@ impl WorkbenchView {
                             div()
                                 .flex_shrink_0()
                                 .text_size(px(TEXT_XS))
-                                .text_color(match tone {
-                                    Tone::Ok => t.ok,
-                                    Tone::Warn => t.warn,
-                                    Tone::Danger => t.danger,
-                                    _ => t.text3,
-                                })
+                                .text_color(t.tone(tone))
                                 .child(sync_text),
                         );
+                    // Every row keeps the slot its actions would take, so
+                    // the sync labels sit in one column.
+                    let mut actions = h_flex().flex_shrink_0().w(px(45.)).gap(px(1.));
                     if bookmark.is_local && !bookmark.is_trunk {
                         // Rename and delete reveal on row hover, like
                         // quiet contextual controls.
                         let (rename, delete) = (bookmark.clone(), bookmark.clone());
-                        row = row.child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap(px(1.))
-                                .opacity(0.)
-                                .group_hover(group, |style| style.opacity(1.))
-                                .child(
-                                    icon_btn(("inspector-bm-rename", index), IconName::Edit)
-                                        .size(22., 11.)
-                                        .tooltip(format!("Rename {}", bookmark.name))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.start_bookmark_rename(&rename, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    icon_btn(("inspector-bm-delete", index), IconName::Trash)
-                                        .size(22., 11.)
-                                        .tooltip(format!("Delete {}", bookmark.name))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.inspector.edit = Some((
-                                                bookmark_key(&delete),
-                                                delete.name.clone(),
-                                                EditMode::Delete,
-                                            ));
-                                            this.inspector.error = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                        );
+                        actions = actions
+                            .opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                            .child(
+                                icon_btn(("inspector-bm-rename", index), IconName::Edit)
+                                    .size(22., 11.)
+                                    .tooltip(format!("Rename {}", bookmark.name))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_bookmark_rename(&rename, window, cx)
+                                    })),
+                            )
+                            .child(
+                                icon_btn(("inspector-bm-delete", index), IconName::Trash)
+                                    .size(22., 11.)
+                                    .tooltip(format!("Delete {}", bookmark.name))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.inspector.edit = Some((
+                                            bookmark_key(&delete),
+                                            delete.name.clone(),
+                                            EditMode::Delete,
+                                        ));
+                                        this.inspector.error = None;
+                                        cx.notify();
+                                    })),
+                            );
                     }
-                    card = card.child(row);
+                    card = card.child(row.child(actions));
                     continue;
                 }
             };
@@ -479,7 +469,7 @@ impl WorkbenchView {
 
         // Sections side by side when the pane is wide, stacked when the
         // split squeezes it.
-        let wide = f32::from(self.inspector.bounds.get().size.width) >= 780.;
+        let wide = self.diff_width >= 780.;
         let mut cards = div().flex().gap(px(24.));
         cards = if wide {
             cards.flex_row().items_start()
@@ -498,7 +488,7 @@ impl WorkbenchView {
                 div()
                     .id("inspector-scroll")
                     .size_full()
-                    .overflow_y_scroll()
+                    .scroll_y()
                     .track_scroll(&self.inspector.scroll)
                     .child(
                         v_flex()
@@ -543,6 +533,5 @@ impl WorkbenchView {
                     ),
             )
             .child(scrollbar("inspector-scrollbar", &self.inspector.scroll))
-            .child(bounds_probe(self.inspector.bounds.clone()))
     }
 }

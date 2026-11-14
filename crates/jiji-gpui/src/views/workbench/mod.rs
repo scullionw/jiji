@@ -33,7 +33,7 @@ use crate::logic::graph::{
 use crate::logic::inspect::{find_node, is_ancestor, stack_position, CompareMode};
 use crate::shell::Dismiss;
 use crate::store::SavedView;
-use crate::theme::theme;
+use crate::theme::{theme, RAIL_W};
 use crate::ui::{bounds_probe, PopoverState, TextInput};
 
 actions!(
@@ -137,6 +137,9 @@ pub struct WorkbenchView {
     graph_width: f32,
     resizing: bool,
     bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The diff pane's width this frame: what the change header's facts
+    /// and verbs, and the file tree, give way to.
+    diff_width: f32,
     /// The selection the scroller last brought into view.
     revealed: Option<String>,
     view_menu: ViewMenu,
@@ -276,6 +279,7 @@ impl WorkbenchView {
             graph_width,
             resizing: false,
             bounds: Rc::default(),
+            diff_width: f32::INFINITY,
             revealed: None,
             view_menu: ViewMenu {
                 popover: PopoverState::default(),
@@ -734,9 +738,19 @@ impl Render for WorkbenchView {
         if self.revealed.is_none() {
             self.sync(window, cx);
         }
-        let collapsed = self.app.read(cx).graph_collapsed;
+        let model = self.app.read(cx);
+        let collapsed = model.graph_collapsed;
+        let rail = if model.sidebar_collapsed { 0. } else { RAIL_W };
         let width = self.shown_width();
         let resizing = self.resizing;
+        // Measured from the window, not from last frame's layout, so the
+        // header's breakpoints never trail a resize.
+        let workbench = f32::from(window.viewport_size().width) - rail;
+        self.diff_width = if collapsed {
+            workbench
+        } else {
+            workbench - width - 1.
+        };
         // Rows record where they paint; last frame's places are stale.
         self.drag_frame(window, cx);
         self.drag.rows.borrow_mut().clear();

@@ -7,10 +7,11 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString, W
 use jiji_core::snapshot::RepoSnapshot;
 use jiji_forge::PrSummary;
 
-use super::{tone_color, PublishView};
+use super::PublishView;
 use crate::logic::menu::review_bookmark;
 use crate::logic::publish::{rerun_summary, review_rows};
 use crate::theme::{theme, RADIUS_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, h_flex, input::field, plan_panel, ref_label, scrollbar, tooltip, truncated, v_flex,
 };
@@ -357,7 +358,7 @@ impl PublishView {
             .id("review-list")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .scroll_y()
             .track_scroll(&self.review_scroll);
         for row in rows.iter().take(MAX_REVIEW_ROWS) {
             let pr = row.pr;
@@ -459,7 +460,7 @@ impl PublishView {
                         .flex()
                         .justify_center()
                         .text_size(px(TEXT_S))
-                        .text_color(tone_color(&t, checks.tone))
+                        .text_color(t.tone(checks.tone))
                         .tooltip(tooltip(checks.label))
                         .child(checks.glyph),
                 );

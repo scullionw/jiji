@@ -14,6 +14,8 @@ use crate::logic::conflicts::{
 };
 use crate::logic::inspect::{find_node, split_path, summary_of};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::pinned;
+use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, empty_state, h_flex, icon, scrollbar, section_header, tooltip, truncated, v_flex, IconName,
 };
@@ -506,7 +508,8 @@ impl Render for ConflictsView {
                 ))
                 .into_any_element();
         }
-        let mut column = v_flex()
+        // Block flow: see the Operations page's column.
+        let mut column = div()
             .w_full()
             .max_w(px(800.))
             .mx_auto()
@@ -522,45 +525,46 @@ impl Render for ConflictsView {
                 cx,
             ));
         for group in &groups {
-            let mut section = v_flex()
-                .mb(px(24.))
+            // The group's name stays in view while its items scroll by.
+            let heading = h_flex()
+                .gap(px(8.))
+                .pt(px(12.))
+                .pb(px(4.))
+                .bg(t.bg1)
                 .child(
-                    h_flex()
-                        .gap(px(8.))
-                        .pt(px(12.))
-                        .pb(px(4.))
-                        .child(
-                            div()
-                                .text_size(px(TEXT_S))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(t.text2)
-                                .child(group.key.title()),
-                        )
-                        .child(
-                            div()
-                                .font_family(t.mono.clone())
-                                .text_size(px(TEXT_XS))
-                                .text_color(t.text3)
-                                .child(group.items.len().to_string()),
-                        ),
+                    div()
+                        .text_size(px(TEXT_S))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text2)
+                        .child(group.key.title()),
                 )
                 .child(
                     div()
-                        .pb(px(8.))
-                        .text_size(px(TEXT_S))
+                        .font_family(t.mono.clone())
+                        .text_size(px(TEXT_XS))
                         .text_color(t.text3)
-                        .child(group.key.blurb()),
+                        .child(group.items.len().to_string()),
                 );
+            let mut section = div().child(
+                div()
+                    .pb(px(8.))
+                    .text_size(px(TEXT_S))
+                    .text_color(t.text3)
+                    .child(group.key.blurb()),
+            );
             for item in &group.items {
                 section = section.child(self.render_item(item, &snapshot, cx));
             }
-            column = column.child(section.child(div().h(px(1.)).bg(t.border2)));
+            column = column.child(div().mb(px(24.)).child(pinned(
+                heading,
+                section.child(div().h(px(1.)).bg(t.border2)),
+            )));
         }
         root.child(
             div()
                 .id("conflicts-scroll")
                 .size_full()
-                .overflow_y_scroll()
+                .scroll_y()
                 .track_scroll(&self.scroll)
                 .child(column),
         )

@@ -29,6 +29,7 @@ use crate::diff::view::DiffSurface;
 use crate::host::CommandError;
 use crate::logic::evolution::{default_span, extend_to, grow, scrub, step_to, Span};
 use crate::logic::inspect::{find_node, summary_of};
+use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_S, TEXT_XS};
 use crate::ui::{
     absolute_time, btn, empty_state, from_now, h_flex, icon, icon_btn, short_age, tooltip,
@@ -96,10 +97,6 @@ impl EvolutionState {
             timeline_scroll: ScrollHandle::new(),
         }
     }
-}
-
-fn short(id: &str) -> String {
-    id.chars().take(8).collect()
 }
 
 fn stamp(version: &EvologEntry) -> &str {
@@ -516,8 +513,8 @@ impl WorkbenchView {
                         .cursor_pointer()
                         .tooltip(tooltip(format!(
                             "What the rewrite from {} to {} changed",
-                            short(&versions[index - 1].commit_id),
-                            short(&version.commit_id)
+                            short_id(&versions[index - 1].commit_id, 8),
+                            short_id(&version.commit_id, 8).to_owned()
                         )))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.evolution.span = Some(Span {
@@ -554,7 +551,7 @@ impl WorkbenchView {
             let mut tip = vec![
                 format!(
                     "{} · version {} of {count}",
-                    short(&version.commit_id),
+                    short_id(&version.commit_id, 8),
                     index + 1
                 ),
                 match summary_of(&version.description) {
@@ -586,7 +583,7 @@ impl WorkbenchView {
                             .text_size(px(10.))
                             .text_color(if endpoint { t.text1 } else { t.text3 })
                             .child(if endpoint {
-                                short(&version.commit_id)
+                                short_id(&version.commit_id, 8).to_owned()
                             } else {
                                 short_age(stamp(version))
                             }),
@@ -637,9 +634,9 @@ impl WorkbenchView {
                     .font_family(t.mono.clone())
                     .text_size(px(TEXT_XS))
                     .text_color(t.text2)
-                    .child(short(&from.commit_id))
+                    .child(short_id(&from.commit_id, 8).to_owned())
                     .child(div().text_color(t.text3).child("→"))
-                    .child(short(&focal.commit_id)),
+                    .child(short_id(&focal.commit_id, 8).to_owned()),
             );
         if span.to - span.from > 1 {
             caption = caption.child(
@@ -708,7 +705,7 @@ impl WorkbenchView {
                             .child(truncated(format!(
                                 "Files and description return to {}; descendants rebase. Undoable \
                              from the op log.",
-                                short(&focal.commit_id)
+                                short_id(&focal.commit_id, 8)
                             ))),
                     )
                     .child(
@@ -738,8 +735,8 @@ impl WorkbenchView {
                         .disabled(acting)
                         .tooltip(format!(
                             "Restore {} to version {}",
-                            change.chars().take(4).collect::<String>(),
-                            short(&focal.commit_id)
+                            short_id(&change, 4),
+                            short_id(&focal.commit_id, 8)
                         ))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.evolution.restore_armed = true;

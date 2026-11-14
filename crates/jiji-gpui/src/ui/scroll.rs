@@ -9,7 +9,7 @@ use gpui::{
     fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Position, ScrollHandle,
-    Style, Window,
+    StatefulInteractiveElement, Style, Styled, Window,
 };
 
 use crate::theme::theme;
@@ -17,6 +17,24 @@ use crate::theme::theme;
 const TRACK_W: f32 = 10.;
 const THUMB_INSET: f32 = 3.;
 const MIN_THUMB: f32 = 28.;
+
+/// Scrolling down a list, and only down it. GPUI otherwise spends a
+/// purely sideways swipe on vertical travel, so a list would lurch when
+/// the fingers drift across it.
+pub trait ScrollY: StatefulInteractiveElement + Styled {
+    fn scroll_y(mut self) -> Self {
+        self.style().restrict_scroll_to_axis = Some(true);
+        self.overflow_y_scroll()
+    }
+}
+
+impl<E: StatefulInteractiveElement + Styled> ScrollY for E {}
+
+/// The same restraint for a `uniform_list`, which scrolls on its own.
+pub fn vertical_only<E: Styled>(mut list: E) -> E {
+    list.style().restrict_scroll_to_axis = Some(true);
+    list
+}
 
 /// A vertical overlay scrollbar for `handle`. Place it as the last child
 /// of the scroller's (relative) parent.

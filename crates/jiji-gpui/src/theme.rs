@@ -16,6 +16,7 @@ use std::rc::Rc;
 use gpui::{point, px, App, BoxShadow, Global, Hsla, Rgba, SharedString};
 
 use crate::diff::highlight::Syn;
+use crate::logic::inspect::Tone;
 
 pub const TITLEBAR_H: f32 = 32.;
 pub const STATUSBAR_H: f32 = 24.;
@@ -483,6 +484,16 @@ pub fn scheme_of(id: &str) -> Option<Scheme> {
 }
 
 impl Theme {
+    /// The color a status tone reads in.
+    pub fn tone(&self, tone: Tone) -> Hsla {
+        match tone {
+            Tone::Ok => self.ok,
+            Tone::Warn => self.warn,
+            Tone::Danger => self.danger,
+            Tone::Muted => self.text3,
+        }
+    }
+
     /// The palette named `id`; Midnight when the id is unknown.
     pub fn named(id: &str, mono: SharedString) -> Self {
         PALETTES

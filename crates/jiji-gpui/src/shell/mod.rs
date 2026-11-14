@@ -679,6 +679,7 @@ impl Render for Shell {
                 let paths = paths.paths().to_vec();
                 this.app.update(cx, |model, cx| model.open_paths(paths, cx));
             }))
+            .child(crate::ui::tooltip_guard())
             .child(self.render_topbar(window, cx))
             .child(
                 div()

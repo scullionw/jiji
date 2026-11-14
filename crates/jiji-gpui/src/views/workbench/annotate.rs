@@ -9,19 +9,25 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, AnyElement, Context, FontWeight, SharedString,
-    UniformListScrollHandle,
+    div, prelude::*, px, uniform_list, AnyElement, Context, FontWeight, ScrollWheelEvent,
+    SharedString, UniformListScrollHandle, Window,
 };
 use jiji_core::snapshot::FileAnnotation;
 
 use super::WorkbenchView;
 use crate::diff::model::LINE_H;
+use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_S, TEXT_XS};
+use crate::ui::vertical_only;
 use crate::ui::{
     from_now, h_flex, icon, icon_btn, short_age, tooltip, truncated, v_flex, IconName,
 };
 
 const GUTTER_W: f32 = 224.;
+/// The line-number column, and the room kept clear after the longest line.
+const NUMBER_W: f32 = 40.;
+const CODE_PAD_R: f32 = 16.;
+const CODE_SIZE: f32 = 12.;
 
 #[derive(Default)]
 pub(super) struct AnnotateState {
@@ -35,6 +41,8 @@ pub(super) struct AnnotateState {
     /// to read "what else came from this change" in a multi-author file.
     hover: Option<u32>,
     scroll: UniformListScrollHandle,
+    /// How far the code is panned sideways; every line rides one offset.
+    pan: f32,
 }
 
 impl WorkbenchView {
@@ -64,6 +72,7 @@ impl WorkbenchView {
         if !same_subject {
             self.annotate.data = None;
             self.annotate.hover = None;
+            self.annotate.pan = 0.;
         }
         self.annotate.key = Some(key);
         self.annotate.error = None;
@@ -105,6 +114,7 @@ impl WorkbenchView {
             return Vec::new();
         };
         let hover = self.annotate.hover;
+        let pan = self.annotate.pan;
         let tint = Theme::blend(t.accent, 0.07, t.bg1);
         let mut rows = Vec::with_capacity(range.len());
         for index in range {
@@ -212,7 +222,7 @@ impl WorkbenchView {
                 row.child(gutter)
                     .child(
                         div()
-                            .w(px(40.))
+                            .w(px(NUMBER_W))
                             .flex_shrink_0()
                             .pr(px(8.))
                             .flex()
@@ -224,17 +234,17 @@ impl WorkbenchView {
                             .child((index + 1).to_string()),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .pr(px(16.))
-                            .font_family(t.mono.clone())
-                            .text_size(px(12.))
-                            .line_height(px(LINE_H))
-                            .text_color(t.text1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(line.text.clone()),
+                        // The code cell clips; the line inside it slides.
+                        div().flex_1().min_w_0().overflow_hidden().child(
+                            div()
+                                .ml(px(-pan))
+                                .font_family(t.mono.clone())
+                                .text_size(px(CODE_SIZE))
+                                .line_height(px(LINE_H))
+                                .text_color(t.text1)
+                                .whitespace_nowrap()
+                                .child(line.text.clone()),
+                        ),
                     )
                     .into_any_element(),
             );
@@ -242,7 +252,11 @@ impl WorkbenchView {
         rows
     }
 
-    pub(super) fn render_annotate(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_annotate(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let t = theme(cx);
         let (change, path) = self.app.read(cx).ui().annotate.clone()?;
         // Only an answer for the shown subject renders.
@@ -321,27 +335,53 @@ impl WorkbenchView {
         };
         let body = match (&view, &self.annotate.error) {
             (Some(view), _) if view.lines.is_empty() => note(
-                format!(
-                    "This file is empty in {}.",
-                    change.chars().take(8).collect::<String>()
-                ),
+                format!("This file is empty in {}.", short_id(&change, 8).to_owned()),
                 t.text3,
             )
             .italic()
             .into_any_element(),
             (Some(view), _) => {
-                let mut body = v_flex().flex_1().min_h_0().child(
-                    uniform_list(
-                        "annotate-lines",
-                        view.lines.len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            this.annotate_rows(range, cx)
-                        }),
-                    )
-                    .track_scroll(self.annotate.scroll.clone())
+                // Long lines pan sideways together. The widest line sets
+                // the travel; the list itself only ever scrolls down.
+                let longest = view
+                    .lines
+                    .iter()
+                    .map(|line| line.text.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let advance =
+                    crate::ui::text_width_in("0", &t.mono, CODE_SIZE, FontWeight::NORMAL, window);
+                let room = (self.diff_width - GUTTER_W - NUMBER_W).max(0.);
+                let max_pan = (longest as f32 * advance + CODE_PAD_R - room).max(0.);
+                self.annotate.pan = self.annotate.pan.clamp(0., max_pan);
+                let mut body = v_flex()
                     .flex_1()
-                    .min_h_0(),
-                );
+                    .min_h_0()
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        let delta = event.delta.pixel_delta(px(LINE_H * 2.5));
+                        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+                        if dx.abs() <= dy.abs() {
+                            return;
+                        }
+                        let pan = (this.annotate.pan - dx).clamp(0., max_pan);
+                        if pan != this.annotate.pan {
+                            this.annotate.pan = pan;
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        vertical_only(uniform_list(
+                            "annotate-lines",
+                            view.lines.len(),
+                            cx.processor(|this, range: Range<usize>, _, cx| {
+                                this.annotate_rows(range, cx)
+                            }),
+                        ))
+                        .track_scroll(self.annotate.scroll.clone())
+                        .flex_1()
+                        .min_h_0(),
+                    );
                 if view.truncated {
                     body = body.child(
                         note(

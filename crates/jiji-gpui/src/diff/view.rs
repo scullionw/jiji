@@ -230,6 +230,8 @@ pub struct DiffSurface {
     /// The file header under the pointer, and whether the pointer is on
     /// its Resolve button.
     header_hover: Option<(usize, bool)>,
+    /// The file under the pointer: the one whose sideways thumb shows.
+    pointer_file: Option<usize>,
     axis: Option<Axis>,
     metrics: Option<Metrics>,
     /// The palette the cached shapes were colored for.
@@ -272,6 +274,7 @@ impl DiffSurface {
             drag: Drag::None,
             thumb_hover: false,
             header_hover: None,
+            pointer_file: None,
             axis: None,
             metrics: None,
             shaped_for: "",
@@ -692,9 +695,23 @@ impl DiffSurface {
         self.scroll_y -= dy;
         self.clamp_scroll();
         self.set_pan(file, before.1 - dx);
-        if before != (self.scroll_y, self.pan_of(file)) {
+        // The rows moved under a still pointer: it may be over another
+        // file now.
+        let pointer_file = self.file_at(f32::from(event.position.y));
+        if before != (self.scroll_y, self.pan_of(file)) || pointer_file != self.pointer_file {
+            self.pointer_file = pointer_file;
             cx.notify();
         }
+    }
+
+    /// The file whose rows sit at window height `y`.
+    fn file_at(&self, y: f32) -> Option<usize> {
+        let geo = self.geo?;
+        let layout = self.layout();
+        if layout.file_rows.is_empty() || y < geo.top || y > geo.bottom {
+            return None;
+        }
+        Some(layout.file_of(layout.row_at(y - geo.top + self.scroll_y)))
     }
 
     fn thumb(&self) -> Option<(f32, f32)> {
@@ -913,6 +930,13 @@ impl DiffSurface {
             self.header_hover = header;
             cx.notify();
         }
+        let pointer_file = inside
+            .then(|| self.file_at(f32::from(event.position.y)))
+            .flatten();
+        if pointer_file != self.pointer_file {
+            self.pointer_file = pointer_file;
+            cx.notify();
+        }
         match self.drag {
             Drag::Select if held => {
                 if let Some(mut selection) = self.selection {
@@ -1072,6 +1096,14 @@ impl DiffSurface {
         let thumb_hot = self.thumb_hover || matches!(self.drag, Drag::Thumb(_));
         let theme = &*theme;
         let header_hover = self.header_hover;
+        // Read where the pointer is now rather than where it last moved:
+        // the rows shift under a still pointer when a tray opens above.
+        let mouse = window.mouse_position();
+        self.pointer_file = bounds
+            .contains(&mouse)
+            .then(|| self.file_at(f32::from(mouse.y)))
+            .flatten();
+        let pointer_file = self.pointer_file;
         let stale = self.stale;
         let resolve = self.resolve.clone();
         let collapsed = self.collapsed.clone();
@@ -1570,10 +1602,11 @@ impl DiffSurface {
                 BorderStyle::default(),
             ));
         }
-        // A horizontal thumb for each visible file that pans, one per code
-        // column (both panes of the split ride the file's one offset). It
-        // rides the bottom of the viewport while the file passes and rests
-        // on the file's own end when that comes first.
+        // A horizontal thumb for the file under the pointer when it pans,
+        // one per code column (both panes of the split ride the file's one
+        // offset). It rides the bottom of the viewport while the file
+        // passes and rests on the file's own end when that comes first.
+        // The other files keep their last line clear.
         let tracks: &[(f32, f32)] = if split {
             &[
                 (geo.left_code, geo.mid),
@@ -1587,6 +1620,9 @@ impl DiffSurface {
                 continue;
             }
             let file = first_file + offset;
+            if pointer_file != Some(file) {
+                continue;
+            }
             let seat = (geo.top + layout.file_bottom(file) - scroll).min(geo.bottom);
             let body_top =
                 (geo.top + layout.file_top(file) - scroll + HEADER_H).max(geo.top + HEADER_H);

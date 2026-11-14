@@ -12,11 +12,14 @@ use jiji_core::snapshot::{OpEffectKind, OperationItem};
 use super::ConfirmPlan;
 use crate::app::{app, AppModel};
 use crate::logic::ops::{clock_time, group_operations, is_root_op, now, ops_since, TimelineRow};
+use crate::logic::text::short_id;
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::pinned;
+use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, consequences, h_flex, icon, plan_actions, plan_panel, plan_title, scrollbar,
-    section_header, tooltip, truncated, v_flex, IconName,
+    section_header, tooltip, truncated, v_flex, wrapped, IconName,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,10 +296,11 @@ impl OperationsView {
                 .into_any_element()
         };
 
-        // One line: a wrapping description next to the row's spacer would
-        // be squeezed to nothing. The full text is a hover away.
+        // The whole description, on as many lines as it needs. (A flex
+        // box of its own, so the paragraph inside is handed the width it
+        // must wrap to.)
         let mut desc = div()
-            .id(("op-desc", index))
+            .flex()
             .min_w(px(40.))
             .flex_shrink()
             .text_size(px(TEXT_M))
@@ -314,9 +318,7 @@ impl OperationsView {
             if quiet {
                 desc = desc.text_color(t.text3);
             }
-            desc = desc
-                .tooltip(tooltip(op.description.clone()))
-                .child(truncated(op.description.clone()));
+            desc = desc.child(wrapped(op.description.clone()));
         }
         let mut head = h_flex().gap(px(8.)).min_w_0().min_h(px(22.)).child(desc);
         if op.is_current {
@@ -376,11 +378,10 @@ impl OperationsView {
             head = head.child(actions);
         }
 
-        // One line, clipped: a wrapping row here makes the layout engine
-        // size the whole column at its narrowest.
         let mut meta = h_flex()
-            .overflow_hidden()
-            .gap(px(8.))
+            .flex_wrap()
+            .gap_x(px(8.))
+            .gap_y(px(3.))
             .mt(px(if quiet { 0. } else { 1. }))
             .text_size(px(TEXT_S))
             .text_color(t.text3)
@@ -390,7 +391,7 @@ impl OperationsView {
                     .font_family(t.mono.clone())
                     .text_color(t.text2)
                     .tooltip(tooltip(op.id.clone()))
-                    .child(op.id.chars().take(8).collect::<String>()),
+                    .child(short_id(&op.id, 8).to_owned()),
             )
             .child(
                 div()
@@ -471,7 +472,12 @@ impl Render for OperationsView {
         };
         let ops = &snapshot.operations;
         let groups = group_operations(ops, now());
-        let mut column = v_flex()
+        // Block flow, not a flex column: a flex column asked for its
+        // height sizes each row before stretching it to the column's
+        // width, so a row whose text wraps would be measured unwrapped
+        // and then squeezed, and a group would sit at its content's
+        // width instead of the page's.
+        let mut column = div()
             .w_full()
             .max_w(px(800.))
             .mx_auto()
@@ -488,27 +494,28 @@ impl Render for OperationsView {
             ));
         let mut index = 0;
         for group in &groups {
-            column = column.child(
-                h_flex()
-                    .gap(px(12.))
-                    .pt(px(12.))
-                    .pb(px(4.))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(TEXT_S))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text2)
-                            .child(group.label.clone()),
-                    )
-                    .child(div().flex_1().h(px(1.)).bg(t.border2)),
-            );
+            // The day stays in view while its operations scroll under it.
+            let heading = h_flex()
+                .gap(px(12.))
+                .pt(px(12.))
+                .pb(px(4.))
+                .bg(t.bg1)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(TEXT_S))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.text2)
+                        .child(group.label.clone()),
+                )
+                .child(div().flex_1().h(px(1.)).bg(t.border2));
+            let mut day = div();
             let last = group.rows.len().saturating_sub(1);
             for (i, row) in group.rows.iter().enumerate() {
                 let (up, down) = (i > 0, i < last);
                 match row {
                     TimelineRow::Op(op) => {
-                        column = column.child(self.render_op(op, index, (up, down), ops, cx));
+                        day = day.child(self.render_op(op, index, (up, down), ops, cx));
                         index += 1;
                     }
                     TimelineRow::Snapshots(run) => {
@@ -524,7 +531,7 @@ impl Render for OperationsView {
                             .text_color(t.text3)
                             .child("~")
                             .into_any_element();
-                        column = column.child(
+                        day = day.child(
                             div()
                                 .id(SharedString::from(format!("op-run-{key}")))
                                 .flex()
@@ -561,8 +568,7 @@ impl Render for OperationsView {
                         if expanded {
                             for (j, op) in run.iter().enumerate() {
                                 let below = j < run.len() - 1 || down;
-                                column =
-                                    column.child(self.render_op(op, index, (true, below), ops, cx));
+                                day = day.child(self.render_op(op, index, (true, below), ops, cx));
                                 index += 1;
                             }
                         } else {
@@ -571,6 +577,7 @@ impl Render for OperationsView {
                     }
                 }
             }
+            column = column.child(pinned(heading, day));
         }
         if ops.len() >= 50 {
             column = column.child(
@@ -598,7 +605,7 @@ impl Render for OperationsView {
             div()
                 .id("operations-scroll")
                 .size_full()
-                .overflow_y_scroll()
+                .scroll_y()
                 .track_scroll(&self.scroll)
                 .child(column),
         )

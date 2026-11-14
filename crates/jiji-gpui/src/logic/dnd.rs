@@ -10,6 +10,7 @@
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot};
 
 use super::inspect::{descendants_of, find_node};
+use crate::logic::text::{counted, short_id};
 
 /// Which backend call a drop makes: with descendants, or only this change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,14 +45,6 @@ impl DropPlan {
 /// exactly how a mutation picks one side deliberately.
 pub fn can_drag(node: &GraphNode) -> bool {
     node.kind != NodeKind::Immutable
-}
-
-fn short(id: &str) -> &str {
-    &id[..id.len().min(4)]
-}
-
-fn plural(count: usize, word: &str) -> String {
-    format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 
 /// The changes a drop would rewrite: the source, plus its descendants when
@@ -101,15 +94,15 @@ pub fn plan_drop(
     if sole_parent && op == DropOp::Rebase {
         return DropPlan::Refused(format!(
             "Already the parent of {} — nothing would move",
-            short(&source.id)
+            short_id(&source.id, 4)
         ));
     }
 
-    let dest = short(&target.id);
+    let dest = short_id(&target.id, 4);
     let parents_label = source
         .parents
         .iter()
-        .map(|id| short(id))
+        .map(|id| short_id(id, 4))
         .collect::<Vec<_>>()
         .join(", ");
     let is_child_target = target.parents.contains(&source.id);
@@ -120,13 +113,13 @@ pub fn plan_drop(
         } else {
             format!(
                 "Rebase onto {dest} — with {}",
-                plural(descendants.len(), "descendant")
+                counted(descendants.len(), "descendant")
             )
         }
     } else if sole_parent {
         format!(
             "Extract {} — its descendants skip past it",
-            short(&source.id)
+            short_id(&source.id, 4)
         )
     } else if is_child_target {
         format!("Move onto {dest} — swapping their order")
@@ -146,12 +139,12 @@ pub fn plan_drop(
         consequences.push(if sole_parent {
             format!(
                 "It stays on {parents_label}; {} reparent onto {parents_label}.",
-                plural(descendants.len(), "descendant")
+                counted(descendants.len(), "descendant")
             )
         } else {
             format!(
                 "{} stay{} behind, reparented onto {parents_label}.",
-                plural(descendants.len(), "descendant"),
+                counted(descendants.len(), "descendant"),
                 if descendants.len() == 1 { "s" } else { "" }
             )
         });

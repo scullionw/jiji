@@ -5,6 +5,7 @@ use gpui::{div, prelude::*, px, Context, Entity, FontWeight, Render, ScrollHandl
 
 use crate::app::{app, AppModel};
 use crate::theme::{theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS};
+use crate::ui::ScrollY as _;
 use crate::ui::{btn, h_flex, icon, kbd, scrollbar, tooltip, v_flex, IconName};
 
 pub struct WelcomeView {
@@ -373,7 +374,7 @@ impl Render for WelcomeView {
                 div()
                     .id("welcome-scroll")
                     .size_full()
-                    .overflow_y_scroll()
+                    .scroll_y()
                     .track_scroll(&self.scroll)
                     .child(
                         v_flex()
