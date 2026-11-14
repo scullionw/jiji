@@ -1,12 +1,15 @@
 //! The welcome screen: an empty tab. Open a repository, pick a recent one,
 //! or install the terminal launcher.
 
-use gpui::{div, prelude::*, px, Context, Entity, FontWeight, Render, ScrollHandle, Window};
+use gpui::{
+    canvas, div, fill, point, prelude::*, px, quad, BorderStyle, Bounds, Context, Entity,
+    FontWeight, Hsla, PathBuilder, Pixels, Point, Render, ScrollHandle, Window,
+};
 
 use crate::app::{app, AppModel};
 use crate::theme::{
-    theme, RADIUS_L, RADIUS_M, RADIUS_S, STATUSBAR_H, TEXT_L, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS,
-    TITLEBAR_H,
+    theme, Theme, RADIUS_L, RADIUS_M, RADIUS_S, STATUSBAR_H, TEXT_L, TEXT_M, TEXT_S, TEXT_XL,
+    TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::ScrollY as _;
 use crate::ui::{
@@ -37,6 +40,136 @@ fn short_path(path: &str) -> String {
         }
     }
     path.to_owned()
+}
+
+/// The map the app draws, told left to right: a trunk of history, one
+/// line that branched and landed, the working line with you on it, and one
+/// more under way. Drawn in the palette's own lane hues.
+fn transit_map(t: &Theme) -> impl IntoElement {
+    const W: f32 = 640.;
+    const H: f32 = 132.;
+    let trunk = Theme::blend(t.text3, 0.7, t.bg1);
+    let (landed, working, other) = (t.lane(1), t.lane(0), t.lane(4));
+    let (wc, bg) = (t.working_copy, t.bg1);
+    canvas(
+        |_, _, _| (),
+        move |bounds: Bounds<Pixels>, (), window, _| {
+            let o = bounds.origin;
+            let at = |x: f32, y: f32| -> Point<Pixels> { point(o.x + px(x), o.y + px(y)) };
+            let line = |window: &mut Window, color: Hsla, dashed: bool, points: &[(f32, f32)]| {
+                let mut builder = PathBuilder::stroke(px(3.));
+                if dashed {
+                    builder = builder.dash_array(&[px(3.), px(4.)]);
+                }
+                builder.move_to(at(points[0].0, points[0].1));
+                for pair in points[1..].chunks(1) {
+                    builder.line_to(at(pair[0].0, pair[0].1));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            // An S-bend between two tracks, as the graph draws lane changes.
+            let bend = |window: &mut Window, color: Hsla, from: (f32, f32), to: (f32, f32)| {
+                let mid = (from.0 + to.0) / 2.;
+                let mut builder = PathBuilder::stroke(px(3.));
+                builder.move_to(at(from.0, from.1));
+                builder.cubic_bezier_to(at(to.0, to.1), at(mid, from.1), at(mid, to.1));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            let station = |window: &mut Window, color: Hsla, x: f32, y: f32| {
+                let r = 6.;
+                window.paint_quad(quad(
+                    Bounds::from_corners(at(x - r, y - r), at(x + r, y + r)),
+                    px(r),
+                    bg,
+                    px(2.5),
+                    color,
+                    BorderStyle::Solid,
+                ));
+            };
+            let diamond = |window: &mut Window, x: f32, y: f32| {
+                let d = 6.;
+                let mut builder = PathBuilder::fill();
+                builder.move_to(at(x, y - d));
+                builder.line_to(at(x + d, y));
+                builder.line_to(at(x, y + d));
+                builder.line_to(at(x - d, y));
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, trunk);
+                }
+            };
+            let (base, mid_track, top_track) = (112., 72., 28.);
+
+            // The trunk, its far history and its future dashed.
+            line(window, trunk, true, &[(0., base), (36., base)]);
+            line(window, trunk, false, &[(36., base), (W - 36., base)]);
+            line(window, trunk, true, &[(W - 36., base), (W, base)]);
+
+            // A line that branched and landed.
+            bend(window, landed, (104., base), (158., mid_track));
+            line(
+                window,
+                landed,
+                false,
+                &[(158., mid_track), (290., mid_track)],
+            );
+            bend(window, landed, (290., mid_track), (344., base));
+            // The working line: you are at its head.
+            bend(window, working, (236., base), (290., top_track));
+            line(
+                window,
+                working,
+                false,
+                &[(290., top_track), (484., top_track)],
+            );
+            // One more under way.
+            bend(window, other, (404., base), (458., mid_track));
+            line(
+                window,
+                other,
+                false,
+                &[(458., mid_track), (530., mid_track)],
+            );
+
+            for x in [104., 236., 344., 404., 560.] {
+                diamond(window, x, base);
+            }
+            for x in [184., 226.] {
+                station(window, landed, x, mid_track);
+            }
+            for x in [316., 372., 428.] {
+                station(window, working, x, top_track);
+            }
+            for x in [484., 530.] {
+                station(window, other, x, mid_track);
+            }
+            // You are here.
+            let (x, y) = (484., top_track);
+            let r = 7.5;
+            window.paint_quad(quad(
+                Bounds::from_corners(at(x - r, y - r), at(x + r, y + r)),
+                px(r),
+                bg,
+                px(2.5),
+                wc,
+                BorderStyle::Solid,
+            ));
+            window.paint_quad(
+                fill(
+                    Bounds::from_corners(at(x - 3.5, y - 3.5), at(x + 3.5, y + 3.5)),
+                    wc,
+                )
+                .corner_radii(px(3.5)),
+            );
+        },
+    )
+    .w(px(W))
+    .h(px(H))
+    .flex_shrink_0()
 }
 
 /// "just now", "5m ago", "3h ago", "2d ago" for a unix-ms instant.
@@ -81,34 +214,36 @@ impl Render for WelcomeView {
         let open_app = self.app.clone();
         let palette_app = self.app.clone();
         let mut stage = v_flex()
-            .w(px(600.))
+            .w(px(640.))
             .max_w_full()
             .gap(px(24.))
             .px(px(24.))
-            .pt(px(32.))
+            .pt(px(24.))
             .pb(px(96.))
+            .child(transit_map(&t))
             .child(
-                v_flex()
-                    .gap(px(14.))
+                h_flex()
+                    .gap(px(16.))
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
                             .justify_center()
-                            .size(px(48.))
-                            .rounded(px(12.))
+                            .size(px(52.))
+                            .rounded(px(13.))
                             .bg(t.bg2)
                             .border_1()
                             .border_color(t.border1)
-                            .child(icon(IconName::Logo, 30., t.accent_strong)),
+                            .child(icon(IconName::Logo, 32., t.accent_strong)),
                     )
                     .child(
                         v_flex()
-                            .gap(px(4.))
+                            .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(TEXT_XL + 6.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(TEXT_XL + 8.))
+                                    .font_weight(FontWeight::BOLD)
                                     .line_height(gpui::relative(1.15))
                                     .child("Jiji"),
                             )
@@ -179,10 +314,10 @@ impl Render for WelcomeView {
                 let row = h_flex()
                     .id(("recent", ix))
                     .group(group.clone())
-                    .h(px(32.))
+                    .h(px(36.))
                     .pl(px(10.))
                     .pr(px(4.))
-                    .gap(px(10.))
+                    .gap(px(12.))
                     .rounded(px(RADIUS_M))
                     .cursor_pointer()
                     .hover(|style| style.bg(t.bg_hover))
@@ -190,10 +325,16 @@ impl Render for WelcomeView {
                         let path = open_path.clone();
                         open_app.update(cx, |m, cx| m.open_repo_at(path, cx))
                     })
-                    .child(
-                        icon(IconName::Folder, 14., t.text3)
-                            .group_hover(group.clone(), |style| style.text_color(t.accent_strong)),
-                    )
+                    .child(crate::ui::monogram(
+                        &repo.name,
+                        &crate::ui::initials(&repo.name)
+                            .chars()
+                            .take(1)
+                            .collect::<String>(),
+                        20.,
+                        false,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex_shrink_0()

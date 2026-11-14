@@ -11,10 +11,10 @@
 //! at 8:1 or better, text3 at 5.5:1 or better), so text3 is the quiet step,
 //! never a faded one.
 //!
-//! What is current carries a two-pixel accent bar — the section in the
-//! rail, the repo's tab, the selected row — and sits on a neutral fill
-//! (`selected`), so hue stays free to mean something: a lane, a status, a
-//! diff side.
+//! bg0 is a clear step below bg1, so the frame reads as a frame around the
+//! work. Hue is identity: six lane hues name workstreams (and, through
+//! [`Theme::identity`], repositories and authors), status hues name
+//! states, file hues name languages. Surfaces stay neutral.
 
 use std::rc::Rc;
 
@@ -54,6 +54,7 @@ pub enum Scheme {
 #[derive(Clone)]
 pub struct Theme {
     pub id: &'static str,
+    pub scheme: Scheme,
 
     pub bg0: Hsla,
     pub bg1: Hsla,
@@ -170,10 +171,10 @@ const PALETTES: [Pal; 10] = [
         id: "midnight",
         label: "Midnight",
         scheme: Scheme::Dark,
-        bg: [0x101115, 0x15161b, 0x1b1c22, 0x24252d],
+        bg: [0x0c0d10, 0x17181d, 0x1e1f25, 0x272830],
         hover: (0xffffff, 0.045),
         border: (0xffffff, 0.125, 0.084),
-        text: [0xe9eaf0, 0xafb2bf, 0x9093a0],
+        text: [0xeceef3, 0xb3b6c3, 0x9599a6],
         accent: 0x7078ee,
         accent_strong: 0xa6abff,
         accent_dim: 0.17,
@@ -189,7 +190,7 @@ const PALETTES: [Pal; 10] = [
         id: "graphite",
         label: "Graphite",
         scheme: Scheme::Dark,
-        bg: [0x111111, 0x171717, 0x1d1d1d, 0x272727],
+        bg: [0x0d0d0d, 0x171717, 0x1d1d1d, 0x272727],
         hover: (0xffffff, 0.045),
         border: (0xffffff, 0.138, 0.091),
         text: [0xececec, 0xb3b3b3, 0x949494],
@@ -208,7 +209,7 @@ const PALETTES: [Pal; 10] = [
         id: "abyss",
         label: "Abyss",
         scheme: Scheme::Dark,
-        bg: [0x0a0f1a, 0x0e1422, 0x131a2a, 0x1a2336],
+        bg: [0x070b13, 0x0e1422, 0x131a2a, 0x1a2336],
         hover: (0x8cb4ff, 0.055),
         border: (0xa0beff, 0.163, 0.105),
         text: [0xdde6f5, 0xa2b1cb, 0x8492ab],
@@ -227,7 +228,7 @@ const PALETTES: [Pal; 10] = [
         id: "moss",
         label: "Moss",
         scheme: Scheme::Dark,
-        bg: [0x0c110d, 0x111713, 0x161e18, 0x1e2821],
+        bg: [0x090d0a, 0x111713, 0x161e18, 0x1e2821],
         hover: (0xbee6c8, 0.045),
         border: (0xbee6c8, 0.138, 0.091),
         text: [0xe3ebe3, 0xa8b6a9, 0x889788],
@@ -246,7 +247,7 @@ const PALETTES: [Pal; 10] = [
         id: "ember",
         label: "Ember",
         scheme: Scheme::Dark,
-        bg: [0x120f0e, 0x181413, 0x1f1a18, 0x29221f],
+        bg: [0x0d0b0a, 0x181413, 0x1f1a18, 0x29221f],
         hover: (0xffdcb4, 0.045),
         border: (0xffdcb4, 0.125, 0.084),
         text: [0xede7df, 0xbbafa3, 0x9b9085],
@@ -265,10 +266,10 @@ const PALETTES: [Pal; 10] = [
         id: "paper",
         label: "Paper",
         scheme: Scheme::Light,
-        bg: [0xf0f0f3, 0xfcfcfd, 0xffffff, 0xffffff],
+        bg: [0xeeeef2, 0xffffff, 0xffffff, 0xffffff],
         hover: (0x141628, 0.045),
         border: (0x141628, 0.154, 0.096),
-        text: [0x1b1c22, 0x454851, 0x5d606a],
+        text: [0x1b1c22, 0x42454e, 0x595c66],
         accent: 0x4e54d6,
         accent_strong: 0x3b40c2,
         accent_dim: 0.10,
@@ -395,27 +396,30 @@ impl Pal {
                 hex(0x814e11),
             ]
         };
+        // Lines on a transit map: six hues of one weight, none of them the
+        // working copy's green or a conflict's red.
         let lanes = if dark {
             [
                 hex(self.accent),
-                hex(0x58a8e4),
-                hex(0xc286d8),
-                hex(0xe07c9f),
-                hex(0x55b98a),
-                hex(0xcf9f55),
+                hex(0x4aa8f0),
+                hex(0xc07cf0),
+                hex(0xf06f9c),
+                hex(0xe9a23b),
+                hex(0x93c94a),
             ]
         } else {
             [
                 hex(self.accent),
-                hex(0x1f78c0),
-                hex(0x9544b3),
-                hex(0xc23a76),
-                hex(0x24875a),
-                hex(0x96690f),
+                hex(0x1a7cc4),
+                hex(0x9442c4),
+                hex(0xc8336c),
+                hex(0x9a6a00),
+                hex(0x4f8a12),
             ]
         };
         Theme {
             id: self.id,
+            scheme: self.scheme,
             bg0: hex(bg0),
             bg1: hex(bg1),
             bg2: hex(bg2),
@@ -539,6 +543,16 @@ impl Theme {
         self.lanes[slot % self.lanes.len()]
     }
 
+    /// A stable hue for a name — a repository, an author — drawn from the
+    /// lane set so identity colors and lines read as one family.
+    pub fn identity(&self, key: &str) -> Hsla {
+        self.lane(identity_slot(key))
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.scheme == Scheme::Dark
+    }
+
     /// The one shadow: floating surfaces only.
     pub fn popover_shadow(&self) -> Vec<BoxShadow> {
         let (rgb, strong, soft) = self.shadow;
@@ -576,6 +590,62 @@ impl Theme {
             a: 1.,
         }
         .into()
+    }
+}
+
+/// FNV-1a over the name's bytes: the same name lands on the same slot on
+/// every run and every machine.
+pub fn identity_slot(key: &str) -> usize {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in key.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash as usize
+}
+
+/// A file's language family, for the hue its icon wears. The hues follow
+/// the colors these languages are known by (GitHub's linguist set), each
+/// pitched for the scheme.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileHue {
+    Rust,
+    TypeScript,
+    JavaScript,
+    Svelte,
+    Markup,
+    Style,
+    Data,
+    Config,
+    Docs,
+    Python,
+    Go,
+    Shell,
+    Native,
+    Image,
+    Muted,
+}
+
+impl Theme {
+    pub fn file_hue(&self, hue: FileHue) -> Hsla {
+        let (dark, light) = match hue {
+            FileHue::Rust => (0xe59a6b, 0xa8501c),
+            FileHue::TypeScript => (0x5aa2f0, 0x2766b0),
+            FileHue::JavaScript => (0xe2c24e, 0x8a6d00),
+            FileHue::Svelte => (0xf47a52, 0xc4421a),
+            FileHue::Markup => (0xec8458, 0xb34a1c),
+            FileHue::Style => (0xb08cf0, 0x7044b8),
+            FileHue::Data => (0xd8b45a, 0x8a6a00),
+            FileHue::Config => (0x9aa7b8, 0x56606e),
+            FileHue::Docs => (0x82abdc, 0x40669a),
+            FileHue::Python => (0x6aaee6, 0x2e6ca4),
+            FileHue::Go => (0x5ccbe0, 0x0b7c99),
+            FileHue::Shell => (0x8fcf6c, 0x3f7f22),
+            FileHue::Native => (0x8aa6e6, 0x3d5fa8),
+            FileHue::Image => (0xd38bd8, 0x93408f),
+            FileHue::Muted => return self.text3,
+        };
+        hex(if self.is_dark() { dark } else { light })
     }
 }
 

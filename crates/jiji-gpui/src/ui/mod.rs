@@ -3,8 +3,10 @@
 //! Views add layout; they don't restyle the material.
 
 mod button;
+mod files;
 pub mod icon;
 pub mod input;
+mod marks;
 mod page;
 mod pinned;
 mod popover;
@@ -20,11 +22,13 @@ use std::sync::Arc;
 use gpui::{div, prelude::*, px, App, Div, FontFeatures, Hsla};
 
 pub use self::button::{btn, checkbox, icon_btn, kbd, segmented, Btn};
+pub use self::files::{file_glyph, file_icon};
 pub use self::icon::{icon, IconName};
 pub use self::input::{InputEvent, TextInput};
+pub use self::marks::{line_of, mark_for, node_mark, Mark};
 pub use self::page::{
-    all_clear, consequences, empty_state, group_head, page_bar, page_filter, page_notice,
-    plan_actions, plan_panel, plan_title, tray, PAGE_PAD,
+    all_clear, consequences, empty_state, group_head, page_bar, page_bar_marked, page_filter,
+    page_notice, plan_actions, plan_panel, plan_title, tray, PAGE_PAD,
 };
 pub use self::pinned::pinned;
 pub use self::popover::{menu_label, menu_row, popover, popover_layer, PopoverState};
@@ -77,6 +81,77 @@ pub fn lead_bar(cx: &App) -> Div {
         .bg(theme(cx).accent)
 }
 
+/// The same mark in a hue of its own: a workstream's lane, say.
+pub fn lead_bar_in(color: Hsla) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(2.))
+        .bg(color)
+}
+
+/// Up to two letters that stand for a name: "William Scullion" → "WS",
+/// "jiji" → "J".
+pub fn initials(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| c.is_whitespace() || c == '@' || c == '-' || c == '_' || c == '.')
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .collect();
+    let first = |word: &str| {
+        word.chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().collect::<String>())
+            .unwrap_or_default()
+    };
+    match words.as_slice() {
+        [] => "·".to_owned(),
+        // An email or a handle stands for one person: one letter.
+        [only] => first(only),
+        [head, ..] if name.contains('@') => first(head),
+        [head, .., last] => format!("{}{}", first(head), first(last)),
+    }
+}
+
+/// A name's tile: its initials on a tint of its identity hue. Square-ish
+/// for a repository, round for a person.
+pub fn monogram(key: &str, letters: &str, size: f32, round: bool, cx: &App) -> Div {
+    let t = theme(cx);
+    let hue = t.identity(key);
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded(px(if round {
+            size / 2.
+        } else {
+            (size / 4.).round()
+        }))
+        .bg(crate::theme::Theme::fade(
+            hue,
+            if t.is_dark() { 0.2 } else { 0.14 },
+        ))
+        .text_color(hue)
+        .text_size(px((size * 0.58).round()))
+        .line_height(px(size))
+        .font_weight(gpui::FontWeight::BOLD)
+        .child(letters.to_owned())
+}
+
+/// A station: the graph's change marker, a ring in its line's hue, for
+/// places outside the graph that point at a change on a line.
+pub fn station(color: Hsla, size: f32) -> Div {
+    div()
+        .flex_shrink_0()
+        .size(px(size))
+        .rounded(px(size / 2.))
+        .border_2()
+        .border_color(color)
+}
+
 /// A small status dot.
 pub fn dot(color: Hsla, size: f32) -> Div {
     div()
@@ -94,4 +169,19 @@ pub fn bounds_probe(
     gpui::canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {})
         .absolute()
         .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initials;
+
+    #[test]
+    fn initials_stand_for_a_name() {
+        assert_eq!(initials("William Scullion"), "WS");
+        assert_eq!(initials("jiji"), "J");
+        assert_eq!(initials("Ada King Lovelace"), "AL");
+        assert_eq!(initials("lauf@example.com"), "L");
+        assert_eq!(initials("jj-lander"), "JL");
+        assert_eq!(initials("  "), "·");
+    }
 }

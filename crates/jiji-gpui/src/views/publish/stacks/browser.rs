@@ -10,7 +10,8 @@ use crate::logic::text::plural_s;
 use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    dot, h_flex, icon, kbd, lead_bar, scrollbar, tooltip, truncated, v_flex, IconName, Tabular as _,
+    dot, h_flex, icon, kbd, lead_bar, node_mark, scrollbar, tooltip, truncated, v_flex, IconName,
+    Mark, Tabular as _,
 };
 use crate::views::publish::PublishView;
 
@@ -24,7 +25,27 @@ impl PublishView {
         let (label, tone) = stack_summary(stack.status);
         let selected = self.selected.as_deref() == Some(&stack.key);
         let key = stack.key.clone();
-        let mut title = h_flex().gap(px(6.)).min_w_0().child(
+        // The stack is a line on the graph: it wears that line's hue here,
+        // on its station and, while chosen, across its row.
+        let line = self
+            .snapshot
+            .as_deref()
+            .zip(stack.head_change.as_deref())
+            .and_then(|(snapshot, head)| crate::ui::line_of(snapshot, head, &t));
+        let hue = line.unwrap_or(t.text3);
+        let mark = div()
+            .id(SharedString::from(format!("mark-{}", stack.key)))
+            .w(px(12.))
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .when(stack.is_active, |el| el.tooltip(tooltip("Current stack")))
+            .child(if stack.is_active {
+                node_mark(Mark::WorkingCopy, t.working_copy, 11.).into_any_element()
+            } else {
+                node_mark(Mark::Station { filled: selected }, hue, 10.).into_any_element()
+            });
+        let title = h_flex().gap(px(6.)).min_w_0().child(
             div()
                 .min_w_0()
                 .flex_shrink()
@@ -32,14 +53,6 @@ impl PublishView {
                 .text_color(t.text1)
                 .child(truncated(stack.title.clone())),
         );
-        if stack.is_active {
-            title = title.child(
-                div()
-                    .id(SharedString::from(format!("current-{}", stack.key)))
-                    .tooltip(tooltip("Current stack"))
-                    .child(dot(t.working_copy, 6.)),
-            );
-        }
         let count = if stack.pr_count > 0 {
             format!("{} PR{}", stack.pr_count, plural_s(stack.pr_count as usize))
         } else {
@@ -58,9 +71,10 @@ impl PublishView {
                 .relative()
                 .flex_shrink_0()
                 .h(px(30.))
-                .gap(px(10.))
-                .pl(px(16.))
+                .gap(px(9.))
+                .pl(px(12.))
                 .pr(px(14.))
+                .child(mark)
                 .child(title.flex_1())
                 .child(
                     div()
@@ -72,28 +86,40 @@ impl PublishView {
                 )
                 .tooltip(tooltip(count))
         } else {
-            v_flex()
+            h_flex()
                 .id(id)
                 .relative()
                 .flex_shrink_0()
+                .items_start()
+                .gap(px(9.))
                 .py(px(7.))
-                .pl(px(16.))
+                .pl(px(12.))
                 .pr(px(12.))
-                .child(title)
+                .child(mark.mt(px(3.)))
                 .child(
-                    h_flex()
-                        .gap(px(6.))
-                        .mt(px(3.))
-                        .text_size(px(TEXT_XS))
-                        .text_color(t.text3)
-                        .child(dot(t.tone(tone), 6.))
-                        .child(label)
-                        .child(div().w(px(1.)).h(px(9.)).bg(t.border1))
-                        .child(count),
+                    v_flex().flex_1().min_w_0().child(title).child(
+                        h_flex()
+                            .gap(px(6.))
+                            .mt(px(3.))
+                            .text_size(px(TEXT_XS))
+                            .text_color(t.text3)
+                            .child(dot(t.tone(tone), 6.))
+                            .child(label)
+                            .child(div().w(px(1.)).h(px(9.)).bg(t.border1))
+                            .child(count),
+                    ),
                 )
         };
         row = if selected {
-            row.bg(t.selected).child(lead_bar(cx))
+            match line {
+                Some(hue) => row
+                    .bg(crate::theme::Theme::fade(
+                        hue,
+                        if t.is_dark() { 0.16 } else { 0.11 },
+                    ))
+                    .child(crate::ui::lead_bar_in(hue)),
+                None => row.bg(t.selected).child(lead_bar(cx)),
+            }
         } else {
             row.hover(|style| style.bg(t.bg_hover))
         };

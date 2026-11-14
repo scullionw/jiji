@@ -27,7 +27,7 @@ use crate::logic::publish::{
     autoland_options_story, job_title, job_tone, land_action_text, review_rows,
 };
 use crate::shell::Dismiss;
-use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::{
     btn, dot, empty_state, h_flex, icon, icon_btn, input::field, popover, popover_layer, ref_label,
     segmented, v_flex, IconName, InputEvent, PopoverState, TextInput,
@@ -835,53 +835,45 @@ impl PublishView {
                 }),
             ));
         }
-        h_flex()
-            .flex_shrink_0()
-            .h(px(TOOLBAR_H))
-            .gap(px(8.))
-            .pl(px(16.))
-            .pr(px(8.))
-            .border_b_1()
-            .border_color(t.border2)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(TEXT_M))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.text1)
-                    .child("Publish"),
-            )
-            .child(
-                div()
-                    .min_w(px(40.))
-                    .flex_shrink()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_S))
-                    .text_color(t.text3)
-                    .child(crate::ui::truncated(repo_label)),
-            )
-            .child(div().flex_shrink_0().ml(px(8.)).child(tabs))
-            .child(div().flex_1())
-            .children(repo.as_ref().map(|repo| {
-                div()
-                    .flex_shrink_0()
-                    .mr(px(4.))
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .child(format!("via {}", repo.remote))
-            }))
-            .child(
-                icon_btn("publish-refresh", IconName::Refresh)
-                    .disabled(prs_loading || self.executing())
-                    .tooltip("Refresh pull requests and selected plan")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_selected(cx))),
-            )
-            .child(
-                h_flex()
-                    .gap(px(6.))
-                    .child(dot(if connected { t.ok } else { t.text3 }, 6.))
-                    .child(connection),
-            )
+        let section = crate::app::Section::Publish;
+        crate::ui::page_bar_marked(
+            Some((section.glyph(), section.hue(&t))),
+            "Publish",
+            None,
+            cx,
+        )
+        .gap(px(8.))
+        .child(
+            div()
+                .min_w(px(40.))
+                .flex_shrink()
+                .font_family(t.mono.clone())
+                .text_size(px(TEXT_S))
+                .text_color(t.text3)
+                .child(crate::ui::truncated(repo_label)),
+        )
+        .child(div().flex_shrink_0().ml(px(8.)).child(tabs))
+        .child(div().flex_1())
+        .children(repo.as_ref().map(|repo| {
+            div()
+                .flex_shrink_0()
+                .mr(px(4.))
+                .text_size(px(TEXT_XS))
+                .text_color(t.text3)
+                .child(format!("via {}", repo.remote))
+        }))
+        .child(
+            icon_btn("publish-refresh", IconName::Refresh)
+                .disabled(prs_loading || self.executing())
+                .tooltip("Refresh pull requests and selected plan")
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_selected(cx))),
+        )
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .child(dot(if connected { t.ok } else { t.text3 }, 6.))
+                .child(connection),
+        )
     }
 
     fn render_connection(

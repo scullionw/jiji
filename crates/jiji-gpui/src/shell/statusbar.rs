@@ -147,8 +147,18 @@ impl Shell {
                 .find(|op| !op.is_snapshot)
                 .or(s.operations.first())
         }) {
+            // The operation's station, in its family's hue as the journal
+            // draws it.
+            let hue = crate::views::operations::op_hue(
+                crate::logic::ops::op_kind(&op.description, op.is_snapshot),
+                &t,
+            );
             bar = bar
-                .child(dot(quiet_dot, 6.))
+                .child(crate::ui::node_mark(
+                    crate::ui::Mark::Station { filled: false },
+                    hue,
+                    8.,
+                ))
                 .child(msg(abbreviate_hashes(&op.description)))
                 .child(
                     div()

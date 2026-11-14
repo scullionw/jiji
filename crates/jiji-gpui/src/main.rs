@@ -133,8 +133,9 @@ fn main() {
             titlebar: Some(TitlebarOptions {
                 title: Some("Jiji".into()),
                 appears_transparent: true,
-                // Centers the traffic lights in the 36px title bar.
-                traffic_light_position: Some(point(px(14.), px(11.))),
+                // Centers the traffic lights on the tab band (the title
+                // bar below its top six points).
+                traffic_light_position: Some(point(px(14.), px(14.))),
             }),
             focus: !background,
             ..Default::default()

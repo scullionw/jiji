@@ -1,7 +1,7 @@
 //! The furniture of a full pane: empty states, section openings, and the
 //! plan panel that states what a consequential action will do.
 
-use gpui::{div, prelude::*, px, App, Div, Entity, FontWeight, SharedString, Window};
+use gpui::{div, prelude::*, px, App, Div, Entity, FontWeight, Hsla, SharedString, Window};
 
 use super::{h_flex, icon, truncated, v_flex, Btn, IconName, Tabular as _, TextInput};
 use crate::theme::{theme, Theme, RADIUS_M, ROW_H, TEXT_M, TEXT_S, TOOLBAR_H};
@@ -102,25 +102,55 @@ fn placeholder(
 }
 
 /// A section page's bar, on the toolbar line every pane shares: the
-/// page's name and how much it holds, then whatever the page acts with.
+/// section's mark, the page's name and how much it holds, then whatever
+/// the page acts with.
 pub fn page_bar(title: impl Into<SharedString>, count: Option<String>, cx: &App) -> Div {
+    page_bar_marked(None, title, count, cx)
+}
+
+/// [`page_bar`] led by a section's glyph on a tint of its hue — the same
+/// tile the rail shows while the section is open.
+pub fn page_bar_marked(
+    mark: Option<(IconName, Hsla)>,
+    title: impl Into<SharedString>,
+    count: Option<String>,
+    cx: &App,
+) -> Div {
     let t = theme(cx);
     let mut bar = h_flex()
         .h(px(TOOLBAR_H))
         .flex_shrink_0()
         .gap(px(10.))
-        .pl(px(PAGE_PAD))
+        .pl(px(if mark.is_some() {
+            PAGE_PAD - 4.
+        } else {
+            PAGE_PAD
+        }))
         .pr(px(8.))
         .border_b_1()
-        .border_color(t.border2)
-        .child(
+        .border_color(t.border2);
+    if let Some((glyph, hue)) = mark {
+        bar = bar.child(
             div()
+                .flex()
                 .flex_shrink_0()
-                .text_size(px(crate::theme::TEXT_L))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.text1)
-                .child(title.into()),
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .mr(px(-2.))
+                .rounded(px(RADIUS_M))
+                .bg(Theme::fade(hue, if t.is_dark() { 0.16 } else { 0.12 }))
+                .child(icon(glyph, 14., hue)),
         );
+    }
+    bar = bar.child(
+        div()
+            .flex_shrink_0()
+            .text_size(px(crate::theme::TEXT_HEAD - 1.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.text1)
+            .child(title.into()),
+    );
     if let Some(count) = count {
         bar = bar.child(
             div()

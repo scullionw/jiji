@@ -118,8 +118,82 @@ pub fn group_operations(ops: &[OperationItem], now: DateTime<FixedOffset>) -> Ve
     groups
 }
 
+/// What an operation did, by the verb jj describes it with: the family
+/// its station on the timeline is colored by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    /// Made or edited a change: commit, new, describe, edit, split.
+    Change,
+    /// Moved or folded history: rebase, squash, abandon, duplicate.
+    Rewrite,
+    /// Talked to a remote or to Git: fetch, push, import, export.
+    Remote,
+    /// Created, moved or dropped a bookmark or tag.
+    Bookmark,
+    /// Took operations back: undo, revert, restore.
+    Undo,
+    /// jj noticed the files changed.
+    Snapshot,
+    Other,
+}
+
+pub fn op_kind(description: &str, is_snapshot: bool) -> OpKind {
+    if is_snapshot {
+        return OpKind::Snapshot;
+    }
+    let lower = description.to_ascii_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    let mentions = |words: &[&str]| words.iter().any(|word| lower.contains(word));
+    match first {
+        "undo" | "revert" | "restore" if mentions(&["operation"]) || first == "undo" => {
+            OpKind::Undo
+        }
+        "fetch" | "push" | "import" | "export" | "clone" | "init" => OpKind::Remote,
+        "rebase" | "squash" | "abandon" | "duplicate" | "absorb" | "parallelize" | "backout"
+        | "revert" | "simplify" => OpKind::Rewrite,
+        "commit" | "new" | "describe" | "edit" | "split" | "restore" | "resolve" | "diffedit"
+        | "create" | "snapshot"
+            if !mentions(&["bookmark", "tag "]) =>
+        {
+            OpKind::Change
+        }
+        "create" | "set" | "move" | "delete" | "forget" | "rename" | "track" | "untrack"
+        | "point" => OpKind::Bookmark,
+        _ if mentions(&["bookmark"]) => OpKind::Bookmark,
+        _ => OpKind::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operations_are_known_by_their_verb() {
+        use super::{op_kind, OpKind};
+        assert_eq!(op_kind("snapshot working copy", true), OpKind::Snapshot);
+        assert_eq!(op_kind("commit f8528903512b", false), OpKind::Change);
+        assert_eq!(op_kind("new empty commit", false), OpKind::Change);
+        assert_eq!(
+            op_kind("rebase commit 1234 and descendants", false),
+            OpKind::Rewrite
+        );
+        assert_eq!(
+            op_kind("fetch from git remote(s) origin", false),
+            OpKind::Remote
+        );
+        assert_eq!(
+            op_kind("push all tracked bookmarks to git remote origin", false),
+            OpKind::Remote
+        );
+        assert_eq!(
+            op_kind("create bookmark main pointing to commit 1234", false),
+            OpKind::Bookmark
+        );
+        assert_eq!(op_kind("undo operation 5678", false), OpKind::Undo);
+        assert_eq!(op_kind("restore to operation 5678", false), OpKind::Undo);
+        assert_eq!(op_kind("restore into commit 1234", false), OpKind::Change);
+        assert_eq!(op_kind("", false), OpKind::Other);
+    }
+
     use super::*;
 
     fn op(id: &str, timestamp: &str, snapshot: bool, current: bool) -> OperationItem {

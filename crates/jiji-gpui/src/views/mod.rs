@@ -3,7 +3,7 @@
 mod bookmarks;
 mod conflicts;
 pub mod menu;
-mod operations;
+pub mod operations;
 pub mod palette;
 pub mod publish;
 pub mod search;

@@ -23,9 +23,9 @@ use crate::theme::{theme, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, checkbox, empty_state, group_head, h_flex, page_bar, page_filter, page_notice, scrollbar,
-    short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent, Tabular as _,
-    TextInput, PAGE_PAD,
+    btn, checkbox, empty_state, group_head, h_flex, page_bar_marked, page_filter, page_notice,
+    scrollbar, short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent,
+    Tabular as _, TextInput, PAGE_PAD,
 };
 use crate::views::menu;
 
@@ -194,10 +194,18 @@ impl BookmarksView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let merged = merged_bookmarks(&snapshot.bookmarks).len();
-        let mut bar = page_bar("Bookmarks", Some(snapshot.bookmarks.len().to_string()), cx)
-            .child(div().w(px(4.)))
-            .child(page_filter(&self.filter, window, cx))
-            .child(div().flex_1());
+        let mut bar = page_bar_marked(
+            Some((
+                crate::app::Section::Bookmarks.glyph(),
+                crate::app::Section::Bookmarks.hue(&theme(cx)),
+            )),
+            "Bookmarks",
+            Some(snapshot.bookmarks.len().to_string()),
+            cx,
+        )
+        .child(div().w(px(4.)))
+        .child(page_filter(&self.filter, window, cx))
+        .child(div().flex_1());
         if !snapshot.git_remotes.is_empty() {
             let (checking, last, now) = {
                 let upstream = &self.app.read(cx).upstream;
@@ -399,15 +407,39 @@ impl BookmarksView {
             .h_full()
             .gap(px(12.))
             .child(name)
-            .child(
-                div()
-                    .w(px(ID_W))
+            .child({
+                // The change it points at, as the graph marks it: its
+                // station in its line's hue, the typed part of its id in
+                // that hue too.
+                let mark = crate::ui::mark_for(snapshot, &bookmark.target, &t);
+                let line = crate::ui::line_of(snapshot, &bookmark.target, &t)
+                    .filter(|_| matches!(mark, Some((crate::ui::Mark::Station { .. }, _))));
+                let id = short_id(&bookmark.target, 8).to_owned();
+                let (head, rest) = id.split_at(id.len().min(2));
+                h_flex()
+                    .w(px(ID_W + 16.))
                     .flex_shrink_0()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .child(short_id(&bookmark.target, 8).to_owned()),
-            )
+                    .gap(px(7.))
+                    .child(
+                        div()
+                            .w(px(9.))
+                            .flex_shrink_0()
+                            .children(mark.map(|(kind, hue)| crate::ui::node_mark(kind, hue, 9.))),
+                    )
+                    .child(
+                        h_flex()
+                            .font_family(t.mono.clone())
+                            .text_size(px(TEXT_XS))
+                            .text_color(t.text3)
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(line.unwrap_or(t.text2))
+                                    .child(head.to_owned()),
+                            )
+                            .child(rest.to_owned()),
+                    )
+            })
             .child(
                 div()
                     .flex_1()
@@ -622,9 +654,21 @@ impl BookmarksView {
                 crate::ui::absolute_time(&bookmark.target_timestamp)
             )))
             .child(
-                div()
+                h_flex()
+                    .gap(px(6.))
                     .max_w(px(META_W - 42.))
-                    .child(truncated(bookmark.target_author.clone())),
+                    .child(crate::ui::monogram(
+                        &bookmark.target_author,
+                        &crate::ui::initials(&bookmark.target_author),
+                        16.,
+                        true,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(truncated(bookmark.target_author.clone())),
+                    ),
             )
             .child(div().w(px(32.)).flex().justify_end().tabular().child(
                 if bookmark.target_timestamp.is_empty() {

@@ -55,6 +55,32 @@ pub const SECTIONS: [Section; 6] = [
 ];
 
 impl Section {
+    /// The section's glyph, on the rail and at the head of its page.
+    pub fn glyph(self) -> crate::ui::IconName {
+        use crate::ui::IconName;
+        match self {
+            Section::Workbench => IconName::Workbench,
+            Section::Conflicts => IconName::Conflicts,
+            Section::Publish => IconName::Publish,
+            Section::Bookmarks => IconName::Bookmark,
+            Section::Operations => IconName::Operations,
+            Section::Workspaces => IconName::Workspaces,
+        }
+    }
+
+    /// The section's own hue: its rail tile while open, its page's mark.
+    /// Drawn from the palette's status and lane colors.
+    pub fn hue(self, t: &crate::theme::Theme) -> gpui::Hsla {
+        match self {
+            Section::Workbench => t.accent_strong,
+            Section::Conflicts => t.danger,
+            Section::Publish => t.ok,
+            Section::Bookmarks => t.lane(4),
+            Section::Operations => t.lane(2),
+            Section::Workspaces => t.lane(1),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Section::Workbench => "Workbench",

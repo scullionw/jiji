@@ -11,20 +11,35 @@ use jiji_core::snapshot::{OpEffectKind, OperationItem};
 
 use super::ConfirmPlan;
 use crate::app::{app, AppModel};
-use crate::logic::ops::{clock_time, group_operations, is_root_op, now, ops_since, TimelineRow};
+use crate::logic::ops::{
+    clock_time, group_operations, is_root_op, now, op_kind, ops_since, OpKind, TimelineRow,
+};
 use crate::logic::text::{abbreviate_hashes, short_id, short_user_host};
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, consequences, group_head, h_flex, icon, label_box, page_bar, plan_actions, plan_panel,
-    plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped, IconName, Tabular as _,
-    PAGE_PAD,
+    btn, consequences, group_head, h_flex, icon, label_box, node_mark, page_bar_marked,
+    plan_actions, plan_panel, plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped,
+    IconName, Mark, Tabular as _, PAGE_PAD,
 };
 
 /// The clock gutter down the journal's leading edge.
 const TIME_W: f32 = 40.;
+
+/// An operation family's hue: the lane set, so the journal and the graph
+/// share one palette.
+pub fn op_hue(kind: OpKind, t: &Theme) -> gpui::Hsla {
+    match kind {
+        OpKind::Change => t.lane(0),
+        OpKind::Remote => t.lane(1),
+        OpKind::Rewrite => t.lane(2),
+        OpKind::Undo => t.lane(3),
+        OpKind::Bookmark => t.lane(4),
+        OpKind::Snapshot | OpKind::Other => Theme::blend(t.text3, 0.85, t.text2),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpAction {
@@ -132,7 +147,7 @@ impl OperationsView {
         cx: &Context<Self>,
     ) -> gpui::Div {
         let t = theme(cx);
-        let line = Theme::fade(t.text3, 0.38);
+        let line = Theme::blend(t.text3, 0.42, t.bg1);
         let mut rail = div()
             .relative()
             .flex_shrink_0()
@@ -274,27 +289,28 @@ impl OperationsView {
             .map(|(_, action)| *action);
         let group = SharedString::from(format!("op-{}", op.id));
 
+        // Each operation is a station on the journal's line, colored by
+        // what it did; the current one is where the repo is now.
+        let hue = op_hue(op_kind(&op.description, op.is_snapshot), &t);
         let glyph = if op.is_current {
             div()
-                .mt(px(3.))
+                .mt(px(8.))
+                .p(px(1.))
+                .rounded(px(9.))
                 .bg(t.bg1)
-                .font_family(t.mono.clone())
-                .text_size(px(13.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(t.accent_strong)
-                .child("@")
+                .child(node_mark(Mark::WorkingCopy, hue, 14.))
                 .into_any_element()
         } else {
-            let size = if quiet { 6. } else { 10. };
+            let size = if quiet { 7. } else { 12. };
             div()
-                .mt(px(if quiet { 13. } else { 11. }))
+                .mt(px(if quiet { 12. } else { 10. }))
                 .size(px(size))
                 .rounded(px(size / 2.))
-                .border(px(if quiet { 1.5 } else { 2. }))
+                .border(px(if quiet { 1.5 } else { 2.5 }))
                 .border_color(if quiet {
-                    Theme::fade(t.text3, 0.55)
+                    Theme::fade(t.text3, 0.6)
                 } else {
-                    Theme::blend(t.text3, 0.8, t.text2)
+                    hue
                 })
                 .bg(t.bg1)
                 .into_any_element()
@@ -394,13 +410,9 @@ impl OperationsView {
         let chip = || label_box(t.text2, t.border2).gap(px(4.));
         for effect in &op.effects {
             let lead = match effect.kind {
-                OpEffectKind::WorkingCopy => div()
-                    .font_family(t.mono.clone())
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(t.working_copy)
-                    .child("@")
-                    .into_any_element(),
+                OpEffectKind::WorkingCopy => {
+                    node_mark(Mark::WorkingCopy, t.working_copy, 9.).into_any_element()
+                }
                 OpEffectKind::RemoteBookmark => {
                     icon(IconName::Bookmark, 9., t.accent).into_any_element()
                 }
@@ -576,7 +588,15 @@ impl Render for OperationsView {
         root.child(
             v_flex()
                 .size_full()
-                .child(page_bar("Operations", Some(ops.len().to_string()), cx))
+                .child(page_bar_marked(
+                    Some((
+                        crate::app::Section::Operations.glyph(),
+                        crate::app::Section::Operations.hue(&theme(cx)),
+                    )),
+                    "Operations",
+                    Some(ops.len().to_string()),
+                    cx,
+                ))
                 .child(
                     div()
                         .relative()

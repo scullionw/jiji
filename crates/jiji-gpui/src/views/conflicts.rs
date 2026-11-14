@@ -17,8 +17,8 @@ use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    all_clear, btn, group_head, h_flex, icon, page_bar, scrollbar, tooltip, truncated, v_flex,
-    wrapped, IconName, PAGE_PAD,
+    all_clear, btn, group_head, h_flex, icon, page_bar_marked, scrollbar, tooltip, truncated,
+    v_flex, wrapped, IconName, PAGE_PAD,
 };
 
 /// The rows' shared left inset: the glyph column plus its gap.
@@ -159,18 +159,24 @@ impl ConflictsView {
             .gap(px(8.))
             .min_w_0()
             .rounded(px(RADIUS_S))
-            .child(
-                div()
-                    .w(px(16.))
-                    .flex_shrink_0()
-                    .flex()
-                    .justify_center()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_M))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(color)
-                    .child(glyph),
-            );
+            .child({
+                let cell = div().w(px(16.)).flex_shrink_0().flex().justify_center();
+                // A conflicted commit wears the graph's own conflict
+                // station; the other kinds keep jj's marks.
+                if item.kind == ConflictKind::File {
+                    cell.child(crate::ui::node_mark(
+                        crate::ui::Mark::Conflict,
+                        t.danger,
+                        13.,
+                    ))
+                } else {
+                    cell.font_family(t.mono.clone())
+                        .text_size(px(TEXT_M))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color)
+                        .child(glyph)
+                }
+            });
         if let (Some(node), false) = (node, item.kind == ConflictKind::Bookmark) {
             summary = summary.group_hover(group.clone(), |style| style.text_color(t.accent_strong));
             let (app, id) = (self.app.clone(), node.id.clone());
@@ -542,7 +548,15 @@ impl Render for ConflictsView {
         root.child(
             v_flex()
                 .size_full()
-                .child(page_bar("Conflicts", Some(total.to_string()), cx))
+                .child(page_bar_marked(
+                    Some((
+                        crate::app::Section::Conflicts.glyph(),
+                        crate::app::Section::Conflicts.hue(&theme(cx)),
+                    )),
+                    "Conflicts",
+                    Some(total.to_string()),
+                    cx,
+                ))
                 .child(
                     div()
                         .relative()

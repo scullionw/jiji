@@ -39,6 +39,7 @@ impl PublishView {
         index: usize,
         last: bool,
         landing: &[LandSegment],
+        hue: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -63,26 +64,25 @@ impl PublishView {
             .or(segment.pr.as_ref());
         let open = self.open.contains(&format!("segment-{key}"));
 
-        // The rail: a position marker on a hairline threading the rows.
-        let marker_color = if merged.is_some() {
-            t.ok
-        } else if next {
-            t.accent_strong
-        } else {
-            t.text3
-        };
+        // The rail: the stack's own line, its stations numbered in landing
+        // order; a landed one turns the ok hue.
+        let station = if merged.is_some() { t.ok } else { hue };
         let mut marker = div()
             .flex()
             .items_center()
             .justify_center()
             .size(px(20.))
             .rounded(px(10.))
-            .border_1()
-            .border_color(if next { t.accent } else { t.border1 })
-            .bg(t.bg1)
+            .border(px(if next { 2.5 } else { 2. }))
+            .border_color(station)
+            .bg(if next {
+                Theme::fade(station, 0.18)
+            } else {
+                t.bg1
+            })
             .text_size(px(TEXT_XS))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(marker_color);
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(if next { t.text1 } else { station });
         marker = if merged.is_some() {
             marker.child(icon(IconName::Check, 11., t.ok))
         } else {
@@ -98,10 +98,10 @@ impl PublishView {
                 div()
                     .absolute()
                     .top_0()
-                    .left(px(9.5))
-                    .w(px(1.))
+                    .left(px(8.5))
+                    .w(px(3.))
                     .h(px(10.))
-                    .bg(t.border1),
+                    .bg(hue),
             );
         if !last {
             rail = rail.child(
@@ -109,9 +109,9 @@ impl PublishView {
                     .absolute()
                     .top(px(30.))
                     .bottom_0()
-                    .left(px(9.5))
-                    .w(px(1.))
-                    .bg(t.border1),
+                    .left(px(8.5))
+                    .w(px(3.))
+                    .bg(hue),
             );
         }
         rail = rail.child(div().mt(px(10.)).child(marker));
@@ -321,6 +321,13 @@ impl PublishView {
     ) -> impl IntoElement {
         let t = theme(cx);
         let total = stack.segments.len();
+        // The stack's line, as the graph draws it.
+        let hue = self
+            .snapshot
+            .as_deref()
+            .zip(stack.head_change.as_deref())
+            .and_then(|(snapshot, head)| crate::ui::line_of(snapshot, head, &t))
+            .unwrap_or(t.accent);
         let merged = landing
             .iter()
             .filter(|segment| matches!(segment.status, LandSegmentStatus::Merged { .. }))
@@ -348,21 +355,20 @@ impl PublishView {
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px(20.))
+                                    .top(px(16.))
                                     .bottom_0()
-                                    .left(px(9.5))
-                                    .w(px(1.))
-                                    .bg(t.border1),
+                                    .left(px(8.5))
+                                    .w(px(3.))
+                                    .bg(hue),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(20.))
-                                    .rounded(px(10.))
-                                    .bg(t.accent_dim)
-                                    .child(icon(IconName::Branch, 11., t.accent_strong)),
+                                // Trunk, where the line lands: history's
+                                // diamond.
+                                div().mt(px(3.)).child(crate::ui::node_mark(
+                                    crate::ui::Mark::Base,
+                                    Theme::blend(t.text3, 0.8, t.bg1),
+                                    14.,
+                                )),
                             ),
                     )
                     .child(
@@ -387,8 +393,14 @@ impl PublishView {
                     ),
             );
         for (index, segment) in stack.segments.iter().enumerate() {
-            ledger =
-                ledger.child(self.render_segment(segment, index, index + 1 == total, landing, cx));
+            ledger = ledger.child(self.render_segment(
+                segment,
+                index,
+                index + 1 == total,
+                landing,
+                hue,
+                cx,
+            ));
         }
         v_flex()
             .flex_1()

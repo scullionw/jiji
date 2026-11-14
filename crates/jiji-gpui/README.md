@@ -74,6 +74,25 @@ One look, stated once so new surfaces keep it. The tokens are in
 - **Flat and ruled.** Depth is the four surface steps and hairlines. No
   gradients, glass, glows or pills; the one shadow belongs to surfaces
   that float. Hairlines are strong enough to read as structure.
+- **A frame around the work.** The title bar, the rail and the status
+  line are one L of bg0, a clear step darker than the work area (bg1)
+  they hold. The frame's hairline runs over the work area only, and the
+  open repo's tab is cut from bg1 and runs down into it, browser-style:
+  flush, never an inset or floating sheet.
+- **The graph is a transit map.** Each workstream is a line in its own
+  lane hue: three-point rails, S-bends where a line changes track, and
+  stations on the line — a ring per change, filled when selected; a
+  ring around a dot for the working copy (you are here); history's
+  diamond; a red disc with the cross cut from it for a conflict. The
+  first stream (the working copy's) owns the accent lane and no other
+  line wears it (`lane_slot`). A change id's unique prefix wears its
+  line's hue, the way jj colors it in a terminal.
+- **Marks travel.** Wherever a change appears outside the graph — the
+  header's title, a bookmark's target, a stack's landing order, the
+  operations journal, the status line — it carries the graph's mark in
+  the graph's hue (`ui::node_mark`, `ui::mark_for`, `ui::line_of`). A
+  selection takes its line's hue too: a tint across the row and the
+  line's color on the leading bar (`ui::lead_bar_in`).
 - **One toolbar line.** Every pane's first bar is `TOOLBAR_H` tall, so a
   single hairline runs the window's width: the graph head, the change
   header, a section's page bar, the repo overview.
@@ -83,11 +102,14 @@ One look, stated once so new surfaces keep it. The tokens are in
   field was. Beside it, trunk's state and the fetch age read quietly, and
   one Settings control holds appearance, integrations and the licence.
   An unregistered copy adds a single Register control. Nothing else.
-- **The accent is a bar.** What is current carries a two-pixel accent
-  bar — the section in the rail, the repo's tab, the selected row
-  (`ui::lead_bar`) — and sits on the neutral `selected` fill. Hue stays
-  free to mean something: a workstream's lane, a status, a diff side. A
-  picker inside a tray still tints its chosen option.
+- **Hue is identity.** Every color names something: a line (lanes), a
+  section (`Section::hue`, its rail tile and page mark), a repository or
+  an author (`Theme::identity`, `ui::monogram`), an operation's family
+  (`op_kind`), a file's language (`ui::file_icon`), a status, a diff
+  side. Surfaces stay neutral; hue arrives in small, saturated marks.
+  What is current without a line of its own — the file tree's row, a
+  page's selection — carries the two-pixel accent bar (`ui::lead_bar`)
+  on the neutral `selected` fill.
 - **Rows run edge to edge.** Graph rows, the file tree, a page's ledger:
   no inset rounded rows on a pane. Rounded rows belong to menus, trays
   and popovers.
@@ -101,13 +123,16 @@ One look, stated once so new surfaces keep it. The tokens are in
 - **The graph hugs its rails.** A row's text starts after its own rails
   (`row_gutter_width`), the way `jj log` prints it — a lone stack's titles
   sit beside their rail however wide deep history runs below.
-- **Color marks the exception.** A modified file's `M` stays quiet; the
-  files that came, went or moved carry their hue. A "+a −r" count closes
-  with the five-block diffstat (`ui::diffstat`), the split read before
-  the numbers are.
-- **A section is a page bar and a ledger** (`ui::page_bar`,
-  `ui::group_head`, `ui::page_notice`, `ui::tray`): the name and count
-  on the toolbar line with the page's filter and acts, pinned group
+- **Files are known by their kind.** A file wears its language's icon
+  and hue in the tree and its diff header. A modified file, the usual
+  case, carries no further mark; the files that came, went or moved say
+  so in their side's hue. A changed line has a solid edge in its side's
+  hue down the gutter. A "+a −r" count closes with the five-block
+  diffstat (`ui::diffstat`), the split read before the numbers are.
+- **A section is a page bar and a ledger** (`ui::page_bar_marked`,
+  `ui::group_head`, `ui::page_notice`, `ui::tray`): the section's mark,
+  name and count on the toolbar line with the page's filter and acts,
+  pinned group
   bands, then full-width rows in columns. No centered reading column,
   no opening paragraph or lede in the bar — what a group is for is said
   once, in its band or under it.
@@ -128,8 +153,10 @@ One look, stated once so new surfaces keep it. The tokens are in
 - The look above: the Tauri app still has filled ref chips, accent-tinted
   selection, a 32px title bar with chip tabs and a row of icon buttons
   (search, palette, licence, settings, theme), a fixed-width graph
-  gutter, and section pages as a centered column under a heading and a
-  paragraph.
+  gutter with thin rails, jj's `@`/`○` glyphs as markers, lanes that can
+  repeat the working line's hue, letter-only file statuses, a welcome
+  screen without the map, and section pages as a centered column under a
+  heading and a paragraph.
 - The status line names the newest operation that did something (not
   the working-copy snapshot every look at the repo records), with its
   age; the backend names itself only when it is not jj-lib.

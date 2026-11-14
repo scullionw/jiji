@@ -15,8 +15,9 @@ use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_HEAD, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, diffstat, from_now, h_flex, icon, icon_btn, label_box, middot, popover, popover_layer,
-    scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Tabular as _, LABEL_H,
+    btn, diffstat, from_now, h_flex, icon, icon_btn, label_box, middot, node_mark, popover,
+    popover_layer, scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Mark,
+    Tabular as _, LABEL_H,
 };
 use crate::views::workbench::WorkbenchView;
 
@@ -33,6 +34,8 @@ const VERB_LABELS_PANE: f32 = 880.;
 /// title: padding, gaps, the pencil, the close button.
 const VERBS_AND_CHROME: f32 = 440.;
 const META_BAR_H: f32 = 32.;
+/// The change's title: the largest type on the workbench.
+const TITLE_SIZE: f32 = TEXT_HEAD + 1.;
 
 impl WorkbenchView {
     pub(super) fn render_title_bar(
@@ -50,7 +53,7 @@ impl WorkbenchView {
         // a pane too narrow for both, the title wins and the verbs fall
         // back to their icons.
         let labelled = self.diff_width > VERB_LABELS_PANE
-            || text_width(&title, TEXT_HEAD, FontWeight::SEMIBOLD, window) + VERBS_AND_CHROME
+            || text_width(&title, TITLE_SIZE, FontWeight::SEMIBOLD, window) + VERBS_AND_CHROME
                 <= self.diff_width;
         let has_body = node
             .description
@@ -65,10 +68,11 @@ impl WorkbenchView {
             .h(px(TOOLBAR_H))
             .min_w_0()
             .gap(px(8.))
-            .pl(px(16.))
+            .pl(px(13.))
             .pr(px(8.))
             .border_b_1()
             .border_color(t.border2);
+        bar = bar.child(self.title_mark(node, cx));
         if title.is_empty() {
             let mut undescribed = h_flex()
                 .min_w_0()
@@ -108,7 +112,7 @@ impl WorkbenchView {
                 div()
                     .id("change-title")
                     .min_w_0()
-                    .text_size(px(TEXT_HEAD))
+                    .text_size(px(TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(tooltip(title.clone()))
                     .child(truncated(title)),
@@ -210,6 +214,23 @@ impl WorkbenchView {
                     this.app.update(cx, |model, cx| model.select_node(None, cx));
                 })),
         )
+    }
+
+    /// The change's own mark from the graph, filled in as it is there:
+    /// the header names the station the map has selected.
+    fn title_mark(&self, node: &GraphNode, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme(cx);
+        let (kind, color) = match crate::ui::mark_for(&self.snapshot, &node.id, &t) {
+            Some((Mark::Station { .. }, hue)) => (Mark::Station { filled: true }, hue),
+            Some(mark) => mark,
+            None => (Mark::Station { filled: true }, t.accent),
+        };
+        div()
+            .flex_shrink_0()
+            .w(px(14.))
+            .flex()
+            .justify_center()
+            .child(node_mark(kind, color, 12.))
     }
 
     pub(super) fn render_more_menu(
@@ -414,12 +435,24 @@ impl WorkbenchView {
         // One line, always: the diff never shifts as the selection moves.
         // Facts leave in order of how much they are missed as the pane
         // narrows; whatever still overruns clips at the view controls.
-        let pane = self.diff_width;
+        // A state tag (working copy, immutable) takes its room from the
+        // facts after it, so they leave that much sooner.
+        let tagged = if node.kind == NodeKind::Mutable {
+            0.
+        } else {
+            96.
+        };
+        let pane = self.diff_width - tagged;
         let (relations, stack_note, identity) = (
             pane > RELATIONS_PANE,
             pane > STACK_NOTE_PANE,
             pane > IDENTITY_PANE,
         );
+        // The change's line, when it rides one: its id and its stack note
+        // wear the hue the graph draws it in.
+        let line = stack_position(snapshot, &node.id)
+            .map(|position| t.lane(lane_of(snapshot, &position.workstream.id).unwrap_or(0)))
+            .filter(|_| node.kind != NodeKind::Immutable);
         // The facts read in groups — who it is, who made it when, what
         // state it is in, where it sits — a quiet dot between groups.
         let mut who: Vec<AnyElement> = Vec::new();
@@ -461,8 +494,8 @@ impl WorkbenchView {
                     .tooltip(tooltip("Change id"))
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text1)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(line.unwrap_or(t.text1))
                             .child(short_id(&node.id, 2).to_owned()),
                     )
                     .child(node.id.chars().skip(2).collect::<String>())
@@ -489,11 +522,22 @@ impl WorkbenchView {
         }
         if identity {
             when.push(
-                div()
+                h_flex()
                     .flex_shrink_0()
-                    .max_w(px(160.))
-                    .text_color(t.text2)
-                    .child(truncated(node.author.clone()))
+                    .gap(px(6.))
+                    .child(crate::ui::monogram(
+                        &node.author,
+                        &crate::ui::initials(&node.author),
+                        18.,
+                        true,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .max_w(px(160.))
+                            .text_color(t.text2)
+                            .child(truncated(node.author.clone())),
+                    )
                     .into_any_element(),
             );
         }
@@ -538,7 +582,7 @@ impl WorkbenchView {
                     .gap(px(5.))
                     .max_w(px(300.))
                     .tooltip(tooltip(format!("{at} of {of} in \u{201c}{title}\u{201d}")))
-                    .child(crate::ui::dot(hue, 6.))
+                    .child(crate::ui::station(hue, 9.))
                     .child(
                         div()
                             .flex_shrink_0()

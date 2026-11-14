@@ -94,6 +94,12 @@ fn sync_text(sync: SyncState) -> &'static str {
     }
 }
 
+/// The air above the tab band. Tabs, the command field and the controls
+/// all center in the band below it; the open tab runs down into the work
+/// area it belongs to.
+const BAND_TOP: f32 = 6.;
+const BAND_H: f32 = TITLEBAR_H - BAND_TOP;
+
 /// The command field's width at a window width: it gives way before the
 /// tabs and the controls on either side of it do.
 fn command_field_width(window_width: f32) -> f32 {
@@ -121,6 +127,14 @@ impl Shell {
         let workbench = has_repo && model.section() == Section::Workbench;
         let graph_collapsed = model.graph_collapsed;
         let registered = model.license.registered;
+        // The hairline that closes the frame runs over the work area only:
+        // the rail and the title bar are one surface.
+        let rail = if has_repo && !model.sidebar_collapsed {
+            crate::theme::RAIL_W - 1.
+        } else {
+            0.
+        };
+        let t = theme(cx);
 
         // The command field rides the window's center line, whatever the
         // tabs and controls beside it measure; the tabs stop short of it.
@@ -164,16 +178,27 @@ impl Shell {
             .relative()
             .h(px(TITLEBAR_H))
             .flex_shrink_0()
+            .pt(px(BAND_TOP))
             .pr(px(8.))
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count == 2 {
                     window.titlebar_double_click();
                 }
             })
+            // First, so the open tab paints over it.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(rail))
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.))
+                    .bg(t.border2),
+            )
             .child(div().w(px(lights)).flex_shrink_0())
             .child(
                 div()
-                    .h_full()
+                    .h(px(BAND_H))
                     .min_w_0()
                     .max_w(px(tabs_room))
                     .child(self.render_tabs(cx)),
@@ -203,7 +228,7 @@ impl Shell {
         h_flex()
             .id("command-field")
             .absolute()
-            .top(px(((TITLEBAR_H - 26.) / 2.).floor()))
+            .top(px(BAND_TOP + ((BAND_H - 26.) / 2.).floor()))
             .left(px(left))
             .w(px(width))
             .h(px(26.))
@@ -227,7 +252,9 @@ impl Shell {
             .child(kbd("⌘K", cx))
     }
 
-    /// The open repos, one tab each.
+    /// The open repos, one tab each. The open one is cut from the work
+    /// area's own surface and runs down into it; the rest are names on the
+    /// frame.
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let model = self.app.read(cx);
@@ -238,22 +265,22 @@ impl Shell {
             .map(|tab| (tab.id, tab.name.as_deref(), tab.path.as_deref()))
             .collect();
         let titles = tab_titles(&entries);
+        let names: Vec<Option<String>> = model.tabs.iter().map(|tab| tab.name.clone()).collect();
         let paths: Vec<Option<String>> = model.tabs.iter().map(|tab| tab.path.clone()).collect();
 
         let mut strip = h_flex()
             .id("tab-strip")
             .h_full()
             .max_w_full()
+            .gap(px(2.))
             .overflow_x_scroll();
-        for ((id, title), path) in titles.into_iter().zip(paths) {
+        for (((id, title), path), name) in titles.into_iter().zip(paths).zip(names) {
             let active = id == active_id;
             let group = SharedString::from(format!("tab-{id}"));
             let app = self.app.clone();
             let close_app = self.app.clone();
             let middle_app = self.app.clone();
-            let mut label = h_flex()
-                .relative()
-                .h_full()
+            let label = h_flex()
                 .min_w_0()
                 .max_w(px(200.))
                 .child(div().truncate().child(title.label.clone()))
@@ -267,28 +294,17 @@ impl Shell {
                             .child(hint),
                     )
                 });
-            if active {
-                label = label.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .h(px(2.))
-                        .bg(t.accent),
-                );
-            }
-            // A tab is its repo's name; the one on screen reads in full ink
-            // over the accent bar, on the line the panes hang from.
             let mut tab = h_flex()
                 .id(("tab", id))
                 .group(group.clone())
                 .relative()
                 .flex_shrink()
                 .min_w_0()
-                .h_full()
+                .h(px(BAND_H))
+                .gap(px(7.))
                 .pl(px(10.))
-                .pr(px(4.))
+                .pr(px(5.))
+                .rounded_t(px(8.))
                 .text_size(px(TEXT_M))
                 .font_weight(if active {
                     FontWeight::SEMIBOLD
@@ -302,9 +318,21 @@ impl Shell {
                 .on_mouse_down(MouseButton::Middle, move |_, _, cx| {
                     middle_app.update(cx, |m, cx| m.close_tab(id, cx));
                 })
+                .children(name.map(|name| {
+                    let letter = crate::ui::initials(&name)
+                        .chars()
+                        .take(1)
+                        .collect::<String>();
+                    crate::ui::monogram(&name, &letter, 16., false, cx)
+                }))
                 .child(label);
             tab = if active {
                 tab.text_color(t.text1)
+                    .bg(t.bg1)
+                    .border_t_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(t.border2)
             } else {
                 tab.text_color(t.text3)
                     .hover(|style| style.text_color(t.text1))
@@ -318,7 +346,6 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .size(px(18.))
-                .ml(px(4.))
                 .rounded(px(RADIUS_S))
                 .opacity(0.)
                 .group_hover(group, |style| style.opacity(1.))

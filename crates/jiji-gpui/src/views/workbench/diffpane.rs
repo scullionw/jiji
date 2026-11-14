@@ -834,10 +834,10 @@ impl WorkbenchView {
                 .id(("tree-row", ix))
                 .relative()
                 .w_full()
-                .h(px(24.))
+                .h(px(26.))
                 .pl(px(8.))
                 .pr(px(10.))
-                .text_size(px(TEXT_S))
+                .text_size(px(TEXT_M))
                 .cursor_pointer()
                 .child(guides);
             let el = match row {
@@ -863,9 +863,8 @@ impl WorkbenchView {
                         )))
                         .child(
                             div()
-                                .ml(px(4.))
+                                .ml(px(5.))
                                 .min_w_0()
-                                .font_family(t.mono.clone())
                                 .text_color(t.text2)
                                 .child(truncated(dir.label.clone())),
                         );
@@ -908,29 +907,38 @@ impl WorkbenchView {
                         .tooltip(tooltip(title))
                         .on_click(cx.listener(move |this, _, _, cx| this.jump_to_file(index, cx)))
                         .child(
-                            // Same cell width as the chevron, so file
-                            // names align with directory labels.
+                            // The file's kind in its language's hue, in the
+                            // chevron's cell so names align with folders.
                             div()
                                 .w(px(14.))
                                 .flex()
                                 .justify_center()
-                                .font_family(t.mono.clone())
-                                .text_size(px(TEXT_XS))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hue)
-                                .child(glyph),
+                                .child(crate::ui::file_icon(&file.name, 14., cx)),
                         )
                         .child(
                             div()
-                                .ml(px(4.))
+                                .ml(px(5.))
                                 .min_w_0()
-                                .font_family(t.mono.clone())
                                 .text_color(if gone { t.text2 } else { t.text1 })
                                 .when(gone, |el| el.line_through())
                                 .child(truncated(file.name.clone())),
                         );
                     if file.has_conflict {
                         el = el.child(div().ml(px(6.)).child(crate::ui::dot(t.danger, 5.)));
+                    }
+                    // What came, went or moved says so at the row's end; the
+                    // usual modified file carries no mark.
+                    if file.status != FileStatus::Modified {
+                        el = el.child(div().flex_1()).child(
+                            div()
+                                .flex_shrink_0()
+                                .pl(px(8.))
+                                .font_family(t.mono.clone())
+                                .text_size(px(TEXT_XS))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hue)
+                                .child(glyph),
+                        );
                     }
                     let el = if cursor.as_deref() == Some(file.path.as_str()) {
                         el.border_1().border_color(t.accent)

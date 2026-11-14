@@ -1,6 +1,7 @@
 //! The frame: a title bar across the top, the section rail down the left,
-//! a status line along the bottom — all on bg0 — around one full-bleed
-//! working area on bg1. Hairlines are the joinery.
+//! a status line along the bottom — one L of bg0, a clear step darker —
+//! around one full-bleed working area on bg1. The open tab is cut from the
+//! working area's surface and runs down into it. Hairlines are the joinery.
 
 mod statusbar;
 pub mod topbar;
@@ -465,21 +466,13 @@ impl Shell {
         // The inbox count rides the rail so conflict state is never
         // hidden behind a section switch.
         let conflicts = snapshot.conflicts.len();
-        let items = [
-            (Section::Workbench, IconName::Workbench),
-            (Section::Conflicts, IconName::Conflicts),
-            (Section::Publish, IconName::Publish),
-            (Section::Bookmarks, IconName::Bookmark),
-            (Section::Operations, IconName::Operations),
-            (Section::Workspaces, IconName::Workspaces),
-        ];
+        let items = SECTIONS.map(|section| (section, section.glyph()));
         let mut rail = v_flex()
             .w(px(RAIL_W))
             .flex_shrink_0()
             .items_center()
-            .gap(px(2.))
-            .pt(px(6.))
-            .border_t_1()
+            .gap(px(4.))
+            .pt(px(8.))
             .border_r_1()
             .border_color(t.border2);
         for (ix, (section, glyph)) in items.into_iter().enumerate() {
@@ -493,28 +486,24 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .size(px(32.))
-                .rounded(px(RADIUS_M))
+                .rounded(px(RADIUS_M + 1.))
                 .cursor_pointer()
-                .hover(|style| style.bg(t.bg_hover))
                 .tooltip(tooltip(format!("{} (⌘{})", section.label(), ix + 1)))
-                .on_click(cx.listener(move |this, _, _, cx| this.go_to(ix, cx)))
-                .child(
-                    icon(glyph, 17., if is_active { t.text1 } else { t.text3 })
-                        .group_hover(group, |style| style.text_color(t.text1)),
-                );
-            if is_active {
-                // The current section: full ink on the selection fill, with
-                // the accent bar on the rail's edge.
-                item = item.bg(t.selected).child(
-                    div()
-                        .absolute()
-                        .left(px(-6.))
-                        .top(px(4.))
-                        .bottom(px(4.))
-                        .w(px(2.))
-                        .bg(t.accent),
-                );
-            }
+                .on_click(cx.listener(move |this, _, _, cx| this.go_to(ix, cx)));
+            item = if is_active {
+                // The current section: its glyph in its own hue on a tint
+                // of it, the one colored tile on the rail.
+                let hue = section.hue(&t);
+                item.bg(crate::theme::Theme::fade(
+                    hue,
+                    if t.is_dark() { 0.16 } else { 0.12 },
+                ))
+                .child(icon(glyph, 17., hue))
+            } else {
+                item.hover(|style| style.bg(t.bg_hover)).child(
+                    icon(glyph, 17., t.text3).group_hover(group, |style| style.text_color(t.text1)),
+                )
+            };
             if section == Section::Conflicts && conflicts > 0 {
                 item = item.child(
                     div()
@@ -693,8 +682,6 @@ impl Render for Shell {
                             .min_w_0()
                             .min_h_0()
                             .bg(t.bg1)
-                            .border_t_1()
-                            .border_color(t.border2)
                             .overflow_hidden()
                             .children(content),
                     ),

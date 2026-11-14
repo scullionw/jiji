@@ -1991,6 +1991,18 @@ impl Rail {
                 rect(self.code, self.y, self.end, self.y + LINE_H),
                 tint,
             ));
+            // The change's edge: a solid stroke in its side's hue down the
+            // gutter's outer edge, so runs of changes read as blocks from
+            // across the room.
+            let edge = if kind == Kind::Added {
+                theme.add_fg
+            } else {
+                theme.del_fg
+            };
+            window.paint_quad(fill(
+                rect(self.x, self.y, self.x + 3., self.y + LINE_H),
+                Theme::fade(edge, 0.9),
+            ));
         }
     }
 }
@@ -2117,22 +2129,22 @@ impl HeaderPaint<'_> {
         );
         x += 12. + 6.;
 
-        // A/M/D/R in the status's hue — a letter, not a tile.
-        let (letter, hue) = match file.status {
-            FileStatus::Added => ("A", theme.add_fg),
-            FileStatus::Modified => ("M", theme.text3),
-            FileStatus::Removed => ("D", theme.del_fg),
-            FileStatus::Renamed => ("R", theme.accent_strong),
-            FileStatus::Copied => ("C", theme.accent_strong),
-        };
-        let bold = Font {
-            weight: FontWeight::SEMIBOLD,
-            ..metrics.code.clone()
-        };
-        label(letter, &bold, XS, hue, window)
-            .paint(at(x), px(height), window, cx)
-            .ok();
-        x += 12. + 8.;
+        // The file's kind in its language's hue.
+        let (glyph, hue) = crate::ui::file_glyph(&file.name);
+        const GLYPH: f32 = 14.;
+        let _ = window.paint_svg(
+            rect(
+                x,
+                y + ((height - GLYPH) / 2.).round(),
+                x + GLYPH,
+                y + ((height - GLYPH) / 2.).round() + GLYPH,
+            ),
+            glyph.path(),
+            TransformationMatrix::unit(),
+            theme.file_hue(hue),
+            cx,
+        );
+        x += GLYPH + 8.;
 
         // Directory quiet, file name carrying the weight.
         let gone = file.status == FileStatus::Removed;
@@ -2180,10 +2192,34 @@ impl HeaderPaint<'_> {
             ));
         }
         path.paint(at(x), px(height), window, cx).ok();
-        x += f32::from(path.width) + 8.;
+        x += f32::from(path.width) + 10.;
 
+        // What came or went says so in its side's hue; a modified file,
+        // the usual case, carries no word.
+        let medium = Font {
+            weight: FontWeight::MEDIUM,
+            ..metrics.ui.clone()
+        };
+        let word = match file.status {
+            FileStatus::Added => Some(("new file", theme.add_fg)),
+            FileStatus::Removed => Some(("deleted", theme.del_fg)),
+            FileStatus::Renamed => Some(("renamed", theme.accent_strong)),
+            FileStatus::Copied => Some(("copied", theme.accent_strong)),
+            FileStatus::Modified => None,
+        };
+        if let Some((word, hue)) = word {
+            let word = label(word, &medium, XS, hue, window);
+            word.paint(at(x), px(height), window, cx).ok();
+            x += f32::from(word.width) + 6.;
+        }
         if let Some(from) = &file.renamed_from {
-            let from = label(format!("← {from}"), &metrics.code, XS, theme.text3, window);
+            let from = label(
+                format!("from {from}"),
+                &metrics.code,
+                XS,
+                theme.text3,
+                window,
+            );
             from.paint(at(x), px(height), window, cx).ok();
             x += f32::from(from.width) + 8.;
         }

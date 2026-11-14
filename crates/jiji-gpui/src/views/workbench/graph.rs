@@ -6,8 +6,7 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, quad, AnyElement, App, BorderStyle, Bounds, Context,
-    Corner, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, SharedString, Stateful,
-    TextRun, Window,
+    Corner, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, Stateful, TextRun, Window,
 };
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
 use jiji_forge::RepoPrState;
@@ -17,7 +16,7 @@ use crate::app::WorkbenchMode;
 use crate::logic::graph::{
     emphasized_stream, full_lanes_for, gutter_width, lane_of, lane_tier, rail_x,
     resolve_focused_workstream, row_bookmarks, row_gutter_width, sync_glyph, ElisionRow,
-    GraphModel, GraphRow, LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT, RAIL_CORNER,
+    GraphModel, GraphRow, LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT,
 };
 use crate::logic::inspect::summary_of;
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
@@ -27,8 +26,8 @@ use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEX
 use crate::ui::ScrollY as _;
 use crate::ui::{
     absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, label_box, lead_bar,
-    menu_label, popover, popover_layer, ref_label, scrollbar, segmented, short_age, tag, tooltip,
-    truncated, v_flex, IconName, Tabular as _,
+    lead_bar_in, menu_label, popover, popover_layer, ref_label, scrollbar, segmented, short_age,
+    tag, tooltip, truncated, v_flex, IconName, Tabular as _,
 };
 use crate::views::menu;
 
@@ -126,8 +125,12 @@ pub fn rename_saved_view(
 
 /// Panes this wide or narrower leave authors out of the rows.
 const AUTHOR_MIN_PANE: f32 = 560.;
-/// A full-spacing rail's stroke, and a node ring's.
-const RAIL_W: f32 = 2.;
+/// A full-spacing rail's stroke: lines on a transit map, not hairlines.
+const RAIL_W: f32 = 3.;
+/// A station's ring.
+const RING_W: f32 = 2.5;
+/// How much of its hue a line keeps while another line has the focus.
+const CALM: f32 = 0.8;
 /// Between a row's parts, and after its last.
 const ROW_GAP: f32 = 8.;
 const ROW_PAD: f32 = 12.;
@@ -261,7 +264,7 @@ impl RowStyle<'_> {
         match rail.lane {
             None => Theme::blend(t.text3, 0.55, t.bg1),
             Some(lane) if Some(lane) == hot_lane => t.lane(lane),
-            Some(lane) => Theme::blend(t.lane(lane), 0.5, t.bg1),
+            Some(lane) => Theme::blend(t.lane(lane), CALM, t.bg1),
         }
     }
 
@@ -355,11 +358,10 @@ struct GutterPaint {
     working_copy: Hsla,
     danger: Hsla,
     base_fill: Hsla,
-    mono: SharedString,
 }
 
 impl GutterPaint {
-    fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         let (left, top, bottom) = (bounds.left(), bounds.top(), bounds.bottom());
         let height: f32 = bounds.size.height.into();
         let cy = top + px(height / 2.);
@@ -390,28 +392,22 @@ impl GutterPaint {
                     });
                 }
                 RailRole::In => {
-                    // Down the rail's own column, round the corner, then
-                    // across to the node.
-                    let s = px(dx.signum());
-                    let r = RAIL_CORNER.min(dx.abs());
-                    let reach = self.clear.min(dx.abs() - r);
+                    // Off its own track into the station from above: an
+                    // S-bend through the band over the node, the way a
+                    // transit line changes tracks.
+                    let end = cy - clear;
+                    let mid = top + (end - top) / 2.;
                     stroke(window, color, width, rail.elided, |path| {
                         path.move_to(point(x, top));
-                        path.line_to(point(x, cy - px(r)));
-                        path.curve_to(point(x + s * r, cy), point(x, cy));
-                        path.line_to(point(nx - s * reach, cy));
+                        path.cubic_bezier_to(point(nx, end), point(x, mid), point(nx, mid));
                     });
                 }
                 RailRole::Out => {
-                    let away: f32 = (x - nx).into();
-                    let s = px(away.signum());
-                    let r = RAIL_CORNER.min(away.abs());
-                    let reach = self.clear.min(away.abs() - r);
+                    let start = cy + clear;
+                    let mid = start + (bottom - start) / 2.;
                     stroke(window, color, width, rail.elided, |path| {
-                        path.move_to(point(nx + s * reach, cy));
-                        path.line_to(point(x - s * r, cy));
-                        path.curve_to(point(x, cy + px(r)), point(x, cy));
-                        path.line_to(point(x, bottom));
+                        path.move_to(point(nx, start));
+                        path.cubic_bezier_to(point(x, bottom), point(nx, mid), point(x, mid));
                     });
                 }
             }
@@ -442,42 +438,37 @@ impl GutterPaint {
         // × conflict.
         match self.marker {
             Marker::WorkingCopy => {
-                let font_size = if self.narrow {
-                    10.
+                // You are here: a ring around a dot, the one marker of its
+                // kind on the map.
+                let (outer, ring, inner) = if self.narrow {
+                    (4., 1.4, 1.8)
                 } else if self.classic {
-                    15.
+                    (7.5, 2., 3.5)
                 } else {
-                    13.
+                    (6.5, 2., 3.)
                 };
-                let run = TextRun {
-                    len: 1,
-                    font: gpui::Font {
-                        family: self.mono.clone(),
-                        features: gpui::FontFeatures::default(),
-                        fallbacks: None,
-                        weight: FontWeight::BOLD,
-                        style: gpui::FontStyle::Normal,
-                    },
-                    color: self.working_copy,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let line = window
-                    .text_system()
-                    .shape_line("@".into(), px(font_size), &[run], None);
-                let line_height = px(font_size * 1.3);
-                let origin = point(nx - line.width / 2., cy - line_height / 2. + px(0.5));
-                let _ = line.paint(origin, line_height, window, cx);
+                window.paint_quad(quad(
+                    disc(px(outer)),
+                    px(outer),
+                    gpui::transparent_black(),
+                    px(ring),
+                    self.working_copy,
+                    BorderStyle::Solid,
+                ));
+                window.paint_quad(fill(disc(px(inner)), self.working_copy).corner_radii(px(inner)));
             }
             Marker::Conflict => {
-                let xr = px(self.radius - 0.8);
-                let width = if self.narrow { 1.4 } else { 2. };
-                stroke(window, self.danger, width, false, |path| {
+                // A closed station: a red disc with the cross cut from it.
+                let rr = r + px(if self.narrow { 0.5 } else { 1.5 });
+                window.paint_quad(fill(disc(rr), self.danger).corner_radii(rr));
+                let xr = rr * 0.42;
+                let width = if self.narrow { 1.1 } else { 1.7 };
+                let ink = gpui::white();
+                stroke(window, ink, width, false, |path| {
                     path.move_to(point(nx - xr, cy - xr));
                     path.line_to(point(nx + xr, cy + xr));
                 });
-                stroke(window, self.danger, width, false, |path| {
+                stroke(window, ink, width, false, |path| {
                     path.move_to(point(nx + xr, cy - xr));
                     path.line_to(point(nx - xr, cy + xr));
                 });
@@ -495,7 +486,7 @@ impl GutterPaint {
                 }
             }
             Marker::Change { ring, fill: inside } => {
-                let width = if self.narrow { 1.2 } else { RAIL_W };
+                let width = if self.narrow { 1.2 } else { RING_W };
                 // The selected node fills in: a solid dot reads as "this
                 // one" at any lane color, without a halo.
                 window.paint_quad(quad(
@@ -1019,14 +1010,21 @@ impl WorkbenchView {
         let radius = match (narrow, classic) {
             (true, true) => 3.,
             (true, false) => 2.5,
-            (false, true) => 5.,
-            (false, false) => 4.,
+            (false, true) => 5.5,
+            (false, false) => 4.75,
         };
-        // Clearance around the marker so rails do not pierce hollow glyphs.
+        // Rails run up to a marker's edge and stop there: the line meets
+        // the station, never shows through its ring.
         let clear = if narrow {
             radius + 2.
+        } else if row.is_working_copy {
+            if classic {
+                7.5
+            } else {
+                6.5
+            }
         } else {
-            (if row.is_working_copy { 7. } else { 6. }) + if classic { 1. } else { 0. }
+            radius + RING_W / 2. - 0.5
         };
         let lane_color = row.lane.map_or(t.accent, |lane| t.lane(lane));
         let marker = if row.is_working_copy {
@@ -1037,10 +1035,12 @@ impl WorkbenchView {
             Marker::Base
         } else {
             Marker::Change {
+                // A station wears its line's color: full on the line in
+                // focus, the line's own calm tone elsewhere.
                 ring: if hot || selected {
                     lane_color
                 } else {
-                    Theme::blend(lane_color, 0.7, t.text3)
+                    Theme::blend(lane_color, CALM, t.bg1)
                 },
                 fill: selected.then_some(lane_color),
             }
@@ -1075,7 +1075,6 @@ impl WorkbenchView {
                 working_copy: t.working_copy,
                 danger: t.danger,
                 base_fill: Theme::blend(t.text3, 0.8, t.bg1),
-                mono: t.mono.clone(),
             },
             gutter_w,
             height,
@@ -1113,6 +1112,15 @@ impl WorkbenchView {
                 )
                 .into_any_element()
         } else {
+            // The part you would type wears the line's color, the way jj
+            // colors it in a terminal; history keeps it neutral.
+            let ink = if is_base {
+                t.text2
+            } else if hot || selected {
+                lane_color
+            } else {
+                Theme::blend(lane_color, 0.78, t.text2)
+            };
             h_flex()
                 .flex_shrink_0()
                 .font_family(t.mono.clone())
@@ -1120,8 +1128,8 @@ impl WorkbenchView {
                 .text_color(t.text3)
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if is_base { t.text2 } else { t.text1 })
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(ink)
                         .child(short(&node.id, 0, 2)),
                 )
                 .child(short(&node.id, 2, 8))
@@ -1382,8 +1390,14 @@ impl WorkbenchView {
             }
             None => {}
         }
+        // The selection takes its line's hue: a tint of it across the row
+        // and the line's color on the leading bar. History selects in the
+        // neutral fill.
+        let hue = (!is_base).then_some(lane_color);
         el = if selected {
-            el.bg(t.selected)
+            el.bg(hue.map_or(t.selected, |hue| {
+                Theme::fade(hue, if t.is_dark() { 0.16 } else { 0.11 })
+            }))
         } else if is_compare_base {
             el.bg(Theme::fade(t.accent, 0.05))
         } else {
@@ -1391,7 +1405,9 @@ impl WorkbenchView {
         };
         // The leading bar marks the selection, and the far end of an
         // active comparison with it, so the pair reads at a glance.
-        if selected || is_compare_base {
+        if selected {
+            el = el.child(lead_bar_in(hue.unwrap_or(t.accent)));
+        } else if is_compare_base {
             el = el.child(lead_bar(cx));
         }
         el = el.child(gutter);
@@ -1676,7 +1692,11 @@ impl WorkbenchView {
                     .w(px(8.))
                     .flex()
                     .justify_center()
-                    .child(crate::ui::dot(t.lane(slot), 8.)),
+                    .child(crate::ui::node_mark(
+                        crate::ui::Mark::Station { filled: true },
+                        t.lane(slot),
+                        10.,
+                    )),
             )
             .child(
                 div()
@@ -1779,17 +1799,34 @@ impl WorkbenchView {
         let t = theme(cx);
         let color = t.lane(lane_of(&self.snapshot, &workstream.id).unwrap_or(0));
         let count = workstream.node_ids.len();
+        // The line in miniature: a short run of track with up to three
+        // stations on it.
+        let stations = count.clamp(1, 3);
         let mut mini = v_flex()
+            .relative()
             .w(px(12.))
             .flex_shrink_0()
             .items_center()
-            .gap(px(2.));
-        for ix in 0..count.min(4) {
+            .gap(px(3.))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .bottom(px(3.))
+                    .left(px(5.))
+                    .w(px(2.))
+                    .bg(color),
+            );
+        for ix in 0..stations {
             let is_wc = workstream.is_active && ix == 0;
-            mini = mini.child(crate::ui::dot(
-                if is_wc { t.working_copy } else { color },
-                if is_wc { 6. } else { 5. },
-            ));
+            mini = mini.child(
+                div()
+                    .size(px(8.))
+                    .rounded(px(4.))
+                    .border_2()
+                    .border_color(if is_wc { t.working_copy } else { color })
+                    .bg(t.bg1),
+            );
         }
         let mut line = h_flex().min_w_0().gap(px(6.)).child(
             div()

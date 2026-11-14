@@ -117,17 +117,28 @@ fn time_of(node: &GraphNode) -> i64 {
         .unwrap_or(0)
 }
 
-/// Lane slots: a workstream's index in snapshot order, cycled through the
-/// six lane hues. Every surface that colors by stream shares this so hue
-/// stays identity.
+/// Lane slots: a workstream's index in snapshot order, mapped onto the six
+/// lane hues. Every surface that colors by stream shares this so hue stays
+/// identity.
 pub const LANE_COUNT: usize = 6;
+
+/// The first stream (the working copy's, when there is one: the snapshot
+/// lists it first) owns slot 0, the accent; the rest cycle through the
+/// other five, so no other line ever wears the working line's color.
+pub fn lane_slot(index: usize) -> usize {
+    if index == 0 {
+        0
+    } else {
+        1 + (index - 1) % (LANE_COUNT - 1)
+    }
+}
 
 pub fn lane_of(snapshot: &RepoSnapshot, stream: &str) -> Option<usize> {
     snapshot
         .workstreams
         .iter()
         .position(|w| w.id == stream)
-        .map(|slot| slot % LANE_COUNT)
+        .map(lane_slot)
 }
 
 pub fn build_graph_model(snapshot: &RepoSnapshot) -> GraphModel {
@@ -176,7 +187,7 @@ fn build(
             .max(0);
         let lane = lane_override
             .or_else(|| lane_of(snapshot, &ws.id))
-            .unwrap_or(si % LANE_COUNT);
+            .unwrap_or(lane_slot(si));
         for (i, id) in present.iter().enumerate() {
             if rank.contains_key(id) {
                 continue;
@@ -635,8 +646,6 @@ pub const GUTTER_PAD: f32 = 12.;
 pub const NODE_ROW_HEIGHT: f32 = 28.;
 pub const NODE_ROW_HEIGHT_CLASSIC: f32 = 46.;
 pub const ELISION_ROW_HEIGHT: f32 = 18.;
-/// Corner radius where an edge bends into or out of a node.
-pub const RAIL_CORNER: f32 = 6.;
 
 /// Row size preference: jj-dense one-liners, or the taller two-line rows
 /// of classic Git clients.
@@ -891,6 +900,14 @@ mod tests {
         // Overflow lanes share the narrow band's last slot.
         assert_eq!(rail_x(40, 4), rail_x(4 + NARROW_LANES - 1, 4));
         assert_eq!(gutter_width(1, 6), 2. * GUTTER_PAD);
+    }
+
+    #[test]
+    fn only_the_first_stream_wears_the_accent_lane() {
+        assert_eq!(lane_slot(0), 0);
+        let rest: Vec<usize> = (1..12).map(lane_slot).collect();
+        assert!(rest.iter().all(|&slot| (1..LANE_COUNT).contains(&slot)));
+        assert_eq!(&rest[..6], &[1, 2, 3, 4, 5, 1]);
     }
 
     #[test]
