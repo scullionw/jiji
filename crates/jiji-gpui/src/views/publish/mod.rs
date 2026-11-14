@@ -27,7 +27,7 @@ use crate::logic::publish::{
     autoland_options_story, job_title, job_tone, land_action_text, review_rows,
 };
 use crate::shell::Dismiss;
-use crate::theme::{theme, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::{
     btn, dot, empty_state, h_flex, icon, icon_btn, input::field, popover, popover_layer, ref_label,
     segmented, v_flex, IconName, InputEvent, PopoverState, TextInput,
@@ -846,7 +846,7 @@ impl PublishView {
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(TEXT_L))
+                    .text_size(px(TEXT_M))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(t.text1)
                     .child("Publish"),

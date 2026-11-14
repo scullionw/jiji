@@ -12,8 +12,8 @@ use jiji_forge::{AutoLandStatus, LandSegment, PublishStack, SubmitHead};
 use super::{Mode, Page, PublishView};
 use crate::logic::publish::stack_summary;
 use crate::logic::text::plural_s;
-use crate::theme::{theme, RADIUS_S, TEXT_L, TEXT_S, TEXT_XS, TOOLBAR_H};
-use crate::ui::{btn, dot, empty_state, h_flex, truncated, v_flex, IconName};
+use crate::theme::{theme, TEXT_L, TEXT_S, TOOLBAR_H};
+use crate::ui::{btn, dot, empty_state, h_flex, truncated, trunk_label, v_flex, IconName};
 
 const BROWSER_W: f32 = 280.;
 const ACTIONS_W: f32 = 300.;
@@ -363,25 +363,14 @@ impl PublishView {
                 plural_s(stack.change_count as usize)
             )));
         }
-        meta_bar = meta_bar.child(
-            fact().child("into").child(
-                div()
-                    .h(px(17.))
-                    .px(px(5.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(RADIUS_S))
-                    .bg(t.accent_dim)
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.accent_strong)
-                    .child(if stack.base.is_empty() {
-                        snapshot.trunk_bookmark.clone()
-                    } else {
-                        stack.base.clone()
-                    }),
-            ),
-        );
+        meta_bar = meta_bar.child(fact().child("into").child(trunk_label(
+            if stack.base.is_empty() {
+                snapshot.trunk_bookmark.clone()
+            } else {
+                stack.base.clone()
+            },
+            cx,
+        )));
         if stack.is_active {
             meta_bar = meta_bar.child(fact().child(dot(t.working_copy, 6.)).child("Current stack"));
         } else if stack.submit_head.is_none() {

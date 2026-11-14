@@ -3,8 +3,8 @@
 //! surface in this pane instead.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton, ScrollHandle,
-    SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, Entity, MouseButton, ScrollHandle, SharedString,
+    Window,
 };
 use jiji_core::snapshot::{BookmarkState, RepoSnapshot};
 
@@ -12,11 +12,11 @@ use super::WorkbenchView;
 use crate::logic::bookmarks::bookmark_key;
 use crate::logic::graph::resolve_focused_workstream;
 use crate::logic::inspect::{find_node, sync_label};
-use crate::theme::{theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_TITLE, TEXT_XS};
+use crate::theme::{theme, ROW_H, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, h_flex, icon, icon_btn, input::field, kbd, ref_label, scrollbar, tooltip, truncated,
-    v_flex, IconName, InputEvent, TextInput,
+    btn, group_head, h_flex, icon, icon_btn, input::field, kbd, lead_bar, page_bar, ref_label,
+    scrollbar, tooltip, truncated, v_flex, IconName, InputEvent, TextInput, PAGE_PAD,
 };
 use crate::views::menu;
 
@@ -145,38 +145,15 @@ impl WorkbenchView {
         );
     }
 
-    fn card_heading(&self, title: &'static str, count: usize, cx: &Context<Self>) -> gpui::Div {
-        let t = theme(cx);
-        h_flex()
-            .gap(px(8.))
-            .pb(px(6.))
-            .mb(px(4.))
-            .border_b_1()
-            .border_color(t.border2)
-            .child(
-                div()
-                    .text_size(px(TEXT_S))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.text2)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .child(count.to_string()),
-            )
-    }
-
     fn render_workstreams(&self, snapshot: &RepoSnapshot, cx: &mut Context<Self>) -> AnyElement {
         let t = theme(cx);
         let focused = self.app.read(cx).ui().focused_workstream.clone();
         let focused =
             resolve_focused_workstream(snapshot, focused.as_deref()).map(|ws| ws.id.clone());
-        let mut card = v_flex().flex_1().min_w_0().child(self.card_heading(
+        let mut card = v_flex().flex_1().min_w_0().child(group_head(
             "Workstreams",
-            snapshot.workstreams.len(),
+            Some(snapshot.workstreams.len()),
+            None,
             cx,
         ));
         for (index, stream) in snapshot.workstreams.iter().enumerate() {
@@ -193,12 +170,11 @@ impl WorkbenchView {
             }
             let mut row = h_flex()
                 .id(("inspector-ws", index))
+                .relative()
                 .gap(px(8.))
                 .min_w_0()
-                .h(px(28.))
-                .mx(px(-8.))
-                .px(px(8.))
-                .rounded(px(RADIUS_S))
+                .h(px(ROW_H))
+                .px(px(PAGE_PAD))
                 .cursor_pointer()
                 .child(dot)
                 .child(
@@ -210,7 +186,7 @@ impl WorkbenchView {
                         .child(truncated(stream.title.clone())),
                 );
             row = if current {
-                row.bg(t.accent_dim)
+                row.bg(t.selected).child(lead_bar(cx))
             } else {
                 row.hover(|style| style.bg(t.bg_hover))
             };
@@ -257,9 +233,10 @@ impl WorkbenchView {
     ) -> AnyElement {
         let t = theme(cx);
         let busy = self.inspector.busy;
-        let mut card = v_flex().flex_1().min_w_0().child(self.card_heading(
+        let mut card = v_flex().flex_1().min_w_0().child(group_head(
             "Bookmarks",
-            snapshot.bookmarks.len(),
+            Some(snapshot.bookmarks.len()),
+            None,
             cx,
         ));
         for (index, bookmark) in snapshot.bookmarks.iter().enumerate() {
@@ -273,7 +250,9 @@ impl WorkbenchView {
             let row = h_flex()
                 .gap(px(8.))
                 .min_w_0()
-                .min_h(px(28.))
+                .min_h(px(ROW_H))
+                .pl(px(PAGE_PAD))
+                .pr(px(8.))
                 .text_size(px(TEXT_M));
             let cancel = btn(("inspector-bm-cancel", index), "Cancel")
                 .small()
@@ -406,6 +385,7 @@ impl WorkbenchView {
             card = card.child(
                 div()
                     .mt(px(4.))
+                    .px(px(PAGE_PAD))
                     .text_size(px(TEXT_XS))
                     .text_color(t.danger)
                     .child(truncated(error.clone())),
@@ -468,70 +448,75 @@ impl WorkbenchView {
         );
 
         // Sections side by side when the pane is wide, stacked when the
-        // split squeezes it.
+        // split squeezes it; a hairline between them either way.
         let wide = self.diff_width >= 780.;
-        let mut cards = div().flex().gap(px(24.));
+        let mut cards = div().flex().border_b_1().border_color(t.border2);
         cards = if wide {
-            cards.flex_row().items_start()
+            cards.flex_row()
         } else {
             cards.flex_col()
         };
         if !snapshot.workstreams.is_empty() {
-            cards = cards.child(self.render_workstreams(&snapshot, cx));
+            let streams = div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .pb(px(8.))
+                .child(self.render_workstreams(&snapshot, cx));
+            cards = cards.child(if wide {
+                streams.border_r_1().border_color(t.border2)
+            } else {
+                streams
+            });
         }
-        cards = cards.child(self.render_bookmark_list(&snapshot, window, cx));
+        cards = cards.child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .pb(px(8.))
+                .child(self.render_bookmark_list(&snapshot, window, cx)),
+        );
 
-        div()
-            .relative()
+        // The repo's standing facts ride the toolbar line the graph pane
+        // starts on, so one hairline runs the window's width.
+        v_flex()
             .size_full()
             .child(
-                div()
-                    .id("inspector-scroll")
-                    .size_full()
-                    .scroll_y()
-                    .track_scroll(&self.inspector.scroll)
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .max_w(px(920.))
-                            .mx_auto()
-                            .pt(px(20.))
-                            .px(px(24.))
-                            .pb(px(24.))
-                            .child(
-                                h_flex()
-                                    .gap(px(16.))
-                                    .mb(px(20.))
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_size(px(TEXT_TITLE))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(t.text1)
-                                            .child(truncated(snapshot.repo_name.clone())),
-                                    )
-                                    .child(facts),
-                            )
-                            .child(cards)
-                            .child(
-                                h_flex()
-                                    .justify_center()
-                                    .gap(px(8.))
-                                    .pt(px(40.))
-                                    .text_size(px(TEXT_S))
-                                    .text_color(t.text3)
-                                    .child(
-                                        h_flex()
-                                            .gap(px(2.))
-                                            .child(kbd("↑", cx))
-                                            .child(kbd("↓", cx)),
-                                    )
-                                    .child("Select a change in the graph to review its diff"),
-                            ),
-                    ),
+                page_bar(snapshot.repo_name.clone(), None, cx)
+                    .child(div().flex_1())
+                    .child(facts.pr(px(8.))),
             )
-            .child(scrollbar("inspector-scrollbar", &self.inspector.scroll))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("inspector-scroll")
+                            .size_full()
+                            .scroll_y()
+                            .track_scroll(&self.inspector.scroll)
+                            .child(
+                                div().w_full().pb(px(24.)).child(cards).child(
+                                    h_flex()
+                                        .justify_center()
+                                        .gap(px(8.))
+                                        .pt(px(32.))
+                                        .text_size(px(TEXT_S))
+                                        .text_color(t.text3)
+                                        .child(
+                                            h_flex()
+                                                .gap(px(2.))
+                                                .child(kbd("↑", cx))
+                                                .child(kbd("↓", cx)),
+                                        )
+                                        .child("Select a change in the graph to review its diff"),
+                                ),
+                            ),
+                    )
+                    .child(scrollbar("inspector-scrollbar", &self.inspector.scroll)),
+            )
     }
 }

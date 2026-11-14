@@ -14,13 +14,16 @@ use crate::app::{app, AppModel};
 use crate::logic::ops::{clock_time, group_operations, is_root_op, now, ops_since, TimelineRow};
 use crate::logic::text::short_id;
 use crate::shell::Dismiss;
-use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
+use crate::theme::{theme, Theme, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, consequences, h_flex, icon, plan_actions, plan_panel, plan_title, scrollbar,
-    section_header, tooltip, truncated, v_flex, wrapped, IconName,
+    btn, consequences, group_head, h_flex, icon, label_box, page_bar, plan_actions, plan_panel,
+    plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped, IconName, PAGE_PAD,
 };
+
+/// The clock gutter down the journal's leading edge.
+const TIME_W: f32 = 40.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpAction {
@@ -140,8 +143,8 @@ impl OperationsView {
                 div()
                     .absolute()
                     .top_0()
-                    .left(px(10.25))
-                    .w(px(1.5))
+                    .left(px(10.))
+                    .w(px(2.))
                     .h(px(stub))
                     .bg(line),
             );
@@ -152,8 +155,8 @@ impl OperationsView {
                     .absolute()
                     .top(px(21.))
                     .bottom_0()
-                    .left(px(10.25))
-                    .w(px(1.5))
+                    .left(px(10.))
+                    .w(px(2.))
                     .bg(line),
             );
         }
@@ -281,12 +284,12 @@ impl OperationsView {
                 .child("@")
                 .into_any_element()
         } else {
-            let size = if quiet { 6. } else { 8. };
+            let size = if quiet { 6. } else { 10. };
             div()
-                .mt(px(if quiet { 13. } else { 12. }))
+                .mt(px(if quiet { 13. } else { 11. }))
                 .size(px(size))
                 .rounded(px(size / 2.))
-                .border(px(1.5))
+                .border(px(if quiet { 1.5 } else { 2. }))
                 .border_color(if quiet {
                     Theme::fade(t.text3, 0.55)
                 } else {
@@ -322,20 +325,7 @@ impl OperationsView {
         }
         let mut head = h_flex().gap(px(8.)).min_w_0().min_h(px(22.)).child(desc);
         if op.is_current {
-            head = head.child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(17.))
-                    .px(px(5.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(RADIUS_S))
-                    .bg(t.accent_dim)
-                    .text_size(px(TEXT_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.accent_strong)
-                    .child("current"),
-            );
+            head = head.child(tag("current", t.accent_strong));
         }
         head = head.child(div().flex_1());
         if actionable {
@@ -393,24 +383,8 @@ impl OperationsView {
                     .tooltip(tooltip(op.id.clone()))
                     .child(short_id(&op.id, 8).to_owned()),
             )
-            .child(
-                div()
-                    .id(("op-time", index))
-                    .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
-                    .child(clock_time(&op.timestamp, clock)),
-            )
-            .child(div().max_w(px(180.)).child(truncated(op.user.clone())));
-        let chip = || {
-            h_flex()
-                .gap(px(4.))
-                .h(px(17.))
-                .px(px(5.))
-                .rounded(px(RADIUS_S))
-                .bg(Theme::fade(t.text1, 0.06))
-                .text_size(px(TEXT_XS))
-                .text_color(t.text2)
-                .whitespace_nowrap()
-        };
+            .child(div().max_w(px(220.)).child(truncated(op.user.clone())));
+        let chip = || label_box(t.text2, t.border2).gap(px(4.));
         for effect in &op.effects {
             let lead = match effect.kind {
                 OpEffectKind::WorkingCopy => div()
@@ -446,18 +420,35 @@ impl OperationsView {
             body = body.child(self.render_confirm(op, action, ops_since(ops, &op.id), cx));
         }
         let id = op.id.clone();
+        // The clock runs down the page's leading edge, the journal's own
+        // gutter: when, then what.
+        let time = div()
+            .id(("op-time", index))
+            .w(px(TIME_W))
+            .flex_shrink_0()
+            .pt(px(9.))
+            .flex()
+            .justify_end()
+            .font_family(t.mono.clone())
+            .text_size(px(TEXT_XS))
+            .text_color(if quiet { t.text3 } else { t.text2 })
+            .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
+            .child(clock_time(&op.timestamp, clock));
         div()
             .id(("op-row", index))
             .group(group)
             .flex()
             .flex_row()
             .gap(px(8.))
+            .pl(px(PAGE_PAD))
+            .pr(px(12.))
             .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, _, cx| {
                 cx.stop_propagation();
                 app(cx).update(cx, |model, cx| {
                     model.open_operation_menu(&id, event.position, cx)
                 });
             })
+            .child(time)
             .child(self.rail(up, down, 11., glyph, cx))
             .child(body)
             .into_any_element()
@@ -477,38 +468,11 @@ impl Render for OperationsView {
         // width, so a row whose text wraps would be measured unwrapped
         // and then squeezed, and a group would sit at its content's
         // width instead of the page's.
-        let mut column = div()
-            .w_full()
-            .max_w(px(800.))
-            .mx_auto()
-            .pt(px(24.))
-            .px(px(24.))
-            .pb(px(32.))
-            .child(section_header(
-                IconName::Operations,
-                "Operations",
-                "Everything that has happened to this repository, newest first. Every entry is a \
-                 complete repo state: restore the repo to any point, or revert a single operation \
-                 — time travel is just another operation, so it can always be undone again.",
-                cx,
-            ));
+        let mut column = div().w_full().pb(px(32.));
         let mut index = 0;
         for group in &groups {
             // The day stays in view while its operations scroll under it.
-            let heading = h_flex()
-                .gap(px(12.))
-                .pt(px(12.))
-                .pb(px(4.))
-                .bg(t.bg1)
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(TEXT_S))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.text2)
-                        .child(group.label.clone()),
-                )
-                .child(div().flex_1().h(px(1.)).bg(t.border2));
+            let heading = group_head(group.label.clone(), None, None, cx);
             let mut day = div();
             let last = group.rows.len().saturating_sub(1);
             for (i, row) in group.rows.iter().enumerate() {
@@ -538,7 +502,8 @@ impl Render for OperationsView {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.))
-                                .rounded(px(RADIUS_S))
+                                .pl(px(PAGE_PAD + TIME_W + 8.))
+                                .pr(px(12.))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(t.bg_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -582,8 +547,8 @@ impl Render for OperationsView {
         if ops.len() >= 50 {
             column = column.child(
                 div()
-                    .mt(px(16.))
-                    .pl(px(30.))
+                    .mt(px(12.))
+                    .pl(px(PAGE_PAD + TIME_W + 38.))
                     .text_size(px(TEXT_XS))
                     .text_color(t.text3)
                     .child("Showing the 50 most recent operations."),
@@ -602,14 +567,38 @@ impl Render for OperationsView {
             "Operations"
         });
         root.child(
-            div()
-                .id("operations-scroll")
+            v_flex()
                 .size_full()
-                .scroll_y()
-                .track_scroll(&self.scroll)
-                .child(column),
+                .child(
+                    page_bar("Operations", Some(ops.len().to_string()), cx).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl(px(4.))
+                            .text_size(px(TEXT_S))
+                            .text_color(t.text3)
+                            .child(truncated(
+                                "Every entry is a whole repo state — restore to any point, or \
+                                 revert one operation. Time travel is an operation too.",
+                            )),
+                    ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .id("operations-scroll")
+                                .size_full()
+                                .scroll_y()
+                                .track_scroll(&self.scroll)
+                                .child(column),
+                        )
+                        .child(scrollbar("operations-scrollbar", &self.scroll)),
+                ),
         )
-        .child(scrollbar("operations-scrollbar", &self.scroll))
         .into_any_element()
     }
 }

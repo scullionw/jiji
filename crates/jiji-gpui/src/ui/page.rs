@@ -1,10 +1,13 @@
 //! The furniture of a full pane: empty states, section openings, and the
 //! plan panel that states what a consequential action will do.
 
-use gpui::{div, prelude::*, px, App, Div, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, App, Div, Entity, FontWeight, SharedString, Window};
 
-use super::{h_flex, icon, truncated, v_flex, Btn, IconName};
-use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS};
+use super::{h_flex, icon, truncated, v_flex, Btn, IconName, TextInput};
+use crate::theme::{theme, Theme, RADIUS_M, ROW_H, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+
+/// The gutter a page's bar, bands and rows share.
+pub const PAGE_PAD: f32 = 16.;
 
 /// A quiet placeholder for a surface with nothing on it: the glyph in
 /// tertiary ink, one line of what, one of why, and the jj command that
@@ -53,35 +56,151 @@ pub fn empty_state(
     el
 }
 
-/// A full-page section's opening: its name and one paragraph of what the
-/// surface does. The icon echoes the rail, small and quiet.
-pub fn section_header(
-    glyph: IconName,
-    title: impl Into<SharedString>,
-    description: impl Into<SharedString>,
+/// A section page's bar, on the toolbar line every pane shares: the
+/// page's name and how much it holds, then whatever the page acts with.
+pub fn page_bar(title: impl Into<SharedString>, count: Option<String>, cx: &App) -> Div {
+    let t = theme(cx);
+    let mut bar = h_flex()
+        .h(px(TOOLBAR_H))
+        .flex_shrink_0()
+        .gap(px(10.))
+        .pl(px(PAGE_PAD))
+        .pr(px(8.))
+        .border_b_1()
+        .border_color(t.border2)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(TEXT_M))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text1)
+                .child(title.into()),
+        );
+    if let Some(count) = count {
+        bar = bar.child(
+            div()
+                .flex_shrink_0()
+                .font_family(t.mono.clone())
+                .text_size(px(TEXT_XS))
+                .text_color(t.text3)
+                .child(count),
+        );
+    }
+    bar
+}
+
+/// The filter a page bar carries: one quiet line, the accent while it has
+/// the keys.
+pub fn page_filter(input: &Entity<TextInput>, window: &Window, cx: &App) -> Div {
+    let t = theme(cx);
+    let focused = input.read(cx).is_focused(window);
+    h_flex()
+        .flex_1()
+        .min_w(px(120.))
+        .max_w(px(360.))
+        .gap(px(7.))
+        .h(px(26.))
+        .px(px(8.))
+        .bg(t.bg_well)
+        .border_1()
+        .border_color(if focused { t.accent } else { t.border2 })
+        .rounded(px(RADIUS_M))
+        .text_size(px(TEXT_S))
+        .line_height(px(18.))
+        .child(icon(IconName::Search, 12., t.text3))
+        .child(input.clone())
+}
+
+/// A page's group heading: a band that stays put (under [`pinned`]) while
+/// its rows pass beneath. The note says what the group is, once.
+///
+/// [`pinned`]: super::pinned
+pub fn group_head(
+    label: impl Into<SharedString>,
+    count: Option<usize>,
+    note: Option<SharedString>,
     cx: &App,
 ) -> Div {
     let t = theme(cx);
-    v_flex()
-        .mb(px(20.))
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .text_size(px(crate::theme::TEXT_TITLE))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.text1)
-                .child(icon(glyph, 16., t.text3))
-                .child(title.into()),
-        )
+    let mut head = h_flex()
+        .h(px(ROW_H))
+        .gap(px(8.))
+        .px(px(PAGE_PAD))
+        .bg(t.recess)
+        .border_b_1()
+        .border_color(t.border2)
+        .text_size(px(TEXT_S))
         .child(
             div()
-                .mt(px(4.))
-                .max_w(px(760.))
-                .text_size(px(TEXT_S))
-                .line_height(gpui::relative(1.55))
+                .flex_shrink_0()
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(t.text2)
-                .child(description.into()),
+                .child(label.into()),
+        );
+    if let Some(count) = count {
+        head = head.child(
+            div()
+                .flex_shrink_0()
+                .font_family(t.mono.clone())
+                .text_size(px(TEXT_XS))
+                .text_color(t.text3)
+                .child(count.to_string()),
+        );
+    }
+    if let Some(note) = note {
+        head = head.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pl(px(4.))
+                .text_color(t.text3)
+                .child(truncated(note)),
+        );
+    }
+    head
+}
+
+/// A notice across the top of a page: what went wrong, and the way to put
+/// it away.
+pub fn page_notice(
+    id: &'static str,
+    text: impl Into<SharedString>,
+    cx: &App,
+    on_dismiss: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let t = theme(cx);
+    h_flex()
+        .min_h(px(ROW_H))
+        .gap(px(8.))
+        .py(px(5.))
+        .pl(px(PAGE_PAD))
+        .pr(px(8.))
+        .bg(Theme::fade(t.danger, 0.08))
+        .border_b_1()
+        .border_color(Theme::fade(t.danger, 0.3))
+        .text_size(px(TEXT_S))
+        .text_color(t.danger)
+        .child(div().flex_1().min_w_0().child(truncated(text)))
+        .child(
+            super::icon_btn(id, IconName::Close)
+                .size(20., 11.)
+                .color(t.danger)
+                .tooltip("Dismiss")
+                .on_click(on_dismiss),
         )
+}
+
+/// A tray: a consequence-stating panel that opens across a page, recessed
+/// below the pane rather than floated over it.
+pub fn tray(cx: &App) -> Div {
+    let t = theme(cx);
+    v_flex()
+        .py(px(12.))
+        .px(px(PAGE_PAD))
+        .bg(t.bg_well)
+        .border_b_1()
+        .border_color(t.border2)
+        .text_size(px(TEXT_S))
 }
 
 /// The plan step before a consequential action: a recessed panel that

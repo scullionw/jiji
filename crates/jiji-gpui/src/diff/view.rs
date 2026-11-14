@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::time::Instant;
 
 use gpui::{
     actions, fill, font, point, prelude::*, px, quad, relative, App, BorderStyle, Bounds,
@@ -17,7 +18,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextRun, TouchPhase, TransformationMatrix, Window,
+    StrikethroughStyle, Style, TextRun, TransformationMatrix, Window,
 };
 use jiji_core::snapshot::FileStatus;
 
@@ -27,7 +28,7 @@ use crate::diff::model::{
     LINE_H, NOTE_H, REGION_H, SIDE_H,
 };
 use crate::theme::{theme, Theme};
-use crate::ui::IconName;
+use crate::ui::{AxisLock, IconName};
 
 actions!(
     diff,
@@ -71,6 +72,16 @@ const CODE_PAD_L: f32 = 8.;
 const CODE_PAD_R: f32 = 16.;
 /// Width of the strip at the right edge that belongs to the scroll thumb.
 const THUMB_ZONE: f32 = 12.;
+/// Depth of the band along a file's bottom edge where its sideways thumb
+/// takes the pointer.
+const THUMB_BAND: f32 = 12.;
+const MIN_THUMB: f32 = 28.;
+/// How far inside a code column's edges a selection drag starts pulling
+/// the lines along: the belt WebKit keeps.
+const PULL_BELT: f32 = 20.;
+/// Pull speed per point of overshoot, and its ceiling, per second.
+const PULL_RATE: f32 = 21.;
+const PULL_MAX: f32 = 2880.;
 
 /// What sits under a right-click, for the context menu.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -158,12 +169,69 @@ enum Drag {
     /// Dragging the vertical thumb; the offset is where on the thumb it was
     /// grabbed.
     Thumb(f32),
+    /// Dragging a file's sideways thumb.
+    Pan(PanGrab),
 }
 
+/// A hold on a sideways thumb: whose it is, the track it runs on, and
+/// where on the thumb it was grabbed.
 #[derive(Clone, Copy, PartialEq)]
-enum Axis {
-    X,
-    Y,
+struct PanGrab {
+    file: usize,
+    track: (f32, f32),
+    grab: f32,
+}
+
+/// A file's sideways scroll bar: one thumb per code column, all riding
+/// the file's one offset.
+#[derive(Clone, Copy)]
+struct PanBar {
+    file: usize,
+    /// The edge the thumbs rest on: the viewport's bottom while the file
+    /// passes, the file's own end when that comes first.
+    seat: f32,
+    pan: f32,
+    max_pan: f32,
+    /// Each code column's left and right edge.
+    tracks: [(f32, f32); 2],
+    columns: usize,
+}
+
+impl PanBar {
+    fn tracks(&self) -> &[(f32, f32)] {
+        &self.tracks[..self.columns]
+    }
+
+    /// A column's thumb: its left edge and width.
+    fn thumb(&self, (x0, x1): (f32, f32)) -> (f32, f32) {
+        let span = x1 - x0;
+        let width = (span * span / (span + self.max_pan))
+            .max(MIN_THUMB)
+            .min(span);
+        (x0 + self.pan / self.max_pan * (span - width), width)
+    }
+
+    /// The offset that puts a column's thumb with its left edge at `left`.
+    fn pan_at(&self, track: (f32, f32), left: f32) -> f32 {
+        let (_, width) = self.thumb(track);
+        let travel = (track.1 - track.0 - width).max(1.);
+        (left - track.0) / travel * self.max_pan
+    }
+
+    /// The thumb under a point, held where the point is.
+    fn grab(&self, x: f32, y: f32) -> Option<PanGrab> {
+        if y < self.seat - THUMB_BAND || y > self.seat {
+            return None;
+        }
+        self.tracks().iter().find_map(|&track| {
+            let (left, width) = self.thumb(track);
+            (x >= left && x <= left + width).then_some(PanGrab {
+                file: self.file,
+                track,
+                grab: x - left,
+            })
+        })
+    }
 }
 
 /// Which code column a paint pass covers.
@@ -232,7 +300,11 @@ pub struct DiffSurface {
     header_hover: Option<(usize, bool)>,
     /// The file under the pointer: the one whose sideways thumb shows.
     pointer_file: Option<usize>,
-    axis: Option<Axis>,
+    /// The pointer is on that thumb.
+    pan_hover: bool,
+    wheel: AxisLock,
+    /// When a selection drag last pulled the view along, for its pace.
+    pulled_at: Option<Instant>,
     metrics: Option<Metrics>,
     /// The palette the cached shapes were colored for.
     shaped_for: &'static str,
@@ -275,7 +347,9 @@ impl DiffSurface {
             thumb_hover: false,
             header_hover: None,
             pointer_file: None,
-            axis: None,
+            pan_hover: false,
+            wheel: AxisLock::default(),
+            pulled_at: None,
             metrics: None,
             shaped_for: "",
             geo: None,
@@ -314,26 +388,26 @@ impl DiffSurface {
         }
         let files = doc.files.len();
         if keep_position && self.collapsed.len() == files {
-            // Same comparison: keep which files are folded, by path.
-            let folded: Vec<&str> = self
+            // Same comparison: keep which files are folded and how far
+            // each is panned, by path.
+            let kept: HashMap<&str, (bool, f32)> = self
                 .doc
                 .files
                 .iter()
-                .zip(&self.collapsed)
-                .filter(|(_, collapsed)| **collapsed)
-                .map(|(file, _)| file.path.as_ref())
+                .zip(self.collapsed.iter().zip(&self.pan))
+                .map(|(file, (collapsed, pan))| (file.path.as_ref(), (*collapsed, *pan)))
                 .collect();
-            self.collapsed = doc
+            (self.collapsed, self.pan) = doc
                 .files
                 .iter()
-                .map(|file| folded.contains(&file.path.as_ref()))
-                .collect();
+                .map(|file| kept.get(file.path.as_ref()).copied().unwrap_or_default())
+                .unzip();
         } else {
             self.collapsed = vec![false; files];
+            self.pan = vec![0.; files];
             self.scroll_y = 0.;
             self.active_file = 0;
         }
-        self.pan = vec![0.; files];
         self.doc = doc;
         self.selection = None;
         self.drag = Drag::None;
@@ -456,7 +530,34 @@ impl DiffSurface {
                 None => layout.file_top(found.file),
             },
         };
+        if let Some((line, range)) = found.line {
+            self.reveal_columns(found.file, line, range);
+        }
         self.scroll_to(y, cx);
+    }
+
+    /// Pan a file until a stretch of one of its lines is in view, a third
+    /// of the way across the column. A stretch already in view stays put.
+    fn reveal_columns(&mut self, file: usize, line: LineId, range: Range<u32>) {
+        let (Some(geo), Some(metrics)) = (self.geo, self.metrics.as_ref()) else {
+            return;
+        };
+        let Some(text) = self.doc.lines.get(line as usize).map(|line| &line.text) else {
+            return;
+        };
+        // The code face is fixed-pitch: a column is a character.
+        let x_of = |byte: u32| {
+            let cols = text
+                .get(..byte as usize)
+                .map_or(0, |head| head.chars().count());
+            CODE_PAD_L + cols as f32 * metrics.ch
+        };
+        let (from, to) = (x_of(range.start), x_of(range.end));
+        let visible = self.code_width(&geo) - THUMB_ZONE;
+        let pan = self.pan_of(file);
+        if from < pan + CODE_PAD_L || to > pan + visible - CODE_PAD_R {
+            self.set_pan(file, from - visible / 3.);
+        }
     }
 
     /// The single-line text selection, if any: what ⌘F adopts as the
@@ -496,12 +597,73 @@ impl DiffSurface {
             return 0.;
         };
         let content = file.max_cols as f32 * metrics.ch + CODE_PAD_L + CODE_PAD_R;
-        let visible = if self.split {
+        (content - self.code_width(&geo)).max(0.)
+    }
+
+    /// The width a file's lines pan within.
+    fn code_width(&self, geo: &Geo) -> f32 {
+        if self.split {
             geo.mid - geo.left_code
         } else {
             geo.right - geo.full_code
+        }
+    }
+
+    /// The code column a side's lines sit in: its left and right edge,
+    /// short of the vertical thumb's strip.
+    fn column(&self, geo: &Geo, side: Side) -> (f32, f32) {
+        match (self.split, side) {
+            (true, Side::Left) => (geo.left_code, geo.mid),
+            (true, Side::Right) => (geo.right_code, geo.right - THUMB_ZONE),
+            (false, _) => (geo.full_code, geo.right - THUMB_ZONE),
+        }
+    }
+
+    /// A file's sideways scroll bar, when its lines outrun the column and
+    /// there is room under its header to seat one.
+    fn pan_bar(&self, file: usize) -> Option<PanBar> {
+        let geo = self.geo?;
+        let layout = self.layout();
+        let max_pan = self.max_pan(file);
+        if max_pan <= 0. || file >= layout.file_rows.len() {
+            return None;
+        }
+        let seat = (geo.top + layout.file_bottom(file) - self.scroll_y).min(geo.bottom);
+        let body_top = (geo.top + layout.file_top(file) - self.scroll_y).max(geo.top) + HEADER_H;
+        if seat - body_top < 2. * LINE_H {
+            return None;
+        }
+        let right = self.column(&geo, Side::Right);
+        let (tracks, columns) = if self.split {
+            ([self.column(&geo, Side::Left), right], 2)
+        } else {
+            ([right; 2], 1)
         };
-        (content - visible).max(0.)
+        Some(PanBar {
+            file,
+            seat,
+            pan: self.pan_of(file),
+            max_pan,
+            tracks,
+            columns,
+        })
+    }
+
+    /// The bar on show: the file's under the pointer, or the one a drag
+    /// holds wherever the pointer has gone since.
+    fn shown_pan_bar(&self) -> Option<PanBar> {
+        let file = match self.drag {
+            Drag::Pan(grab) => Some(grab.file),
+            _ => self.pointer_file,
+        };
+        self.pan_bar(file?)
+    }
+
+    /// The sideways thumb under a point, held where the point is. The
+    /// thumb sits in its own file's rows, so the point names the file.
+    fn pan_grab(&self, position: Point<Pixels>) -> Option<PanGrab> {
+        let (x, y) = (f32::from(position.x), f32::from(position.y));
+        self.pan_bar(self.file_at(y)?)?.grab(x, y)
     }
 
     /// A file's pan offset, held inside its current range (the range
@@ -663,29 +825,7 @@ impl DiffSurface {
     // ── Input ──
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let precise = event.delta.precise();
-        let delta = event.delta.pixel_delta(px(LINE_H * 2.5));
-        let (mut dx, mut dy) = (f32::from(delta.x), f32::from(delta.y));
-        if precise {
-            // A trackpad gesture commits to the axis it starts on, so a
-            // vertical fling never drifts the code sideways. The lock holds
-            // through the momentum tail and clears when fingers land again.
-            if matches!(event.touch_phase, TouchPhase::Started) {
-                self.axis = None;
-            }
-            if self.axis.is_none() && (dx != 0. || dy != 0.) {
-                self.axis = Some(if dx.abs() > dy.abs() {
-                    Axis::X
-                } else {
-                    Axis::Y
-                });
-            }
-            match self.axis {
-                Some(Axis::X) => dy = 0.,
-                Some(Axis::Y) => dx = 0.,
-                None => {}
-            }
-        }
+        let (dx, dy) = self.wheel.travel(event, LINE_H * 2.5);
         // Sideways travel pans the file under the pointer.
         let file = self.geo.map_or(0, |geo| {
             let y = f32::from(event.position.y) - geo.top + self.scroll_y;
@@ -700,6 +840,7 @@ impl DiffSurface {
         let pointer_file = self.file_at(f32::from(event.position.y));
         if before != (self.scroll_y, self.pan_of(file)) || pointer_file != self.pointer_file {
             self.pointer_file = pointer_file;
+            self.pan_hover = self.drag == Drag::None && self.pan_grab(event.position).is_some();
             cx.notify();
         }
     }
@@ -761,6 +902,13 @@ impl DiffSurface {
                 self.drag_thumb(y, grab);
                 cx.notify();
             }
+            return;
+        }
+        // The sideways thumb lies over the code, so only the thumb itself
+        // takes the press; the rest of its band still selects text.
+        if let Some(grab) = self.pan_grab(event.position) {
+            self.drag = Drag::Pan(grab);
+            cx.notify();
             return;
         }
         let (pos, side) = self.hit(event.position, None, window, cx);
@@ -941,9 +1089,12 @@ impl DiffSurface {
             Drag::Select if held => {
                 if let Some(mut selection) = self.selection {
                     let head = self.hit(event.position, Some(selection.side), window, cx).0;
-                    if head != selection.head {
-                        selection.head = head;
-                        self.selection = Some(selection);
+                    let moved = head != selection.head;
+                    selection.head = head;
+                    self.selection = Some(selection);
+                    // A pointer held at an edge moves no head, yet the
+                    // next frame has rows or columns to pull in under it.
+                    if moved || self.pull(event.position, &selection) != (0., 0.) {
                         cx.notify();
                     }
                 }
@@ -952,13 +1103,22 @@ impl DiffSurface {
                 self.drag_thumb(f32::from(event.position.y), grab);
                 cx.notify();
             }
+            Drag::Pan(grab) if held => {
+                if let Some(bar) = self.pan_bar(grab.file) {
+                    let left = f32::from(event.position.x) - grab.grab;
+                    self.set_pan(grab.file, bar.pan_at(grab.track, left));
+                    cx.notify();
+                }
+            }
             Drag::None => {
                 let hover = self.geo.is_some_and(|geo| {
                     let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
                     x >= geo.right - THUMB_ZONE && x <= geo.right && y >= geo.top && y <= geo.bottom
                 });
-                if hover != self.thumb_hover {
+                let pan_hover = inside && self.pan_grab(event.position).is_some();
+                if hover != self.thumb_hover || pan_hover != self.pan_hover {
                     self.thumb_hover = hover;
+                    self.pan_hover = pan_hover;
                     cx.notify();
                 }
             }
@@ -967,9 +1127,11 @@ impl DiffSurface {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.drag != Drag::None {
             self.drag = Drag::None;
+            self.pulled_at = None;
+            self.pan_hover = self.pan_grab(event.position).is_some();
             cx.notify();
         }
     }
@@ -1103,7 +1265,8 @@ impl DiffSurface {
             .contains(&mouse)
             .then(|| self.file_at(f32::from(mouse.y)))
             .flatten();
-        let pointer_file = self.pointer_file;
+        let pan_bar = self.shown_pan_bar();
+        let pan_hot = self.pan_hover || matches!(self.drag, Drag::Pan(_));
         let stale = self.stale;
         let resolve = self.resolve.clone();
         let collapsed = self.collapsed.clone();
@@ -1124,8 +1287,8 @@ impl DiffSurface {
             }
         }
 
-        // The visible row range, and the pan offset and range of each file
-        // it touches.
+        // The visible row range, and the pan offset of each file it
+        // touches.
         let (first, last, first_file, pans) = {
             let layout = self.layout();
             let first = layout.row_at(scroll);
@@ -1135,13 +1298,8 @@ impl DiffSurface {
             }
             let first_file = layout.file_of(first);
             let last_file = layout.file_of(last.saturating_sub(1)).max(first_file);
-            let pans: Vec<(f32, f32)> = (first_file..=last_file)
-                .map(|file| {
-                    (
-                        (self.pan_of(file) * scale).round() / scale,
-                        self.max_pan(file),
-                    )
-                })
+            let pans: Vec<f32> = (first_file..=last_file)
+                .map(|file| (self.pan_of(file) * scale).round() / scale)
                 .collect();
             (first, last, first_file, pans)
         };
@@ -1238,8 +1396,14 @@ impl DiffSurface {
                             rect(geo.left, y, geo.right, y + GAP_H),
                             theme.recess,
                         ));
-                        let mut x =
-                            (if split { geo.left_code } else { geo.full_code }) + CODE_PAD_L;
+                        let code = if split { geo.left_code } else { geo.full_code };
+                        // The fold mark, centered in the number gutter:
+                        // lines were left out here.
+                        let fold = label("⋯", &metrics.ui, SMALL, theme.text3, window);
+                        let fold_x = geo.left + (code - geo.left - f32::from(fold.width)) / 2.;
+                        fold.paint(point(px(fold_x), px(y)), px(GAP_H), window, cx)
+                            .ok();
+                        let mut x = code + CODE_PAD_L;
                         if let Some(context) = context {
                             let symbol: SharedString = match context.char_indices().nth(64) {
                                 Some((cut, _)) => format!("{}…", &context[..cut]).into(),
@@ -1482,7 +1646,7 @@ impl DiffSurface {
                         _ => continue,
                     };
                     let y = row_y(row);
-                    let origin_x = code_x + CODE_PAD_L - pans[layout.file_of(row) - first_file].0;
+                    let origin_x = code_x + CODE_PAD_L - pans[layout.file_of(row) - first_file];
                     let line = &lines[id as usize];
                     min_id = min_id.min(id);
                     max_id = max_id.max(id);
@@ -1602,43 +1766,17 @@ impl DiffSurface {
                 BorderStyle::default(),
             ));
         }
-        // A horizontal thumb for the file under the pointer when it pans,
-        // one per code column (both panes of the split ride the file's one
-        // offset). It rides the bottom of the viewport while the file
-        // passes and rests on the file's own end when that comes first.
-        // The other files keep their last line clear.
-        let tracks: &[(f32, f32)] = if split {
-            &[
-                (geo.left_code, geo.mid),
-                (geo.right_code, geo.right - THUMB_ZONE),
-            ]
-        } else {
-            &[(geo.full_code, geo.right - THUMB_ZONE)]
-        };
-        for (offset, &(pan, max_pan)) in pans.iter().enumerate() {
-            if max_pan <= 0. || layout.file_rows.is_empty() {
-                continue;
-            }
-            let file = first_file + offset;
-            if pointer_file != Some(file) {
-                continue;
-            }
-            let seat = (geo.top + layout.file_bottom(file) - scroll).min(geo.bottom);
-            let body_top =
-                (geo.top + layout.file_top(file) - scroll + HEADER_H).max(geo.top + HEADER_H);
-            if seat - body_top < 2. * LINE_H {
-                continue;
-            }
-            for &(x0, x1) in tracks {
-                let track = x1 - x0;
-                let width = (track * track / (track + max_pan)).max(28.);
-                let x = x0 + pan / max_pan * (track - width);
+        // The sideways thumbs of the file under the pointer, when it
+        // pans. The other files keep their last line clear.
+        if let Some(bar) = pan_bar {
+            for &track in bar.tracks() {
+                let (x, width) = bar.thumb(track);
                 window.paint_quad(quad(
-                    rect(x, seat - 10., x + width, seat - 2.),
+                    rect(x, bar.seat - 10., x + width, bar.seat - 2.),
                     px(4.),
-                    thumb_color(false),
+                    thumb_color(pan_hot),
                     px(0.),
-                    thumb_color(false),
+                    thumb_color(pan_hot),
                     BorderStyle::default(),
                 ));
             }
@@ -1659,32 +1797,65 @@ impl DiffSurface {
         }
     }
 
-    /// While a selection drag sits past the top or bottom edge, scroll
-    /// toward it every frame and extend the selection to the new edge row.
+    /// Where a selection drag is pulling the view, as overshoot in points:
+    /// sideways once the pointer is in the belt at either edge of the
+    /// selection's column, up or down once it is past the surface. Zero
+    /// on an axis with nothing further that way to bring in.
+    fn pull(&self, position: Point<Pixels>, selection: &Selection) -> (f32, f32) {
+        let Some(geo) = self.geo else {
+            return (0., 0.);
+        };
+        let past = |at: f32, low: f32, high: f32| (at - low).min(0.) + (at - high).max(0.);
+        let with_room = |pull: f32, at: f32, max: f32| {
+            if (pull < 0. && at > 0.) || (pull > 0. && at < max) {
+                pull
+            } else {
+                0.
+            }
+        };
+        let (x0, x1) = self.column(&geo, selection.side);
+        // A press in the belt is not a pull until the drag has set off.
+        let pull_x = if selection.anchor == selection.head {
+            0.
+        } else {
+            past(position.x.into(), x0 + PULL_BELT, x1 - PULL_BELT)
+        };
+        let pull_y = past(position.y.into(), geo.top, geo.bottom);
+        // Long lines pan within their own file: the one under the head.
+        let file = self.layout().file_of(selection.head.row);
+        (
+            with_room(pull_x, self.pan_of(file), self.max_pan(file)),
+            with_room(pull_y, self.scroll_y, self.max_scroll()),
+        )
+    }
+
+    /// While a selection drag pulls at an edge, move toward it every frame
+    /// and extend the selection to what comes into view. The pace follows
+    /// the clock, not the display's refresh rate.
     fn tick_autoscroll(&mut self, window: &mut Window, cx: &App) {
-        if self.drag != Drag::Select {
-            return;
-        }
-        let (Some(geo), Some(mut selection)) = (self.geo, self.selection) else {
+        let (Drag::Select, Some(mut selection)) = (self.drag, self.selection) else {
             return;
         };
         let mouse = window.mouse_position();
-        let y = f32::from(mouse.y);
-        let over = if y < geo.top {
-            y - geo.top
-        } else if y > geo.bottom {
-            y - geo.bottom
-        } else {
+        let (pull_x, pull_y) = self.pull(mouse, &selection);
+        if (pull_x, pull_y) == (0., 0.) {
+            self.pulled_at = None;
             return;
-        };
-        let before = self.scroll_y;
-        self.scroll_y += (over * 0.35).clamp(-48., 48.);
-        self.clamp_scroll();
-        if self.scroll_y != before {
-            selection.head = self.hit(mouse, Some(selection.side), window, cx).0;
-            self.selection = Some(selection);
-            window.request_animation_frame();
         }
+        let now = Instant::now();
+        let elapsed = self.pulled_at.map_or(1. / 60., |at| {
+            now.duration_since(at).as_secs_f32().min(0.05)
+        });
+        self.pulled_at = Some(now);
+        let step = |pull: f32| (pull * PULL_RATE).clamp(-PULL_MAX, PULL_MAX) * elapsed;
+
+        let file = self.layout().file_of(selection.head.row);
+        self.scroll_y += step(pull_y);
+        self.clamp_scroll();
+        self.set_pan(file, self.pan_of(file) + step(pull_x));
+        selection.head = self.hit(mouse, Some(selection.side), window, cx).0;
+        self.selection = Some(selection);
+        window.request_animation_frame();
     }
 }
 
@@ -2053,7 +2224,7 @@ impl HeaderPaint<'_> {
             window.paint_quad(quad(
                 button,
                 px(4.),
-                if hot { theme.accent_dim } else { theme.bg3 },
+                if hot { theme.accent_dim } else { theme.btn_bg },
                 px(1.),
                 if hot {
                     Theme::fade(theme.accent, 0.4)
@@ -2239,10 +2410,13 @@ impl Element for DiffElement {
 
         // The later request wins where both are hovered: text cursor over
         // the code, arrow over headers and the thumb strip.
-        let over_header = self.view.read(cx).header_hover.is_some();
+        let view = self.view.read(cx);
+        let on_pan_thumb = view.pan_hover || matches!(view.drag, Drag::Pan(_));
         window.set_cursor_style(
-            if over_header {
+            if view.header_hover.is_some() {
                 CursorStyle::PointingHand
+            } else if on_pan_thumb {
+                CursorStyle::Arrow
             } else {
                 CursorStyle::IBeam
             },

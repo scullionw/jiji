@@ -504,16 +504,15 @@ impl Shell {
                         .group_hover(group, |style| style.text_color(t.text1)),
                 );
             if is_active {
-                // The current section: full ink on a quiet fill, with a
-                // short accent tick on the rail's edge.
-                item = item.bg(crate::theme::Theme::fade(t.text1, 0.08)).child(
+                // The current section: full ink on the selection fill, with
+                // the accent bar on the rail's edge.
+                item = item.bg(t.selected).child(
                     div()
                         .absolute()
                         .left(px(-6.))
-                        .top(px(9.))
-                        .bottom(px(9.))
+                        .top(px(4.))
+                        .bottom(px(4.))
                         .w(px(2.))
-                        .rounded_r(px(2.))
                         .bg(t.accent),
                 );
             }

@@ -4,9 +4,11 @@
 use gpui::{div, prelude::*, px, Context, Entity, FontWeight, Render, ScrollHandle, Window};
 
 use crate::app::{app, AppModel};
-use crate::theme::{theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS};
+use crate::theme::{
+    theme, RADIUS_L, RADIUS_M, RADIUS_S, STATUSBAR_H, TEXT_M, TEXT_S, TEXT_XL, TEXT_XS, TITLEBAR_H,
+};
 use crate::ui::ScrollY as _;
-use crate::ui::{btn, h_flex, icon, kbd, scrollbar, tooltip, v_flex, IconName};
+use crate::ui::{btn, h_flex, icon, kbd, scrollbar, tooltip, truncated, v_flex, IconName};
 
 pub struct WelcomeView {
     app: Entity<AppModel>,
@@ -46,8 +48,11 @@ fn from_now(at_ms: u64) -> String {
 }
 
 impl Render for WelcomeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
+        // The stage sits in the middle of the pane; a scroller cannot ask
+        // for that itself, so the pane's height is stated.
+        let pane_height = f32::from(window.viewport_size().height) - TITLEBAR_H - STATUSBAR_H - 2.;
         let model = self.app.read(cx);
         let opening = model.tab().opening;
         let error = model.ui().error.clone();
@@ -73,9 +78,9 @@ impl Render for WelcomeView {
         let open_app = self.app.clone();
         let palette_app = self.app.clone();
         let mut stage = v_flex()
-            .w(px(560.))
+            .w(px(580.))
             .max_w_full()
-            .gap(px(20.))
+            .gap(px(22.))
             .px(px(24.))
             .pt(px(32.))
             .pb(px(96.))
@@ -159,23 +164,22 @@ impl Render for WelcomeView {
             });
 
         if !recents.is_empty() {
-            let mut list = v_flex()
-                .rounded(px(RADIUS_L))
-                .border_1()
-                .border_color(t.border2)
-                .overflow_hidden();
+            // A plain list: rows reach a little past the column on both
+            // sides, so their text keeps the column's edge.
+            let mut list = v_flex().mx(px(-8.));
             for (ix, repo) in recents.into_iter().enumerate() {
                 let group = format!("recent-{ix}");
                 let open_app = self.app.clone();
                 let forget_app = self.app.clone();
                 let (open_path, forget_path) = (repo.path.clone(), repo.path.clone());
-                let mut row = h_flex()
+                let row = h_flex()
                     .id(("recent", ix))
                     .group(group.clone())
-                    .h(px(34.))
-                    .pl(px(12.))
-                    .pr(px(6.))
+                    .h(px(30.))
+                    .pl(px(8.))
+                    .pr(px(4.))
                     .gap(px(12.))
+                    .rounded(px(RADIUS_M))
                     .cursor_pointer()
                     .hover(|style| style.bg(t.bg_hover))
                     .on_click(move |_, _, cx| {
@@ -185,7 +189,7 @@ impl Render for WelcomeView {
                     .child(
                         div()
                             .flex_shrink_0()
-                            .max_w(px(200.))
+                            .w(px(150.))
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
                             .child(repo.name.clone()),
@@ -194,11 +198,10 @@ impl Render for WelcomeView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .font_family(t.mono.clone())
                             .text_size(px(TEXT_XS))
                             .text_color(t.text3)
-                            .child(short_path(&repo.path)),
+                            .child(truncated(short_path(&repo.path))),
                     )
                     .child(
                         div()
@@ -227,9 +230,6 @@ impl Render for WelcomeView {
                             })
                             .child(icon(IconName::Close, 11., t.text3)),
                     );
-                if ix > 0 {
-                    row = row.border_t_1().border_color(t.border2);
-                }
                 list = list.child(row);
             }
             stage = stage.child(
@@ -237,9 +237,12 @@ impl Render for WelcomeView {
                     .child(
                         div()
                             .pb(px(6.))
-                            .text_size(px(TEXT_S))
+                            .mb(px(4.))
+                            .border_b_1()
+                            .border_color(t.border2)
+                            .text_size(px(TEXT_XS))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text2)
+                            .text_color(t.text3)
                             .child("Recent"),
                     )
                     .child(list),
@@ -378,7 +381,7 @@ impl Render for WelcomeView {
                     .track_scroll(&self.scroll)
                     .child(
                         v_flex()
-                            .min_h_full()
+                            .min_h(px(pane_height.max(0.)))
                             .items_center()
                             .justify_center()
                             .child(stage),

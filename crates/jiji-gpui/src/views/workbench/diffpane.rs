@@ -24,8 +24,8 @@ use crate::logic::tree::{active_row_key, build_tree_rows, visible_tree_rows, Tre
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    bounds_probe, empty_state, h_flex, icon, icon_btn, popover, scrollbar, segmented, tooltip,
-    truncated, v_flex, IconName, InputEvent, TextInput,
+    bounds_probe, empty_state, h_flex, icon, icon_btn, lead_bar, popover, scrollbar, segmented,
+    tooltip, truncated, v_flex, IconName, InputEvent, TextInput,
 };
 
 const TREE_MIN: f32 = 160.;
@@ -807,7 +807,7 @@ impl WorkbenchView {
         let stat = |sign: &str, count: u32, color: gpui::Hsla| {
             (count > 0).then(|| div().text_color(color).child(format!("{sign}{count}")))
         };
-        let mut list = v_flex().p(px(4.)).pb(px(24.));
+        let mut list = v_flex().pt(px(4.)).pb(px(24.));
         for (ix, row) in visible_tree_rows(&rows, &self.diff.tree_collapsed)
             .into_iter()
             .enumerate()
@@ -826,13 +826,15 @@ impl WorkbenchView {
                         .child(div().w(px(1.)).h_full().bg(t.border2)),
                 );
             }
+            // Rows run edge to edge, like the graph's: the one on screen
+            // takes the selection fill and the leading bar.
             let base = h_flex()
                 .id(("tree-row", ix))
+                .relative()
                 .w_full()
-                .h(px(22.))
-                .pl(px(4.))
-                .pr(px(8.))
-                .rounded(px(RADIUS_S))
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(10.))
                 .text_size(px(TEXT_S))
                 .cursor_pointer()
                 .child(guides);
@@ -887,7 +889,7 @@ impl WorkbenchView {
                         el
                     };
                     if active == dir.path {
-                        el.bg(t.accent_dim)
+                        el.bg(t.selected).child(lead_bar(cx))
                     } else {
                         el.hover(|style| style.bg(t.bg_hover))
                     }
@@ -934,7 +936,7 @@ impl WorkbenchView {
                         el
                     };
                     if active == file.path {
-                        el.bg(t.accent_dim)
+                        el.bg(t.selected).child(lead_bar(cx))
                     } else {
                         el.hover(|style| style.bg(t.bg_hover))
                     }

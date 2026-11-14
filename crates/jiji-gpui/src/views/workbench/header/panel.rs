@@ -16,7 +16,9 @@ use crate::logic::text::short_id;
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::vertical_only;
-use crate::ui::{btn, h_flex, input::field, ref_label, rich, tooltip, truncated, v_flex};
+use crate::ui::{
+    btn, h_flex, input::field, ref_label, rich, tooltip, truncated, trunk_label, v_flex,
+};
 use crate::views::workbench::{TrayConfirm, TrayDown, TrayEnter, TrayUp, WorkbenchView};
 
 impl WorkbenchView {
@@ -187,11 +189,14 @@ impl WorkbenchView {
             );
         for name in &node.bookmarks {
             let trunk = *name == snapshot.trunk_bookmark;
-            let mut chip = ref_label(None, name.clone(), cx).max_w(px(140.));
-            if trunk {
-                chip = chip.bg(theme.accent_dim).text_color(theme.accent_strong);
-            }
-            row = row.child(chip);
+            row = row.child(
+                if trunk {
+                    trunk_label(name.clone(), cx)
+                } else {
+                    ref_label(None, name.clone(), cx)
+                }
+                .max_w(px(140.)),
+            );
         }
         if selected {
             row.bg(theme.accent_dim)

@@ -12,7 +12,7 @@ use super::Shell;
 use crate::app::{tab_titles, Section, ThemeMode, UPSTREAM_INTERVALS};
 use crate::host::license::{PERSONAL_CHECKOUT_URL, PERSONAL_PRICE, SOLO_CHECKOUT_URL, SOLO_PRICE};
 use crate::theme::{
-    theme, theme_defs, Scheme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
+    theme, theme_defs, Scheme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::{
     btn, h_flex, icon, icon_btn, input::field, menu_label, popover, popover_layer, segmented,
@@ -190,7 +190,7 @@ impl Shell {
 
         let mut strip = h_flex()
             .id("tab-strip")
-            .gap(px(2.))
+            .h_full()
             .max_w_full()
             .overflow_x_scroll();
         for ((id, title), path) in titles.into_iter().zip(paths) {
@@ -199,11 +199,14 @@ impl Shell {
             let app = self.app.clone();
             let close_app = self.app.clone();
             let middle_app = self.app.clone();
-            let mut label = h_flex().min_w_0().max_w(px(180.)).child(
-                div()
-                    .truncate()
-                    .child(title.label.clone())
-                    .when_some(title.hint, |el, hint| {
+            let mut label = h_flex()
+                .relative()
+                .h_full()
+                .min_w_0()
+                .max_w(px(180.))
+                .child(div().truncate().child(title.label.clone()).when_some(
+                    title.hint,
+                    |el, hint| {
                         el.child(
                             div()
                                 .ml(px(5.))
@@ -211,18 +214,31 @@ impl Shell {
                                 .text_color(t.text3)
                                 .child(hint),
                         )
-                    }),
-            );
+                    },
+                ));
             label = label.flex().flex_row();
+            if active {
+                label = label.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(2.))
+                        .bg(t.accent),
+                );
+            }
+            // A tab is its repo's name; the one on screen reads in full ink
+            // over the accent bar, on the line the panes hang from.
             let mut tab = h_flex()
                 .id(("tab", id))
                 .group(group.clone())
+                .relative()
                 .flex_shrink()
                 .min_w_0()
-                .h(px(24.))
+                .h_full()
                 .pl(px(10.))
-                .pr(px(3.))
-                .rounded(px(RADIUS_M))
+                .pr(px(4.))
                 .text_size(px(TEXT_S))
                 .font_weight(FontWeight::MEDIUM)
                 .whitespace_nowrap()
@@ -234,38 +250,35 @@ impl Shell {
                 })
                 .child(label);
             tab = if active {
-                tab.text_color(t.text1).bg(Theme::fade(t.text1, 0.08))
+                tab.text_color(t.text1)
             } else {
                 tab.text_color(t.text3)
-                    .hover(|style| style.text_color(t.text2).bg(t.bg_hover))
+                    .hover(|style| style.text_color(t.text1))
             };
             // The close affordance keeps its footprint (no layout shift)
-            // and only surfaces on hover or on the active tab.
-            let mut close = div()
+            // and only surfaces under the pointer.
+            let close = div()
                 .id(("tab-close", id))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
                 .justify_center()
                 .size(px(18.))
-                .ml(px(5.))
+                .ml(px(4.))
                 .rounded(px(RADIUS_S))
+                .opacity(0.)
+                .group_hover(group, |style| style.opacity(1.))
                 .hover(|style| style.bg(t.bg_hover))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     close_app.update(cx, |m, cx| m.close_tab(id, cx));
                 })
                 .child(icon(IconName::Close, 10., t.text3));
-            if !active {
-                close = close
-                    .opacity(0.)
-                    .group_hover(group, |style| style.opacity(1.));
-            }
             strip = strip.child(tab.child(close));
         }
         let app = self.app.clone();
         strip = strip.child(
-            div().ml(px(2.)).child(
+            div().ml(px(4.)).child(
                 icon_btn("new-tab", IconName::Plus)
                     .size(22., 13.)
                     .tooltip("New tab (⌘T)")
@@ -521,7 +534,7 @@ impl Shell {
                             .rounded(px(RADIUS_M))
                             .border_1()
                             .border_color(t.border1)
-                            .bg(t.bg3)
+                            .bg(t.btn_bg)
                             .cursor_pointer()
                             .hover(|style| style.bg(t.btn_hover))
                             .on_click(move |_, _, cx| cx.open_url(url))
@@ -575,7 +588,7 @@ impl Shell {
         let app = self.app.clone();
         anchor.child(popover_layer(
             Corner::TopRight,
-            28.,
+            30.,
             panel,
             cx.listener(move |this, _, _, cx| {
                 this.license_error = None;
@@ -798,7 +811,7 @@ impl Shell {
         );
         anchor.child(popover_layer(
             Corner::TopRight,
-            28.,
+            30.,
             panel,
             cx.listener(|this, _, _, cx| {
                 this.settings_menu.close();
@@ -952,7 +965,7 @@ impl Shell {
         }
         anchor.child(popover_layer(
             Corner::TopRight,
-            28.,
+            30.,
             panel,
             cx.listener(|this, _, _, cx| {
                 this.theme_menu.close();

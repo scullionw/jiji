@@ -15,7 +15,7 @@ use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, h_flex, icon, input::field, ref_label, rich, segmented, tooltip, truncated, v_flex,
+    btn, h_flex, icon, input::field, rich, segmented, tooltip, truncated, trunk_label, v_flex,
     IconName,
 };
 use crate::views::workbench::WorkbenchView;
@@ -146,7 +146,8 @@ impl WorkbenchView {
                     .h(px(18.))
                     .px(px(5.))
                     .rounded(px(RADIUS_S))
-                    .bg(t.ref_bg)
+                    .border_1()
+                    .border_color(t.border1)
                     .font_family(t.mono.clone())
                     .text_size(px(TEXT_XS))
                     .cursor_pointer()
@@ -341,11 +342,7 @@ impl WorkbenchView {
                     format!("everything between {} and here", short_id(trunk, 4)),
                     !matches!(self.compare, CompareMode::Change(_)) && from.as_ref() == Some(trunk),
                 )
-                .child(
-                    ref_label(None, snapshot.trunk_bookmark.clone(), cx)
-                        .bg(t.accent_dim)
-                        .text_color(t.accent_strong),
-                )
+                .child(trunk_label(snapshot.trunk_bookmark.clone(), cx))
                 .on_click(cx.listener(pick(CompareMode::Trunk))),
             );
         }

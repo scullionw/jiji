@@ -30,10 +30,10 @@ use crate::host::CommandError;
 use crate::logic::evolution::{default_span, extend_to, grow, scrub, step_to, Span};
 use crate::logic::inspect::{find_node, summary_of};
 use crate::logic::text::short_id;
-use crate::theme::{theme, Theme, RADIUS_S, TEXT_S, TEXT_XS};
+use crate::theme::{theme, TEXT_S, TEXT_XS};
 use crate::ui::{
-    absolute_time, btn, empty_state, from_now, h_flex, icon, icon_btn, short_age, tooltip,
-    truncated, v_flex, IconName,
+    absolute_time, btn, empty_state, from_now, h_flex, icon, icon_btn, label_box, short_age,
+    tooltip, truncated, v_flex, IconName,
 };
 
 /// Warm every step's diff once the chain is known — capped so a
@@ -914,17 +914,10 @@ impl WorkbenchView {
                     .child("Evolution"),
             )
             .child(
-                h_flex()
+                label_box(t.text2, t.border1)
                     .id("evolution-of")
-                    .flex_shrink_0()
                     .gap(px(4.))
-                    .h(px(17.))
-                    .px(px(5.))
-                    .rounded(px(RADIUS_S))
-                    .bg(Theme::fade(t.text1, 0.07))
                     .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text2)
                     .tooltip(tooltip(
                         "Every version this change was rewritten through, oldest to newest",
                     ))

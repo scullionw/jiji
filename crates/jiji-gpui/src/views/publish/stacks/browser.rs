@@ -7,9 +7,11 @@ use jiji_forge::PublishStack;
 use super::BROWSER_W;
 use crate::logic::publish::stack_summary;
 use crate::logic::text::plural_s;
-use crate::theme::{theme, Theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
-use crate::ui::{dot, h_flex, icon, kbd, scrollbar, tooltip, truncated, v_flex, IconName};
+use crate::ui::{
+    dot, h_flex, icon, kbd, lead_bar, scrollbar, tooltip, truncated, v_flex, IconName,
+};
 use crate::views::publish::PublishView;
 
 impl PublishView {
@@ -67,15 +69,7 @@ impl PublishView {
                     .child(count),
             );
         row = if selected {
-            row.bg(Theme::fade(t.accent, 0.12)).child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(t.accent),
-            )
+            row.bg(t.selected).child(lead_bar(cx))
         } else {
             row.hover(|style| style.bg(t.bg_hover))
         };

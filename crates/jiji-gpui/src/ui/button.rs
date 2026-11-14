@@ -134,7 +134,7 @@ impl RenderOnce for Btn {
         let transparent = gpui::transparent_black();
         let (bg, border, fg, icon_fg, hover_bg, hover_border, hover_fg) = match self.kind {
             BtnKind::Secondary => (
-                t.bg3,
+                t.btn_bg,
                 t.border1,
                 t.text1,
                 t.text3,
@@ -152,7 +152,7 @@ impl RenderOnce for Btn {
                 t.accent_contrast,
             ),
             BtnKind::Danger => (
-                t.bg3,
+                t.btn_bg,
                 t.border1,
                 t.danger,
                 t.danger,

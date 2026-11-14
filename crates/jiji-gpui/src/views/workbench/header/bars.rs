@@ -11,11 +11,11 @@ use crate::logic::inspect::{
 };
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
 use crate::logic::text::{counted, short_id};
-use crate::theme::{theme, Theme, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::theme::{theme, Theme, RADIUS_S, TEXT_HEAD, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, from_now, h_flex, icon, icon_btn, popover, popover_layer, scrollbar, text_width, tooltip,
-    truncated, v_flex, IconName,
+    btn, from_now, h_flex, icon, icon_btn, label_box, popover, popover_layer, scrollbar, tag,
+    text_width, tooltip, truncated, v_flex, IconName, LABEL_H,
 };
 use crate::views::workbench::WorkbenchView;
 
@@ -31,7 +31,7 @@ const VERB_LABELS_PANE: f32 = 880.;
 /// The title bar's labelled verbs plus everything else that is not the
 /// title: padding, gaps, the pencil, the close button.
 const VERBS_AND_CHROME: f32 = 440.;
-const META_BAR_H: f32 = 30.;
+const META_BAR_H: f32 = 32.;
 
 impl WorkbenchView {
     pub(super) fn render_title_bar(
@@ -49,7 +49,7 @@ impl WorkbenchView {
         // a pane too narrow for both, the title wins and the verbs fall
         // back to their icons.
         let labelled = self.diff_width > VERB_LABELS_PANE
-            || text_width(&title, TEXT_L, FontWeight::SEMIBOLD, window) + VERBS_AND_CHROME
+            || text_width(&title, TEXT_HEAD, FontWeight::SEMIBOLD, window) + VERBS_AND_CHROME
                 <= self.diff_width;
         let has_body = node
             .description
@@ -72,33 +72,25 @@ impl WorkbenchView {
             let mut undescribed = h_flex()
                 .min_w_0()
                 .gap(px(8.))
-                .text_size(px(TEXT_L))
+                .text_size(px(TEXT_HEAD))
                 .italic()
                 .text_color(t.text3)
                 .child("No description yet");
             if avail.describe {
                 undescribed = undescribed.child(
-                    h_flex()
-                        .id("describe")
-                        .flex_shrink_0()
-                        .gap(px(5.))
-                        .h(px(22.))
-                        .px(px(7.))
-                        .rounded(px(RADIUS_S))
-                        .not_italic()
-                        .text_size(px(TEXT_S))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(t.warn)
-                        .bg(t.warn_dim)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(Theme::fade(t.warn, 0.22)))
-                        .on_click(cx.listener(|this, _, window, cx| this.open_editor(window, cx)))
-                        .child(icon(IconName::Edit, 11., t.warn))
-                        .child(if has_draft {
-                            "Resume draft"
-                        } else {
-                            "Describe"
-                        }),
+                    div().not_italic().child(
+                        btn(
+                            "describe",
+                            if has_draft {
+                                "Resume draft"
+                            } else {
+                                "Describe"
+                            },
+                        )
+                        .small()
+                        .icon(IconName::Edit)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_editor(window, cx))),
+                    ),
                 );
             } else {
                 undescribed = undescribed.child(
@@ -115,7 +107,7 @@ impl WorkbenchView {
                 div()
                     .id("change-title")
                     .min_w_0()
-                    .text_size(px(TEXT_L))
+                    .text_size(px(TEXT_HEAD))
                     .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(tooltip(title.clone()))
                     .child(truncated(title)),
@@ -481,23 +473,8 @@ impl WorkbenchView {
                 });
         }
         match node.kind {
-            NodeKind::WorkingCopy => {
-                facts = facts.child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(t.working_copy)
-                        .child("working copy"),
-                )
-            }
-            NodeKind::Immutable => {
-                facts = facts.child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("immutable"),
-                )
-            }
+            NodeKind::WorkingCopy => facts = facts.child(tag("working copy", t.working_copy)),
+            NodeKind::Immutable => facts = facts.child(tag("immutable", t.text3)),
             NodeKind::Mutable => {}
         }
         facts = facts
@@ -525,15 +502,8 @@ impl WorkbenchView {
         }
         if node.has_conflict {
             facts = facts.child(
-                h_flex()
-                    .flex_shrink_0()
+                label_box(t.danger, Theme::fade(t.danger, 0.42))
                     .gap(px(4.))
-                    .h(px(17.))
-                    .px(px(5.))
-                    .rounded(px(RADIUS_S))
-                    .bg(t.danger_dim)
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.danger)
                     .child(icon(IconName::Conflicts, 11., t.danger))
                     .child("conflicts"),
             );
@@ -625,15 +595,17 @@ impl WorkbenchView {
         };
         let manageable = mark.is_local && !mark.is_trunk;
         let armed = self.header.tray == Tray::Manage(mark.name.clone());
-        let mut chip = h_flex()
+        let (ink, line) = if mark.is_trunk {
+            (t.accent_strong, Theme::fade(t.accent, 0.5))
+        } else if armed {
+            (t.text1, t.accent)
+        } else {
+            (t.text2, t.border1)
+        };
+        let mut chip = label_box(ink, line)
             .id(("bookmark-chip", key))
-            .flex_shrink_0()
             .gap(px(5.))
-            .h(px(17.))
-            .px(px(5.))
-            .rounded(px(RADIUS_S))
             .font_family(t.mono.clone())
-            .text_size(px(TEXT_XS))
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 crate::views::menu::bookmark_menu(mark.name.clone(), mark.remote.clone()),
@@ -645,12 +617,6 @@ impl WorkbenchView {
                     .text_color(t.tone(tone))
                     .child(sync_text),
             );
-        chip = if mark.is_trunk {
-            chip.bg(t.accent_dim).text_color(t.accent_strong)
-        } else {
-            chip.bg(if armed { t.bg_hover } else { t.ref_bg })
-                .text_color(t.text2)
-        };
         chip = if manageable {
             let name = mark.name.clone();
             chip.cursor_pointer()
@@ -669,24 +635,18 @@ impl WorkbenchView {
         // The bookmark's pull request: a one-click route to GitHub, wearing
         // the same state the graph badge shows.
         let badge = pr_badge(pr);
-        let (fg, bg) = match badge.tone {
-            PrTone::Open => (t.ok, t.ok_dim),
-            PrTone::Draft => (t.text3, t.ref_bg),
-            PrTone::Merged => (t.accent_strong, t.accent_dim),
-            PrTone::Closed => (t.danger, t.danger_dim),
+        let fg = match badge.tone {
+            PrTone::Open => t.ok,
+            PrTone::Draft => t.text3,
+            PrTone::Merged => t.accent_strong,
+            PrTone::Closed => t.danger,
         };
         let url = pr.url.clone();
-        let mut pr_chip = h_flex()
+        let mut pr_chip = label_box(fg, Theme::fade(fg, 0.42))
             .id(("pr-chip", key))
-            .flex_shrink_0()
             .gap(px(4.))
-            .h(px(17.))
-            .px(px(5.))
-            .rounded(px(RADIUS_S))
-            .bg(bg)
-            .text_size(px(TEXT_XS))
-            .text_color(fg)
             .cursor_pointer()
+            .hover(|style| style.bg(t.bg_hover))
             .tooltip(tooltip(format!("{} · open on GitHub", badge.title)))
             .on_click(move |_, _, cx| cx.open_url(&url))
             .on_mouse_down(
@@ -720,7 +680,7 @@ impl WorkbenchView {
             let mut rerun = div()
                 .id(("rerun-ci", key))
                 .flex_shrink_0()
-                .h(px(17.))
+                .h(px(LABEL_H))
                 .px(px(5.))
                 .rounded(px(RADIUS_S))
                 .text_size(px(TEXT_XS))

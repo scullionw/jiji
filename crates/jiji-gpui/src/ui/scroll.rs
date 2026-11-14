@@ -4,12 +4,13 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId,
+    canvas, fill, point, px, relative, size, App, Axis, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Position, ScrollHandle,
-    StatefulInteractiveElement, Style, Styled, Window,
+    ScrollWheelEvent, StatefulInteractiveElement, Style, Styled, TouchPhase, Window,
 };
 
 use crate::theme::theme;
@@ -34,6 +35,103 @@ impl<E: StatefulInteractiveElement + Styled> ScrollY for E {}
 pub fn vertical_only<E: Styled>(mut list: E) -> E {
     list.style().restrict_scroll_to_axis = Some(true);
     list
+}
+
+/// A gesture is over once the device has said nothing for this long.
+const GESTURE_GAP: Duration = Duration::from_millis(120);
+/// Travel across a gesture's axis, beyond its travel along it, that turns
+/// the gesture onto the other axis.
+const TURN_AFTER: f32 = 12.;
+
+/// The axis a scroll gesture travels. A view that scrolls both ways puts
+/// its wheel events through one, so a vertical fling never drifts the
+/// content sideways and a sideways swipe never nudges the rows.
+///
+/// A gesture begins where the device says fingers landed, or after a
+/// pause: smooth-scrolling mice send precise deltas and never report a
+/// landing, so a lock that waited for one would hold its first axis for
+/// good. The gesture follows the axis it sets off on and turns once travel
+/// across that axis has clearly outrun travel along it.
+#[derive(Default)]
+pub struct AxisLock {
+    axis: Option<Axis>,
+    /// Travel across the axis that travel along it has not answered.
+    stray: f32,
+    last: Option<Instant>,
+}
+
+impl AxisLock {
+    /// The travel `event` asks for in pixels, on the gesture's axis only.
+    /// A notched wheel reports one axis at a time and passes as it is.
+    pub fn travel(&mut self, event: &ScrollWheelEvent, line_height: f32) -> (f32, f32) {
+        let delta = event.delta.pixel_delta(px(line_height));
+        let delta = (f32::from(delta.x), f32::from(delta.y));
+        if !event.delta.precise() {
+            return delta;
+        }
+        let now = Instant::now();
+        let paused = self
+            .last
+            .is_none_or(|last| now.duration_since(last) > GESTURE_GAP);
+        self.last = Some(now);
+        let landed = matches!(event.touch_phase, TouchPhase::Started);
+        self.steer(paused || landed, delta)
+    }
+
+    fn steer(&mut self, fresh: bool, (dx, dy): (f32, f32)) -> (f32, f32) {
+        if fresh {
+            self.axis = None;
+            self.stray = 0.;
+        }
+        if dx == 0. && dy == 0. {
+            return (0., 0.);
+        }
+        let axis = match self.axis {
+            None if dx.abs() > dy.abs() => Axis::Horizontal,
+            None => Axis::Vertical,
+            Some(axis) => {
+                let (along, across) = match axis {
+                    Axis::Horizontal => (dx.abs(), dy.abs()),
+                    Axis::Vertical => (dy.abs(), dx.abs()),
+                };
+                self.stray = (self.stray + across - along).max(0.);
+                if self.stray >= TURN_AFTER {
+                    self.stray = 0.;
+                    axis.invert()
+                } else {
+                    axis
+                }
+            }
+        };
+        self.axis = Some(axis);
+        match axis {
+            Axis::Horizontal => (dx, 0.),
+            Axis::Vertical => (0., dy),
+        }
+    }
+}
+
+/// Hear the wheel over the parent's box before anything inside it does.
+/// A scroller handles the wheel on its own listener, which runs ahead of
+/// its ancestors'; this is how an ancestor takes a sideways swipe off a
+/// list before the list spends the swipe's drift on its rows. Add it as
+/// the last child of a `relative` parent; stop propagation to keep the
+/// event.
+pub fn wheel_first(
+    on_wheel: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.should_handle_scroll(window) {
+                    on_wheel(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// A vertical overlay scrollbar for `handle`. Place it as the last child
@@ -225,5 +323,47 @@ impl Element for Scrollbar {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gesture_keeps_the_axis_it_sets_off_on() {
+        let mut lock = AxisLock::default();
+        assert_eq!(lock.steer(true, (1., -9.)), (0., -9.));
+        // Drift across a vertical fling is dropped.
+        assert_eq!(lock.steer(false, (3., -20.)), (0., -20.));
+        assert_eq!(lock.steer(false, (2., 0.)), (0., 0.));
+        assert_eq!(lock.steer(false, (1., -6.)), (0., -6.));
+    }
+
+    #[test]
+    fn the_next_gesture_picks_its_own_axis() {
+        let mut lock = AxisLock::default();
+        assert_eq!(lock.steer(true, (0., -30.)), (0., -30.));
+        // A device that never reports a landing: the pause is the boundary.
+        assert_eq!(lock.steer(true, (-14., 0.)), (-14., 0.));
+        assert_eq!(lock.steer(false, (-14., 3.)), (-14., 0.));
+    }
+
+    #[test]
+    fn sustained_travel_across_the_axis_turns_the_gesture() {
+        let mut lock = AxisLock::default();
+        // A sideways swipe whose first report leaned down.
+        assert_eq!(lock.steer(true, (1., 1.)), (0., 1.));
+        assert_eq!(lock.steer(false, (-5., 0.)), (0., 0.));
+        assert_eq!(lock.steer(false, (-5., 0.)), (0., 0.));
+        assert_eq!(lock.steer(false, (-5., 1.)), (-5., 0.));
+        assert_eq!(lock.steer(false, (-8., 2.)), (-8., 0.));
+    }
+
+    #[test]
+    fn an_idle_report_decides_nothing() {
+        let mut lock = AxisLock::default();
+        assert_eq!(lock.steer(true, (0., 0.)), (0., 0.));
+        assert_eq!(lock.steer(false, (-4., 1.)), (-4., 0.));
     }
 }

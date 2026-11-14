@@ -19,14 +19,27 @@ use crate::logic::graph::sync_glyph;
 use crate::logic::text::short_id;
 use crate::shell::topbar::checked_age_label;
 use crate::shell::Dismiss;
-use crate::theme::{theme, Theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_S, TEXT_XS};
+use crate::theme::{theme, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, checkbox, empty_state, h_flex, icon, scrollbar, section_header, short_age, tooltip,
-    truncated, v_flex, IconName, InputEvent, TextInput,
+    btn, checkbox, empty_state, group_head, h_flex, page_bar, page_filter, page_notice, scrollbar,
+    short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent, TextInput, PAGE_PAD,
 };
 use crate::views::menu;
+
+/// One bookmark, one line.
+const BOOKMARK_ROW_H: f32 = 32.;
+/// The name column takes a third of the page, within these.
+const NAME_MIN: f32 = 200.;
+const NAME_MAX: f32 = 440.;
+/// A short change id, and the author-and-age cell that the row's actions
+/// take over under the pointer.
+const ID_W: f32 = 62.;
+const META_W: f32 = 150.;
+/// How much of the page a cleanup sweep's checklist may take before it
+/// scrolls.
+const CLEANUP_LIST_MAX: f32 = 216.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeleteKind {
@@ -171,31 +184,19 @@ impl BookmarksView {
         }
     }
 
-    fn render_toolbar(
+    /// The page's bar: how many bookmarks, the filter, and the two acts
+    /// that concern all of them.
+    fn render_bar(
         &self,
         snapshot: &RepoSnapshot,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let t = theme(cx);
         let merged = merged_bookmarks(&snapshot.bookmarks).len();
-        let focused = self.filter.read(cx).is_focused(window);
-        let mut bar = h_flex().gap(px(8.)).mb(px(16.)).child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(8.))
-                .h(px(28.))
-                .px(px(8.))
-                .bg(t.bg_well)
-                .border_1()
-                .border_color(if focused { t.accent } else { t.border1 })
-                .rounded(px(RADIUS_M))
-                .text_size(px(TEXT_S))
-                .line_height(px(18.))
-                .child(icon(IconName::Search, 13., t.text3))
-                .child(self.filter.clone()),
-        );
+        let mut bar = page_bar("Bookmarks", Some(snapshot.bookmarks.len().to_string()), cx)
+            .child(div().w(px(4.)))
+            .child(page_filter(&self.filter, window, cx))
+            .child(div().flex_1());
         if !snapshot.git_remotes.is_empty() {
             let (checking, last, now) = {
                 let upstream = &self.app.read(cx).upstream;
@@ -209,6 +210,7 @@ impl BookmarksView {
             let app = self.app.clone();
             bar = bar.child(
                 btn("bookmarks-fetch", label)
+                    .ghost()
                     .icon(IconName::Refresh)
                     .disabled(checking)
                     .tooltip("jj git fetch — refresh what the remotes have")
@@ -222,6 +224,7 @@ impl BookmarksView {
             bar = bar.child(
                 btn("bookmarks-cleanup", format!("Clean up merged ({merged})"))
                     .icon(IconName::Trash)
+                    .armed(self.cleanup_open)
                     .disabled(self.busy)
                     .on_click(cx.listener(move |this, _, _, cx| this.open_cleanup(&snapshot, cx))),
             );
@@ -229,7 +232,7 @@ impl BookmarksView {
         bar
     }
 
-    /// The consequence-stating card: exactly what a sweep will delete,
+    /// The consequence-stating tray: exactly what a sweep will delete,
     /// opt-out per row, remote deletion opt-in.
     fn render_cleanup(&self, snapshot: &RepoSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
@@ -239,19 +242,16 @@ impl BookmarksView {
         } else {
             &snapshot.trunk_bookmark
         };
-        let mut card = v_flex()
-            .mb(px(20.))
-            .py(px(12.))
-            .px(px(16.))
-            .bg(t.bg_well)
-            .border_1()
-            .border_color(t.border2)
-            .rounded(px(RADIUS_L))
-            .text_size(px(TEXT_S))
-            .child(div().mb(px(8.)).text_color(t.text2).child(format!(
-                "These bookmarks point at work that is already part of {trunk} — deleting them \
-                 loses nothing."
-            )));
+        let mut card = tray(cx).child(div().mb(px(8.)).text_color(t.text2).child(format!(
+            "These bookmarks point at work that is already part of {trunk} — deleting them \
+             loses nothing."
+        )));
+        // The tray stays under the bar while the page scrolls, so a long
+        // sweep scrolls inside it.
+        let mut list = div()
+            .id("cleanup-list")
+            .max_h(px(CLEANUP_LIST_MAX))
+            .scroll_y();
         for (index, bookmark) in merged.iter().enumerate() {
             let key = bookmark_key(bookmark);
             let on = self.checked.contains(&key);
@@ -261,7 +261,7 @@ impl BookmarksView {
                 }
                 cx.notify();
             });
-            card = card.child(
+            list = list.child(
                 h_flex()
                     .gap(px(8.))
                     .py(px(3.))
@@ -285,6 +285,7 @@ impl BookmarksView {
                     )),
             );
         }
+        card = card.child(list);
         if merged.iter().any(|b| b.is_local && b.tracked) {
             card = card.child(
                 h_flex()
@@ -340,6 +341,7 @@ impl BookmarksView {
         &self,
         bookmark: &BookmarkState,
         snapshot: &RepoSnapshot,
+        name_w: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -348,22 +350,10 @@ impl BookmarksView {
         let can_jump = snapshot.nodes.iter().any(|node| node.id == bookmark.target);
         let has_remotes = !snapshot.git_remotes.is_empty();
         let (glyph, tone, sync_text) = sync_glyph(bookmark.sync);
-        let chip = |text: &'static str, fg, bg| {
-            div()
-                .flex_shrink_0()
-                .h(px(16.))
-                .px(px(5.))
-                .flex()
-                .items_center()
-                .rounded(px(RADIUS_S))
-                .bg(bg)
-                .text_size(px(TEXT_XS))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(fg)
-                .child(text)
-        };
 
-        let mut name = h_flex().gap(px(6.)).min_w_0().text_size(px(TEXT_S)).child(
+        // One line, in columns: the name and its states, the change it
+        // points at, then who moved it last and when.
+        let mut name = h_flex().w(px(name_w)).flex_shrink_0().gap(px(6.)).child(
             div()
                 .min_w_0()
                 .flex_shrink()
@@ -376,7 +366,7 @@ impl BookmarksView {
                 .child(truncated(bookmark.name.clone())),
         );
         if bookmark.is_trunk {
-            name = name.child(chip("trunk", t.accent_strong, t.accent_dim));
+            name = name.child(tag("trunk", t.accent_strong));
         }
         if !glyph.is_empty() {
             name = name.child(
@@ -390,37 +380,38 @@ impl BookmarksView {
             );
         }
         if !bookmark.is_local && bookmark.tracked {
-            name = name.child(chip("tracked", t.text3, Theme::fade(t.text1, 0.06)));
+            name = name.child(tag("tracked", t.text3));
         }
         if bookmark.is_merged {
-            name = name.child(chip("merged", t.ok, t.ok_dim));
+            name = name.child(tag("merged", t.ok));
         }
-        let target = h_flex()
-            .gap(px(4.))
-            .min_w_0()
-            .text_size(px(TEXT_XS))
-            .text_color(t.text3)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(t.mono.clone())
-                    .text_color(t.text2)
-                    .child(short_id(&bookmark.target, 8).to_owned()),
-            )
-            .child(div().min_w(px(40.)).flex_shrink().child(truncated(
-                if bookmark.target_description.is_empty() {
-                    "(no description)".to_owned()
-                } else {
-                    bookmark.target_description.clone()
-                },
-            )));
-        let mut ident = v_flex()
+        let mut ident = h_flex()
             .id(SharedString::from(format!("ident-{key}")))
             .flex_1()
             .min_w_0()
-            .gap(px(1.))
+            .h_full()
+            .gap(px(12.))
             .child(name)
-            .child(target);
+            .child(
+                div()
+                    .w(px(ID_W))
+                    .flex_shrink_0()
+                    .font_family(t.mono.clone())
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .child(short_id(&bookmark.target, 8).to_owned()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(40.))
+                    .text_color(t.text2)
+                    .child(truncated(if bookmark.target_description.is_empty() {
+                        "(no description)".to_owned()
+                    } else {
+                        bookmark.target_description.clone()
+                    })),
+            );
         if can_jump {
             let app = self.app.clone();
             let id = bookmark.target.clone();
@@ -436,16 +427,14 @@ impl BookmarksView {
             ));
         }
 
-        let mut row = div()
+        let mut row = h_flex()
             .id(SharedString::from(format!("row-{key}")))
             .group(group.clone())
-            .flex()
-            .flex_row()
-            .items_center()
+            .h(px(BOOKMARK_ROW_H))
             .gap(px(12.))
-            .min_h(px(40.))
-            .py(px(3.))
-            .px(px(8.))
+            .pl(px(PAGE_PAD))
+            .pr(px(12.))
+            .text_size(px(TEXT_S))
             .border_b_1()
             .border_color(t.border2)
             .hover(|style| style.bg(t.bg_hover))
@@ -614,9 +603,9 @@ impl BookmarksView {
             .top_0()
             .bottom_0()
             .right_0()
-            .w(px(110.))
+            .w(px(META_W))
             .justify_end()
-            .gap(px(8.))
+            .gap(px(10.))
             .text_size(px(TEXT_XS))
             .text_color(t.text3)
             .group_hover(group, |style| style.invisible())
@@ -627,19 +616,26 @@ impl BookmarksView {
             )))
             .child(
                 div()
-                    .max_w(px(80.))
+                    .max_w(px(META_W - 42.))
                     .child(truncated(bookmark.target_author.clone())),
             )
-            .child(if bookmark.target_timestamp.is_empty() {
-                String::new()
-            } else {
-                short_age(&bookmark.target_timestamp)
-            });
+            .child(
+                div()
+                    .w(px(32.))
+                    .flex()
+                    .justify_end()
+                    .font_family(t.mono.clone())
+                    .child(if bookmark.target_timestamp.is_empty() {
+                        String::new()
+                    } else {
+                        short_age(&bookmark.target_timestamp)
+                    }),
+            );
         row.child(
             h_flex()
                 .relative()
                 .flex_shrink_0()
-                .min_w(px(110.))
+                .min_w(px(META_W))
                 .min_h(px(22.))
                 .justify_end()
                 .child(actions)
@@ -651,50 +647,24 @@ impl BookmarksView {
     fn render_group(
         &self,
         label: &str,
-        blurb: Option<String>,
+        note: Option<String>,
         bookmarks: &[&BookmarkState],
         snapshot: &RepoSnapshot,
+        name_w: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let t = theme(cx);
         // The heading stays put while its group scrolls under it.
-        let heading = h_flex()
-            .gap(px(8.))
-            .pt(px(12.))
-            .px(px(8.))
-            .pb(px(4.))
-            .bg(t.bg1)
-            .border_b_1()
-            .border_color(t.border2)
-            .child(
-                div()
-                    .text_size(px(TEXT_S))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.text2)
-                    .child(label.to_owned()),
-            )
-            .child(
-                div()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .child(bookmarks.len().to_string()),
-            );
+        let heading = group_head(
+            label.to_owned(),
+            Some(bookmarks.len()),
+            note.map(Into::into),
+            cx,
+        );
         let mut group = div();
-        if let Some(blurb) = blurb {
-            group = group.child(
-                div()
-                    .my(px(8.))
-                    .px(px(8.))
-                    .text_size(px(TEXT_S))
-                    .text_color(t.text3)
-                    .child(blurb),
-            );
-        }
         for bookmark in bookmarks {
-            group = group.child(self.render_row(bookmark, snapshot, cx));
+            group = group.child(self.render_row(bookmark, snapshot, name_w, cx));
         }
-        div().mb(px(20.)).child(pinned(heading, group))
+        pinned(heading, group)
     }
 }
 
@@ -726,61 +696,31 @@ impl Render for BookmarksView {
         }
         let query = self.filter.read(cx).text().to_owned();
         let groups = group_bookmarks(&snapshot.bookmarks, &query);
+        // The name column takes a third of the page, the same on every
+        // row whatever else the row is showing.
+        let page_w = f32::from(window.viewport_size().width);
+        let name_w = (page_w * 0.3).clamp(NAME_MIN, NAME_MAX);
         // Block flow: see the Operations page's column.
-        let mut column = div()
-            .w_full()
-            .max_w(px(800.))
-            .mx_auto()
-            .pt(px(24.))
-            .px(px(24.))
-            .pb(px(32.))
-            .child(section_header(
-                IconName::Bookmark,
-                "Bookmarks",
-                "Every bookmark this repo knows: your local ones and each remote's branches — \
-                 what the team is working on, and what is ready to be cleaned up.",
-                cx,
-            ))
-            .child(self.render_toolbar(&snapshot, window, cx));
-        if let Some(error) = &self.error {
-            column = column.child(
-                h_flex()
-                    .gap(px(8.))
-                    .mb(px(12.))
-                    .py(px(6.))
-                    .px(px(12.))
-                    .rounded(px(RADIUS_M))
-                    .bg(Theme::fade(t.danger, 0.08))
-                    .text_size(px(TEXT_S))
-                    .text_color(t.danger)
-                    .child(div().flex_1().min_w_0().child(truncated(error.clone())))
-                    .child(
-                        div()
-                            .id("bookmarks-error-dismiss")
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.error = None;
-                                cx.notify();
-                            }))
-                            .child(icon(IconName::Close, 12., t.danger)),
-                    ),
-            );
-        }
-        if self.cleanup_open {
-            column = column.child(self.render_cleanup(&snapshot, cx));
-        }
+        let mut column = div().w_full().pb(px(32.));
         if groups.local.is_empty() && groups.remotes.is_empty() {
             column = column.child(
                 div()
-                    .py(px(16.))
+                    .py(px(14.))
+                    .px(px(PAGE_PAD))
                     .text_size(px(TEXT_S))
                     .text_color(t.text3)
                     .child(format!("Nothing matches \u{201c}{query}\u{201d}.")),
             );
         }
         if !groups.local.is_empty() {
-            column = column.child(self.render_group("Local", None, &groups.local, &snapshot, cx));
+            column = column.child(self.render_group(
+                "Local",
+                None,
+                &groups.local,
+                &snapshot,
+                name_w,
+                cx,
+            ));
         }
         for (remote, bookmarks) in &groups.remotes {
             column = column.child(self.render_group(
@@ -791,18 +731,44 @@ impl Render for BookmarksView {
                 )),
                 bookmarks,
                 &snapshot,
+                name_w,
                 cx,
             ));
         }
+        let mut page = v_flex()
+            .size_full()
+            .child(self.render_bar(&snapshot, window, cx));
+        if let Some(error) = &self.error {
+            page = page.child(page_notice(
+                "bookmarks-error-dismiss",
+                error.clone(),
+                cx,
+                cx.listener(|this, _, _, cx| {
+                    this.error = None;
+                    cx.notify();
+                }),
+            ));
+        }
+        if self.cleanup_open {
+            page = page.child(self.render_cleanup(&snapshot, cx));
+        }
         root.child(
-            div()
-                .id("bookmarks-scroll")
-                .size_full()
-                .scroll_y()
-                .track_scroll(&self.scroll)
-                .child(column),
+            page.child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("bookmarks-scroll")
+                            .size_full()
+                            .scroll_y()
+                            .track_scroll(&self.scroll)
+                            .child(column),
+                    )
+                    .child(scrollbar("bookmarks-scrollbar", &self.scroll)),
+            ),
         )
-        .child(scrollbar("bookmarks-scrollbar", &self.scroll))
         .into_any_element()
     }
 }

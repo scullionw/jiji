@@ -21,12 +21,15 @@ pub use self::button::{btn, checkbox, icon_btn, kbd, segmented, Btn};
 pub use self::icon::{icon, IconName};
 pub use self::input::{InputEvent, TextInput};
 pub use self::page::{
-    consequences, empty_state, plan_actions, plan_panel, plan_title, section_header,
+    consequences, empty_state, group_head, page_bar, page_filter, page_notice, plan_actions,
+    plan_panel, plan_title, tray, PAGE_PAD,
 };
 pub use self::pinned::pinned;
 pub use self::popover::{menu_label, menu_row, popover, popover_layer, PopoverState};
-pub use self::scroll::{scrollbar, vertical_only, ScrollY};
-pub use self::text::{ref_label, rich, text_width, text_width_in};
+pub use self::scroll::{scrollbar, vertical_only, wheel_first, AxisLock, ScrollY};
+pub use self::text::{
+    label_box, ref_label, rich, tag, text_width, text_width_in, trunk_label, LABEL_H,
+};
 pub use self::time::{absolute_time, from_now, short_age};
 pub use self::tooltip::{tooltip, tooltip_guard};
 pub use self::truncate::truncated;
@@ -44,6 +47,18 @@ pub fn v_flex() -> Div {
 /// A hairline between groups of a menu or panel.
 pub fn separator(cx: &App) -> Div {
     div().h(px(1.)).my(px(4.)).bg(theme(cx).border2)
+}
+
+/// The mark of what is current: a two-pixel accent bar on the leading edge
+/// of a `relative()` row.
+pub fn lead_bar(cx: &App) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(2.))
+        .bg(theme(cx).accent)
 }
 
 /// A small status dot.

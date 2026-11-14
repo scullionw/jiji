@@ -4,30 +4,56 @@
 use gpui::{div, prelude::*, px, App, Div, FontWeight, Hsla, SharedString, Window};
 
 use super::{icon, truncated, IconName};
-use crate::theme::{theme, FONT_UI, RADIUS_S, TEXT_XS};
+use crate::theme::{theme, Theme, FONT_UI, RADIUS_S, TEXT_XS};
 
-/// A ref label: a bookmark, tag or remote name riding a row.
+/// The height every label riding a row shares.
+pub const LABEL_H: f32 = 18.;
+
+/// A ref label: a bookmark, tag or remote name riding a row. A hairline
+/// box with no fill, so a row of them stays lighter than the title beside
+/// it.
 pub fn ref_label(glyph: Option<IconName>, text: impl Into<SharedString>, cx: &App) -> Div {
     let t = theme(cx);
-    let mut el = div()
-        .flex()
-        .flex_row()
-        .flex_shrink_0()
-        .items_center()
+    let mut el = label_box(t.text2, t.border1)
         .gap(px(3.))
-        .h(px(17.))
-        .px(px(5.))
-        .rounded(px(RADIUS_S))
-        .bg(t.ref_bg)
-        .text_color(t.text2)
-        .font_family(t.mono.clone())
-        .text_size(px(TEXT_XS))
-        .line_height(px(17.))
-        .whitespace_nowrap();
+        .font_family(t.mono.clone());
     if let Some(glyph) = glyph {
         el = el.child(icon(glyph, 10., t.text3));
     }
     el.child(truncated(text))
+}
+
+/// The trunk bookmark's label: the one ref everything measures against,
+/// in the accent.
+pub fn trunk_label(text: impl Into<SharedString>, cx: &App) -> Div {
+    let t = theme(cx);
+    label_box(t.accent_strong, Theme::fade(t.accent, 0.5))
+        .font_family(t.mono.clone())
+        .child(truncated(text))
+}
+
+/// A state word riding a row ("conflict", "merged", "trunk"): the tone's
+/// ink inside the tone's own hairline.
+pub fn tag(text: impl Into<SharedString>, color: Hsla) -> Div {
+    label_box(color, Theme::fade(color, 0.36)).child(text.into())
+}
+
+/// The box [`ref_label`] and [`tag`] share: callers add the content.
+pub fn label_box(ink: Hsla, line: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .h(px(LABEL_H))
+        .px(px(5.))
+        .rounded(px(RADIUS_S))
+        .border_1()
+        .border_color(line)
+        .text_color(ink)
+        .text_size(px(TEXT_XS))
+        .line_height(px(LABEL_H - 2.))
+        .whitespace_nowrap()
 }
 
 /// A sentence with inline emphasis: `**strong**` reads in full ink and

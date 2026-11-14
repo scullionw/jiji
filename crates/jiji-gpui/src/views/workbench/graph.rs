@@ -9,7 +9,7 @@ use gpui::{
     Corner, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, SharedString, Stateful,
     TextRun, Window,
 };
-use jiji_core::snapshot::{NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
+use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
 use jiji_forge::RepoPrState;
 
 use super::{ShownDiff, WorkbenchView};
@@ -23,14 +23,12 @@ use crate::logic::inspect::summary_of;
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
 use crate::logic::text::counted;
 use crate::store::SavedView;
-use crate::theme::{
-    theme, Theme, RADIUS_L, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H,
-};
+use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, menu_label, popover,
-    popover_layer, ref_label, scrollbar, segmented, short_age, tooltip, truncated, v_flex,
-    IconName,
+    absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, label_box, lead_bar,
+    menu_label, popover, popover_layer, ref_label, scrollbar, segmented, short_age, tag, tooltip,
+    truncated, v_flex, IconName,
 };
 use crate::views::menu;
 
@@ -128,6 +126,115 @@ pub fn rename_saved_view(
 
 /// Panes this wide or narrower leave authors out of the rows.
 const AUTHOR_MIN_PANE: f32 = 560.;
+/// A full-spacing rail's stroke, and a node ring's.
+const RAIL_W: f32 = 2.;
+/// Between a row's parts, and after its last.
+const ROW_GAP: f32 = 8.;
+const ROW_PAD: f32 = 12.;
+/// What a title keeps however many labels its row carries.
+const TITLE_MIN: f32 = 96.;
+/// A ref's name truncates past this, and is not worth showing under
+/// `REF_MIN`.
+const REF_MAX: f32 = 120.;
+const REF_MIN: f32 = 44.;
+/// A label's padding and hairlines.
+const LABEL_PAD: f32 = 12.;
+
+/// How wide `chars` monospace characters run at `size`.
+fn mono_width_at(chars: f32, size: f32) -> f32 {
+    chars * size * 0.61
+}
+
+/// How wide `text` runs in a label's monospace.
+fn mono_width(text: &str) -> f32 {
+    mono_width_at(text.chars().count() as f32, TEXT_XS)
+}
+
+/// The labels riding one graph row, fitted to the room the title spares.
+/// A ref that does not fit whole truncates into what is left; one that
+/// cannot is counted in a closing "+N" that names it.
+struct RowLabels {
+    room: f32,
+    used: f32,
+    /// Refs still to be offered: while any remain, the count keeps its
+    /// seat.
+    refs_left: usize,
+    shown: Vec<AnyElement>,
+    hidden: Vec<String>,
+}
+
+impl RowLabels {
+    /// Room the closing count needs.
+    const MORE: f32 = 24.;
+    const GAP: f32 = 4.;
+
+    fn new(room: f32, refs: usize) -> Self {
+        Self {
+            room,
+            used: 0.,
+            refs_left: refs,
+            shown: Vec::new(),
+            hidden: Vec::new(),
+        }
+    }
+
+    fn left(&self) -> f32 {
+        let seat = if self.refs_left > 0 || !self.hidden.is_empty() {
+            Self::MORE
+        } else {
+            0.
+        };
+        self.room - self.used - seat
+    }
+
+    /// Room for a ref that wants `natural` and reads down to `least`:
+    /// `None` once it (or one before it) had to be counted instead.
+    fn grant(&mut self, natural: f32, least: f32, name: &str) -> Option<f32> {
+        self.refs_left = self.refs_left.saturating_sub(1);
+        let left = self.left();
+        if !self.hidden.is_empty() || left < least.min(natural) {
+            self.hidden.push(name.to_owned());
+            return None;
+        }
+        let granted = natural.min(left);
+        self.used += granted + Self::GAP;
+        Some(granted)
+    }
+
+    /// A label that may leave without a trace: a state the node marker or
+    /// the row already carries.
+    fn fits(&mut self, width: f32) -> bool {
+        let fits = self.hidden.is_empty() && width <= self.left();
+        if fits {
+            self.used += width + Self::GAP;
+        }
+        fits
+    }
+
+    fn add(&mut self, label: impl IntoElement) {
+        self.shown.push(label.into_any_element());
+    }
+
+    fn into_row(self, id: impl Into<gpui::ElementId>, t: &Theme) -> Div {
+        let mut row = h_flex()
+            .flex_shrink_0()
+            .gap(px(Self::GAP))
+            .children(self.shown);
+        if !self.hidden.is_empty() {
+            row = row.child(
+                div()
+                    .id(id)
+                    .flex_shrink_0()
+                    .font_family(t.mono.clone())
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .tooltip(tooltip(self.hidden.join(", ")))
+                    .child(format!("+{}", self.hidden.len())),
+            );
+        }
+        row
+    }
+}
 
 /// Everything a row needs to draw itself, shared by a whole pass.
 struct RowStyle<'a> {
@@ -144,16 +251,38 @@ struct RowStyle<'a> {
     comparison: Option<&'a ShownDiff>,
     /// Whether the pane has room for authors beside the descriptions.
     authors: bool,
+    /// The width the rows lay out in.
+    width: f32,
 }
 
 impl RowStyle<'_> {
     fn rail_color(&self, rail: &Rail, hot_lane: Option<usize>) -> Hsla {
         let t = &self.theme;
         match rail.lane {
-            None => Theme::blend(t.text3, 0.5, t.bg1),
-            Some(lane) if Some(lane) == hot_lane => Theme::blend(t.lane(lane), 0.8, t.bg1),
-            Some(lane) => Theme::blend(t.lane(lane), 0.38, t.bg1),
+            None => Theme::blend(t.text3, 0.55, t.bg1),
+            Some(lane) if Some(lane) == hot_lane => t.lane(lane),
+            Some(lane) => Theme::blend(t.lane(lane), 0.5, t.bg1),
         }
+    }
+
+    /// How much of a row its labels may take. The title keeps what it
+    /// needs, up to half the row; ids, author and age keep theirs.
+    fn label_room(&self, node: &GraphNode, title: &str) -> f32 {
+        let classic = self.density == RowDensity::Classic;
+        let mut text = self.width - self.gutter - ROW_GAP - ROW_PAD;
+        if !classic {
+            let ids = if node.is_divergent { 19. } else { 8. };
+            let age = 30. + if self.authors { 82. } else { 0. };
+            text -= mono_width_at(ids, TEXT_S) + age + 3. * ROW_GAP;
+        }
+        let size = if classic { TEXT_L } else { TEXT_M };
+        let wanted = if title.is_empty() {
+            120.
+        } else {
+            title.chars().count() as f32 * size * 0.54
+        };
+        let title_room = wanted.min((text * 0.5).max(TITLE_MIN));
+        (text - title_room).max(0.)
     }
 
     /// The lane slot of the emphasized workstream.
@@ -239,7 +368,7 @@ impl GutterPaint {
 
         for (role, rail, color) in &self.rails {
             let tier = lane_tier(rail.col, self.full);
-            let width = if tier == LaneTier::Full { 1.5 } else { 1. };
+            let width = if tier == LaneTier::Full { RAIL_W } else { 1. };
             let color = if tier == LaneTier::Overflow {
                 Theme::fade(*color, 0.55)
             } else {
@@ -288,7 +417,7 @@ impl GutterPaint {
             }
         }
         if let Some(color) = self.stub_below {
-            let width = if self.narrow { 1. } else { 1.5 };
+            let width = if self.narrow { 1. } else { RAIL_W };
             stroke(window, color, width, true, |path| {
                 path.move_to(point(nx, cy + clear));
                 path.line_to(point(nx, bottom));
@@ -343,7 +472,7 @@ impl GutterPaint {
             }
             Marker::Conflict => {
                 let xr = px(self.radius - 0.8);
-                let width = if self.narrow { 1.4 } else { 1.8 };
+                let width = if self.narrow { 1.4 } else { 2. };
                 stroke(window, self.danger, width, false, |path| {
                     path.move_to(point(nx - xr, cy - xr));
                     path.line_to(point(nx + xr, cy + xr));
@@ -366,7 +495,7 @@ impl GutterPaint {
                 }
             }
             Marker::Change { ring, fill: inside } => {
-                let width = if self.narrow { 1.2 } else { 1.5 };
+                let width = if self.narrow { 1.2 } else { RAIL_W };
                 // The selected node fills in: a solid dot reads as "this
                 // one" at any lane color, without a halo.
                 window.paint_quad(quad(
@@ -390,31 +519,6 @@ fn gutter_canvas(paint: GutterPaint, width: f32, height: f32) -> impl IntoElemen
     .w(px(width))
     .h(px(height))
     .flex_shrink_0()
-}
-
-/// A small ref-shaped chip in a custom tone.
-fn chip(
-    text: impl Into<SharedString>,
-    fg: Hsla,
-    bg: Option<Hsla>,
-    mono: Option<SharedString>,
-) -> Div {
-    let mut el = h_flex()
-        .flex_shrink_0()
-        .gap(px(3.))
-        .h(px(17.))
-        .px(px(5.))
-        .rounded(px(RADIUS_S))
-        .text_size(px(TEXT_XS))
-        .text_color(fg)
-        .whitespace_nowrap();
-    if let Some(bg) = bg {
-        el = el.bg(bg);
-    }
-    if let Some(mono) = mono {
-        el = el.font_family(mono);
-    }
-    el.child(text.into())
 }
 
 impl WorkbenchView {
@@ -878,6 +982,7 @@ impl WorkbenchView {
             prs: self.app.read(cx).forge.prs.clone(),
             comparison: self.shown.as_ref().filter(|shown| shown.from.is_some()),
             authors: width > AUTHOR_MIN_PANE,
+            width,
         }
     }
 
@@ -923,10 +1028,10 @@ impl WorkbenchView {
             Marker::Base
         } else {
             Marker::Change {
-                ring: if hot {
+                ring: if hot || selected {
                     lane_color
                 } else {
-                    Theme::blend(lane_color, 0.55, t.text3)
+                    Theme::blend(lane_color, 0.7, t.text3)
                 },
                 fill: selected.then_some(lane_color),
             }
@@ -1037,26 +1142,24 @@ impl WorkbenchView {
         let is_compare_base = style
             .comparison
             .is_some_and(|shown| shown.from.as_deref() == Some(node.id.as_str()));
-        let is_compare_to = style.comparison.is_some_and(|shown| shown.id == node.id);
 
-        let mut tags = h_flex()
-            .flex_shrink_0()
-            .min_w_0()
-            .gap(px(4.))
-            .overflow_hidden();
-        if is_compare_base {
-            tags = tags.child(
-                chip("diff base", t.accent_strong, Some(t.accent_dim), None)
+        // Labels ride the row only as far as the title can spare: whatever
+        // does not fit is counted, never clipped.
+        let bookmarks = row_bookmarks(style.snapshot, row);
+        let mut labels = RowLabels::new(
+            style.label_room(node, title),
+            bookmarks.len() + node.tags.len(),
+        );
+        if is_compare_base && labels.fits(62.) {
+            labels.add(
+                tag("diff base", t.accent_strong)
                     .id(("diff-base", key))
                     .tooltip(tooltip(
                         "The diff pane measures the selection against this change",
                     )),
             );
         }
-        if node.has_conflict {
-            tags = tags.child(chip("conflict", t.danger, Some(t.danger_dim), None));
-        }
-        for (bx, bookmark) in row_bookmarks(style.snapshot, row).into_iter().enumerate() {
+        for (bx, bookmark) in bookmarks.into_iter().enumerate() {
             let (glyph, tone, sync_label) = sync_glyph(bookmark.sync);
             let full_name = match &bookmark.remote {
                 Some(remote) => format!("{}@{remote}", bookmark.name),
@@ -1069,33 +1172,29 @@ impl WorkbenchView {
             } else {
                 full_name.clone()
             };
-            let (fg, bg) = if !bookmark.is_local {
-                (t.text3, None)
+            let (ink, line) = if !bookmark.is_local {
+                (t.text3, t.border2)
             } else if bookmark.is_trunk {
                 // Trunk is the one ref the whole graph measures against.
-                (t.accent_strong, Some(t.accent_dim))
+                (t.accent_strong, Theme::fade(t.accent, 0.5))
             } else {
-                (t.text2, Some(t.ref_bg))
+                (t.text2, t.border1)
             };
-            let mut label = h_flex()
+            let fixed = LABEL_PAD + if glyph.is_empty() { 0. } else { 10. };
+            let natural = mono_width(&shown).min(REF_MAX) + fixed;
+            let Some(granted) = labels.grant(natural, REF_MIN + fixed, &full_name) else {
+                continue;
+            };
+            let mut label = label_box(ink, line)
                 .id(("bm", key * 64 + bx))
-                .flex_shrink_0()
                 .gap(px(3.))
-                .h(px(17.))
-                .px(px(if bookmark.is_local { 5. } else { 2. }))
-                .rounded(px(RADIUS_S))
                 .font_family(t.mono.clone())
-                .text_size(px(TEXT_XS))
-                .text_color(fg)
                 .tooltip(tooltip(format!("{full_name} — {sync_label}")))
                 .on_mouse_down(
                     MouseButton::Right,
                     menu::bookmark_menu(bookmark.name.clone(), bookmark.remote.clone()),
                 )
-                .child(div().max_w(px(104.)).child(truncated(shown)));
-            if let Some(bg) = bg {
-                label = label.bg(bg);
-            }
+                .child(div().max_w(px(granted - fixed)).child(truncated(shown)));
             if !glyph.is_empty() {
                 label = label.child(
                     div()
@@ -1104,55 +1203,75 @@ impl WorkbenchView {
                         .child(glyph),
                 );
             }
-            tags = tags.child(label);
+            labels.add(label);
             if let Some(pr) = pr_for_bookmark(bookmark, style.prs.as_deref()) {
                 // The bookmark's pull request, right beside its label.
                 // Tones read like GitHub's states: open green, draft muted,
                 // merged accent, closed danger.
                 let badge = pr_badge(pr);
-                let (fg, bg) = match badge.tone {
-                    PrTone::Open => (t.ok, Some(t.ok_dim)),
-                    PrTone::Draft => (t.text3, Some(t.ref_bg)),
-                    PrTone::Merged => (t.accent_strong, Some(t.accent_dim)),
-                    PrTone::Closed => (t.danger, Some(t.danger_dim)),
+                let ink = match badge.tone {
+                    PrTone::Open => t.ok,
+                    PrTone::Draft => t.text3,
+                    PrTone::Merged => t.accent_strong,
+                    PrTone::Closed => t.danger,
                 };
-                let mut el = chip(badge.label, fg, bg, Some(t.mono.clone()))
-                    .id(("pr", key * 64 + bx))
-                    .on_mouse_down(MouseButton::Right, menu::pr_menu(pr.number))
-                    .tooltip(tooltip(badge.title));
-                for glyph in [badge.review, badge.checks].into_iter().flatten() {
-                    el = el.child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(t.tone(glyph.tone))
-                            .child(glyph.glyph),
-                    );
+                let marks = [badge.review, badge.checks];
+                let room = mono_width(&badge.label)
+                    + LABEL_PAD
+                    + 13. * marks.iter().flatten().count() as f32;
+                if labels.fits(room) {
+                    let mut el = tag(badge.label, ink)
+                        .gap(px(3.))
+                        .font_family(t.mono.clone())
+                        .id(("pr", key * 64 + bx))
+                        .on_mouse_down(MouseButton::Right, menu::pr_menu(pr.number))
+                        .tooltip(tooltip(badge.title));
+                    for glyph in marks.into_iter().flatten() {
+                        el = el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(t.tone(glyph.tone))
+                                .child(glyph.glyph),
+                        );
+                    }
+                    labels.add(el);
                 }
-                tags = tags.child(el);
             }
         }
+        // The marker already says "conflict"; the word joins it when the
+        // refs leave room.
+        if node.has_conflict && labels.fits(54.) {
+            labels.add(tag("conflict", t.danger));
+        }
         // Colocated git tags, read-only: markers only, no tag management.
-        for tag in &node.tags {
-            tags = tags.child(ref_label(Some(IconName::Tag), tag.clone(), cx).max_w(px(120.)));
+        for name in &node.tags {
+            let fixed = LABEL_PAD + 13.;
+            let natural = mono_width(name).min(REF_MAX) + fixed;
+            if let Some(granted) = labels.grant(natural, REF_MIN + fixed, name) {
+                labels.add(ref_label(Some(IconName::Tag), name.clone(), cx).max_w(px(granted)));
+            }
         }
         if row.is_stack_head && row.behind_trunk > 0 {
-            tags = tags.child(
-                div()
-                    .id(("behind", key))
-                    .flex_shrink_0()
-                    .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.warn)
-                    .tooltip(tooltip(format!(
-                        "{} change{} behind trunk",
-                        row.behind_trunk,
-                        if row.behind_trunk == 1 { "" } else { "s" }
-                    )))
-                    .child(format!("↓{}", row.behind_trunk)),
-            );
+            let text = format!("↓{}", row.behind_trunk);
+            if labels.fits(mono_width(&text)) {
+                labels.add(
+                    div()
+                        .id(("behind", key))
+                        .flex_shrink_0()
+                        .font_family(t.mono.clone())
+                        .text_size(px(TEXT_XS))
+                        .text_color(t.warn)
+                        .tooltip(tooltip(format!(
+                            "{} change{} behind trunk",
+                            row.behind_trunk,
+                            if row.behind_trunk == 1 { "" } else { "s" }
+                        )))
+                        .child(text),
+                );
+            }
         }
-        if node.is_empty {
-            tags = tags.child(
+        if node.is_empty && labels.fits(34.) {
+            labels.add(
                 div()
                     .flex_shrink_0()
                     .text_size(px(TEXT_XS))
@@ -1160,6 +1279,7 @@ impl WorkbenchView {
                     .child("empty"),
             );
         }
+        let tags = labels.into_row(("more-refs", key), t);
 
         // The description owns the row: long author names give way first,
         // and in a squeezed pane the author leaves for the tooltip.
@@ -1251,24 +1371,16 @@ impl WorkbenchView {
             None => {}
         }
         el = if selected {
-            el.bg(t.accent_dim)
+            el.bg(t.selected)
         } else if is_compare_base {
             el.bg(Theme::fade(t.accent, 0.05))
         } else {
             el.hover(|style| style.bg(t.bg_hover))
         };
-        // An active comparison marks both endpoints on the row's leading
-        // edge, so the pair reads at a glance.
-        if is_compare_base || (is_compare_to && selected) {
-            el = el.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(t.accent),
-            );
+        // The leading bar marks the selection, and the far end of an
+        // active comparison with it, so the pair reads at a glance.
+        if selected || is_compare_base {
+            el = el.child(lead_bar(cx));
         }
         el = el.child(gutter);
         if classic {
@@ -1331,7 +1443,7 @@ impl WorkbenchView {
                         bounds.left() + px(rail_x(rail.col, full)),
                         from,
                         bounds.bottom(),
-                        if tier == LaneTier::Full { 1.5 } else { 1. },
+                        if tier == LaneTier::Full { RAIL_W } else { 1. },
                         color,
                     );
                 };
@@ -1494,8 +1606,9 @@ impl WorkbenchView {
         body
     }
 
-    /// One workstream at a time: the chain in a card, the immutable base
-    /// it sits on in a recessed zone below, the other lanes as a list.
+    /// One workstream at a time: the chain under its own band, the
+    /// immutable base it sits on in a recessed zone below, the other lanes
+    /// as a list.
     fn render_focus(&mut self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let snapshot = self.snapshot.clone();
@@ -1511,10 +1624,10 @@ impl WorkbenchView {
             ));
         };
         let selected = self.selected_ids(cx);
-        let inner = (width - 2. * 12.).max(240.);
-        let style = self.row_style(&focus.graph, inner, &selected, Some(lane.id.clone()), cx);
-        // The chain renders inside the card body; the immutable base(s)
-        // and their terminal `~` rows sit in a recessed zone below.
+        let style = self.row_style(&focus.graph, width, &selected, Some(lane.id.clone()), cx);
+        // The chain runs edge to edge under the workstream's own band; the
+        // immutable base(s) and their terminal `~` rows sit in a recessed
+        // zone below.
         let split_at = focus
             .graph
             .rows
@@ -1542,10 +1655,17 @@ impl WorkbenchView {
         let mut head = h_flex()
             .h(px(36.))
             .gap(px(8.))
-            .px(px(12.))
+            .pl(px(8.))
+            .pr(px(12.))
             .border_b_1()
             .border_color(t.border2)
-            .child(crate::ui::dot(t.lane(slot), 8.))
+            .child(
+                div()
+                    .w(px(8.))
+                    .flex()
+                    .justify_center()
+                    .child(crate::ui::dot(t.lane(slot), 8.)),
+            )
             .child(
                 div()
                     .min_w_0()
@@ -1560,19 +1680,17 @@ impl WorkbenchView {
             );
         }
         head = head.child(div().flex_1());
-        let mut card = v_flex()
+        let mut lane_block = v_flex()
             .w_full()
-            .max_w(px(760.))
-            .rounded(px(RADIUS_L))
-            .border_1()
+            .border_b_1()
             .border_color(t.border2)
-            .overflow_hidden()
             .child(head.child(meta))
             .child(v_flex().py(px(4.)).children(chain));
         if !base.is_empty() {
             let mut zone = v_flex()
                 .border_t_1()
                 .border_color(t.border2)
+                .bg(t.recess)
                 .pb(px(4.))
                 .child(
                     h_flex()
@@ -1606,10 +1724,10 @@ impl WorkbenchView {
                         )),
                 );
             }
-            card = card.child(zone);
+            lane_block = lane_block.child(zone);
         }
 
-        let mut body = v_flex().w_full().p(px(12.)).child(card);
+        let mut body = v_flex().w_full().pb(px(12.)).child(lane_block);
         let siblings: Vec<&WorkstreamSummary> = snapshot
             .workstreams
             .iter()
@@ -1617,14 +1735,21 @@ impl WorkbenchView {
             .collect();
         if !siblings.is_empty() {
             body = body.child(
-                div()
-                    .mt(px(20.))
-                    .mb(px(4.))
-                    .px(px(8.))
+                h_flex()
+                    .h(px(28.))
+                    .mt(px(12.))
+                    .px(px(12.))
+                    .gap(px(6.))
                     .text_size(px(TEXT_XS))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(t.text3)
-                    .child("Other workstreams"),
+                    .child("Other workstreams")
+                    .child(
+                        div()
+                            .font_family(t.mono.clone())
+                            .font_weight(FontWeight::NORMAL)
+                            .child(siblings.len().to_string()),
+                    ),
             );
             for (ix, sibling) in siblings.into_iter().enumerate() {
                 body = body.child(self.sibling_lane(sibling, ix, cx));
@@ -1684,11 +1809,9 @@ impl WorkbenchView {
         h_flex()
             .id(("sibling", key))
             .w_full()
-            .max_w(px(760.))
             .gap(px(10.))
-            .px(px(8.))
+            .px(px(12.))
             .py(px(6.))
-            .rounded(px(RADIUS_M))
             .cursor_pointer()
             .hover(|style| style.bg(t.bg_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.focus_workstream(id.clone(), cx)))
@@ -1714,6 +1837,52 @@ mod tests {
             name: name.into(),
             revset: revset.into(),
         }
+    }
+
+    #[test]
+    fn refs_that_fit_ride_whole() {
+        let mut labels = RowLabels::new(200., 2);
+        assert_eq!(labels.grant(60., 50., "one"), Some(60.));
+        assert_eq!(labels.grant(60., 50., "two"), Some(60.));
+        assert!(labels.hidden.is_empty());
+    }
+
+    #[test]
+    fn a_ref_truncates_into_what_the_title_spares() {
+        let mut labels = RowLabels::new(90., 1);
+        // The last ref needs no seat kept for a count, so it takes it all.
+        assert_eq!(labels.grant(140., 56., "long"), Some(90.));
+        assert!(labels.hidden.is_empty());
+    }
+
+    #[test]
+    fn what_cannot_fit_is_counted_and_so_is_everything_after() {
+        let mut labels = RowLabels::new(120., 3);
+        assert_eq!(labels.grant(80., 56., "one"), Some(80.));
+        // 120 - 84 used - the count's seat leaves no readable ref.
+        assert_eq!(labels.grant(80., 56., "two"), None);
+        // A short one would fit, but refs do not skip the queue.
+        assert_eq!(labels.grant(20., 20., "three"), None);
+        assert_eq!(labels.hidden, ["two", "three"]);
+        // Nor does a state word ride after the count.
+        assert!(!labels.fits(10.));
+    }
+
+    #[test]
+    fn the_count_keeps_its_seat_while_refs_remain() {
+        let mut labels = RowLabels::new(100., 2);
+        // The first of two leaves room for "+1" beside it.
+        assert_eq!(labels.grant(140., 56., "one"), Some(100. - RowLabels::MORE));
+        assert_eq!(labels.grant(60., 56., "two"), None);
+        assert_eq!(labels.hidden, ["two"]);
+    }
+
+    #[test]
+    fn a_state_word_leaves_without_a_trace() {
+        let mut labels = RowLabels::new(40., 0);
+        assert!(!labels.fits(54.));
+        assert!(labels.fits(34.));
+        assert!(labels.hidden.is_empty());
     }
 
     #[test]

@@ -291,7 +291,7 @@ impl Palette {
             row = row.bg(if item.danger {
                 t.danger_dim
             } else {
-                Theme::fade(t.text1, 0.08)
+                t.selected
             });
         }
         row = match &item.hint {

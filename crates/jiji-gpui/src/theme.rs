@@ -5,11 +5,16 @@
 //!   bg0  the frame: title bar, rail, status bar
 //!   bg1  the working panes: graph, diff, section pages
 //!   bg2  surfaces above a pane: popovers, menus, file headers
-//!   bg3  controls: buttons, active segments, ref labels
+//!   bg3  controls: buttons, active segments
 //!
 //! Text steps hold their contrast on every surface from bg0 to bg2 (text2
 //! at 8:1 or better, text3 at 5.5:1 or better), so text3 is the quiet step,
 //! never a faded one.
+//!
+//! What is current carries a two-pixel accent bar — the section in the
+//! rail, the repo's tab, the selected row — and sits on a neutral fill
+//! (`selected`), so hue stays free to mean something: a lane, a status, a
+//! diff side.
 
 use std::rc::Rc;
 
@@ -18,21 +23,24 @@ use gpui::{point, px, App, BoxShadow, Global, Hsla, Rgba, SharedString};
 use crate::diff::highlight::Syn;
 use crate::logic::inspect::Tone;
 
-pub const TITLEBAR_H: f32 = 32.;
+pub const TITLEBAR_H: f32 = 36.;
 pub const STATUSBAR_H: f32 = 24.;
 pub const RAIL_W: f32 = 44.;
 pub const TOOLBAR_H: f32 = 36.;
+/// A list row: one line of text with room to breathe.
+pub const ROW_H: f32 = 28.;
 
 pub const TEXT_XS: f32 = 11.;
 pub const TEXT_S: f32 = 12.;
 pub const TEXT_M: f32 = 13.;
 pub const TEXT_L: f32 = 14.;
-pub const TEXT_TITLE: f32 = 17.;
+/// The title of what a pane is about.
+pub const TEXT_HEAD: f32 = 15.;
 pub const TEXT_XL: f32 = 20.;
 
 pub const RADIUS_S: f32 = 4.;
 pub const RADIUS_M: f32 = 6.;
-pub const RADIUS_L: f32 = 8.;
+pub const RADIUS_L: f32 = 10.;
 
 /// The platform's own UI face.
 pub const FONT_UI: &str = ".SystemUIFont";
@@ -52,12 +60,14 @@ pub struct Theme {
     pub bg2: Hsla,
     pub bg3: Hsla,
     pub bg_hover: Hsla,
+    /// The row that is selected: neutral, a clear step past hover.
+    pub selected: Hsla,
     /// Inputs and segmented tracks: recessed below the pane.
     pub bg_well: Hsla,
+    /// A secondary button: a faint raise the pane shows through.
+    pub btn_bg: Hsla,
     /// A secondary button under the pointer.
     pub btn_hover: Hsla,
-    /// A ref label's fill.
-    pub ref_bg: Hsla,
     pub border1: Hsla,
     pub border2: Hsla,
     pub text1: Hsla,
@@ -72,9 +82,7 @@ pub struct Theme {
 
     pub working_copy: Hsla,
     pub ok: Hsla,
-    pub ok_dim: Hsla,
     pub warn: Hsla,
-    pub warn_dim: Hsla,
     pub danger: Hsla,
     pub danger_dim: Hsla,
 
@@ -164,7 +172,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Dark,
         bg: [0x101115, 0x15161b, 0x1b1c22, 0x24252d],
         hover: (0xffffff, 0.045),
-        border: (0xffffff, 0.10, 0.06),
+        border: (0xffffff, 0.125, 0.084),
         text: [0xe9eaf0, 0xafb2bf, 0x9093a0],
         accent: 0x7078ee,
         accent_strong: 0xa6abff,
@@ -183,7 +191,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Dark,
         bg: [0x111111, 0x171717, 0x1d1d1d, 0x272727],
         hover: (0xffffff, 0.045),
-        border: (0xffffff, 0.11, 0.065),
+        border: (0xffffff, 0.138, 0.091),
         text: [0xececec, 0xb3b3b3, 0x949494],
         accent: 0x7d9fc8,
         accent_strong: 0xa8c1df,
@@ -202,7 +210,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Dark,
         bg: [0x0a0f1a, 0x0e1422, 0x131a2a, 0x1a2336],
         hover: (0x8cb4ff, 0.055),
-        border: (0xa0beff, 0.13, 0.075),
+        border: (0xa0beff, 0.163, 0.105),
         text: [0xdde6f5, 0xa2b1cb, 0x8492ab],
         accent: 0x3eb3dc,
         accent_strong: 0x74cdee,
@@ -221,7 +229,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Dark,
         bg: [0x0c110d, 0x111713, 0x161e18, 0x1e2821],
         hover: (0xbee6c8, 0.045),
-        border: (0xbee6c8, 0.11, 0.065),
+        border: (0xbee6c8, 0.138, 0.091),
         text: [0xe3ebe3, 0xa8b6a9, 0x889788],
         accent: 0x6fbf80,
         accent_strong: 0x97d6a3,
@@ -240,7 +248,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Dark,
         bg: [0x120f0e, 0x181413, 0x1f1a18, 0x29221f],
         hover: (0xffdcb4, 0.045),
-        border: (0xffdcb4, 0.10, 0.06),
+        border: (0xffdcb4, 0.125, 0.084),
         text: [0xede7df, 0xbbafa3, 0x9b9085],
         accent: 0xe2844f,
         accent_strong: 0xf1a67a,
@@ -259,7 +267,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Light,
         bg: [0xf0f0f3, 0xfcfcfd, 0xffffff, 0xffffff],
         hover: (0x141628, 0.045),
-        border: (0x141628, 0.14, 0.08),
+        border: (0x141628, 0.154, 0.096),
         text: [0x1b1c22, 0x454851, 0x5d606a],
         accent: 0x4e54d6,
         accent_strong: 0x3b40c2,
@@ -278,7 +286,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Light,
         bg: [0xefe9e0, 0xfbf8f3, 0xfffdf9, 0xfffdf9],
         hover: (0x503c1e, 0.05),
-        border: (0x503c1e, 0.15, 0.085),
+        border: (0x503c1e, 0.165, 0.102),
         text: [0x221d16, 0x4c4337, 0x645b4e],
         accent: 0xaa4f2c,
         accent_strong: 0x9d4a2b,
@@ -297,7 +305,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Light,
         bg: [0xe9eef4, 0xf8fafc, 0xffffff, 0xffffff],
         hover: (0x143c6e, 0.045),
-        border: (0x143c6e, 0.15, 0.085),
+        border: (0x143c6e, 0.165, 0.102),
         text: [0x16202c, 0x38485c, 0x516072],
         accent: 0x1b6cc2,
         accent_strong: 0x185aa2,
@@ -316,7 +324,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Light,
         bg: [0xeaeee7, 0xf9fbf8, 0xffffff, 0xffffff],
         hover: (0x1e4628, 0.045),
-        border: (0x1e4628, 0.15, 0.085),
+        border: (0x1e4628, 0.165, 0.102),
         text: [0x1a211b, 0x3d493f, 0x566157],
         accent: 0x277a4b,
         accent_strong: 0x216640,
@@ -335,7 +343,7 @@ const PALETTES: [Pal; 10] = [
         scheme: Scheme::Light,
         bg: [0xf2eaec, 0xfcf8f9, 0xffffff, 0xffffff],
         hover: (0x5a283c, 0.045),
-        border: (0x5a283c, 0.15, 0.085),
+        border: (0x5a283c, 0.165, 0.102),
         text: [0x251c1f, 0x4f4247, 0x685a5f],
         accent: 0xad3564,
         accent_strong: 0x922a53,
@@ -413,9 +421,18 @@ impl Pal {
             bg2: hex(bg2),
             bg3: hex(bg3),
             bg_hover: alpha(self.hover.0, self.hover.1),
+            selected: alpha(self.hover.0, self.hover.1 * 2.),
             bg_well: mix(bg0, if dark { 0.70 } else { 0.55 }, bg1),
-            btn_hover: mix(bg3, 0.92, self.text[0]),
-            ref_bg: alpha(self.text[0], 0.07),
+            btn_bg: if dark {
+                alpha(self.text[0], 0.05)
+            } else {
+                hex(bg3)
+            },
+            btn_hover: if dark {
+                alpha(self.text[0], 0.10)
+            } else {
+                mix(bg3, 0.93, self.text[0])
+            },
             border1: alpha(self.border.0, self.border.1),
             border2: alpha(self.border.0, self.border.2),
             text1: hex(self.text[0]),
@@ -428,9 +445,7 @@ impl Pal {
             accent_hover: mix(self.accent, 0.88, self.text[0]),
             working_copy: hex(self.working_copy),
             ok: hex(self.ok),
-            ok_dim: alpha(self.ok, 0.14),
             warn: hex(self.warn),
-            warn_dim: alpha(self.warn, 0.14),
             danger: hex(self.danger),
             danger_dim: alpha(self.danger, 0.14),
             lanes,

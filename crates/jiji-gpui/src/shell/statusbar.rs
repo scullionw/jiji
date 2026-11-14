@@ -143,15 +143,7 @@ impl Shell {
                 .child(dot(quiet_dot, 6.))
                 .child(msg(op.description.clone()));
             if snapshot.as_ref().is_some_and(|s| s.backend == "mock") {
-                bar = bar.child(
-                    div()
-                        .flex_shrink_0()
-                        .px(px(5.))
-                        .rounded(px(RADIUS_S))
-                        .bg(t.warn_dim)
-                        .text_color(t.warn)
-                        .child("mock data"),
-                );
+                bar = bar.child(div().flex_shrink_0().text_color(t.warn).child("mock data"));
             }
         } else {
             bar = bar

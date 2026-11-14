@@ -11,7 +11,9 @@ use crate::logic::inspect::summary_of;
 use crate::logic::text::{plural_s, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
-use crate::ui::{h_flex, icon, ref_label, scrollbar, tooltip, truncated, v_flex, IconName};
+use crate::ui::{
+    h_flex, icon, ref_label, scrollbar, tooltip, truncated, trunk_label, v_flex, IconName,
+};
 use crate::views::publish::PublishView;
 
 impl PublishView {
@@ -368,23 +370,14 @@ impl PublishView {
                             .gap(px(8.))
                             .h(px(20.))
                             .mb(px(6.))
-                            .child(
-                                div()
-                                    .h(px(17.))
-                                    .px(px(5.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(RADIUS_S))
-                                    .bg(t.accent_dim)
-                                    .font_family(t.mono.clone())
-                                    .text_size(px(TEXT_XS))
-                                    .text_color(t.accent_strong)
-                                    .child(if stack.base.is_empty() {
-                                        "trunk".to_owned()
-                                    } else {
-                                        stack.base.clone()
-                                    }),
-                            )
+                            .child(trunk_label(
+                                if stack.base.is_empty() {
+                                    "trunk".to_owned()
+                                } else {
+                                    stack.base.clone()
+                                },
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .text_size(px(TEXT_XS))

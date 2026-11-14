@@ -17,7 +17,8 @@ use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, empty_state, h_flex, icon, scrollbar, section_header, tooltip, truncated, v_flex, IconName,
+    btn, empty_state, group_head, h_flex, icon, page_bar, scrollbar, tooltip, truncated, v_flex,
+    wrapped, IconName, PAGE_PAD,
 };
 
 /// The rows' shared left inset: the glyph column plus its gap.
@@ -209,7 +210,8 @@ impl ConflictsView {
         let mut row = v_flex()
             .gap(px(8.))
             .py(px(12.))
-            .border_t_1()
+            .px(px(PAGE_PAD))
+            .border_b_1()
             .border_color(t.border2)
             .child(self.render_head(item, snapshot, cx));
         match item.kind {
@@ -388,7 +390,8 @@ impl ConflictsView {
                         .h(px(22.))
                         .px(px(7.))
                         .rounded(px(RADIUS_S))
-                        .bg(Theme::fade(t.text1, 0.06))
+                        .border_1()
+                        .border_color(t.border1)
                         .text_size(px(TEXT_XS))
                         .text_color(t.text2)
                         .child(
@@ -411,7 +414,12 @@ impl ConflictsView {
                             let (app, id) = (self.app.clone(), id.clone());
                             chip = chip
                                 .cursor_pointer()
-                                .hover(|style| style.bg(t.accent_dim).text_color(t.accent_strong))
+                                .hover(|style| {
+                                    style
+                                        .bg(t.bg_hover)
+                                        .border_color(Theme::fade(t.accent, 0.5))
+                                        .text_color(t.accent_strong)
+                                })
                                 .tooltip(tooltip(format!("Go to {id}")))
                                 .on_click(move |_, _, cx| {
                                     app.update(cx, |model, cx| model.jump_to_change(&id, cx))
@@ -509,66 +517,63 @@ impl Render for ConflictsView {
                 .into_any_element();
         }
         // Block flow: see the Operations page's column.
-        let mut column = div()
-            .w_full()
-            .max_w(px(800.))
-            .mx_auto()
-            .pt(px(24.))
-            .px(px(24.))
-            .pb(px(32.))
-            .child(section_header(
-                IconName::Conflicts,
-                "Conflicts",
-                "Everything that needs attention, in plain language. jj never blocks on a \
-                 conflict: rewrites and syncs always complete, what collided is recorded \
-                 first-class, and other work can continue in the meantime.",
-                cx,
-            ));
+        let mut column = div().w_full().pb(px(32.));
+        let mut total = 0;
         for group in &groups {
-            // The group's name stays in view while its items scroll by.
-            let heading = h_flex()
-                .gap(px(8.))
-                .pt(px(12.))
-                .pb(px(4.))
-                .bg(t.bg1)
-                .child(
-                    div()
-                        .text_size(px(TEXT_S))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.text2)
-                        .child(group.key.title()),
-                )
-                .child(
-                    div()
-                        .font_family(t.mono.clone())
-                        .text_size(px(TEXT_XS))
-                        .text_color(t.text3)
-                        .child(group.items.len().to_string()),
-                );
+            total += group.items.len();
+            // The group's name stays in view while its items scroll by;
+            // under it, once, what this kind of conflict is and what to do.
+            let heading = group_head(group.key.title(), Some(group.items.len()), None, cx);
             let mut section = div().child(
                 div()
-                    .pb(px(8.))
+                    .flex()
+                    .max_w(px(820.))
+                    .py(px(10.))
+                    .px(px(PAGE_PAD))
                     .text_size(px(TEXT_S))
+                    .line_height(gpui::relative(1.5))
                     .text_color(t.text3)
-                    .child(group.key.blurb()),
+                    .child(wrapped(group.key.blurb())),
             );
+            section = section.child(div().h(px(1.)).bg(t.border2));
             for item in &group.items {
                 section = section.child(self.render_item(item, &snapshot, cx));
             }
-            column = column.child(div().mb(px(24.)).child(pinned(
-                heading,
-                section.child(div().h(px(1.)).bg(t.border2)),
-            )));
+            column = column.child(pinned(heading, section));
         }
         root.child(
-            div()
-                .id("conflicts-scroll")
+            v_flex()
                 .size_full()
-                .scroll_y()
-                .track_scroll(&self.scroll)
-                .child(column),
+                .child(
+                    page_bar("Conflicts", Some(total.to_string()), cx).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl(px(4.))
+                            .text_size(px(TEXT_S))
+                            .text_color(t.text3)
+                            .child(truncated(
+                                "jj never blocks on a conflict: what collided is recorded, and \
+                             other work goes on.",
+                            )),
+                    ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .id("conflicts-scroll")
+                                .size_full()
+                                .scroll_y()
+                                .track_scroll(&self.scroll)
+                                .child(column),
+                        )
+                        .child(scrollbar("conflicts-scrollbar", &self.scroll)),
+                ),
         )
-        .child(scrollbar("conflicts-scrollbar", &self.scroll))
         .into_any_element()
     }
 }

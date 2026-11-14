@@ -120,6 +120,10 @@ fn ns_window(window: &Window) -> Result<Ref, String> {
 
 /// Put the window above other apps' windows without activating this app:
 /// it keeps painting, and the user's keyboard focus stays where it was.
+/// The real pointer passes through it: a floating window would otherwise
+/// take the user's clicks, and their pointer crossing it would land moves
+/// in the middle of a script's own. Scripted events are handed straight
+/// to the view, so they still arrive.
 pub fn float_without_focus(window: &Window) {
     let Ok(ns_window) = ns_window(window) else {
         return;
@@ -131,6 +135,13 @@ pub fn float_without_focus(window: &Window) {
         let set_level: unsafe extern "C" fn(Ref, Ref, isize) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         set_level(ns_window, sel_registerName(c"setLevel:".as_ptr()), FLOATING);
+        let set_flag: unsafe extern "C" fn(Ref, Ref, bool) =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        set_flag(
+            ns_window,
+            sel_registerName(c"setIgnoresMouseEvents:".as_ptr()),
+            true,
+        );
         let send: unsafe extern "C" fn(Ref, Ref) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         send(

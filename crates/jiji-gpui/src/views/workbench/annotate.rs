@@ -17,10 +17,10 @@ use jiji_core::snapshot::FileAnnotation;
 use super::WorkbenchView;
 use crate::diff::model::LINE_H;
 use crate::logic::text::short_id;
-use crate::theme::{theme, Theme, RADIUS_S, TEXT_S, TEXT_XS};
-use crate::ui::vertical_only;
+use crate::theme::{theme, Theme, TEXT_S, TEXT_XS};
 use crate::ui::{
-    from_now, h_flex, icon, icon_btn, short_age, tooltip, truncated, v_flex, IconName,
+    from_now, h_flex, icon, icon_btn, label_box, short_age, tooltip, truncated, v_flex,
+    vertical_only, wheel_first, AxisLock, IconName,
 };
 
 const GUTTER_W: f32 = 224.;
@@ -43,6 +43,7 @@ pub(super) struct AnnotateState {
     scroll: UniformListScrollHandle,
     /// How far the code is panned sideways; every line rides one offset.
     pan: f32,
+    wheel: AxisLock,
 }
 
 impl WorkbenchView {
@@ -294,17 +295,10 @@ impl WorkbenchView {
                     .child(truncated(path.clone())),
             )
             .child(
-                h_flex()
+                label_box(t.text2, t.border1)
                     .id("annotate-in")
-                    .flex_shrink_0()
                     .gap(px(4.))
-                    .h(px(17.))
-                    .px(px(5.))
-                    .rounded(px(RADIUS_S))
-                    .bg(Theme::fade(t.text1, 0.07))
                     .font_family(t.mono.clone())
-                    .text_size(px(TEXT_XS))
-                    .text_color(t.text2)
                     .tooltip(tooltip("The file as it stands in this change's tree"))
                     .child("in")
                     .child(
@@ -354,34 +348,33 @@ impl WorkbenchView {
                 let room = (self.diff_width - GUTTER_W - NUMBER_W).max(0.);
                 let max_pan = (longest as f32 * advance + CODE_PAD_R - room).max(0.);
                 self.annotate.pan = self.annotate.pan.clamp(0., max_pan);
-                let mut body = v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                        let delta = event.delta.pixel_delta(px(LINE_H * 2.5));
-                        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
-                        if dx.abs() <= dy.abs() {
+                // A sideways gesture is taken off the list before the list
+                // spends its drift on the rows.
+                let pan_first =
+                    wheel_first(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        let (dx, _) = this.annotate.wheel.travel(event, LINE_H * 2.5);
+                        if dx == 0. {
                             return;
                         }
+                        cx.stop_propagation();
                         let pan = (this.annotate.pan - dx).clamp(0., max_pan);
                         if pan != this.annotate.pan {
                             this.annotate.pan = pan;
                             cx.notify();
                         }
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        vertical_only(uniform_list(
-                            "annotate-lines",
-                            view.lines.len(),
-                            cx.processor(|this, range: Range<usize>, _, cx| {
-                                this.annotate_rows(range, cx)
-                            }),
-                        ))
-                        .track_scroll(self.annotate.scroll.clone())
-                        .flex_1()
-                        .min_h_0(),
-                    );
+                    }));
+                let mut body = v_flex().relative().flex_1().min_h_0().child(
+                    vertical_only(uniform_list(
+                        "annotate-lines",
+                        view.lines.len(),
+                        cx.processor(|this, range: Range<usize>, _, cx| {
+                            this.annotate_rows(range, cx)
+                        }),
+                    ))
+                    .track_scroll(self.annotate.scroll.clone())
+                    .flex_1()
+                    .min_h_0(),
+                );
                 if view.truncated {
                     body = body.child(
                         note(
@@ -394,7 +387,7 @@ impl WorkbenchView {
                         .border_color(t.border2),
                     );
                 }
-                body.into_any_element()
+                body.child(pan_first).into_any_element()
             }
             (None, Some(error)) => note(error.clone(), t.warn).into_any_element(),
             (None, None) => {
