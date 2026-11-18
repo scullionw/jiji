@@ -6,6 +6,12 @@
 //! restarts until the user asks, so a release never interrupts a describe
 //! or a split mid-edit. The archive is only ever installed after its
 //! minisign signature verifies against the public key below.
+//!
+//! Installing swaps the running bundle for whatever the feed holds, so
+//! only a build that is the app the feed carries may do it. That is the
+//! `self-update` feature, which `scripts/bundle.sh` turns on for the
+//! shipping identity alone: a side-by-side preview ("Jiji GPUI.app")
+//! never asks the feed, or it would be replaced by the release there.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,9 +70,24 @@ pub fn bundle_path() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Whether this build can update itself at all.
+/// Why this build does not update itself, for the user who asks it to;
+/// `None` when it does.
+pub fn unsupported() -> Option<&'static str> {
+    if !cfg!(feature = "self-update") {
+        return Some(
+            "This preview build does not update itself. The release feed carries the shipping \
+             Jiji app, which would replace it. To update the preview, rebuild it from source.",
+        );
+    }
+    if !cfg!(target_os = "macos") || cfg!(debug_assertions) || bundle_path().is_none() {
+        return Some("This build was not installed as an app bundle, so it cannot update itself.");
+    }
+    None
+}
+
+/// Whether this build updates itself at all.
 pub fn supported() -> bool {
-    cfg!(target_os = "macos") && !cfg!(debug_assertions) && bundle_path().is_some()
+    unsupported().is_none()
 }
 
 fn parse_version(text: &str) -> Option<(u64, u64, u64)> {

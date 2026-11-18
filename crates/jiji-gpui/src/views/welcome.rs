@@ -190,7 +190,7 @@ impl Render for WelcomeView {
         // for that itself, so the pane's height is stated.
         let pane_height = f32::from(window.viewport_size().height) - TITLEBAR_H - STATUSBAR_H - 2.;
         let model = self.app.read(cx);
-        let opening = model.tab().opening;
+        let opening = model.tab().opening.is_some();
         let error = model.ui().error.clone();
         let recents = model.recent_repos.clone();
         let cli = &model.cli;

@@ -25,13 +25,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use jiji_forge::{
-    load_autoland_records, remove_autoland_record, resolve_token, run_autoland,
-    save_autoland_records, unix_now_ms, upsert_autoland_record, AutoLandConfig, AutoLandRecord,
-    AutoLandState, AutoLandStatus, ForgeError, GitHubClient, LandOptions, LandRepoForge,
-    StopSignal,
+    load_autoland_records, remove_autoland_record, run_autoland, save_autoland_records,
+    unix_now_ms, upsert_autoland_record, AutoLandConfig, AutoLandRecord, AutoLandState,
+    AutoLandStatus, ForgeError, GitHubClient, LandOptions, LandRepoForge, StopSignal,
 };
 
-use super::forge::{token_store, HostVcs};
+use super::forge::{resolved_token, HostVcs};
 use super::{CommandError, Host, HostEvent, HostResult};
 
 /// The active job's handles.
@@ -167,7 +166,7 @@ impl Host {
         let repo = self
             .detected_repo(repo_path)
             .ok_or_else(jiji_forge::no_github_remote)?;
-        let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
+        let resolved = resolved_token(Some(&repo))?.ok_or(ForgeError::NoToken)?;
         let client = GitHubClient::for_repo(&repo, &resolved.token)?;
 
         let prior = auto

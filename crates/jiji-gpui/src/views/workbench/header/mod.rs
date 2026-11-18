@@ -211,7 +211,10 @@ impl WorkbenchView {
         self.diff.current().map(|diff| diff.files.as_slice())
     }
 
-    fn keep_open_draft(&mut self, cx: &mut Context<Self>) {
+    /// File what an open describe editor holds as the change's draft. Every
+    /// way the editor goes away without saving comes through here,
+    /// including the view itself being dropped (see `WorkbenchView::new`).
+    pub(super) fn keep_open_draft(&mut self, cx: &mut App) {
         if self.header.tray != Tray::Edit {
             return;
         }
@@ -877,5 +880,86 @@ impl WorkbenchView {
             Tray::None | Tray::Edit => None,
         };
         header.children(tray).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use crate::app::{AppModel, Section, UiIntent};
+    use crate::shell::Shell;
+
+    const DRAFT: &str = "Typed, then left unsaved";
+
+    /// The app on a planted repo, with the working copy's describe editor
+    /// open and `DRAFT` typed over whatever it held.
+    fn editing(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<AppModel>,
+        gpui::WindowHandle<Shell>,
+        std::path::PathBuf,
+    ) {
+        let dir = crate::testing::scratch(name);
+        let model = crate::testing::install(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(&dir.join("repo"));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        open_editor(&model, cx);
+        cx.simulate_keystrokes(window.into(), "cmd-a");
+        cx.simulate_input(window.into(), DRAFT);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        (model, window, dir)
+    }
+
+    /// Open the describe editor the way the command palette does.
+    fn open_editor(model: &gpui::Entity<AppModel>, cx: &mut TestAppContext) {
+        model.update(cx, |model, cx| model.send_intent(UiIntent::Describe, cx));
+        cx.run_until_parked();
+    }
+
+    /// What the describe editor holds, while it is open.
+    fn editor_text(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Option<String> {
+        window
+            .update(cx, |shell, _, cx| {
+                let workbench = shell.workbench()?;
+                let header = &workbench.read(cx).header;
+                (header.tray == super::Tray::Edit).then(|| header.editor.read(cx).text().to_owned())
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn an_unsaved_description_survives_a_visit_to_another_section(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing("draft-section", cx);
+
+        // ⌘5 replaces the workbench with Operations: the editor goes with
+        // the view it lived in.
+        cx.simulate_keystrokes(window.into(), "cmd-5");
+        model.read_with(cx, |model, _| {
+            assert_eq!(model.section(), Section::Operations)
+        });
+        cx.simulate_keystrokes(window.into(), "cmd-1");
+        assert_eq!(editor_text(window, cx), None);
+
+        open_editor(&model, cx);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_unsaved_description_survives_a_visit_to_another_tab(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing("draft-tab", cx);
+
+        cx.simulate_keystrokes(window.into(), "cmd-t");
+        model.read_with(cx, |model, _| assert_eq!(model.tabs.len(), 2));
+        cx.simulate_keystrokes(window.into(), "ctrl-tab");
+        assert_eq!(editor_text(window, cx), None);
+
+        open_editor(&model, cx);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

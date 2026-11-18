@@ -202,9 +202,18 @@ pub struct Tab {
     /// background by the repo's own watcher.
     pub snapshot: Option<Arc<RepoSnapshot>>,
     pub ui: TabUi,
-    pub opening: bool,
+    /// The path an open in flight is bringing into this tab. The tab is
+    /// spoken for from the moment the open starts, not from when it lands.
+    pub opening: Option<String>,
     /// Whether the tab ever showed a selection of its own.
     seen: bool,
+}
+
+impl Tab {
+    /// Empty, with nothing on its way in: a repo may open here.
+    fn is_free(&self) -> bool {
+        self.path.is_none() && self.opening.is_none()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -450,7 +459,7 @@ impl AppModel {
             name: name.filter(|name| !name.is_empty()),
             snapshot: None,
             ui: TabUi::default(),
-            opening: false,
+            opening: None,
             seen: false,
         });
         id
@@ -675,6 +684,23 @@ impl AppModel {
 
     pub fn set_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.tab_mut().ui.error = Some(message.into());
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+impl AppModel {
+    /// Put a repo on the active tab the way a landed open does, minus the
+    /// host session and minus following it to the forge and upstream: both
+    /// reach for credentials and the network, which a test must not.
+    pub fn plant_repo(&mut self, snapshot: RepoSnapshot, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        tab.path = Some(snapshot.repo_path.clone());
+        tab.name = Some(snapshot.repo_name.clone());
+        tab.snapshot = Some(Arc::new(snapshot));
+        Self::select_working_copy(tab);
+        cx.emit(AppEvent::Snapshot);
+        cx.emit(AppEvent::Navigation);
         cx.notify();
     }
 }

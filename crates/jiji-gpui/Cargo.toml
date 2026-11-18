@@ -22,6 +22,11 @@ path = "src/main.rs"
 # screenshots: GPUI's offscreen renderer and frame stepping sit behind its
 # test-support feature. Never in a shipping build.
 headless = ["gpui/test-support", "gpui_platform/test-support"]
+# The in-app updater. Off unless the build is the app the release feed
+# carries: the feed holds the Tauri app today, and a side-by-side preview
+# that updated from it would be replaced by that app. scripts/bundle.sh
+# turns it on for the shipping identity only.
+self-update = []
 
 [dependencies]
 # gpui-pre is a weekly crates.io snapshot of Zed's main branch (the official
@@ -62,6 +67,11 @@ tree-sitter-md = "0.5"
 tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-svelte-ng = "1.0"
+
+[dev-dependencies]
+# Tests that drive the model or a window run on GPUI's test context: the
+# app with a deterministic scheduler and windows that exist only in memory.
+gpui = { package = "gpui-pre", version = "0.3.13", features = ["test-support"] }
 
 # Match the main workspace: optimized dependencies even in dev builds
 # (jj-lib's tree diffing is ~10x slower unoptimized).

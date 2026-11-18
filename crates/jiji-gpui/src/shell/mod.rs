@@ -371,6 +371,13 @@ impl Shell {
         }
     }
 
+    /// The workbench, while it is the section on screen.
+    #[cfg(test)]
+    pub fn workbench(&self) -> Option<Entity<crate::views::workbench::WorkbenchView>> {
+        let (_, view) = self.content.as_ref()?;
+        view.clone().downcast().ok()
+    }
+
     fn rest_focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(self.content_focus.as_ref().unwrap_or(&self.focus), cx);
     }

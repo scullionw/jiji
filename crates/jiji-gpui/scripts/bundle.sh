@@ -3,9 +3,12 @@
 #
 #   scripts/bundle.sh             a side-by-side build: "Jiji GPUI.app",
 #                                 its own bundle id, safe to keep next to
-#                                 an installed Jiji
+#                                 an installed Jiji. It never updates
+#                                 itself: the release feed carries the
+#                                 shipping app, which would replace it.
 #   JIJI_BUNDLE_RELEASE=1 …       the shipping identity (Jiji.app,
-#                                 com.lauf.jiji) plus the updater archive
+#                                 com.lauf.jiji), with the in-app updater,
+#                                 plus the updater archive
 #
 # The bundle is ad-hoc signed, which is enough to run it on this machine.
 # Notarization, and the minisign signature the in-app updater verifies,
@@ -19,12 +22,14 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 if [ "${JIJI_BUNDLE_RELEASE:-0}" = 1 ]; then
   NAME="Jiji"
   IDENTIFIER="com.lauf.jiji"
+  FEATURES="self-update"
 else
   NAME="Jiji GPUI"
   IDENTIFIER="com.lauf.jiji.gpui"
+  FEATURES=""
 fi
 
-cargo build --release
+cargo build --release --features "$FEATURES"
 
 OUT="$ROOT/target/release/bundle"
 APP="$OUT/$NAME.app"

@@ -57,6 +57,21 @@ pub(crate) fn token_store(repo: Option<&ForgeRepo>) -> KeychainTokenStore {
     KeychainTokenStore::new(host)
 }
 
+/// The token to act with: the keychain's, the environment's, or the `gh`
+/// CLI's — every read of the user's credentials comes through here.
+///
+/// Under test there is never one. Tests must not read real credentials,
+/// and without a token nothing downstream talks to the forge, so a test
+/// that puts a repo on screen stays off the network.
+pub(crate) fn resolved_token(
+    repo: Option<&ForgeRepo>,
+) -> Result<Option<jiji_forge::ResolvedToken>, ForgeError> {
+    if cfg!(test) {
+        return Ok(None);
+    }
+    resolve_token(&token_store(repo))
+}
+
 fn client_for(repo: Option<&ForgeRepo>, token: &str) -> Result<GitHubClient, ForgeError> {
     match repo {
         Some(repo) => GitHubClient::for_repo(repo, token),
@@ -82,7 +97,7 @@ impl Host {
 
     fn assemble_status(&self, repo_path: &str) -> HostResult<ForgeStatus> {
         let repo = self.detected_repo(repo_path);
-        let source = resolve_token(&token_store(repo.as_ref()))?.map(|t| t.source);
+        let source = resolved_token(repo.as_ref())?.map(|t| t.source);
         let login = source.and_then(|s| self.forge.login_for(s));
         Ok(ForgeStatus {
             repo,
@@ -102,7 +117,7 @@ impl Host {
     /// unauthenticated status so the UI can render the connect state.
     pub fn forge_verify(&self, repo_path: &str) -> HostResult<ForgeStatus> {
         let repo = self.detected_repo(repo_path);
-        let Some(resolved) = resolve_token(&token_store(repo.as_ref()))? else {
+        let Some(resolved) = resolved_token(repo.as_ref())? else {
             self.forge.forget();
             return self.assemble_status(repo_path);
         };
@@ -144,7 +159,7 @@ impl Host {
     /// The connected repo and its client.
     fn forge_client(&self, repo_path: &str) -> HostResult<(ForgeRepo, GitHubClient, TokenSource)> {
         let repo = self.detected_repo(repo_path).ok_or_else(no_github_remote)?;
-        let resolved = resolve_token(&token_store(Some(&repo)))?.ok_or(ForgeError::NoToken)?;
+        let resolved = resolved_token(Some(&repo))?.ok_or(ForgeError::NoToken)?;
         let client = GitHubClient::for_repo(&repo, &resolved.token)?;
         Ok((repo, client, resolved.source))
     }
@@ -352,7 +367,7 @@ impl Host {
 /// resolves. Shipping itself needs no GitHub API, so no token (or a failed
 /// fetch of PR state) degrades to a plan without the warning.
 fn ship_pr_facts(repo: &ForgeRepo) -> Option<RepoPrState> {
-    let resolved = resolve_token(&token_store(Some(repo))).ok().flatten()?;
+    let resolved = resolved_token(Some(repo)).ok().flatten()?;
     let client = GitHubClient::for_repo(repo, &resolved.token).ok()?;
     let report = client.open_prs(&repo.owner, &repo.name).ok()?;
     Some(RepoPrState::new(report, &repo.owner))

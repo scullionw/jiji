@@ -217,14 +217,23 @@ impl AppModel {
         self.activate_tab(self.tabs[next].id, cx);
     }
 
-    /// Open a repo somewhere sensible: the tab that already shows it, the
-    /// active tab while it is empty, or a new tab.
+    /// Open a repo somewhere sensible: the tab that already shows it (or is
+    /// already opening it), the active tab while it is free, or a new tab.
+    ///
+    /// Opens land later, so several can be asked for before the first does
+    /// (two folders opened together from Finder). A tab an open is headed
+    /// for counts as taken: each open gets a tab of its own.
     pub fn open_repo_at(&mut self, path: String, cx: &mut Context<Self>) {
-        if let Some(existing) = self.tab_for_path(&path).map(|tab| tab.id) {
+        let existing = self
+            .tabs
+            .iter()
+            .find(|tab| tab.path.as_deref() == Some(&path) || tab.opening.as_deref() == Some(&path))
+            .map(|tab| tab.id);
+        if let Some(existing) = existing {
             self.activate_tab(existing, cx);
             return;
         }
-        let id = if self.tab().path.is_none() {
+        let id = if self.tab().is_free() {
             self.active_id
         } else {
             let id = self.create_tab(None, None);
@@ -240,7 +249,7 @@ impl AppModel {
     /// by then.
     pub(super) fn open_repo_into(&mut self, tab_id: u64, path: String, cx: &mut Context<Self>) {
         if let Some(tab) = self.tab_by_id(tab_id) {
-            tab.opening = true;
+            tab.opening = Some(path.clone());
             tab.ui.error = None;
         }
         cx.notify();
@@ -267,16 +276,16 @@ impl AppModel {
                 let Some(tab) = self.tab_by_id(tab_id) else {
                     return;
                 };
-                tab.opening = false;
+                tab.ui.error = Some(error.message);
                 if error.code == "git_repo_without_jj" {
                     if let Some(root) = error.path.clone() {
-                        tab.ui.error = Some(error.message);
+                        // Still this folder's tab while the offer is up.
                         cx.notify();
                         self.offer_jj_setup(tab_id, root, cx);
                         return;
                     }
                 }
-                tab.ui.error = Some(error.message);
+                tab.opening = None;
                 cx.notify();
                 return;
             }
@@ -313,7 +322,7 @@ impl AppModel {
         }
         if let Some(tab) = self.tab_by_id(tab_id) {
             tab.path = Some(repo_path.clone());
-            tab.opening = false;
+            tab.opening = None;
             tab.ui.section = Section::Workbench;
         }
         self.apply_snapshot(snapshot.clone(), cx);
@@ -351,9 +360,11 @@ impl AppModel {
     /// A plain Git repository: offer to set jj up in it, the way `jj git
     /// init --colocate` does, then open it. Nothing touches the folder
     /// unless the user says yes; declining leaves the refusal in the
-    /// status bar.
+    /// status bar. The tab stays the folder's (`opening`) until the answer
+    /// is in, so nothing else opens into it meanwhile.
     pub(super) fn offer_jj_setup(&mut self, tab_id: u64, git_root: String, cx: &mut Context<Self>) {
         let Some(window) = self.window else {
+            self.stop_opening(tab_id, cx);
             return;
         };
         let name = git_root
@@ -376,15 +387,16 @@ impl AppModel {
             )
         });
         let Ok(answer) = answer else {
+            self.stop_opening(tab_id, cx);
             return;
         };
         cx.spawn(async move |this, cx| {
             if answer.await != Ok(0) {
+                let _ = this.update(cx, |this, cx| this.stop_opening(tab_id, cx));
                 return;
             }
             let Ok(init) = this.update(cx, |this, cx| {
                 if let Some(tab) = this.tab_by_id(tab_id) {
-                    tab.opening = true;
                     tab.ui.error = None;
                 }
                 cx.notify();
@@ -397,7 +409,7 @@ impl AppModel {
                 Ok(root) => this.open_repo_into(tab_id, root, cx),
                 Err(error) => {
                     if let Some(tab) = this.tab_by_id(tab_id) {
-                        tab.opening = false;
+                        tab.opening = None;
                         tab.ui.error = Some(error.message);
                     }
                     cx.notify();
@@ -405,6 +417,14 @@ impl AppModel {
             });
         })
         .detach();
+    }
+
+    /// An open that will not land after all: its tab is free again.
+    fn stop_opening(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_by_id(tab_id) {
+            tab.opening = None;
+            cx.notify();
+        }
     }
 
     /// Remove a repo from the recents list (the welcome screen's ×).
@@ -446,6 +466,131 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{git_repo, install, jj_repo, scratch};
+    use gpui::TestAppContext;
+
+    /// Where each tab's open in flight is headed, in strip order.
+    fn headed(model: &AppModel) -> Vec<Option<String>> {
+        model.tabs.iter().map(|tab| tab.opening.clone()).collect()
+    }
+
+    /// The repo each tab shows, in strip order.
+    fn shown(model: &AppModel) -> Vec<Option<String>> {
+        model.tabs.iter().map(|tab| tab.path.clone()).collect()
+    }
+
+    fn open(model: &gpui::Entity<AppModel>, paths: &[&String], cx: &mut TestAppContext) {
+        let paths = paths.iter().map(PathBuf::from).collect();
+        model.update(cx, |model, cx| model.open_paths(paths, cx));
+    }
+
+    #[gpui::test]
+    fn folders_opened_together_get_a_tab_each(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-together");
+        let model = install(&dir, cx);
+        let (alpha, beta) = (jj_repo(&dir, "alpha"), jj_repo(&dir, "beta"));
+
+        // Neither open has landed when the second is asked for: the first
+        // already holds the empty tab the app started on.
+        open(&model, &[&alpha, &beta], cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(headed(model), [Some(alpha.clone()), Some(beta.clone())]);
+        });
+
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(shown(model), [Some(alpha.clone()), Some(beta.clone())]);
+            assert_eq!(headed(model), [None, None]);
+            // The last one asked for has the screen.
+            assert_eq!(model.tab().path, Some(beta.clone()));
+            assert_eq!(model.store.tabs().repos.len(), 2);
+            assert_eq!(model.recent_repos.len(), 2);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_folder_asked_for_twice_opens_once_and_a_failed_open_frees_its_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = scratch("tabs-twice");
+        let model = install(&dir, cx);
+        let name = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let (missing, other) = (name("missing"), name("other"));
+
+        // Still on its way: the second ask goes to the tab it is headed for.
+        open(&model, &[&missing, &other, &missing], cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(headed(model), [Some(missing.clone()), Some(other.clone())]);
+            assert_eq!(model.tab().opening, Some(missing.clone()));
+        });
+
+        // Nothing is at either path, so both opens fail, each in its own
+        // tab, which is then free for the next open.
+        cx.run_until_parked();
+        let third = name("third");
+        model.read_with(cx, |model, _| {
+            assert_eq!(headed(model), [None, None]);
+            assert!(model.tabs.iter().all(|tab| tab.ui.error.is_some()));
+        });
+        open(&model, &[&third], cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(headed(model), [Some(third.clone()), None])
+        });
+        cx.run_until_parked();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A plain Git folder asked for, up to the point where the app is
+    /// offering to set jj up in it.
+    fn offered(name: &str, cx: &mut TestAppContext) -> (gpui::Entity<AppModel>, PathBuf, String) {
+        let dir = scratch(name);
+        let model = install(&dir, cx);
+        // The offer is a question asked on the app's window.
+        cx.add_window(crate::shell::Shell::new);
+        let plain = git_repo(&dir, "plain");
+        open(&model, &[&plain], cx);
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        (model, dir, plain)
+    }
+
+    #[gpui::test]
+    fn a_folder_being_offered_jj_setup_keeps_its_tab(cx: &mut TestAppContext) {
+        let (model, dir, plain) = offered("tabs-offer-accept", cx);
+
+        // While the question is up, another repo arrives: it must not
+        // take the tab the offer is about.
+        let other = jj_repo(&dir, "other");
+        open(&model, &[&other], cx);
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(headed(model), [Some(plain.clone()), None]);
+            assert_eq!(shown(model), [None, Some(other.clone())]);
+        });
+
+        cx.simulate_prompt_answer("Set up jj");
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(shown(model), [Some(plain.clone()), Some(other.clone())]);
+            assert_eq!(headed(model), [None, None]);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn declining_jj_setup_frees_the_tab_and_keeps_the_refusal(cx: &mut TestAppContext) {
+        let (model, dir, plain) = offered("tabs-offer-decline", cx);
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!((shown(model), headed(model)), (vec![None], vec![None]));
+            assert!(model.tab().ui.error.is_some());
+            assert!(!std::path::Path::new(&plain).join(".jj").exists());
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn tab_labels_fall_back_to_the_path_then_a_placeholder() {

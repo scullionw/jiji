@@ -30,16 +30,23 @@ cd crates/jiji-gpui
 cargo run                         # the app; debug builds count as registered
 cargo run --release
 cargo build --features headless   # a build scripted runs can drive unseen
+cargo test                        # logic, plus the model and views driven in memory
 scripts/bundle.sh                 # target/release/bundle/Jiji GPUI.app
 JIJI_BUNDLE_RELEASE=1 scripts/bundle.sh   # Jiji.app + the updater archive
 ```
+
+`Jiji GPUI.app` is a preview meant to sit next to an installed Jiji, and it
+never updates itself: the release feed carries the shipping app, so an
+update from it would replace the preview with that app. The in-app updater
+is the `self-update` feature, which only the `JIJI_BUNDLE_RELEASE=1` build
+turns on.
 
 With arguments the binary is the `jiji` CLI (`jiji-desktop publish …`), so
 the app's own switches are environment variables:
 
 | Variable | |
 |---|---|
-| `JIJI_OPEN=<path>` | open this repository at launch |
+| `JIJI_OPEN=<path>` | open this repository at launch; several, separated like `PATH`, arrive together the way folders opened from Finder do |
 | `JIJI_DATA_DIR=<dir>` | keep preferences, recents and licence here instead of the shared directory — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock snapshot (needs a directory containing `.jj`) |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
@@ -78,6 +85,21 @@ visible window. What a headless run cannot show is what AppKit draws or
 does itself: the traffic lights and the window's corners are not in a
 screenshot, and the translation of real OS events, the input method,
 native menus and sheets, and how frames reach a display are not exercised.
+
+## Tests
+
+`cargo test` covers the pure logic and, through GPUI's test context, the
+model and the views themselves: the real `AppModel` and `Shell` in a window
+that exists only in memory, with tasks running when the test lets them
+(`src/testing.rs`). That is where navigation belongs — what survives a
+switch of section or tab, which tab an open lands in — since those go
+wrong between views rather than inside a function.
+
+These tests open real repositories, made for the test and without remotes,
+and under test the host finds no forge token, so they read no credentials
+and reach no network. Keep it that way: a test that needs a token-bearing
+path should fake the forge, not lift the guard in
+`host::forge::resolved_token`.
 
 ## Layout
 
@@ -199,7 +221,9 @@ One look, stated once so new surfaces keep it. The tokens are in
 - Bookmark rows always reserve room for their hover actions.
 - No layout or panel transitions.
 - The in-app updater downloads and verifies releases like the Tauri one, but
-  no release pipeline builds this bundle yet.
+  no release pipeline builds this bundle yet: the feed holds Tauri builds.
+  Until it carries this shell, only the shipping-identity build asks it
+  (see Run).
 
 ## GPUI notes
 

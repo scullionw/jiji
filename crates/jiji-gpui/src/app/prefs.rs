@@ -448,7 +448,8 @@ impl AppModel {
 
     // ── App updates ──
 
-    /// Checks at startup and every few hours; bundled release builds only.
+    /// Checks at startup and every few hours; builds that update themselves
+    /// only (see `update::unsupported`).
     pub(super) fn start_update_checks(&mut self, cx: &mut Context<Self>) {
         if !update::supported() {
             return;
@@ -539,13 +540,8 @@ impl AppModel {
         let Some(window) = self.window else {
             return;
         };
-        if !update::supported() {
-            self.tell(
-                PromptLevel::Info,
-                "Check for Updates",
-                "This build was not installed as an app bundle, so it cannot update itself.",
-                cx,
-            );
+        if let Some(why) = update::unsupported() {
+            self.tell(PromptLevel::Info, "Check for Updates", why, cx);
             return;
         }
         if let Some(staged) = &self.update.staged {

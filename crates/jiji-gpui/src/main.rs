@@ -11,6 +11,8 @@ mod logic;
 mod script;
 mod shell;
 mod store;
+#[cfg(test)]
+mod testing;
 mod theme;
 mod ui;
 mod views;
@@ -67,10 +69,18 @@ fn main() {
     let _ = log::set_logger(&Logger).map(|()| log::set_max_level(log::LevelFilter::Info));
 
     // Development switches ride the environment so argv stays the CLI's:
-    //   JIJI_OPEN=<path>      open this repository at launch
+    //   JIJI_OPEN=<path>      open this repository at launch; several,
+    //                         separated like PATH, arrive together the
+    //                         way folders opened from Finder do
     //   JIJI_SCRIPT=<steps>   drive the window (see script.rs)
     //   JIJI_HEADLESS=1       never show the window (see headless.rs)
-    let open_at_launch = std::env::var("JIJI_OPEN").ok();
+    let open_at_launch: Vec<std::path::PathBuf> = std::env::var_os("JIJI_OPEN")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let refuse = |why: String| -> ! {
         eprintln!("jiji: {why}");
         std::process::exit(2);
@@ -139,8 +149,8 @@ fn main() {
         // screenshots should not depend on where a window was last left.
         let geometry = store.window().filter(|_| !headless);
         let model = AppModel::install(store, mono_font(cx), cx);
-        if let Some(path) = open_at_launch {
-            model.update(cx, |model, cx| model.open_repo_at(path, cx));
+        if !open_at_launch.is_empty() {
+            model.update(cx, |model, cx| model.open_paths(open_at_launch, cx));
         }
 
         let default_size = size(px(1280.), px(820.));

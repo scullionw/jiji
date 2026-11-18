@@ -252,6 +252,11 @@ impl WorkbenchView {
                 this.on_inspector_input(event, cx)
             }),
         );
+        // Switching section or tab drops this view (the shell rebuilds its
+        // content on navigation), and an editor open in it goes too: its
+        // text is kept as the change's draft, as it is on every other way
+        // out of the editor.
+        subscriptions.push(cx.on_release(|this, cx| this.keep_open_draft(cx)));
         let mut this = Self {
             drag: dnd::DragState::default(),
             washes: dnd::Washes::default(),
