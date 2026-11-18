@@ -4,8 +4,8 @@
 //! launcher forwards to it); without, it is the app.
 
 mod app;
-mod capture;
 mod diff;
+mod headless;
 mod host;
 mod logic;
 mod script;
@@ -69,19 +69,46 @@ fn main() {
     // Development switches ride the environment so argv stays the CLI's:
     //   JIJI_OPEN=<path>      open this repository at launch
     //   JIJI_SCRIPT=<steps>   drive the window (see script.rs)
-    //   JIJI_BACKGROUND=1     never take focus; float so it keeps painting
+    //   JIJI_HEADLESS=1       never show the window (see headless.rs)
     let open_at_launch = std::env::var("JIJI_OPEN").ok();
+    let refuse = |why: String| -> ! {
+        eprintln!("jiji: {why}");
+        std::process::exit(2);
+    };
     let script = match std::env::var("JIJI_SCRIPT").ok().map(|s| script::parse(&s)) {
         Some(Ok(steps)) => steps,
-        Some(Err(err)) => {
-            eprintln!("jiji: {err}");
-            std::process::exit(2);
-        }
+        Some(Err(err)) => refuse(err),
         None => Vec::new(),
     };
-    let background = std::env::var("JIJI_BACKGROUND").as_deref() == Ok("1");
+    let headless = std::env::var("JIJI_HEADLESS").as_deref() == Ok("1");
+    if std::env::var_os("JIJI_BACKGROUND").is_some() {
+        refuse("JIJI_BACKGROUND is gone: use JIJI_HEADLESS=1, which shows no window at all".into());
+    }
+    if headless && script.is_empty() {
+        refuse("JIJI_HEADLESS needs a JIJI_SCRIPT: nothing else can reach a window that is never shown".into());
+    }
+    if !headless::SUPPORTED {
+        if headless {
+            refuse(format!("this build cannot run headless: {}", headless::HOW));
+        }
+        if script
+            .iter()
+            .any(|step| matches!(step, script::Step::Shot(_)))
+        {
+            refuse(format!(
+                "this build cannot take screenshots: {}",
+                headless::HOW
+            ));
+        }
+    }
 
     let application = gpui_platform::application().with_assets(ui::icon::Assets);
+    // No Dock icon and no menu bar for a run nobody is meant to see.
+    let application = if headless {
+        application.with_windowing(gpui::WindowingRequest::Headless)
+    } else {
+        application
+    };
     // Folders arriving through Launch Services — the `jiji` launcher's
     // `open -b`, or a drop on the Dock icon.
     application.on_open_urls(|urls| {
@@ -108,7 +135,9 @@ fn main() {
         cx.set_menus(shell::menus());
 
         let store = Store::open();
-        let geometry = store.window();
+        // A headless run always starts at the default size: its
+        // screenshots should not depend on where a window was last left.
+        let geometry = store.window().filter(|_| !headless);
         let model = AppModel::install(store, mono_font(cx), cx);
         if let Some(path) = open_at_launch {
             model.update(cx, |model, cx| model.open_repo_at(path, cx));
@@ -137,14 +166,15 @@ fn main() {
                 // bar below its top six points).
                 traffic_light_position: Some(point(px(14.), px(14.))),
             }),
-            focus: !background,
+            focus: !headless,
+            show: !headless,
             ..Default::default()
         };
         let window = cx
             .open_window(options, |window, cx| cx.new(|cx| Shell::new(window, cx)))
             .expect("the main window opens");
-        if background {
-            let _ = window.update(cx, |_, window, _| capture::float_without_focus(window));
+        if headless {
+            headless::pump_frames(window.into(), cx);
         } else {
             cx.activate(true);
         }
@@ -164,7 +194,9 @@ fn main() {
                 if delivered.is_err() {
                     break;
                 }
-                let _ = cx.update(|cx| cx.activate(true));
+                if !headless {
+                    cx.update(|cx| cx.activate(true));
+                }
             }
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(150))
@@ -173,7 +205,7 @@ fn main() {
         .detach();
 
         if !script.is_empty() {
-            script::run(script, window.into(), cx);
+            script::run(script, window.into(), headless, cx);
         }
     });
 }

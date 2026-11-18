@@ -29,6 +29,7 @@ compare the screenshots.
 cd crates/jiji-gpui
 cargo run                         # the app; debug builds count as registered
 cargo run --release
+cargo build --features headless   # a build scripted runs can drive unseen
 scripts/bundle.sh                 # target/release/bundle/Jiji GPUI.app
 JIJI_BUNDLE_RELEASE=1 scripts/bundle.sh   # Jiji.app + the updater archive
 ```
@@ -42,20 +43,26 @@ the app's own switches are environment variables:
 | `JIJI_DATA_DIR=<dir>` | keep preferences, recents and licence here instead of the shared directory — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock snapshot (needs a directory containing `.jj`) |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
-| `JIJI_BACKGROUND=1` | float the window without taking focus (for scripted runs) |
 | `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
+| `JIJI_HEADLESS=1` | never show the window; a scripted run nobody sees (needs a `headless` build) |
 
 ## Scripted runs
 
-`JIJI_SCRIPT` takes `;`-separated steps and delivers them to the app's own
-window as native events, in-process — the pointer, the keyboard focus and
-(unless a step copies) the clipboard stay the user's. A background window
-floats, so it lets the real pointer through: clicks land on whatever is
-under it, and a pointer crossing it cannot land moves among the script's:
+`JIJI_SCRIPT` takes `;`-separated steps and hands them to the app's window
+through GPUI's own event dispatch, in-process: nothing is synthesized at
+the OS level, and the clipboard is only touched by a step that copies.
+
+With `JIJI_HEADLESS=1` the window is never shown. It is the real app — the
+real platform, executors, watchers and text — but there is no Dock icon,
+nothing takes focus or sits over other work, and neither the pointer nor
+the keyboard can reach it. Frames are delivered by the run itself and
+screenshots are rendered offscreen (`src/headless.rs`); the app quits when
+the steps run out. Runs do not see each other, so several can go at once.
 
 ```sh
-JIJI_DATA_DIR=/tmp/jiji-test JIJI_BACKGROUND=1 JIJI_OPEN=~/Dev/some-repo \
-JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png;quit" \
+cargo build --features headless
+JIJI_DATA_DIR=/tmp/jiji-test JIJI_HEADLESS=1 JIJI_OPEN=~/Dev/some-repo \
+JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png" \
   target/debug/jiji-desktop
 ```
 
@@ -63,6 +70,14 @@ JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png;quit" \
 in parts), `scroll`, `key`, `type`, `wait`, `shot`, `resize`, `quit`;
 prefixes `shift-`, `alt-`, `cmd-`. Coordinates are window points;
 screenshots are at the display's scale.
+
+The `headless` feature turns on GPUI's `test-support`, which is where its
+offscreen renderer lives, so it stays out of ordinary and shipping builds:
+without it `JIJI_HEADLESS` and `shot` are refused, and a script drives the
+visible window. What a headless run cannot show is what AppKit draws or
+does itself: the traffic lights and the window's corners are not in a
+screenshot, and the translation of real OS events, the input method,
+native menus and sheets, and how frames reach a display are not exercised.
 
 ## Layout
 
@@ -215,10 +230,14 @@ Things this code works around, so the next change does not rediscover them:
 - **A scroller hears the wheel before its ancestors do**, and spends a
   sideways swipe's vertical drift on its rows. An ancestor that pans
   listens in the capture phase (`ui::wheel_first`) and stops the event.
-- **A window re-reads the real pointer when its bounds change.** After a
-  resize or a move GPUI asks the OS where the pointer is, so hover follows
-  the user's own pointer rather than the last scripted one. A scripted
-  `resize` puts its pointer back afterwards (`script::run`).
+- **A window reads the real pointer when it opens and when its bounds
+  change**, hidden or not, so hover would follow wherever the user's own
+  pointer rests. A scripted run starts with its pointer off the window and
+  puts it back after a `resize` (`script::run`).
+- **A window that is not visible is never asked for a frame**, and GPUI
+  keeps its dirty flag to itself. A headless run steps frames by hand and
+  reads the flag from `App::debug_state` (`headless::pump_frames`), so it
+  draws only when the app asked — a missed `cx.notify()` stays visible.
 - **A scripted `scroll` is one precise delta with no touch phase** — the
   smooth-mouse case, not the trackpad one. Scroll down before scrolling
   sideways in a script; a sideways scroll fresh from launch only covers a

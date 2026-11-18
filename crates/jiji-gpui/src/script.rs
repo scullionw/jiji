@@ -1,9 +1,11 @@
-//! Scripted runs: drive the real window without the pointer or keyboard.
+//! Scripted runs: drive the app's window without the pointer or keyboard.
 //!
-//! Steps are injected through GPUI's own event dispatch, so they take the
-//! same path OS input does (hit-testing, focus, key bindings, the input
-//! method) — but nothing is synthesized at the OS level, the window never
-//! takes focus, and the clipboard is only touched by a step that copies.
+//! Steps go in through GPUI's own event dispatch — the call the platform
+//! makes once it has translated an OS event — so they take the path real
+//! input does from there on: hit-testing, focus, key bindings, the input
+//! handler. Nothing is synthesized at the OS level, and the clipboard is
+//! only touched by a step that copies. With `JIJI_HEADLESS=1` the window
+//! is never shown at all (see `headless.rs`).
 //!
 //! `JIJI_SCRIPT` holds the steps, separated by `;`, coordinates in window
 //! points:
@@ -19,11 +21,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    px, size, AnyWindowHandle, App, AppContext as _, AsyncApp, Keystroke, Modifiers, MouseButton,
-    Window,
+    point, px, size, AnyWindowHandle, App, AppContext as _, AsyncApp, InputEvent, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, Window,
 };
-
-use crate::capture::{NativeTarget, Pointer};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -192,29 +193,58 @@ async fn frame(cx: &AsyncApp) {
         .await;
 }
 
+fn at((x, y): (f32, f32)) -> Point<Pixels> {
+    point(px(x), px(y))
+}
+
+/// Hand the window one input event, as the platform does with its own.
+fn send(event: impl InputEvent, window: AnyWindowHandle, cx: &mut AsyncApp) {
+    let delivered = cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(event.to_platform_input(), cx);
+    });
+    if let Err(err) = delivered {
+        eprintln!("jiji: step not delivered: {err}");
+    }
+}
+
+/// The pointer arriving at `to`, `held` if a button is down on the way.
+fn moved(to: (f32, f32), held: Option<MouseButton>, modifiers: Modifiers) -> MouseMoveEvent {
+    MouseMoveEvent {
+        position: at(to),
+        pressed_button: held,
+        modifiers,
+    }
+}
+
+fn down(
+    button: MouseButton,
+    on: (f32, f32),
+    clicks: usize,
+    modifiers: Modifiers,
+) -> MouseDownEvent {
+    MouseDownEvent {
+        button,
+        position: at(on),
+        modifiers,
+        click_count: clicks,
+        first_mouse: false,
+    }
+}
+
+fn up(button: MouseButton, on: (f32, f32), clicks: usize, modifiers: Modifiers) -> MouseUpEvent {
+    MouseUpEvent {
+        button,
+        position: at(on),
+        modifiers,
+        click_count: clicks,
+    }
+}
+
 async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
     let update = |cx: &mut AsyncApp, f: &mut dyn FnMut(&mut Window, &mut App)| {
         let _ = cx.update_window(window, |_, window, cx| f(window, cx));
     };
-    // Read the native handles while GPUI lends the window out, then
-    // deliver with the app unborrowed: the view's handler re-enters it.
-    let target = |cx: &mut AsyncApp| {
-        cx.update_window(window, |_, window, _| NativeTarget::of(window))
-            .map_err(|err| err.to_string())
-            .and_then(|target| target)
-    };
-    let mouse = |cx: &mut AsyncApp,
-                 kind: Pointer,
-                 button: MouseButton,
-                 position: (f32, f32),
-                 clicks: usize,
-                 modifiers: Modifiers| {
-        let sent = target(cx)
-            .and_then(|target| target.send_mouse(kind, button, position, clicks, modifiers));
-        if let Err(err) = sent {
-            eprintln!("jiji: pointer step failed: {err}");
-        }
-    };
+    let left = MouseButton::Left;
     match step {
         Step::Click {
             at: position,
@@ -222,76 +252,67 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
             button,
             modifiers,
         } => {
-            mouse(cx, Pointer::Move, button, position, 0, modifiers);
+            send(moved(position, None, modifiers), window, cx);
             frame(cx).await;
             // A double click is two presses, the second counted twice —
             // what the platform sends.
             for n in 1..=count {
-                mouse(cx, Pointer::Down, button, position, n, modifiers);
+                send(down(button, position, n, modifiers), window, cx);
                 frame(cx).await;
-                mouse(cx, Pointer::Up, button, position, n, modifiers);
+                send(up(button, position, n, modifiers), window, cx);
                 frame(cx).await;
             }
         }
-        Step::Move(x, y) => {
-            mouse(
-                cx,
-                Pointer::Move,
-                MouseButton::Left,
-                (x, y),
-                0,
-                Modifiers::default(),
-            );
-        }
+        Step::Move(x, y) => send(moved((x, y), None, Modifiers::default()), window, cx),
         Step::Drag {
             from,
             to,
             modifiers,
         } => {
-            let button = MouseButton::Left;
-            mouse(cx, Pointer::Move, button, from, 0, modifiers);
+            send(moved(from, None, modifiers), window, cx);
             frame(cx).await;
-            mouse(cx, Pointer::Down, button, from, 1, modifiers);
+            send(down(left, from, 1, modifiers), window, cx);
             frame(cx).await;
             // Travel in a few hops: the first leaves the drag threshold,
             // the rest let drop targets react on the way.
             for step in 1..=4 {
                 let t = step as f32 / 4.;
                 let hop = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
-                mouse(cx, Pointer::Drag, button, hop, 1, modifiers);
+                send(moved(hop, Some(left), modifiers), window, cx);
                 frame(cx).await;
             }
             frame(cx).await;
-            mouse(cx, Pointer::Up, button, to, 1, modifiers);
+            send(up(left, to, 1, modifiers), window, cx);
         }
-        Step::Press(at, modifiers) => {
-            mouse(cx, Pointer::Move, MouseButton::Left, at, 0, modifiers);
+        Step::Press(on, modifiers) => {
+            send(moved(on, None, modifiers), window, cx);
             frame(cx).await;
-            mouse(cx, Pointer::Down, MouseButton::Left, at, 1, modifiers);
+            send(down(left, on, 1, modifiers), window, cx);
         }
-        Step::Hold(at, modifiers) => {
-            mouse(cx, Pointer::Drag, MouseButton::Left, at, 1, modifiers);
+        Step::Hold(on, modifiers) => {
+            send(moved(on, Some(left), modifiers), window, cx);
             frame(cx).await;
         }
-        Step::Release(at, modifiers) => {
-            mouse(cx, Pointer::Up, MouseButton::Left, at, 1, modifiers);
-        }
+        Step::Release(on, modifiers) => send(up(left, on, 1, modifiers), window, cx),
         Step::Scroll {
             at: position,
-            delta,
+            delta: (dx, dy),
         } => {
-            mouse(
-                cx,
-                Pointer::Move,
-                MouseButton::Left,
-                position,
-                0,
-                Modifiers::default(),
-            );
+            send(moved(position, None, Modifiers::default()), window, cx);
             frame(cx).await;
-            if let Err(err) = target(cx).and_then(|target| target.send_scroll(position, delta)) {
-                eprintln!("jiji: scroll step failed: {err}");
-            }
+            // One precise delta that belongs to no gesture: what a
+            // smooth-scrolling mouse sends, and a trackpad mid-swipe.
+            send(
+                ScrollEvent {
+                    position: at(position),
+                    delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                    source: ScrollSource::Pointer,
+                },
+                window,
+                cx,
+            );
         }
         Step::Key(key) => {
             update(cx, &mut |window, cx| match Keystroke::parse_with_os(
@@ -325,13 +346,13 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
                 .await;
         }
         Step::Shot(path) => {
-            // Let whatever the previous step changed reach the screen.
+            // Let whatever the previous step changed reach a frame.
             cx.background_executor()
                 .timer(Duration::from_millis(180))
                 .await;
             update(
                 cx,
-                &mut |window, _| match crate::capture::window_png(window, &path) {
+                &mut |window, _| match crate::headless::screenshot(window, &path) {
                     Ok(()) => println!("wrote {}", path.display()),
                     Err(err) => eprintln!("jiji: shot failed: {err}"),
                 },
@@ -340,34 +361,42 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
         Step::Resize(w, h) => {
             update(cx, &mut |window, _| window.resize(size(px(w), px(h))));
         }
-        Step::Quit => {
-            let _ = cx.update(|cx| cx.quit());
-        }
+        Step::Quit => cx.update(|cx| cx.quit()),
     }
 }
 
 /// Run the steps against `window`, after the first frames have painted.
-pub fn run(steps: Vec<Step>, window: AnyWindowHandle, cx: &mut App) {
+/// With `quit_after`, the app quits when the steps run out: a window
+/// nobody can see has no one to close it.
+pub fn run(steps: Vec<Step>, window: AnyWindowHandle, quit_after: bool, cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor()
             .timer(Duration::from_millis(900))
             .await;
+        // GPUI reads the real pointer when it opens a window, and a
+        // scripted one never arrives to correct it: start with the
+        // pointer off the window, so nothing begins hovered by wherever
+        // the user's own pointer rests.
+        send(moved((-1., -1.), None, Modifiers::default()), window, cx);
         let mut pointer = None;
         for step in steps {
             let resized = matches!(step, Step::Resize(..));
             pointer = step.pointer_after().or(pointer);
             run_step(step, window, cx).await;
-            // GPUI re-reads the real pointer whenever a window's bounds
-            // change, which would leave hover wherever the user's own
-            // pointer happens to rest. Put the scripted one back.
-            if let (true, Some((x, y))) = (resized, pointer) {
+            // It reads it again whenever the window's bounds change. Put
+            // the scripted pointer back.
+            if resized {
                 frame(cx).await;
                 frame(cx).await;
+                let (x, y) = pointer.unwrap_or((-1., -1.));
                 run_step(Step::Move(x, y), window, cx).await;
             }
             cx.background_executor()
                 .timer(Duration::from_millis(120))
                 .await;
+        }
+        if quit_after {
+            cx.update(|cx| cx.quit());
         }
     })
     .detach();

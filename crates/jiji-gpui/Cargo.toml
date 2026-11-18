@@ -17,6 +17,12 @@ path = "src/main.rs"
 # both shells exist side by side.
 [workspace]
 
+[features]
+# Scripted runs with nothing on screen (JIJI_HEADLESS=1) and their
+# screenshots: GPUI's offscreen renderer and frame stepping sit behind its
+# test-support feature. Never in a shipping build.
+headless = ["gpui/test-support", "gpui_platform/test-support"]
+
 [dependencies]
 # gpui-pre is a weekly crates.io snapshot of Zed's main branch (the official
 # `gpui` crate has not been published since 0.2.2, October 2025). The library
@@ -42,8 +48,6 @@ serde_json = "1"
 unicode-segmentation = "1"
 # getrusage, for the diff benchmark's whole-process CPU cost per frame.
 libc = "0.2"
-# Only to reach the NSWindow for scripted runs' `shot=` self-capture.
-raw-window-handle = "0.6"
 
 tree-sitter = "0.27"
 tree-sitter-highlight = "0.27"
