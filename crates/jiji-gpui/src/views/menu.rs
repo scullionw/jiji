@@ -9,8 +9,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, Action, AnyElement, App, Bounds, Context,
-    Corner, Entity, FocusHandle, Keystroke, MouseDownEvent, Pixels, Point, Subscription, Window,
+    anchored, deferred, div, point, prelude::*, px, Action, Anchor, AnyElement, App, Bounds,
+    Context, Entity, FocusHandle, Keystroke, MouseDownEvent, Pixels, Point, Subscription, Window,
 };
 
 use crate::app::AppModel;
@@ -234,7 +234,7 @@ impl ContextMenu {
                     ClipboardOp::Paste => Box::new(input::Paste),
                     ClipboardOp::SelectAll => Box::new(input::SelectAll),
                 };
-                window.focus(&field);
+                window.focus(&field, cx);
                 field.dispatch_action(action.as_ref(), window, cx);
             }
             action => self
@@ -374,9 +374,9 @@ impl Render for ContextMenu {
             let fits_right =
                 panel.right() + px(2. + SUB_MAX_W + 8.) <= window.viewport_size().width;
             let (corner, x) = if fits_right {
-                (Corner::TopLeft, panel.right() + px(2.))
+                (Anchor::TopLeft, panel.right() + px(2.))
             } else {
-                (Corner::TopRight, panel.left() - px(2.))
+                (Anchor::TopRight, panel.left() - px(2.))
             };
             anchored()
                 .anchor(corner)
@@ -395,7 +395,7 @@ impl Render for ContextMenu {
                     cx.stop_propagation();
                     this.close(cx);
                 }))
-                .on_scroll_wheel(cx.listener(|this, _, _, cx| this.close(cx)))
+                .on_scroll(cx.listener(|this, _, _, cx| this.close(cx)))
                 .child(anchored().position(self.position).child(panel))
                 .children(flyout),
         )

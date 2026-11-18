@@ -17,8 +17,8 @@ use gpui::{
     ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextRun, TransformationMatrix, Window,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, SharedString,
+    StrikethroughStyle, Style, TextAlign, TextRun, TransformationMatrix, Window,
 };
 use jiji_core::snapshot::FileStatus;
 
@@ -825,7 +825,7 @@ impl DiffSurface {
 
     // ── Input ──
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         let (dx, dy) = self.wheel.travel(event, LINE_H * 2.5);
         // Sideways travel pans the file under the pointer.
         let file = self.geo.map_or(0, |geo| {
@@ -874,7 +874,7 @@ impl DiffSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         let Some(geo) = self.geo else { return };
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         if let Some((file, on_resolve)) = self.header_at(x, y, window) {
@@ -1016,7 +1016,7 @@ impl DiffSurface {
     /// nothing.
     fn on_context(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         let mut target = DiffTarget {
             selection: self.selected_text(),
@@ -1380,12 +1380,22 @@ impl DiffSurface {
                             window,
                         );
                         let x = geo.left + 16.;
-                        name.paint(point(px(x), px(y)), px(height), window, cx).ok();
+                        name.paint(
+                            point(px(x), px(y)),
+                            px(height),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
                         if let Some(caption) = side {
                             label(caption.clone(), &metrics.ui, XS, theme.text3, window)
                                 .paint(
                                     point(px(x + f32::from(name.width) + 10.), px(y)),
                                     px(height),
+                                    TextAlign::Left,
+                                    None,
                                     window,
                                     cx,
                                 )
@@ -1402,8 +1412,15 @@ impl DiffSurface {
                         // lines were left out here.
                         let fold = label("⋯", &metrics.ui, SMALL, theme.text3, window);
                         let fold_x = geo.left + (code - geo.left - f32::from(fold.width)) / 2.;
-                        fold.paint(point(px(fold_x), px(y)), px(GAP_H), window, cx)
-                            .ok();
+                        fold.paint(
+                            point(px(fold_x), px(y)),
+                            px(GAP_H),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
                         let mut x = code + CODE_PAD_L;
                         if let Some(context) = context {
                             let symbol: SharedString = match context.char_indices().nth(64) {
@@ -1412,7 +1429,14 @@ impl DiffSurface {
                             };
                             let symbol = label(symbol, &metrics.code, XS, theme.text2, window);
                             symbol
-                                .paint(point(px(x), px(y)), px(GAP_H), window, cx)
+                                .paint(
+                                    point(px(x), px(y)),
+                                    px(GAP_H),
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
                                 .ok();
                             x += f32::from(symbol.width) + 12.;
                         }
@@ -1424,7 +1448,16 @@ impl DiffSurface {
                             theme.text3,
                             window,
                         );
-                        count.paint(point(px(x), px(y)), px(GAP_H), window, cx).ok();
+                        count
+                            .paint(
+                                point(px(x), px(y)),
+                                px(GAP_H),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
                     }
                     Row::Image { file } => {
                         // Old and new side by side as plain hairlined
@@ -1481,8 +1514,10 @@ impl DiffSurface {
                                     let (w, h) = (w * scale, h * scale);
                                     let left = x + (box_w - w) / 2.;
                                     let top = y + 16. + (box_h - h) / 2.;
+                                    let frame = rect(left, top, left + w, top + h);
                                     let _ = window.paint_image(
-                                        rect(left, top, left + w, top + h),
+                                        frame,
+                                        frame,
                                         gpui::Corners::default(),
                                         picture,
                                         0,
@@ -1506,6 +1541,8 @@ impl DiffSurface {
                                         .paint(
                                             point(px(left), px(y + 16. + box_h / 2. - 9.)),
                                             px(18.),
+                                            TextAlign::Left,
+                                            None,
                                             window,
                                             cx,
                                         )
@@ -1520,6 +1557,8 @@ impl DiffSurface {
                                     .paint(
                                         point(px(cx_x), px(y + 16. + box_h + 6.)),
                                         px(18.),
+                                        TextAlign::Left,
+                                        None,
                                         window,
                                         cx,
                                     )
@@ -1542,7 +1581,14 @@ impl DiffSurface {
                             ));
                         }
                         label(text.clone(), &metrics.ui, SMALL, color, window)
-                            .paint(point(px(geo.left + 16.), px(y)), px(NOTE_H), window, cx)
+                            .paint(
+                                point(px(geo.left + 16.), px(y)),
+                                px(NOTE_H),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
                             .ok();
                     }
                     Row::Line {
@@ -1730,8 +1776,15 @@ impl DiffSurface {
                     }
 
                     if let Some(text) = &text {
-                        text.paint(point(px(origin_x), px(y)), px(LINE_H), window, cx)
-                            .ok();
+                        text.paint(
+                            point(px(origin_x), px(y)),
+                            px(LINE_H),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .ok();
                     }
                 }
             });
@@ -2030,7 +2083,15 @@ fn paint_number(
         .entry((no, tone))
         .or_insert_with(|| label(no.to_string(), &metrics.code, XS, color, window));
     let x = right_edge - metrics.ch_xs - f32::from(line.width);
-    line.paint(point(px(x), px(y)), px(LINE_H), window, cx).ok();
+    line.paint(
+        point(px(x), px(y)),
+        px(LINE_H),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    )
+    .ok();
 }
 
 fn paint_sign(
@@ -2048,7 +2109,15 @@ fn paint_sign(
         Kind::Removed => &metrics.minus,
     };
     let x = x + (geo.signw - f32::from(sign.width)) / 2.;
-    sign.paint(point(px(x), px(y)), px(LINE_H), window, cx).ok();
+    sign.paint(
+        point(px(x), px(y)),
+        px(LINE_H),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    )
+    .ok();
 }
 
 /// How wide a header's Resolve button is, and where it sits.
@@ -2119,6 +2188,7 @@ impl HeaderPaint<'_> {
         let _ = window.paint_svg(
             rect(x, y + (height - 12.) / 2., x + 12., y + (height + 12.) / 2.),
             chevron.path(),
+            None,
             TransformationMatrix::unit(),
             if self.hover.is_some() {
                 theme.text2
@@ -2140,6 +2210,7 @@ impl HeaderPaint<'_> {
                 y + ((height - GLYPH) / 2.).round() + GLYPH,
             ),
             glyph.path(),
+            None,
             TransformationMatrix::unit(),
             theme.file_hue(hue),
             cx,
@@ -2191,7 +2262,8 @@ impl HeaderPaint<'_> {
                 BorderStyle::default(),
             ));
         }
-        path.paint(at(x), px(height), window, cx).ok();
+        path.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+            .ok();
         x += f32::from(path.width) + 10.;
 
         // What came or went says so in its side's hue; a modified file,
@@ -2209,7 +2281,8 @@ impl HeaderPaint<'_> {
         };
         if let Some((word, hue)) = word {
             let word = label(word, &medium, XS, hue, window);
-            word.paint(at(x), px(height), window, cx).ok();
+            word.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
             x += f32::from(word.width) + 6.;
         }
         if let Some(from) = &file.renamed_from {
@@ -2220,7 +2293,8 @@ impl HeaderPaint<'_> {
                 theme.text3,
                 window,
             );
-            from.paint(at(x), px(height), window, cx).ok();
+            from.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
             x += f32::from(from.width) + 8.;
         }
         if file.has_conflict {
@@ -2234,7 +2308,7 @@ impl HeaderPaint<'_> {
                 "conflict".to_owned()
             };
             label(chip, &medium, XS, theme.danger, window)
-                .paint(at(x), px(height), window, cx)
+                .paint(at(x), px(height), TextAlign::Left, None, window, cx)
                 .ok();
         }
 
@@ -2273,6 +2347,8 @@ impl HeaderPaint<'_> {
             text.paint(
                 point(button.left() + px(8.), button.top()),
                 px(22.),
+                TextAlign::Left,
+                None,
                 window,
                 cx,
             )
@@ -2313,7 +2389,8 @@ impl HeaderPaint<'_> {
             }
             let stat = label(format!("{sign}{count}"), &metrics.code, XS, color, window);
             right -= f32::from(stat.width);
-            stat.paint(at(right), px(height), window, cx).ok();
+            stat.paint(at(right), px(height), TextAlign::Left, None, window, cx)
+                .ok();
             right -= 6.;
         }
     }
@@ -2399,14 +2476,6 @@ struct DiffElement {
     view: Entity<DiffSurface>,
 }
 
-impl IntoElement for DiffElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for DiffElement {
     type RequestLayoutState = ();
     /// The whole surface, and the strip at its right edge that belongs to
@@ -2488,7 +2557,7 @@ impl Element for DiffElement {
 
         let view = self.view.clone();
         let hitbox = surface.clone();
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                 view.update(cx, |view, cx| view.on_scroll(event, cx));
             }

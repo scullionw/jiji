@@ -34,7 +34,7 @@ impl PublishView {
         self.review_name.update(cx, |input, cx| {
             input.set_text(&name, cx);
             input.select_all_text(cx);
-            input.focus(window);
+            input.focus(window, cx);
         });
         cx.notify();
     }
@@ -260,7 +260,7 @@ impl PublishView {
                         .child(
                             div()
                                 .min_w(px(40.))
-                                .flex_shrink()
+                                .flex_shrink_1()
                                 .text_size(px(TEXT_S))
                                 .text_color(t.text3)
                                 .child(truncated(pr.title.clone())),
@@ -442,7 +442,7 @@ impl PublishView {
                                 .child(
                                     div()
                                         .min_w(px(40.))
-                                        .flex_shrink()
+                                        .flex_shrink_1()
                                         .font_family(t.mono.clone())
                                         .child(truncated(format!(
                                             "{} → {}",

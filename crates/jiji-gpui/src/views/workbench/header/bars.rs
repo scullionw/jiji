@@ -1,7 +1,7 @@
 //! The header's two bars: the title with its verbs, then the facts about
 //! the change and the controls for how its diff is shown.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, Corner, FontWeight, Hsla, Window};
+use gpui::{div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, Hsla, Window};
 use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot};
 
 use super::{title_or_none, Confirm, Tray};
@@ -384,7 +384,7 @@ impl WorkbenchView {
             );
         }
         anchor.child(popover_layer(
-            Corner::TopRight,
+            Anchor::TopRight,
             30.,
             panel,
             cx.listener(|this, _, _, cx| {
@@ -985,7 +985,7 @@ impl WorkbenchView {
                 )
                 .child(scrollbar("files-menu-scrollbar", &self.header.files_scroll));
             anchor = anchor.child(popover_layer(
-                Corner::TopRight,
+                Anchor::TopRight,
                 26.,
                 panel,
                 cx.listener(|this, _, _, cx| {

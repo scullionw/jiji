@@ -50,7 +50,7 @@ impl Palette {
             "Type a command…"
         };
         let input = cx.new(|cx| TextInput::new(window, cx).placeholder(placeholder));
-        input.update(cx, |input, _| input.focus(window));
+        input.update(cx, |input, cx| input.focus(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,

@@ -70,7 +70,7 @@ impl Search {
                 .with_text(&seed)
         });
         input.update(cx, |input, cx| {
-            input.focus(window);
+            input.focus(window, cx);
             input.select_all_text(cx);
         });
         let subscriptions = vec![cx.subscribe_in(
@@ -123,15 +123,13 @@ impl Search {
         let app = self.app.clone();
         self.pending = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
-            let Ok(searched) = app.read_with(cx, |model, cx| {
+            let searched = app.read_with(cx, |model, cx| {
                 model.bg(cx, move |host| {
                     host.backend()
                         .search_history(Path::new(&repo), &query)
                         .map_err(crate::host::CommandError::from)
                 })
-            }) else {
-                return;
-            };
+            });
             let response = searched.await;
             let _ = this.update(cx, |this, cx| {
                 if this.seq != seq {

@@ -93,7 +93,7 @@ impl OperationsView {
             .as_ref()
             .is_some_and(|(open, kind)| open == op_id && *kind == action);
         self.confirm = (!same).then(|| (op_id.to_owned(), action));
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -322,7 +322,7 @@ impl OperationsView {
         let mut desc = div()
             .flex()
             .min_w(px(40.))
-            .flex_shrink()
+            .flex_shrink_1()
             .text_size(px(TEXT_M))
             .text_color(t.text1);
         if op.description.is_empty() {

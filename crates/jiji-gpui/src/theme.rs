@@ -562,12 +562,14 @@ impl Theme {
                 offset: point(px(0.), px(12.)),
                 blur_radius: px(32.),
                 spread_radius: px(-8.),
+                inset: false,
             },
             BoxShadow {
                 color: alpha(rgb, soft),
                 offset: point(px(0.), px(2.)),
                 blur_radius: px(6.),
                 spread_radius: px(0.),
+                inset: false,
             },
         ]
     }

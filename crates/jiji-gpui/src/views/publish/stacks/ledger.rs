@@ -142,7 +142,7 @@ impl PublishView {
         line = line.child(
             div()
                 .min_w(px(40.))
-                .flex_shrink()
+                .flex_shrink_1()
                 .text_size(px(TEXT_M))
                 .text_color(if merged.is_some() { t.text3 } else { t.text1 })
                 .child(truncated(
@@ -178,7 +178,7 @@ impl PublishView {
             Some(bookmark) => meta.child(
                 ref_label(None, bookmark.clone(), cx)
                     .id(SharedString::from(format!("seg-ref-{key}")))
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .min_w_0()
                     .max_w(px(220.))
                     .on_mouse_down(

@@ -521,7 +521,7 @@ impl WorkbenchView {
         self.diff.find_open = true;
         self.refind(cx);
         self.diff.find_input.update(cx, |input, cx| {
-            input.focus(window);
+            input.focus(window, cx);
             input.select_all_text(cx);
         });
         cx.notify();
@@ -534,7 +534,7 @@ impl WorkbenchView {
         self.diff.find_open = false;
         self.surface.update(cx, |surface, cx| {
             surface.clear_find(cx);
-            window.focus(&surface.focus_handle(cx));
+            window.focus(&surface.focus_handle(cx), cx);
         });
         cx.notify();
     }
@@ -963,7 +963,7 @@ impl WorkbenchView {
             let el = el.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     this.diff.tree_cursor = Some(key.clone());
                     cx.notify();
                 }),

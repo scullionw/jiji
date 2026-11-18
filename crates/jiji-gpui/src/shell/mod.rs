@@ -126,6 +126,7 @@ pub fn menus() -> Vec<gpui::Menu> {
     vec![
         Menu {
             name: "Jiji".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("About Jiji", About),
                 MenuItem::action("Check for Updates…", CheckUpdates),
@@ -141,6 +142,7 @@ pub fn menus() -> Vec<gpui::Menu> {
         },
         Menu {
             name: "File".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("New Tab", NewTab),
                 MenuItem::action("Open Repository…", OpenRepo),
@@ -151,6 +153,7 @@ pub fn menus() -> Vec<gpui::Menu> {
         },
         Menu {
             name: "Edit".into(),
+            disabled: false,
             items: vec![
                 MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
                 MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
@@ -166,6 +169,7 @@ pub fn menus() -> Vec<gpui::Menu> {
         },
         Menu {
             name: "View".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Command Palette…", TogglePalette),
                 MenuItem::separator(),
@@ -185,6 +189,7 @@ pub fn menus() -> Vec<gpui::Menu> {
         },
         Menu {
             name: "Window".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
@@ -195,6 +200,7 @@ pub fn menus() -> Vec<gpui::Menu> {
         },
         Menu {
             name: "Help".into(),
+            disabled: false,
             items: vec![MenuItem::action("Jiji Help", Help)],
         },
     ]
@@ -301,7 +307,7 @@ impl Shell {
             _subscriptions: subscriptions,
         };
         this.sync(window, cx);
-        window.focus(&this.focus);
+        window.focus(&this.focus, cx);
         this
     }
 
@@ -326,7 +332,7 @@ impl Shell {
             self.content = Some((key, view));
             self.content_focus = focus;
             if !palette_open && !search_open {
-                self.rest_focus(window);
+                self.rest_focus(window, cx);
             }
         }
 
@@ -353,7 +359,7 @@ impl Shell {
         if palette_open && self.palette.is_none() {
             self.palette = Some(crate::views::palette::build(window, cx));
         } else if !palette_open && self.palette.take().is_some() {
-            self.rest_focus(window);
+            self.rest_focus(window, cx);
         }
         if self.menu.as_ref().map(|(seq, _)| *seq) != menu_seq {
             self.menu = crate::views::menu::build(&self.app, window, cx);
@@ -361,12 +367,12 @@ impl Shell {
         if search_open && self.search.is_none() {
             self.search = Some(crate::views::search::build(window, cx));
         } else if !search_open && self.search.take().is_some() {
-            self.rest_focus(window);
+            self.rest_focus(window, cx);
         }
     }
 
-    fn rest_focus(&self, window: &mut Window) {
-        window.focus(self.content_focus.as_ref().unwrap_or(&self.focus));
+    fn rest_focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(self.content_focus.as_ref().unwrap_or(&self.focus), cx);
     }
 
     fn go_to(&mut self, index: usize, cx: &mut Context<Self>) {

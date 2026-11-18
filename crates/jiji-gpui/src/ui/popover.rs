@@ -2,7 +2,7 @@
 //! open/closed state, and one way to hang a panel off its trigger.
 
 use gpui::{
-    anchored, canvas, deferred, div, point, prelude::*, px, App, Bounds, Corner, DispatchPhase,
+    anchored, canvas, deferred, div, point, prelude::*, px, Anchor, App, Bounds, DispatchPhase,
     Div, ElementId, FontWeight, HitboxBehavior, MouseDownEvent, SharedString, Stateful, Window,
 };
 
@@ -118,15 +118,15 @@ fn backdrop(
 /// above everything else and stays inside the window. A press anywhere
 /// outside the panel calls `on_dismiss` and goes no further.
 pub fn popover_layer(
-    corner: Corner,
+    corner: Anchor,
     top: f32,
     panel: impl IntoElement,
     on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let seat = div().absolute().top(px(top));
     let seat = match corner {
-        Corner::TopRight | Corner::BottomRight => seat.right_0(),
-        Corner::TopLeft | Corner::BottomLeft => seat.left_0(),
+        Anchor::TopRight | Anchor::BottomRight | Anchor::RightCenter => seat.right_0(),
+        _ => seat.left_0(),
     };
     seat.child(
         deferred(

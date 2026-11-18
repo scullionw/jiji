@@ -198,7 +198,7 @@ impl WorkbenchView {
         header.more.close();
         header.files.close();
         if had_tray {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
     }
 
@@ -246,7 +246,7 @@ impl WorkbenchView {
         self.header.tray = Tray::None;
         self.header.error = None;
         self.header.dest_hover = None;
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -274,13 +274,13 @@ impl WorkbenchView {
         match &tray {
             Tray::Bookmark => self.header.bookmark_name.update(cx, |input, cx| {
                 input.set_text("", cx);
-                input.focus(window);
+                input.focus(window, cx);
             }),
             Tray::Manage(name) => {
                 let name = name.clone();
                 self.header.rename.update(cx, |input, cx| {
                     input.set_text(name, cx);
-                    input.focus(window);
+                    input.focus(window, cx);
                 });
             }
             Tray::Rebase | Tray::Compare => self.focus_filter_or_tray(window, cx),
@@ -292,9 +292,9 @@ impl WorkbenchView {
                 if self.compare != CompareMode::Parent {
                     self.set_compare(CompareMode::Parent, cx);
                 }
-                window.focus(&self.header.tray_focus);
+                window.focus(&self.header.tray_focus, cx);
             }
-            _ => window.focus(&self.header.tray_focus),
+            _ => window.focus(&self.header.tray_focus, cx),
         }
         cx.notify();
     }
@@ -305,9 +305,9 @@ impl WorkbenchView {
         if self.dest_candidates().len() > 6 {
             self.header
                 .filter
-                .update(cx, |input, _| input.focus(window));
+                .update(cx, |input, cx| input.focus(window, cx));
         } else {
-            window.focus(&self.header.tray_focus);
+            window.focus(&self.header.tray_focus, cx);
         }
     }
 
@@ -332,7 +332,7 @@ impl WorkbenchView {
         self.header.editor.update(cx, |input, cx| {
             input.set_text(text, cx);
             input.set_disabled(false, cx);
-            input.focus(window);
+            input.focus(window, cx);
         });
         cx.notify();
     }
@@ -346,7 +346,7 @@ impl WorkbenchView {
         self.header.draft_restored = false;
         self.header.editor.update(cx, |input, cx| {
             input.set_text(base, cx);
-            input.focus(window);
+            input.focus(window, cx);
         });
         cx.notify();
     }
@@ -375,7 +375,7 @@ impl WorkbenchView {
                         if this.header.node == for_node && this.header.tray != Tray::None {
                             this.header.editing_from = None;
                             this.header.tray = Tray::None;
-                            window.focus(&this.focus);
+                            window.focus(&this.focus, cx);
                         }
                     }
                     Err(error) => this.header.error = Some(error.message),

@@ -48,7 +48,7 @@ impl PublishView {
         let title = h_flex().gap(px(6.)).min_w_0().child(
             div()
                 .min_w_0()
-                .flex_shrink()
+                .flex_shrink_1()
                 .text_size(px(TEXT_M))
                 .text_color(t.text1)
                 .child(truncated(stack.title.clone())),

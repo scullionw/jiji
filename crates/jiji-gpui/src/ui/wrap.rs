@@ -9,8 +9,8 @@
 
 use gpui::{
     point, px, size, App, AvailableSpace, Bounds, Element, ElementId, Font, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Pixels, SharedString, Size, Style, TextAlign,
-    TextRun, Window, WrappedLine,
+    InspectorElementId, LayoutId, Pixels, SharedString, Size, Style, TextAlign, TextRun, Window,
+    WrappedLine,
 };
 
 /// The narrowest a paragraph is ever really laid out.
@@ -62,14 +62,6 @@ fn extent(lines: &[WrappedLine], line_height: Pixels) -> Size<Pixels> {
         let line = line.size(line_height);
         size(total.width.max(line.width), total.height + line.height)
     })
-}
-
-impl IntoElement for Wrapped {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for Wrapped {

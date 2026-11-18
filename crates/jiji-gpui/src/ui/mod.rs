@@ -47,9 +47,7 @@ use crate::theme::theme;
 /// in a column hold still as they change.
 pub trait Tabular: Styled {
     fn tabular(mut self) -> Self {
-        self.text_style()
-            .get_or_insert_with(Default::default)
-            .font_features = Some(FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
+        self.text_style().font_features = Some(FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
         self
     }
 }

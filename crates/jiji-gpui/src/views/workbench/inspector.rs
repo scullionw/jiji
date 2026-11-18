@@ -84,7 +84,7 @@ impl WorkbenchView {
         self.inspector.rename.update(cx, |input, cx| {
             input.set_text(&bookmark.name, cx);
             input.select_all_text(cx);
-            input.focus(window);
+            input.focus(window, cx);
         });
         cx.notify();
     }
@@ -193,7 +193,7 @@ impl WorkbenchView {
             if let Some(bookmark) = &stream.bookmark {
                 row = row.child(
                     ref_label(None, bookmark.clone(), cx)
-                        .flex_shrink()
+                        .flex_shrink_1()
                         .min_w_0()
                         .max_w(px(150.)),
                 );

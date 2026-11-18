@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, quad, AnyElement, App, BorderStyle, Bounds, Context,
-    Corner, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, Stateful, TextRun, Window,
+    canvas, div, fill, point, prelude::*, px, quad, Anchor, AnyElement, App, BorderStyle, Bounds,
+    Context, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, Stateful, TextAlign, TextRun,
+    Window,
 };
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
 use jiji_forge::RepoPrState;
@@ -587,7 +588,7 @@ impl WorkbenchView {
                         .size_full()
                         .scroll_y()
                         .track_scroll(&self.scroll)
-                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
                         .child(body),
                 )
                 .child(scrollbar("graph-scrollbar", &self.scroll)),
@@ -860,7 +861,7 @@ impl WorkbenchView {
                                     let name = rename_name.clone();
                                     this.view_menu.rename.update(cx, |input, cx| {
                                         input.set_text(name, cx);
-                                        input.focus(window);
+                                        input.focus(window, cx);
                                     });
                                     cx.notify();
                                 })),
@@ -932,7 +933,7 @@ impl WorkbenchView {
                         this.view_menu.saving = true;
                         this.view_menu
                             .name
-                            .update(cx, |input, _| input.focus(window));
+                            .update(cx, |input, cx| input.focus(window, cx));
                         cx.notify();
                     }))
                     .child("Save as view…"),
@@ -950,7 +951,7 @@ impl WorkbenchView {
             );
         }
         anchor.child(popover_layer(
-            Corner::TopLeft,
+            Anchor::TopLeft,
             28.,
             panel,
             cx.listener(|this, _, _, cx| {
@@ -1137,11 +1138,10 @@ impl WorkbenchView {
         };
 
         let title = summary_of(&node.description);
-        let mut desc =
-            div()
-                .min_w(px(40.))
-                .flex_shrink()
-                .text_size(px(if classic { TEXT_L } else { TEXT_M }));
+        let mut desc = div()
+            .min_w(px(40.))
+            .flex_shrink_1()
+            .text_size(px(if classic { TEXT_L } else { TEXT_M }));
         desc = if title.is_empty() {
             desc.text_color(t.text3)
                 .italic()
@@ -1343,7 +1343,7 @@ impl WorkbenchView {
             .pr(px(12.))
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     this.select(id.clone(), event.modifiers(), cx);
                 }),
             )
@@ -1501,7 +1501,7 @@ impl WorkbenchView {
                         bounds.left() + px(rail_x(mark.col, full)) - line.width / 2.,
                         cy - line_height / 2.,
                     );
-                    let _ = line.paint(origin, line_height, window, cx);
+                    let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
                 }
             },
         )
@@ -1707,7 +1707,7 @@ impl WorkbenchView {
         if let Some(bookmark) = &lane.bookmark {
             head = head.child(
                 ref_label(None, bookmark.clone(), cx)
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .min_w_0(),
             );
         }
@@ -1837,7 +1837,7 @@ impl WorkbenchView {
         if let Some(bookmark) = &workstream.bookmark {
             line = line.child(
                 ref_label(None, bookmark.clone(), cx)
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .min_w_0(),
             );
         }

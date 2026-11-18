@@ -18,9 +18,15 @@ path = "src/main.rs"
 [workspace]
 
 [dependencies]
-# runtime_shaders: compile the Metal shaders at startup instead of at build
-# time, so building needs no Xcode Metal Toolchain component.
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# gpui-pre is a weekly crates.io snapshot of Zed's main branch (the official
+# `gpui` crate has not been published since 0.2.2, October 2025). The library
+# names stay `gpui` and `gpui_platform`. Snapshots can break API from one to
+# the next; Cargo.lock holds the one in use until `cargo update` moves it.
+gpui = { package = "gpui-pre", version = "0.3.13" }
+# font-kit: the macOS glyph rasterizer; without it text lays out but never
+# draws. runtime_shaders: compile the Metal shaders at startup instead of at
+# build time, so building needs no Xcode Metal Toolchain component.
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.13", features = ["font-kit", "runtime_shaders"] }
 jiji-core = { path = "../jiji-core" }
 jiji-forge = { path = "../jiji-forge" }
 jiji-cli = { path = "../jiji-cli" }

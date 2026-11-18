@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     canvas, fill, point, px, relative, size, App, Axis, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Position, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Style, Styled, TouchPhase, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Position, ScrollEvent,
+    ScrollHandle, StatefulInteractiveElement, Style, Styled, TouchPhase, Window,
 };
 
 use crate::theme::theme;
@@ -63,7 +63,7 @@ pub struct AxisLock {
 impl AxisLock {
     /// The travel `event` asks for in pixels, on the gesture's axis only.
     /// A notched wheel reports one axis at a time and passes as it is.
-    pub fn travel(&mut self, event: &ScrollWheelEvent, line_height: f32) -> (f32, f32) {
+    pub fn travel(&mut self, event: &ScrollEvent, line_height: f32) -> (f32, f32) {
         let delta = event.delta.pixel_delta(px(line_height));
         let delta = (f32::from(delta.x), f32::from(delta.y));
         if !event.delta.precise() {
@@ -118,12 +118,12 @@ impl AxisLock {
 /// the last child of a `relative` parent; stop propagation to keep the
 /// event.
 pub fn wheel_first(
-    on_wheel: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+    on_wheel: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     canvas(
         |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture && hitbox.should_handle_scroll(window) {
                     on_wheel(event, window, cx);
                 }
@@ -162,7 +162,7 @@ struct Geometry {
 }
 
 fn geometry(bounds: Bounds<Pixels>, handle: &ScrollHandle) -> Option<Geometry> {
-    let max = handle.max_offset().height;
+    let max = handle.max_offset().y;
     let viewport = handle.bounds().size.height;
     if max <= px(0.5) || viewport <= px(0.) {
         return None;
@@ -186,14 +186,6 @@ fn geometry(bounds: Bounds<Pixels>, handle: &ScrollHandle) -> Option<Geometry> {
         thumb,
         ratio: if travel > px(0.) { max / travel } else { 0. },
     })
-}
-
-impl IntoElement for Scrollbar {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for Scrollbar {
@@ -307,7 +299,7 @@ impl Element for Scrollbar {
                     return;
                 }
                 let top = event.position.y - grab - track.top();
-                let max = handle.max_offset().height;
+                let max = handle.max_offset().y;
                 let target = (top * ratio).clamp(px(0.), max);
                 let mut offset = handle.offset();
                 offset.y = -target;

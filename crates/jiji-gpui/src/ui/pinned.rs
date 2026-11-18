@@ -21,14 +21,6 @@ pub fn pinned(heading: impl IntoElement, body: impl IntoElement) -> Pinned {
     }
 }
 
-impl IntoElement for Pinned {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Pinned {
     /// The heading's layout, for its height.
     type RequestLayoutState = LayoutId;

@@ -6,8 +6,8 @@
 //! it.
 
 use gpui::{
-    px, size, App, Bounds, Element, ElementId, Font, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, Pixels, SharedString, Style, TextRun, Window,
+    px, size, App, Bounds, Element, ElementId, Font, GlobalElementId, InspectorElementId, LayoutId,
+    Pixels, SharedString, Style, TextAlign, TextRun, Window,
 };
 
 pub struct Truncated {
@@ -27,14 +27,6 @@ pub struct Face {
     font: Font,
     font_size: Pixels,
     line_height: Pixels,
-}
-
-impl IntoElement for Truncated {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for Truncated {
@@ -139,6 +131,13 @@ impl Element for Truncated {
             let kept = self.text[..cut].trim_end();
             line = shape(format!("{kept}…").into(), window);
         }
-        let _ = line.paint(bounds.origin, face.line_height, window, cx);
+        let _ = line.paint(
+            bounds.origin,
+            face.line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     }
 }

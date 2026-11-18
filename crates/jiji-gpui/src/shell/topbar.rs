@@ -4,7 +4,7 @@
 //! the window's one Settings control.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Corner, Div, FontWeight, MouseButton, SharedString,
+    div, prelude::*, px, Anchor, AnyElement, Context, Div, FontWeight, MouseButton, SharedString,
     Window,
 };
 use jiji_core::snapshot::SyncState;
@@ -298,7 +298,7 @@ impl Shell {
                 .id(("tab", id))
                 .group(group.clone())
                 .relative()
-                .flex_shrink()
+                .flex_shrink_1()
                 .min_w_0()
                 .h(px(BAND_H))
                 .gap(px(7.))
@@ -493,7 +493,7 @@ impl Shell {
     fn license_layer(&self, panel: Div, cx: &mut Context<Self>) -> impl IntoElement {
         let app = self.app.clone();
         popover_layer(
-            Corner::TopRight,
+            Anchor::TopRight,
             30.,
             panel,
             cx.listener(move |this, _, _, cx| {
@@ -895,7 +895,7 @@ impl Shell {
         panel = panel.child(footer);
 
         anchor.child(popover_layer(
-            Corner::TopRight,
+            Anchor::TopRight,
             30.,
             panel,
             cx.listener(|this, _, _, cx| {

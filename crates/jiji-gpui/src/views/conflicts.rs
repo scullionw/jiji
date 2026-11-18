@@ -269,7 +269,7 @@ impl ConflictsView {
                         .child(
                             h_flex()
                                 .min_w(px(40.))
-                                .flex_shrink()
+                                .flex_shrink_1()
                                 .overflow_hidden()
                                 .child(
                                     div()
@@ -280,7 +280,7 @@ impl ConflictsView {
                                 .child(
                                     div()
                                         .min_w(px(20.))
-                                        .flex_shrink()
+                                        .flex_shrink_1()
                                         .text_color(t.text1)
                                         .child(truncated(name.to_owned())),
                                 ),
@@ -413,7 +413,7 @@ impl ConflictsView {
                                 chip = chip.child(
                                     div()
                                         .min_w(px(20.))
-                                        .flex_shrink()
+                                        .flex_shrink_1()
                                         .child(truncated(title.to_owned())),
                                 );
                             }

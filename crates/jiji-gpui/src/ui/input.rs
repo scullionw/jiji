@@ -14,7 +14,7 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, Div, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString, Style, TextAlign,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, SharedString, Style, TextAlign,
     TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -388,8 +388,8 @@ impl TextInput {
         cx.notify();
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
@@ -765,7 +765,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.goal_x = None;
         let offset = self.index_for_mouse(event.position);
         match event.click_count {
@@ -798,7 +798,7 @@ impl TextInput {
         if self.disabled {
             return;
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         // A masked field never gives its text away.
         let has_selection = !self.selection.is_empty() && !self.masked;
         let position = event.position;
@@ -821,7 +821,7 @@ impl TextInput {
         }
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -1001,7 +1001,7 @@ impl EntityInputHandler for TextInput {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut context = KeyContext::new_with_defaults();
+        let mut context = KeyContext::new_with_defaults(cx.platform_info().os);
         context.add("TextInput");
         if self.multiline {
             context.add("multiline");
@@ -1053,7 +1053,7 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .child(TextElement { input: cx.entity() })
     }
 }
@@ -1135,14 +1135,6 @@ fn lay_out(
         lines.push(laid);
     }
     (lines, top)
-}
-
-impl IntoElement for TextElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for TextElement {

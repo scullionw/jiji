@@ -2,7 +2,7 @@
 //! stack will do, the blockers in its way, and the action column that
 //! holds it.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, Corner, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, SharedString};
 use jiji_core::snapshot::RepoSnapshot;
 use jiji_forge::{LandSegmentStatus, MergeMethod, PublishStack, ReviewDecision};
 
@@ -770,7 +770,7 @@ impl PublishView {
                         }))
                     };
                     more = more.child(popover_layer(
-                        Corner::TopRight,
+                        Anchor::TopRight,
                         30.,
                         popover(cx).min_w(px(220.)).p(px(4.)).child(ship),
                         cx.listener(|this, _, _, cx| {

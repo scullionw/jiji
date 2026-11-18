@@ -331,7 +331,7 @@ impl WorkbenchView {
             return;
         }
         let offset = self.scroll.offset();
-        let limit = self.scroll.max_offset().height;
+        let limit = self.scroll.max_offset().y;
         let next = (offset.y - px(step)).clamp(-limit, px(0.));
         if next != offset.y {
             self.scroll.set_offset(point(offset.x, next));

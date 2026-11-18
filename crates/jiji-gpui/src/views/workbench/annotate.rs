@@ -9,8 +9,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, AnyElement, Context, FontWeight, ScrollWheelEvent,
-    SharedString, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, AnyElement, Context, FontWeight, ScrollEvent, SharedString,
+    UniformListScrollHandle, Window,
 };
 use jiji_core::snapshot::FileAnnotation;
 
@@ -288,7 +288,7 @@ impl WorkbenchView {
             .child(
                 div()
                     .min_w(px(40.))
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .font_family(t.mono.clone())
                     .text_size(px(TEXT_S))
                     .text_color(t.text2)
@@ -351,7 +351,7 @@ impl WorkbenchView {
                 // A sideways gesture is taken off the list before the list
                 // spends its drift on the rows.
                 let pan_first =
-                    wheel_first(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                    wheel_first(cx.listener(move |this, event: &ScrollEvent, _, cx| {
                         let (dx, _) = this.annotate.wheel.travel(event, LINE_H * 2.5);
                         if dx == 0. {
                             return;
@@ -371,7 +371,7 @@ impl WorkbenchView {
                             this.annotate_rows(range, cx)
                         }),
                     ))
-                    .track_scroll(self.annotate.scroll.clone())
+                    .track_scroll(&self.annotate.scroll)
                     .flex_1()
                     .min_h_0(),
                 );

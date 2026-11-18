@@ -55,6 +55,24 @@ pub enum Step {
     Quit,
 }
 
+impl Step {
+    /// Where the step leaves the scripted pointer, if it moves it.
+    fn pointer_after(&self) -> Option<(f32, f32)> {
+        match self {
+            Step::Click { at, .. } | Step::Scroll { at, .. } => Some(*at),
+            Step::Move(x, y) => Some((*x, *y)),
+            Step::Drag { to, .. } => Some(*to),
+            Step::Press(at, _) | Step::Hold(at, _) | Step::Release(at, _) => Some(*at),
+            Step::Key(_)
+            | Step::Type(_)
+            | Step::Wait(_)
+            | Step::Shot(_)
+            | Step::Resize(..)
+            | Step::Quit => None,
+        }
+    }
+}
+
 fn numbers<const N: usize>(op: &str, value: &str) -> Result<[f32; N], String> {
     let parsed: Result<Vec<f32>, _> = value.split(',').map(|n| n.trim().parse()).collect();
     parsed
@@ -276,7 +294,10 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
             }
         }
         Step::Key(key) => {
-            update(cx, &mut |window, cx| match Keystroke::parse(&key) {
+            update(cx, &mut |window, cx| match Keystroke::parse_with_os(
+                &key,
+                gpui::OperatingSystem::Mac,
+            ) {
                 Ok(keystroke) => {
                     window.dispatch_keystroke(keystroke, cx);
                 }
@@ -331,8 +352,19 @@ pub fn run(steps: Vec<Step>, window: AnyWindowHandle, cx: &mut App) {
         cx.background_executor()
             .timer(Duration::from_millis(900))
             .await;
+        let mut pointer = None;
         for step in steps {
+            let resized = matches!(step, Step::Resize(..));
+            pointer = step.pointer_after().or(pointer);
             run_step(step, window, cx).await;
+            // GPUI re-reads the real pointer whenever a window's bounds
+            // change, which would leave hover wherever the user's own
+            // pointer happens to rest. Put the scripted one back.
+            if let (true, Some((x, y))) = (resized, pointer) {
+                frame(cx).await;
+                frame(cx).await;
+                run_step(Step::Move(x, y), window, cx).await;
+            }
             cx.background_executor()
                 .timer(Duration::from_millis(120))
                 .await;

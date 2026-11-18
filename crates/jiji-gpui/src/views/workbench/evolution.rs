@@ -649,7 +649,7 @@ impl WorkbenchView {
                 div()
                     .id("evolution-op")
                     .min_w(px(40.))
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .tooltip(tooltip(format!(
                         "Recorded by operation {}: {op}",
                         focal.op_id.clone().unwrap_or_default()
@@ -687,7 +687,7 @@ impl WorkbenchView {
             caption = caption.child(
                 div()
                     .min_w(px(40.))
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .text_color(t.danger)
                     .child(truncated(error.clone())),
             );
@@ -700,7 +700,7 @@ impl WorkbenchView {
                     .child(
                         div()
                             .min_w(px(40.))
-                            .flex_shrink()
+                            .flex_shrink_1()
                             .text_color(t.text2)
                             .child(truncated(format!(
                                 "Files and description return to {}; descendants rebase. Undoable \

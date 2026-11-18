@@ -280,7 +280,7 @@ impl WorkbenchView {
                 }
             }),
         ))
-        .track_scroll(self.header.dest_scroll.clone())
+        .track_scroll(&self.header.dest_scroll)
         .h(px(height));
         frame.child(list).into_any_element()
     }

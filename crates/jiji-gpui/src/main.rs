@@ -16,8 +16,8 @@ mod ui;
 mod views;
 
 use gpui::{
-    point, prelude::*, px, size, App, Application, Bounds, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    point, prelude::*, px, size, App, Bounds, SharedString, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 
 use crate::app::AppModel;
@@ -81,7 +81,7 @@ fn main() {
     };
     let background = std::env::var("JIJI_BACKGROUND").as_deref() == Ok("1");
 
-    let application = Application::new().with_assets(ui::icon::Assets);
+    let application = gpui_platform::application().with_assets(ui::icon::Assets);
     // Folders arriving through Launch Services — the `jiji` launcher's
     // `open -b`, or a drop on the Dock icon.
     application.on_open_urls(|urls| {
@@ -148,7 +148,7 @@ fn main() {
         } else {
             cx.activate(true);
         }
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

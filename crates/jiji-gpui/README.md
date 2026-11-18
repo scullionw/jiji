@@ -12,6 +12,17 @@ Tauri app's build, lockfile and CI never see GPUI. The binary is
 directory (`~/Library/Application Support/com.lauf.jiji`), so recents, saved
 views, the licence and auto-land records carry over.
 
+## GPUI version
+
+`gpui` here is [`gpui-pre`](https://crates.io/crates/gpui-pre), a weekly
+crates.io snapshot of Zed's main branch: Zed has not published the `gpui`
+crate itself since 0.2.2 (October 2025). It tracks Zed's compiler too, so
+it wants a recent stable Rust. `Cargo.lock` holds the snapshot in use;
+`cargo update -p gpui-pre -p gpui-pre-platform` moves both to the newest.
+A snapshot may break API: fix what the compiler reports, then run the same
+scripted tour on the build from before and the build from after and
+compare the screenshots.
+
 ## Run
 
 ```sh
@@ -204,6 +215,10 @@ Things this code works around, so the next change does not rediscover them:
 - **A scroller hears the wheel before its ancestors do**, and spends a
   sideways swipe's vertical drift on its rows. An ancestor that pans
   listens in the capture phase (`ui::wheel_first`) and stops the event.
+- **A window re-reads the real pointer when its bounds change.** After a
+  resize or a move GPUI asks the OS where the pointer is, so hover follows
+  the user's own pointer rather than the last scripted one. A scripted
+  `resize` puts its pointer back afterwards (`script::run`).
 - **A scripted `scroll` is one precise delta with no touch phase** — the
   smooth-mouse case, not the trackpad one. Scroll down before scrolling
   sideways in a script; a sideways scroll fresh from launch only covers a

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Corner, Entity, FocusHandle, Focusable, FontWeight,
+    div, prelude::*, px, Anchor, AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight,
     Hsla, ScrollHandle, SharedString, Subscription, Window,
 };
 use jiji_core::snapshot::RepoSnapshot;
@@ -826,7 +826,7 @@ impl PublishView {
         );
         if self.connection.is_open() {
             connection = connection.child(popover_layer(
-                Corner::TopRight,
+                Anchor::TopRight,
                 30.,
                 self.render_connection(window, cx),
                 cx.listener(|this, _, _, cx| {
@@ -846,7 +846,7 @@ impl PublishView {
         .child(
             div()
                 .min_w(px(40.))
-                .flex_shrink()
+                .flex_shrink_1()
                 .font_family(t.mono.clone())
                 .text_size(px(TEXT_S))
                 .text_color(t.text3)
@@ -1054,7 +1054,7 @@ impl PublishView {
                     )
                     .child(
                         ref_label(None, job.head_bookmark.clone(), cx)
-                            .flex_shrink()
+                            .flex_shrink_1()
                             .min_w_0(),
                     )
                     .child(div().flex_1())
@@ -1129,7 +1129,7 @@ impl Render for PublishView {
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
             .on_action(cx.listener(|this, _: &FindStack, window, cx| {
                 if this.page == Page::Stacks {
-                    this.query.update(cx, |input, _| input.focus(window));
+                    this.query.update(cx, |input, cx| input.focus(window, cx));
                 }
             }))
             .child(self.render_page_bar(window, cx));

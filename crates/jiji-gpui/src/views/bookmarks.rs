@@ -122,9 +122,7 @@ impl BookmarksView {
         cx.spawn(async move |this, cx| {
             let mut failure = None;
             for step in steps {
-                let Ok(task) = app.update(cx, |model, cx| model.mutate(cx, step)) else {
-                    return;
-                };
+                let task = app.update(cx, |model, cx| model.mutate(cx, step));
                 if let Err(error) = task.await {
                     failure = Some(error.message);
                     break;
@@ -179,7 +177,7 @@ impl BookmarksView {
             cx.notify();
         } else if self.filter.read(cx).is_focused(window) {
             // Out of the filter, back to the list.
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         } else {
             cx.propagate();
         }
@@ -382,7 +380,7 @@ impl BookmarksView {
             .child(
                 div()
                     .min_w_0()
-                    .flex_shrink()
+                    .flex_shrink_1()
                     .font_family(t.mono.clone())
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(t.text1)
@@ -513,7 +511,7 @@ impl BookmarksView {
                         .child(
                             div()
                                 .min_w(px(40.))
-                                .flex_shrink()
+                                .flex_shrink_1()
                                 .text_size(px(TEXT_XS))
                                 .text_color(t.text2)
                                 .child(truncated(label)),
