@@ -6,21 +6,18 @@
 //! rest by name.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ForgeProvider {
     GitHub,
 }
 
 /// The forge-side identity of a repository, derived from one git remote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ForgeRepo {
     pub provider: ForgeProvider,
     /// Name of the git remote this was derived from (e.g. "origin").

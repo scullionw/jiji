@@ -1,10 +1,9 @@
 //! The GitHub API client.
 //!
 //! Deliberately synchronous (like jjpr's engine): no async runtime to host,
-//! so the same client serves Tauri commands (thread-pooled via
-//! `#[tauri::command(async)]` on sync fns), the future CLI, and the M5
-//! watch loop's background thread. Callers must not invoke it on the UI
-//! thread or inside an async task.
+//! so the same client serves the desktop app's background tasks, the CLI,
+//! and the auto-land loop's thread. Callers must not invoke it on the UI
+//! thread.
 
 use std::time::Duration;
 

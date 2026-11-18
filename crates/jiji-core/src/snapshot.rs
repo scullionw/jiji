@@ -1,21 +1,18 @@
 //! Immutable UI snapshot types.
 //!
 //! These are Jiji-owned DTOs, deliberately denormalized for rendering. They
-//! form the stable boundary between the frontend and whatever produces repo
-//! state, so the UI never consumes raw jj-lib objects. Regenerate the
-//! TypeScript bindings with `bun run bindings` after changing them.
+//! form the stable boundary between the interface and whatever produces
+//! repo state, so the UI never consumes raw jj-lib objects.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// Which slice of the repo a snapshot renders. `Workstreams` is the working
 /// default; the others are read-oriented lenses over more history. `Team`
 /// and `Recent` add commits on top of the default set; `Mine`, `Trunk`,
 /// `All`, and `Custom` replace it (keeping the working copy pinned so the
 /// "where am I" anchor never disappears).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum SnapshotView {
     /// Your mutable work on the immutable bases it sits on.
     Workstreams,
@@ -40,9 +37,8 @@ impl Default for SnapshotView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct RepoSnapshot {
     pub repo_path: String,
     pub repo_name: String,
@@ -74,9 +70,8 @@ pub struct RepoSnapshot {
     pub resolve_tool: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct WorkspaceSummary {
     pub name: String,
     pub is_default: bool,
@@ -91,9 +86,8 @@ pub struct WorkspaceSummary {
 
 /// One mutable line of work: an ordered chain of dependent changes,
 /// optionally published through a bookmark.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct WorkstreamSummary {
     pub id: String,
     pub title: String,
@@ -105,9 +99,8 @@ pub struct WorkstreamSummary {
     pub behind_trunk: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct GraphNode {
     /// Unique node id — what selection and every backend request use. The
     /// short change id (stable across rewrites) normally; when the change
@@ -147,18 +140,16 @@ pub struct GraphNode {
     pub is_divergent: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum NodeKind {
     WorkingCopy,
     Mutable,
     Immutable,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct BookmarkState {
     pub name: String,
     /// Change id the bookmark points at.
@@ -188,17 +179,15 @@ pub struct BookmarkState {
 }
 
 /// One configured git remote, as `git remote -v` would list it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct GitRemote {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum SyncState {
     Synced,
     Ahead,
@@ -210,9 +199,8 @@ pub enum SyncState {
     RemoteOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ConflictItem {
     pub id: String,
     pub kind: ConflictKind,
@@ -237,9 +225,8 @@ pub struct ConflictItem {
     pub workspace: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum ConflictKind {
     File,
     Bookmark,
@@ -249,9 +236,8 @@ pub enum ConflictKind {
 /// Which side of a 2-sided file conflict a take verb keeps — the CLI's
 /// built-in `:ours`/`:theirs` merge tools: "ours" is side #1 of the
 /// conflict, "theirs" side #2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum ConflictSide {
     Ours,
     Theirs,
@@ -259,9 +245,8 @@ pub enum ConflictSide {
 
 /// Per-change data too expensive to compute for every node in a snapshot.
 /// Fetched lazily when the UI inspects one change.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ChangeDetail {
     /// Change id this detail was computed for, echoed back from the request.
     pub id: String,
@@ -271,9 +256,8 @@ pub struct ChangeDetail {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ChangedFile {
     /// Repo-relative path, `/`-separated.
     pub path: String,
@@ -283,9 +267,8 @@ pub struct ChangedFile {
     pub has_conflict: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum FileStatus {
     Added,
     Modified,
@@ -297,9 +280,8 @@ pub enum FileStatus {
 /// The full content diff for one change, fetched lazily when the diff
 /// surface renders a selection. Heavier than `ChangeDetail`: every file's
 /// contents are materialized and diffed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ChangeDiff {
     /// Change id this diff was computed for, echoed back from the request.
     pub id: String,
@@ -314,9 +296,8 @@ pub struct ChangeDiff {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct FileDiff {
     /// Repo-relative path, `/`-separated.
     pub path: String,
@@ -331,9 +312,8 @@ pub struct FileDiff {
 /// sides are all text arrives as `conflict` — its merge structure rather
 /// than a parent-relative diff of jj's marker text; binary or oversized
 /// conflicts fall back to the marker-text pipeline like any other content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum FileDiffContent {
     /// Unified hunks ready to render. An empty hunk list is a contentless
     /// change (empty file added, or a mode-only change).
@@ -357,9 +337,7 @@ pub enum FileDiffContent {
     /// absent side (added or removed file).
     #[serde(rename_all = "camelCase")]
     Binary {
-        #[ts(type = "number | null")]
         old_size: Option<u64>,
-        #[ts(type = "number | null")]
         new_size: Option<u64>,
     },
     /// Either side exceeds the per-file size limit for diffing.
@@ -370,14 +348,12 @@ pub enum FileDiffContent {
 }
 
 /// One side of an image diff, ready for an `<img>` element.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ImageContent {
     /// MIME type inferred from this side's file extension.
     pub mime: String,
     /// This side's full byte size.
-    #[ts(type = "number")]
     pub size: u64,
     /// The image bytes as base64, sized for a `data:` URI; None when the
     /// side exceeds the inline cap and renders as metadata only.
@@ -385,9 +361,8 @@ pub struct ImageContent {
 }
 
 /// One unified hunk: a run of changed lines plus surrounding context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct DiffHunk {
     /// 1-based line number of the hunk's first line on the old side.
     pub old_start: u32,
@@ -400,9 +375,8 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
     /// The line's text (without its trailing newline) split into intraline
@@ -418,18 +392,16 @@ pub struct DiffLine {
     pub pair: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum DiffLineKind {
     Context,
     Removed,
     Added,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct DiffSegment {
     pub text: String,
     pub changed: bool,
@@ -437,9 +409,8 @@ pub struct DiffSegment {
 
 /// One block of a conflicted file's merge structure (`FileDiffContent::
 /// Conflict`), in file order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum ConflictSection {
     /// A run every side agrees on, rendered as context (all lines carry
     /// `Context` kind). Long runs are trimmed to diff context around the
@@ -456,9 +427,8 @@ pub enum ConflictSection {
 }
 
 /// One side of a conflict region, as its changes from the base.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ConflictSideDiff {
     /// The side's conflict label when the tree carries one (a commit
     /// description, "revert destination", …); None for plain "side #N".
@@ -470,9 +440,8 @@ pub struct ConflictSideDiff {
 
 /// One file's part in a split: either the whole file (the fast path) or a
 /// subset of its diff hunks. What the split panel sends per checked row.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SplitSelection {
     /// Repo-relative path, `/`-separated.
     pub path: String,
@@ -497,9 +466,8 @@ impl SplitSelection {
 /// Coordinates of one selected unified hunk, as the diff surface rendered
 /// it: 1-based start lines plus the per-side line counts (context lines
 /// included). A hunk that no longer matches these exactly is refused.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SplitHunk {
     pub old_start: u32,
     pub new_start: u32,
@@ -527,9 +495,8 @@ pub(crate) fn hunks_phrase(n: usize) -> String {
 /// One history search: which changes added or removed a string (pickaxe,
 /// `jj log -S` semantics), or touched a file whose path contains it.
 /// Fetched by the search surface; never part of a snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct HistorySearch {
     /// The query this search answered, echoed back for stale-response
     /// matching.
@@ -543,9 +510,8 @@ pub struct HistorySearch {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SearchHit {
     /// Node id, addressed like `GraphNode::id`: the short change id, or the
     /// short commit id for a divergent change or a hidden commit.
@@ -563,9 +529,8 @@ pub struct SearchHit {
     pub more_files: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SearchFileHit {
     /// Repo-relative path, `/`-separated.
     pub path: String,
@@ -582,9 +547,8 @@ pub struct SearchFileHit {
 /// One change's evolution (`jj evolog`): the versions its commit was
 /// rewritten through, newest first. Fetched by the evolution panel; never
 /// part of a snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ChangeEvolog {
     /// The change id this evolog answers, echoed back for stale-response
     /// matching.
@@ -601,9 +565,8 @@ pub struct ChangeEvolog {
 /// One version of a change. Versions are addressed by commit id — the
 /// change id names them all — and stay inspectable after being rewritten
 /// away (a hidden commit id still resolves for diffs and restores).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct EvologEntry {
     /// Short commit id of this version.
     pub commit_id: String,
@@ -623,9 +586,8 @@ pub struct EvologEntry {
 /// One file annotated line by line (`jj file annotate`): which change
 /// introduced each line of the file as it stands in one change's tree.
 /// Fetched by the annotate pane; never part of a snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct FileAnnotation {
     /// The change id this annotation answers, echoed back for
     /// stale-response matching.
@@ -643,9 +605,8 @@ pub struct FileAnnotation {
 }
 
 /// A change some annotated line came from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AnnotateOrigin {
     /// Node id addressed like `GraphNode::id`: the short change id, or the
     /// short commit id for a divergent change or a hidden commit. What a
@@ -664,9 +625,8 @@ pub struct AnnotateOrigin {
 }
 
 /// One line of an annotated file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AnnotateLine {
     /// Index into `FileAnnotation::origins` of the change that introduced
     /// this line.
@@ -677,9 +637,8 @@ pub struct AnnotateLine {
 
 /// What a mutation did, surfaced as the operation breadcrumb after the
 /// snapshot refreshes. Every write action returns one.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct MutationOutcome {
     /// Short hex id of the jj operation this mutation recorded; `None` when
     /// the request was a no-op and nothing changed.
@@ -692,9 +651,8 @@ pub struct MutationOutcome {
     pub target_change: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct OperationItem {
     pub id: String,
     pub description: String,
@@ -714,18 +672,16 @@ pub struct OperationItem {
     pub more_effects: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct OpEffect {
     pub kind: OpEffectKind,
     /// E.g. "main moved", "main@origin updated", "working copy moved".
     pub label: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum OpEffectKind {
     Bookmark,
     RemoteBookmark,

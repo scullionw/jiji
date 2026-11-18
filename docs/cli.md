@@ -3,7 +3,7 @@
 The standalone `jiji` executable and the desktop app share `jiji-core` and
 `jiji-forge`. Stack discovery, jjpr branch matching, PR segmentation, status
 classification, `trunk()` configuration, publishing, and landing use the same
-Rust implementation. The CLI runs without a desktop window or webview.
+Rust implementation. The CLI runs without a desktop window.
 
 ## Install and run
 
@@ -16,8 +16,6 @@ cargo install --path crates/jiji-cli --locked
 For development:
 
 ```sh
-bun run cli --help
-# equivalent to:
 cargo run -p jiji-cli -- --help
 ```
 

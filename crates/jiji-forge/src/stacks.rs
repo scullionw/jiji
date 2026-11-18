@@ -5,13 +5,11 @@ use std::collections::{HashMap, HashSet};
 
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot};
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::{ChecksRollup, PrSummary, RepoPrState, ReviewDecision, SubmitHead};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct StackSegment {
     pub bookmark: Option<String>,
     pub title: String,
@@ -20,9 +18,8 @@ pub struct StackSegment {
     pub pr: Option<PrSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum StackStatus {
     Local,
     Conflicts,
@@ -47,9 +44,8 @@ impl StackStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct PublishStack {
     pub key: String,
     pub title: String,

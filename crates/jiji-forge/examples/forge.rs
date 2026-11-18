@@ -30,13 +30,13 @@
 //! re-runs the failed Actions runs on a commit.
 //!
 //! `watch` is the real thing — the desktop app's auto-land job driven
-//! headless (the future CLI entry point the spec asks the engine to
-//! support): it supervises the stack under the bookmark, merging and
-//! reconciling rounds as GitHub allows, mutating the repo and the PRs
-//! exactly like the app's queued job. Press Enter to stop it. With
+//! headless, as `jiji watch` does: it supervises the stack under the
+//! bookmark, merging and reconciling rounds as GitHub allows, mutating the
+//! repo and the PRs exactly like the app's queued job. Press Enter to stop
+//! it. With
 //! `--state-file` it persists the same job record the app writes — a
 //! stopped or killed watch resumes its story (rounds, landed PRs) on the
-//! next run, the persistence slice's CLI proof.
+//! next run.
 
 use jiji_forge::{
     detect_github_repo, no_github_remote, plan_land, plan_submit, resolve_token, ForgeAuth,

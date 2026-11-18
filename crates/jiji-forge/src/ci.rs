@@ -10,7 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 use crate::github::GitHubClient;
@@ -43,9 +42,8 @@ impl WorkflowRun {
 }
 
 /// What one re-run request accomplished, for the UI to tell straight.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct CiRerunReport {
     /// Workflow runs whose failed jobs were sent back to work.
     pub rerun: Vec<String>,

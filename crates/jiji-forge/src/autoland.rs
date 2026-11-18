@@ -1,14 +1,12 @@
 //! The auto-land job engine: jjpr's `watch` loop as a supervised state
-//! machine over the land engine's plan → execute round (see the jjpr
-//! inspiration note). A queued job keeps re-deriving the landing plan from
-//! fresh local and GitHub facts, runs a round when the plan has actions,
-//! and waits when it does not — so the M4 land flow's deliberate
-//! one-merge-per-run becomes the automated continue the product spec's
-//! auto-land workflow describes.
+//! machine over the land engine's plan → execute round. A queued job keeps
+//! re-deriving the landing plan from fresh local and GitHub facts, runs a
+//! round when the plan has actions, and waits when it does not — so the
+//! land flow's deliberate one-merge-per-run becomes an automated continue.
 //!
 //! The engine stays headless and synchronous like the rest of the crate:
-//! the host owns the thread (the Tauri app spawns one per job; a future
-//! CLI can drive the same loop from `main`), a [`StopSignal`] makes the
+//! the host owns the thread (the desktop app spawns one per job; `jiji
+//! watch` drives the same loop from `main`), a [`StopSignal`] makes the
 //! between-round sleep interruptible, and every phase change goes out
 //! through a plain callback so any host can render it. jjpr's supervision
 //! lessons are kept: a consecutive-error budget absorbs transient forge
@@ -19,20 +17,18 @@
 //! derive — each round is exactly the plan → execute the manual Land
 //! button runs, including its just-in-time re-checks.
 //!
-//! Job state also persists (the M5 persistence slice): [`AutoLandRecord`]
-//! is the one-job record a host saves on every publish and loads at the
-//! next launch, so a waiting or parked job survives a restart as cleanly
+//! Job state also persists: [`AutoLandRecord`] is one job's record, and a
+//! host saves its records on every publish and loads them at the next
+//! launch, so a waiting or parked job survives a restart as cleanly
 //! resumable status. The format and file IO live here — plain JSON
-//! written atomically via a sibling temp file and rename — so a future
-//! CLI persists the exact same record; the host owns only where the file
-//! lives and when to save. Deliberately no database crate: the concrete
-//! requirement is one small human-debuggable record written at most once
-//! per poll, which a JSON file meets outright (revisit if multi-job
-//! bookkeeping or job history outgrows it).
+//! written atomically via a sibling temp file and rename — so the app and
+//! the CLI persist the exact same records; the host owns only where the
+//! file lives and when to save. Deliberately no database crate: the
+//! requirement is a small human-debuggable file written at most once per
+//! poll, which JSON meets outright.
 //!
-//! Deliberately deferred (later M5 slices): more than one job at a time,
-//! and queue-position/ETA supervision beyond polling until GitHub's
-//! automation finishes.
+//! Deliberately deferred: queue-position/ETA supervision beyond polling
+//! until GitHub's automation finishes.
 
 use std::io;
 use std::path::Path;
@@ -40,7 +36,6 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 use crate::land::{
@@ -144,9 +139,8 @@ impl Default for AutoLandConfig {
 }
 
 /// Where the job stands right now.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum AutoLandPhase {
     /// Between rounds, watching for conditions to change. `attention`
     /// distinguishes "GitHub clears this by itself" (checks running, a
@@ -183,9 +177,8 @@ impl AutoLandPhase {
 
 /// A PR the job saw land — merged by a round or recognized as merged on
 /// GitHub (auto-merge, the queue, or someone clicking the button).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AutoLandMerged {
     pub number: u64,
     pub url: String,
@@ -194,9 +187,8 @@ pub struct AutoLandMerged {
 
 /// The job as a host renders it: published on every phase change and
 /// answered whole when a surface reconnects.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AutoLandState {
     pub head_bookmark: String,
     /// The options every round lands with — the method and bypass chosen
@@ -261,9 +253,8 @@ const AUTOLAND_RECORDS_VERSION: u32 = 2;
 /// interrupted story. Saved on every publish and loaded at the next
 /// launch; a record only renders while its repo is open, which is why the
 /// repo path rides along.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AutoLandRecord {
     /// The repo the job was queued in (`RepoSnapshot::repo_path`).
     pub repo_path: String,
@@ -306,9 +297,8 @@ struct AutoLandRecordV1 {
 /// survived from an earlier session (or whose thread died) — the UI's
 /// "interrupted — resume?" state is a non-terminal record that is not
 /// live.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct AutoLandStatus {
     pub record: AutoLandRecord,
     pub live: bool,

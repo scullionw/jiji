@@ -99,7 +99,7 @@ impl<'a> RevsetBlockingExt<'a> for Box<dyn revset::Revset + 'a> {
 }
 
 /// Safety valve for pathological repos: mutable history this deep is almost
-/// certainly a misconfigured trunk, and the M0 UI cannot render it anyway.
+/// certainly a misconfigured trunk, and a graph that long is unusable anyway.
 const MAX_MUTABLE_NODES: usize = 500;
 /// Commits a view lens (Team, All, a custom revset, …) may add to a
 /// snapshot. Past this the snapshot reports itself truncated; the graph is
@@ -127,8 +127,8 @@ const MAX_DIFF_TOTAL_LINES: isize = 20_000;
 /// image still gets an entry with its metadata, just no preview.
 const MAX_IMAGE_INLINE_BYTES: usize = 8 << 20;
 /// Total inlined image bytes per change across all files — the image
-/// counterpart of `MAX_DIFF_TOTAL_LINES`, keeping one response (and the
-/// frontend's diff LRU) bounded when a change carries many images. Later
+/// counterpart of `MAX_DIFF_TOTAL_LINES`, keeping one response (and any
+/// cache holding it) bounded when a change carries many images. Later
 /// images keep their metadata and drop the preview.
 const MAX_IMAGE_TOTAL_BYTES: usize = 16 << 20;
 /// Unified-diff context lines, matching jj's default.
@@ -452,7 +452,8 @@ impl RepoBackend for JjBackend {
         let (write, mut workspace, repo) = self.load_repo_for_write(path)?;
         // A stale workspace cannot sync (mutations keep refusing it), but
         // it must still open read-only — a viewer that errors out is worse
-        // than a snapshot that lags the disk. M3 owns the guided recovery.
+        // than a snapshot that lags the disk. `update_stale_workspace` is
+        // the recovery.
         let repo = match sync_workspace(&mut workspace, repo.clone()) {
             Ok(repo) => repo,
             Err(BackendError::StaleWorkspace(reason)) => {
@@ -4523,8 +4524,8 @@ fn diff_trees(
     })
 }
 
-/// MIME type for paths whose extension the webview renders inline as an
-/// image; None for everything else.
+/// MIME type for paths whose extension marks an image the diff shows
+/// inline; None for everything else.
 fn image_mime(path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(path).extension()?.to_str()?;
     match ext.to_ascii_lowercase().as_str() {
@@ -10349,7 +10350,7 @@ mod tests {
         // The stale state cleared, and mutations work again. The rescued
         // stale copy is a visible sibling of the same change, so the change
         // is divergent and the outcome follows the checked-out copy by
-        // commit id — slice 8's addressing rule.
+        // commit id, the way a divergent copy is always addressed.
         let after = backend.open(dir.path()).unwrap();
         assert_eq!(outcome.target_change.as_deref(), Some(after.working_copy.as_str()));
         assert!(!after.workspaces.iter().find(|w| w.is_current).unwrap().is_stale);
@@ -10908,7 +10909,7 @@ mod tests {
 
         // A conflicted bookmark refuses before anything runs. The two
         // concurrent moves need *sibling* targets — ancestor/descendant
-        // adds fast-forward instead of conflicting (the slice-2 lesson).
+        // adds fast-forward instead of conflicting.
         backend.new_change(dir.path(), &first).unwrap();
         let sibling = backend.open(dir.path()).unwrap().working_copy;
         let settings = test_settings();

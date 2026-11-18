@@ -1,4 +1,4 @@
-//! Deterministic mock snapshot used while the jj-lib backend is pending.
+//! A deterministic mock repository, for demos, screenshots and tests.
 //!
 //! The data is intentionally shaped like a real session: one active stack
 //! with a working copy on top, a compact sibling workstream, trunk context,
@@ -2386,7 +2386,7 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         conflicts: mock_conflicts(),
         operations,
         // The fabricated machine has Sublime Merge installed, so every
-        // Resolve affordance renders (the stub/harness replay the mutation).
+        // Resolve affordance renders.
         resolve_tool: Some("smerge".into()),
     }
 }
@@ -2856,7 +2856,7 @@ fn conflict_list_content() -> FileDiffContent {
 }
 
 // Tiny real PNGs (grain textures, 48x48 and 64x64) so the mock repo
-// exercises the image-diff surface with data the webview can render.
+// exercises the image-diff surface with images that really decode.
 const GRAIN_OLD_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAHYklEQVR42o3aW67lNgxEUc0s\
      Sb/fncx/MAnKwDrYEYKgP4zja8sURRaLpHTPuze//f3966fn+vTh7ev66+e35/r25ePr+vj+\
      zev688fX5/r6+cPr+vDuj9f18/uX5/ry6f3rev/299f149vn5/r88d3rmi6uX9Xp7MUm3Iv9\

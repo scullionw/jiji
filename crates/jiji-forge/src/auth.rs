@@ -12,15 +12,13 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 use crate::remote::ForgeRepo;
 
 /// Where the active token came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum TokenSource {
     /// Stored by Jiji in the system keychain (the in-app login).
     Keychain,
@@ -32,9 +30,8 @@ pub enum TokenSource {
 
 /// Authentication state for the UI: which token would be used, and the
 /// login it verified as (when a verification has happened this session).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ForgeAuth {
     /// `None` — no token anywhere; the UI offers connecting.
     pub source: Option<TokenSource>,
@@ -44,9 +41,8 @@ pub struct ForgeAuth {
 
 /// Everything the Publish surface needs to render the forge connection:
 /// the detected repository plus authentication state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ForgeStatus {
     /// GitHub repo behind the open jj repo's preferred remote, when one is.
     pub repo: Option<ForgeRepo>,
@@ -61,7 +57,7 @@ pub struct ResolvedToken {
 }
 
 /// Persistent token storage. One implementation is the real keychain; tests
-/// and the harness use the in-memory store.
+/// use the in-memory store.
 pub trait TokenStore: Send + Sync {
     fn get(&self) -> Result<Option<String>, ForgeError>;
     fn set(&self, token: &str) -> Result<(), ForgeError>;

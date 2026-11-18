@@ -12,10 +12,14 @@ jobs:
 
     runs-on: macos-latest
 
+    env:
+      APP: target/release/bundle/Jiji.app
+      DMG: dist/Jiji_darwin_universal.dmg
+      ARCHIVE: dist/Jiji_darwin_universal.app.tar.gz
+      NOTES: dist/notes.md
+
     steps:
       - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -23,63 +27,108 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
 
-      - name: install frontend dependencies
-        run: bun install --frozen-lockfile
-
       - name: check tag matches app version
         run: |
-          APP_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
-          TAG_VERSION="${GITHUB_REF_NAME#app-v}"
-          test "$APP_VERSION" = "$TAG_VERSION"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "$VERSION" = "${GITHUB_REF_NAME#app-v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dist
 
       - name: release notes from the changelog
         run: |
-          VERSION="${GITHUB_REF_NAME#app-v}"
           awk -v heading="## $VERSION" '
             index($0, heading) == 1 { found = 1; next }
             found && /^## / { exit }
             found { print }
-          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          ' CHANGELOG.md > "$NOTES"
           # A tag without its own changelog section is a release mistake.
-          test -s "$RUNNER_TEMP/notes.md"
+          test -s "$NOTES"
           {
-            echo "RELEASE_NOTES<<__RELEASE_NOTES__"
-            cat "$RUNNER_TEMP/notes.md"
             echo
             echo "Download the DMG below: a universal build, signed and notarized. Existing installs update in place."
-            echo "__RELEASE_NOTES__"
-          } >> "$GITHUB_ENV"
+          } >> "$NOTES"
 
-      - name: prepare App Store Connect key
+      - name: import the signing certificate
         env:
-          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/private_keys"
-          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
-          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
-
-      - uses: tauri-apps/tauri-action@v0.6.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm "$RUNNER_TEMP/certificate.p12"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" |
+            sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          test -n "$IDENTITY"
+          echo "JIJI_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
 
+      - name: build and sign Jiji.app
+        run: JIJI_UNIVERSAL=1 scripts/bundle.sh
+
+      - name: notarize the app, then the DMG that carries it
+        env:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY"
+          # Stapling is the check: it fails unless Apple accepted the upload.
+          notarize() {
+            xcrun notarytool submit "$1" --wait \
+              --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER"
+          }
 
-        with:
-          tauriScript: bun tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: "Jiji v__VERSION__"
-          releaseBody: ${{ env.RELEASE_NOTES }}
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          assetNamePattern: "[name]_[platform]_[arch][ext]"
-          args: "--target universal-apple-darwin --bundles app,dmg"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/Jiji.zip"
+          notarize "$RUNNER_TEMP/Jiji.zip"
+          xcrun stapler staple "$APP"
+
+          STAGE="$RUNNER_TEMP/dmg"
+          mkdir -p "$STAGE"
+          ditto "$APP" "$STAGE/Jiji.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname Jiji -srcfolder "$STAGE" -format UDZO "$DMG"
+          codesign --force --timestamp --sign "$JIJI_SIGN_IDENTITY" "$DMG"
+          notarize "$DMG"
+          xcrun stapler staple "$DMG"
+
+      # What installed copies download: the stapled bundle as a tarball,
+      # signed with the updater key, and the manifest that names it. The
+      # key is a minisign key in the Tauri updater's wrapping (the first
+      # releases shipped with that updater, and every install checks
+      # against its public half), so Tauri's signer is the tool that reads
+      # it. The version is exact because nothing else here locks it.
+      - name: sign the updater archive and write its manifest
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$ARCHIVE" \
+            -C "$(dirname "$APP")" Jiji.app
+          npx --yes @tauri-apps/cli@2.10.1 signer sign "$ARCHIVE"
+          jq -n \
+            --arg version "$VERSION" \
+            --rawfile notes "$NOTES" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$ARCHIVE.sig")" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$(basename "$ARCHIVE")" \
+            '{ version: $version, notes: $notes, pub_date: $pub_date,
+               platforms: { "darwin-aarch64": { signature: $signature, url: $url },
+                            "darwin-x86_64":  { signature: $signature, url: $url } } }' \
+            > dist/latest.json
+
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "Jiji v$VERSION" --notes-file "$NOTES" \
+            "$DMG" "$ARCHIVE" "$ARCHIVE.sig" dist/latest.json

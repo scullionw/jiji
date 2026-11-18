@@ -1,0 +1,57 @@
+[package]
+name = "jiji-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Jiji: a desktop workbench for Jujutsu repositories."
+
+[features]
+# Scripted runs with nothing on screen (JIJI_HEADLESS=1) and their
+# screenshots: GPUI's offscreen renderer and frame stepping sit behind its
+# test-support feature. Never in a shipping build.
+headless = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+jiji-core = { path = "../jiji-core" }
+jiji-forge = { path = "../jiji-forge" }
+jiji-cli = { path = "../jiji-cli" }
+
+# gpui-pre is a weekly crates.io snapshot of Zed's main branch (the official
+# `gpui` crate has not been published since 0.2.2, October 2025). The library
+# names stay `gpui` and `gpui_platform`. Snapshots can break API from one to
+# the next; Cargo.lock holds the one in use until `cargo update` moves it.
+gpui = { package = "gpui-pre", version = "0.3.13" }
+# font-kit: the macOS glyph rasterizer; without it text lays out but never
+# draws. runtime_shaders: compile the Metal shaders at startup instead of at
+# build time, so building needs no Xcode Metal Toolchain component.
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.13", features = ["font-kit", "runtime_shaders"] }
+
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+log.workspace = true
+minisign-verify = "0.2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+unicode-segmentation = "1"
+
+tree-sitter = "0.27"
+tree-sitter-highlight = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-css = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-md = "0.5"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-svelte-ng = "1.0"
+
+[dev-dependencies]
+# Tests that drive the model or a window run on GPUI's test context: the
+# app with a deterministic scheduler and windows that exist only in memory.
+gpui = { package = "gpui-pre", version = "0.3.13", features = ["test-support"] }

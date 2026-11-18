@@ -1,16 +1,15 @@
-//! Ship directly to trunk: the spec's "Ship Now" workflow as the same
-//! plan → confirm → execute shape as submit and land. Shipping moves the
-//! trunk bookmark to a stack's head and pushes it — the PR-less way to
-//! land work when repo policy allows pushing trunk.
+//! Ship directly to trunk, in the same plan → confirm → execute shape as
+//! submit and land. Shipping moves the trunk bookmark to a stack's head and
+//! pushes it — the PR-less way to land work when repo policy allows pushing
+//! trunk.
 //!
-//! The shape mirrors the spec's ship flow exactly: the host fetches the
-//! latest trunk *before* planning (so the plan previews against current
-//! remote state and says whether a rebase is needed), and the push's
-//! force-with-lease expectation is the trunk-moved-again guard — a remote
-//! moved between the plan's fetch and the push refuses cleanly, nothing
-//! is overwritten, and re-running Ship (fetch → re-plan → rebase → push)
-//! *is* the retry path. Like submit, an already-shipped stack plans zero
-//! actions instead of failing.
+//! The host fetches the latest trunk *before* planning (so the plan
+//! previews against current remote state and says whether a rebase is
+//! needed), and the push's force-with-lease expectation is the
+//! trunk-moved-again guard — a remote moved between the plan's fetch and
+//! the push refuses cleanly, nothing is overwritten, and re-running Ship
+//! (fetch → re-plan → rebase → push) *is* the retry path. Like submit, an
+//! already-shipped stack plans zero actions instead of failing.
 //!
 //! Deliberately not asked: whether GitHub's branch protection allows the
 //! push. There is no reliable read of push permission for the viewer
@@ -23,7 +22,6 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SyncState};
 use jiji_core::BackendError;
@@ -33,9 +31,8 @@ use crate::pr::RepoPrState;
 use crate::submit::SubmitStepStatus;
 
 /// One shipping action, in execution order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum ShipAction {
     /// The stack sits on an older trunk: rebase it (the root and all its
     /// descendants) onto the fetched trunk first, so what ships is what
@@ -60,9 +57,8 @@ pub enum ShipAction {
 }
 
 /// What shipping a stack to trunk will do, derived before anything runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ShipPlan {
     /// The stack head being shipped (a snapshot node id).
     pub head_change: String,
@@ -80,9 +76,8 @@ pub struct ShipPlan {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ShipStep {
     pub action: ShipAction,
     pub status: SubmitStepStatus,
@@ -90,9 +85,8 @@ pub struct ShipStep {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct ShipOutcome {
     pub steps: Vec<ShipStep>,
     pub failed: bool,

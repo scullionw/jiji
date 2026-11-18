@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/jiji-core", "crates/jiji-forge", "crates/jiji-cli", "src-tauri"]
+members = ["crates/jiji-core", "crates/jiji-forge", "crates/jiji-cli", "crates/jiji-desktop"]
 resolver = "2"
 
 [workspace.package]
@@ -15,8 +15,10 @@ authors = ["lauf"]
 [profile.dev.package."*"]
 opt-level = 2
 
+[profile.release]
+debug = "line-tables-only"
+
 [workspace.dependencies]
-anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
@@ -24,7 +26,6 @@ futures = "0.3"
 # Only for jj-lib APIs that take gix types (tests pick an object hash);
 # pinned to the gix jj-lib builds against so no second copy compiles.
 gix = { version = "0.87.1", default-features = false }
-insta = { version = "1", features = ["json"] }
 jj-lib = "0.45.1"
 keyring = "4"
 log = "0.4"
@@ -34,24 +35,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
-# macos-private-api: lets wry disable WKWebView's own (opaque white)
-# background so live-resize exposes the NSWindow color instead of a white
-# flash. Not Mac App Store safe (drawsBackground KVC); we ship via GitHub.
-tauri = { version = "2", features = ["macos-private-api"] }
-tauri-build = { version = "2", features = [] }
-tauri-plugin-clipboard-manager = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-log = "2"
-tauri-plugin-opener = "2"
-tauri-plugin-process = "2"
-tauri-plugin-shell = "2"
-tauri-plugin-store = "2"
-tauri-plugin-updater = "2"
-tauri-plugin-window-state = "2"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 url = "2"
 whoami = "1"

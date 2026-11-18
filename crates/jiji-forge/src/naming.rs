@@ -1,8 +1,7 @@
 //! Branch-name derivation for unbookmarked stack heads: publishing a
 //! stack whose head carries no bookmark derives the branch name from the
 //! work itself, so inventing a bookmark by hand stops being a required
-//! step of the publish flow (the spec's "sensible defaults based on
-//! commit description").
+//! step of the publish flow.
 //!
 //! The rules are Jiji-owned. jjpr — the forge-engine inspiration — was
 //! checked for derivation rules to borrow (the local source at v0.23.0,

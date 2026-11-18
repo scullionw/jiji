@@ -189,12 +189,6 @@ pub struct TextPlan {
     pub warnings: Vec<TextWarning>,
 }
 
-impl TextPlan {
-    pub fn has_write(&self) -> bool {
-        self.title.is_some() || self.body.is_some()
-    }
-}
-
 /// Decide what to do with an existing PR's title and body given the
 /// commit-derived expectations. Pure — the caller supplies the on-GitHub
 /// text and applies the answer.

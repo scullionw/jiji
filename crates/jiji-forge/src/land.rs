@@ -1,7 +1,7 @@
 //! The land engine: recognize what already merged, merge the bottom PR
 //! when it is ready, then reconcile the local stack — jjpr's bottom-up
 //! merge → fetch → reconcile loop as an explicit plan → confirm → execute
-//! flow (see the jjpr inspiration note).
+//! flow.
 //!
 //! The shape mirrors [`crate::submit`]: `plan_land` derives everything the
 //! run will do before anything runs — the merge (or the hand-off to
@@ -18,10 +18,10 @@
 //! merges and the stack above rebases, the next PR's checks are freshly
 //! re-running, so a second merge in the same run would almost always be
 //! against stale CI. Re-running Land *is* the continue flow — the same
-//! idempotence rule as re-running submit — and the M5 watch loop is that
+//! idempotence rule as re-running submit — and [`crate::autoland`] is that
 //! re-run automated. Where the repo offers landing automation (auto-merge,
 //! a merge queue), the plan prefers enabling and supervising it over
-//! driving the merge locally, per the product spec's background-jobs note.
+//! driving the merge locally.
 //!
 //! The user steers a run through [`LandOptions`]: a merge method to
 //! insist on (the default picks squash, then rebase, then a merge
@@ -43,7 +43,6 @@ use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SyncState};
 use jiji_core::BackendError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 use crate::pr::{ChecksRollup, PrState, PrSummary, RepoPrState, ReviewDecision};
@@ -53,9 +52,8 @@ use crate::submit::{stack_segments, SubmitStepStatus};
 /// How a PR merges into its base. GitHub's three; when several are allowed
 /// the plan prefers squash (jjpr's default and the stacked-PR convention),
 /// then rebase, then a merge commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum MergeMethod {
     Squash,
     Rebase,
@@ -103,9 +101,8 @@ fn default_merge_method() -> MergeMethod {
 /// block. The options ride on the plan and on an auto-land job's record,
 /// so every re-derivation and just-in-time re-check judges by the same
 /// rules the user confirmed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandOptions {
     #[serde(default)]
     pub method: Option<MergeMethod>,
@@ -269,9 +266,8 @@ pub fn parse_pr_land_state(data: &Value, number: u64) -> Result<PrLandState, For
 }
 
 /// Where a segment stands in the landing story.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum LandSegmentStatus {
     /// GitHub already merged this segment's PR; this run reconciles it.
     #[serde(rename_all = "camelCase")]
@@ -286,9 +282,8 @@ pub enum LandSegmentStatus {
     Stacked,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandSegment {
     pub bookmark: String,
     /// Change ids in the segment, bottom-first.
@@ -299,9 +294,8 @@ pub struct LandSegment {
 }
 
 /// One landing action, in execution order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum LandAction {
     /// Mark a draft PR ready for review — a draft cannot merge, enqueue,
     /// or arm auto-merge, and landing it means publishing it.
@@ -398,9 +392,8 @@ pub enum LandAction {
 /// mergeability) — what an auto-land job watches through quietly — and
 /// false when the user has to act first (a draft, requested changes,
 /// failing checks, an unpublished stack).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandBlocker {
     pub message: String,
     pub wait: bool,
@@ -423,9 +416,8 @@ impl LandBlocker {
 }
 
 /// What landing a stack will do this run, derived before anything runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandPlan {
     pub head_bookmark: String,
     pub remote: String,
@@ -446,9 +438,8 @@ pub struct LandPlan {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandStep {
     pub action: LandAction,
     pub status: SubmitStepStatus,
@@ -456,9 +447,8 @@ pub struct LandStep {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct LandOutcome {
     pub steps: Vec<LandStep>,
     pub failed: bool,

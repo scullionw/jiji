@@ -1,28 +1,33 @@
-# Releasing Jiji For macOS
+# Releasing Jiji for macOS
 
-Jiji ships outside the Mac App Store through GitHub Releases. The release workflow builds a macOS DMG for users and updater artifacts for Tauri's updater.
+Jiji ships outside the Mac App Store through GitHub Releases. Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`, which builds a universal `Jiji.app`, signs and notarizes it, and publishes:
 
-## Preflight
+| Asset | |
+|---|---|
+| `Jiji_darwin_universal.dmg` | The download. `https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_universal.dmg` always serves the newest; the README and the website link to it. |
+| `Jiji_darwin_universal.app.tar.gz` and `.sig` | What an installed copy downloads to update itself, and its signature. |
+| `latest.json` | The updater's manifest: the version, the notes, and where the archive is. |
 
-Run:
+The app binary is `jiji-desktop`, and it embeds the `jiji` command line from `crates/jiji-cli`: the `jiji` entry point the app installs forwards to it, so the DMG carries the CLI without a second executable.
+
+## Release flow
+
+1. Set the version in `Cargo.toml` (`[workspace.package]`); every crate inherits it.
+2. Give the version its own `## <version> - <date>` section in `CHANGELOG.md`. The workflow publishes that section as the release notes (and the notes the updater shows), and fails a tag that has none.
+3. Verify, commit, tag and push:
 
 ```bash
-bun run release:preflight
+cargo test --workspace
+scripts/bundle.sh && open target/release/bundle/Jiji.app
+
+git commit -am "release 0.5.0"
+git tag app-v0.5.0
+git push origin HEAD app-v0.5.0
 ```
 
-The preflight checks version sync, updater configuration, required release files, GitHub secret names, and whether the GitHub repo is usable as a public release source.
+The workflow refuses a tag that does not match the workspace version.
 
-The desktop executable is `jiji-desktop`; it embeds the same command-line
-implementation as the standalone `jiji` binary from `crates/jiji-cli`. This
-keeps Cargo workspace builds from overwriting one executable with the other.
-The app-installed `jiji` entry point forwards commands to the embedded CLI,
-so the existing app/DMG release includes the command-line tools without a
-separate sidecar. Check `cargo run -p jiji-cli -- --help` and
-`target/debug/jiji-desktop --help` when validating CLI packaging locally.
-
-## Required GitHub Secrets
-
-The macOS release workflow expects:
+## Secrets
 
 ```txt
 APPLE_CERTIFICATE
@@ -34,41 +39,6 @@ TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 ```
 
-`APPLE_CERTIFICATE` must be a base64-encoded Developer ID Application `.p12`. `APPLE_CERTIFICATE_PASSWORD` is the password used when exporting that `.p12`.
+`APPLE_CERTIFICATE` is a base64-encoded Developer ID Application `.p12`, and `APPLE_CERTIFICATE_PASSWORD` the password it was exported with. The three `APPLE_API_*` secrets are an App Store Connect API key, for notarization.
 
-The updater private key and password are local maintainer secrets. The matching public key is committed in `src-tauri/tauri.conf.json`.
-
-## Release Flow
-
-Update versions together:
-
-```txt
-package.json
-Cargo.toml
-src-tauri/tauri.conf.json
-```
-
-Give the version its own `## <version> - <date>` section in `CHANGELOG.md`.
-The workflow publishes that section as the GitHub release notes (and the
-updater's notes), and fails a tag that has none.
-
-Then verify, commit, tag, and push:
-
-```bash
-bun run release:preflight
-bun run check
-bun run test
-cargo test --workspace
-
-git add .
-git commit -m "release 0.1.1"
-git tag app-v0.1.1
-git push origin HEAD
-git push origin app-v0.1.1
-```
-
-Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`. The workflow uses `--bundles app,dmg`; the `app` bundle is required so Tauri emits updater artifacts and signatures, and the `dmg` bundle is the user-facing download.
-
-The DMG is published as `Jiji_darwin_universal.dmg`, so
-`https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_universal.dmg`
-always serves the newest release; the README and the website link to it.
+The `TAURI_SIGNING_*` pair is the updater key. Jiji's first releases were built with Tauri, and every installed copy verifies an update against that key's public half, so the key and its format stay: it is a minisign key in the Tauri updater's wrapping, the workflow signs with Tauri's signer, and `latest.json` and the archive keep the layout that updater reads. The public key is `PUBKEY` in `crates/jiji-desktop/src/host/update.rs`. Losing the private key means no installed copy can update.

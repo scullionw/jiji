@@ -1,10 +1,10 @@
 //! Real jj user-config loading.
 //!
-//! The read-only milestones ran on jj-lib's built-in defaults; mutations need
-//! the user's actual identity and `immutable_heads()`/`trunk()` aliases. This
-//! module stacks config the way the jj CLI does — built-in defaults, an
-//! environment base, user config files, then repo config — and exposes the
-//! resulting `UserSettings` plus the revset aliases map parsed from it.
+//! Mutations need the user's actual identity and `immutable_heads()`/
+//! `trunk()` aliases, not jj-lib's built-in defaults. This module stacks
+//! config the way the jj CLI does — built-in defaults, an environment base,
+//! user config files, then repo config — and exposes the resulting
+//! `UserSettings` plus the revset aliases map parsed from it.
 //!
 //! Policy: broken config is a hard error, matching the CLI. A user whose
 //! config does not load cannot run `jj` either, and silently falling back to

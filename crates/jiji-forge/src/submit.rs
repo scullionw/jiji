@@ -1,14 +1,14 @@
 //! The submit engine: analyze a bookmark's stack from the repo snapshot,
 //! plan the minimum set of remote actions, then execute the plan.
 //!
-//! The shape is jjpr's (see the jjpr inspiration note): every submission
+//! The shape is jjpr's: every submission
 //! derives an explicit plan first — which bookmarks push, which PRs open
 //! and against which bases, which existing PRs retarget — and execution
 //! walks that plan. That is what makes submit idempotent: re-running
 //! against an already-consistent stack plans nothing, and "the stack is up
 //! to date" is an empty action list, not a special case. The plan is a
-//! ts-rs DTO so the Publish section renders exactly what will run, and a
-//! future CLI can print the same object.
+//! plain DTO, so the Publish section renders exactly what will run and
+//! the CLI prints the same object.
 //!
 //! Re-submitting also reconciles what GitHub shows: existing PR titles and
 //! descriptions update from the commits through the fingerprint machinery
@@ -20,7 +20,7 @@
 //! ([`SubmitPlan::open_new_prs_as_drafts`]); an existing PR's draft flag
 //! is never changed here — [`crate::readiness`] owns that.
 //!
-//! What this slice deliberately leaves to later slices: foreign bases
+//! Deliberately left out: foreign bases
 //! (a coworker's branch in the stack's ancestry — the snapshot does not
 //! carry remote-only bookmarks on nodes yet), and
 //! recognizing already-merged PRs (needs a per-bookmark merged-PR query;
@@ -29,7 +29,6 @@
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SyncState};
 use jiji_core::BackendError;
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::comment::{inherit_fossils, parse_stack_data, render_stack_comment, StackEntry};
 use crate::error::ForgeError;
@@ -45,9 +44,8 @@ use crate::template::{new_pr_body, PrTemplate};
 /// bookmark created by the plan on confirm. jjpr has no second form (it
 /// submits only up to the topmost existing bookmark); Jiji adds it so
 /// inventing a bookmark by hand stops being part of the publish flow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum SubmitHead {
     /// Publish the stack under this local non-trunk bookmark.
     #[serde(rename_all = "camelCase")]
@@ -62,9 +60,8 @@ pub enum SubmitHead {
 /// One publishable run of changes under a bookmark, listed bottom-up in
 /// [`SubmitPlan::segments`]. Mirrors jjpr's segment: the commits between
 /// the bookmark below (or trunk) and this segment's bookmark.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SubmitSegment {
     pub bookmark: String,
     /// Branch this segment's PR merges into: the trunk branch for the
@@ -80,9 +77,8 @@ pub struct SubmitSegment {
 }
 
 /// One remote action the plan will run, in execution order.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-#[ts(export)]
 pub enum SubmitAction {
     /// Create a local bookmark at an unbookmarked stack head, its name
     /// derived from the segment's bottom change description
@@ -144,9 +140,8 @@ pub enum SubmitAction {
 }
 
 /// What submitting a stack will do, derived before anything runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SubmitPlan {
     /// The bookmark the plan publishes up to: the stack's top bookmark,
     /// or — planning from an unbookmarked head — the derived name the
@@ -196,9 +191,8 @@ impl SubmitPlan {
 }
 
 /// Per-action result of executing a plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum SubmitStepStatus {
     Done,
     Failed,
@@ -207,9 +201,8 @@ pub enum SubmitStepStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SubmitStep {
     pub action: SubmitAction,
     pub status: SubmitStepStatus,
@@ -219,9 +212,8 @@ pub struct SubmitStep {
     pub pr: Option<PrSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct SubmitOutcome {
     pub steps: Vec<SubmitStep>,
     pub failed: bool,

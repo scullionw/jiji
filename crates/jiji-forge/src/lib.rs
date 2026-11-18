@@ -1,17 +1,16 @@
 //! Shared remote workflow engine for PR stacks, landing, and auto-land.
 //!
 //! This crate stays headless — synchronous, no UI types, no async runtime —
-//! so the Tauri app and first-class CLI host the same logic. The engine's
-//! shape follows jjpr (see the jjpr inspiration note):
-//! forge facts fetched fresh through one small client, explicit
-//! plan-then-execute flows layered on top in later milestones.
+//! so the desktop app and the CLI host the same logic. The engine's shape
+//! follows jjpr: forge facts fetched fresh through one small client, with
+//! explicit plan-then-execute flows layered on top.
 //!
-//! What lives here today:
+//! What lives here:
 //! - [`remote`]: detecting the GitHub repo behind a jj repo's git remotes
 //! - [`auth`]: token storage (system keychain) and the resolution chain
 //! - [`github`]: the API client (REST for identity and PR writes, one
 //!   batched GraphQL query for PR state)
-//! - [`pr`]: PR state mapped into Jiji-owned, TS-exported DTOs
+//! - [`pr`]: PR state mapped into Jiji-owned DTOs
 //! - [`submit`]: the analyze → plan → execute submission engine
 //! - [`naming`]: branch-name derivation for unbookmarked stack heads
 //! - [`reconcile`]: fingerprinted PR title/description reconciliation

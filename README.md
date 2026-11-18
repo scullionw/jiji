@@ -104,21 +104,22 @@ in.
 
 ## Building from source
 
-You need Rust, Bun, and the [Tauri prerequisites](https://tauri.app/start/prerequisites/)
-for macOS.
+Jiji is one Cargo workspace, all Rust: you need a current stable toolchain
+and Xcode's command line tools.
 
 ```bash
-bun install
-bun run tauri dev
-```
-
-Checks:
-
-```bash
-bun run check
-bun run test
+cargo run -p jiji-desktop         # the app
+cargo run -p jiji-cli -- --help   # the CLI
 cargo test --workspace
+scripts/bundle.sh                 # target/release/bundle/Jiji.app
 ```
+
+| Crate | |
+|---|---|
+| `jiji-core` | Repository state and every mutation, on jj-lib. |
+| `jiji-forge` | Publishing, landing and auto-land against GitHub. |
+| `jiji-cli` | The `jiji` command. |
+| `jiji-desktop` | The app, drawn with [GPUI](https://www.gpui.rs). Its [README](crates/jiji-desktop/README.md) covers the layout, the design rules and how to test it. |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contributions (small, focused PRs
 are strongly preferred) and [RELEASING.md](RELEASING.md) for the release flow.

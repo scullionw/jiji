@@ -9,14 +9,12 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use ts_rs::TS;
 
 use crate::error::ForgeError;
 
 /// One pull request's review-relevant state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct PrSummary {
     pub number: u64,
     pub title: String,
@@ -39,9 +37,8 @@ pub struct PrSummary {
     pub checks: ChecksRollup,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum PrState {
     Open,
     Merged,
@@ -49,9 +46,8 @@ pub enum PrState {
 }
 
 /// GitHub's `reviewDecision`: `None` when the repo does not require reviews.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum ReviewDecision {
     Approved,
     ChangesRequested,
@@ -61,9 +57,8 @@ pub enum ReviewDecision {
 
 /// CI state of the PR's head commit, GitHub's own rollup across check runs
 /// and commit statuses. `None` when nothing is configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub enum ChecksRollup {
     Passing,
     Failing,
@@ -72,9 +67,8 @@ pub enum ChecksRollup {
 }
 
 /// The open-PR state of one repository.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct PrStateReport {
     pub prs: Vec<PrSummary>,
     /// True when the repo has more open PRs than the one batched query
@@ -85,9 +79,8 @@ pub struct PrStateReport {
 /// The open-PR answer as the UI consumes it: the report plus its
 /// bookmark-attachment view — head branch → PR, fork-filtered via
 /// [`prs_by_branch`], so a local bookmark's badge is one map lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
 pub struct RepoPrState {
     pub report: PrStateReport,
     pub by_branch: HashMap<String, PrSummary>,

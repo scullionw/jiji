@@ -1,7 +1,7 @@
 //! The adapter boundary between Jiji and repository state.
 //!
-//! Everything UI-facing goes through `RepoBackend` so the jj-lib integration
-//! can land later without touching the Tauri command surface or the frontend.
+//! Everything UI-facing goes through `RepoBackend`, so the interface never
+//! depends on jj-lib directly and the mock backend can stand in for it.
 
 use std::path::Path;
 
