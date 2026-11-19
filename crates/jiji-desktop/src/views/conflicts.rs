@@ -396,7 +396,9 @@ impl ConflictsView {
                         .id(SharedString::from(format!("target-{}-{index}", item.id)))
                         .gap(px(6.))
                         .min_w_0()
-                        .max_w(px(300.))
+                        // Room for a summary line whole; a narrow row
+                        // shrinks the candidates side by side.
+                        .max_w(px(480.))
                         .h(px(22.))
                         .px(px(7.))
                         .rounded(px(RADIUS_S))

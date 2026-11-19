@@ -822,7 +822,7 @@ impl WorkbenchView {
                         .bg(t.bg3),
                 );
             }
-            skeleton.into_any_element()
+            crate::ui::motion::breathing("evolution-skeleton", skeleton).into_any_element()
         };
         if let Some(error) = &self.evolution.error {
             return note(error.clone(), t.warn)

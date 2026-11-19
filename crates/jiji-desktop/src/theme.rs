@@ -17,8 +17,9 @@
 //! states, file hues name languages. Surfaces stay neutral.
 
 use std::rc::Rc;
+use std::time::Duration;
 
-use gpui::{point, px, App, BoxShadow, Global, Hsla, Rgba, SharedString};
+use gpui::{point, px, App, BoxShadow, Global, Hsla, Rgba, SharedString, Task};
 
 use crate::diff::highlight::Syn;
 use crate::logic::inspect::Tone;
@@ -582,6 +583,76 @@ impl Theme {
         }
     }
 
+    /// The palette `t` of the way from this one to `to`: each color walked
+    /// in sRGB, as a crossfade walks each pixel. Its name and faces are the
+    /// destination's.
+    fn toward(&self, to: &Theme, t: f32) -> Theme {
+        let walk = |a: Hsla, b: Hsla| -> Hsla {
+            let (a, b) = (Rgba::from(a), Rgba::from(b));
+            Rgba {
+                r: a.r + (b.r - a.r) * t,
+                g: a.g + (b.g - a.g) * t,
+                b: a.b + (b.b - a.b) * t,
+                a: a.a + (b.a - a.a) * t,
+            }
+            .into()
+        };
+        macro_rules! walked {
+            ($($color:ident),* $(,)?) => {
+                Theme {
+                    id: to.id,
+                    scheme: to.scheme,
+                    $($color: walk(self.$color, to.$color),)*
+                    lanes: std::array::from_fn(|ix| walk(self.lanes[ix], to.lanes[ix])),
+                    shadow: to.shadow,
+                    syn: std::array::from_fn(|ix| walk(self.syn[ix], to.syn[ix])),
+                    mono: to.mono.clone(),
+                }
+            };
+        }
+        walked!(
+            bg0,
+            bg1,
+            bg2,
+            bg3,
+            bg_hover,
+            selected,
+            bg_well,
+            btn_bg,
+            btn_hover,
+            border1,
+            border2,
+            text1,
+            text2,
+            text3,
+            accent,
+            accent_strong,
+            accent_dim,
+            accent_contrast,
+            accent_hover,
+            working_copy,
+            ok,
+            warn,
+            danger,
+            danger_dim,
+            add_fg,
+            add_bg,
+            add_gutter,
+            add_word,
+            del_fg,
+            del_bg,
+            del_gutter,
+            del_word,
+            gutter_surface,
+            recess,
+            file_head,
+            selection,
+            scrollbar,
+            scrollbar_hover,
+            scrim,
+        )
+    }
+
     /// `color-mix(in srgb, a <pct>, b)` for two opaque colors.
     pub fn blend(a: Hsla, pct: f32, b: Hsla) -> Hsla {
         let (a, b) = (Rgba::from(a), Rgba::from(b));
@@ -663,6 +734,51 @@ pub fn theme(cx: &App) -> Rc<Theme> {
 pub fn set_theme(theme: Theme, cx: &mut App) {
     cx.set_global(ActiveTheme(Rc::new(theme)));
     cx.refresh_windows();
+}
+
+/// How long a change of palette takes to cross over.
+pub const CROSSFADE: Duration = Duration::from_millis(200);
+
+/// The crossfade under way; the next change of palette replaces it, and
+/// starts from wherever it had got to.
+struct Crossfade {
+    _running: Task<()>,
+}
+
+impl Global for Crossfade {}
+
+/// Put `next` on screen, crossfading from the palette there: every color
+/// walks to its new value, which on a surface of flat fills is the picture
+/// a crossfade gives. At once with nothing on screen yet, or under Reduce
+/// Motion.
+pub fn fade_to(next: Theme, cx: &mut App) {
+    if !has_theme(cx) || cx.reduce_motion() {
+        set_theme(next, cx);
+        return;
+    }
+    let (from, next) = (theme(cx), Rc::new(next));
+    let started = cx.background_executor().now();
+    let fade = cx.spawn(async move |cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(16))
+            .await;
+        let done = cx.update(|cx| {
+            let elapsed = cx.background_executor().now() - started;
+            let t = elapsed.as_secs_f32() / CROSSFADE.as_secs_f32();
+            let shown = if t >= 1. {
+                next.clone()
+            } else {
+                Rc::new(from.toward(&next, crate::ui::motion::ease_out(t)))
+            };
+            cx.set_global(ActiveTheme(shown));
+            cx.refresh_windows();
+            t >= 1.
+        });
+        if done {
+            break;
+        }
+    });
+    cx.set_global(Crossfade { _running: fade });
 }
 
 pub fn has_theme(cx: &App) -> bool {

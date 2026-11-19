@@ -284,17 +284,20 @@ impl AppModel {
         self.open_menu(position, selection, target, cx);
     }
 
-    /// A text field.
+    /// A text field, or text to read; `guesses` when the pointer is on a
+    /// misspelling.
     pub fn open_editable_menu(
         &mut self,
         has_selection: bool,
         read_only: bool,
+        guesses: Option<Vec<String>>,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         let target = MenuTarget::Editable {
             has_selection,
             read_only,
+            guesses: guesses.as_deref(),
         };
         self.open_menu(position, "", target, cx);
     }
@@ -320,7 +323,7 @@ impl AppModel {
     /// the field).
     pub fn run_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         match action {
-            MenuAction::Clipboard(_) => {}
+            MenuAction::Clipboard(_) | MenuAction::Spell(_) => {}
             MenuAction::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             MenuAction::NewChild(id) => {
                 self.mutate_quiet(cx, move |backend, path| backend.new_change(path, &id))

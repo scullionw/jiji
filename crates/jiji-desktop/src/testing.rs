@@ -43,10 +43,13 @@ pub fn scratch(name: &str) -> PathBuf {
     dir.canonicalize().unwrap()
 }
 
-/// Key bindings and actions, as `main` registers them.
+/// Key bindings and actions, as `main` registers them. Motion holds
+/// still, as in a scripted run: a test about motion lets it run itself.
 fn bind(cx: &mut App) {
+    crate::ui::motion::hold(cx);
     crate::ui::tooltip::init(cx);
     crate::ui::input::bind_keys(cx);
+    crate::ui::select::bind_keys(cx);
     crate::shell::bind_keys(cx);
     crate::views::workbench::bind_keys(cx);
     crate::views::bind_keys(cx);

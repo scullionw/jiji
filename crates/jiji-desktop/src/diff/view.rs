@@ -1264,6 +1264,8 @@ impl DiffSurface {
         });
     }
 
+    /// Where each column of a row starts. A gutter's numbers start clear
+    /// of the change's edge stroke down its outer side.
     fn geometry(&self, bounds: Bounds<Pixels>) -> Geo {
         let ch_xs = self.metrics.as_ref().map_or(6.6, |m| m.ch_xs);
         let left = f32::from(bounds.left());
@@ -1278,10 +1280,10 @@ impl DiffSurface {
             bottom: f32::from(bounds.bottom()),
             numw,
             signw,
-            full_code: left + 2. * numw + signw,
+            full_code: left + EDGE + 2. * numw + signw,
             mid,
-            left_code: left + numw + signw,
-            right_code: mid + 1. + numw + signw,
+            left_code: left + EDGE + numw + signw,
+            right_code: mid + 1. + EDGE + numw + signw,
         }
     }
 
@@ -1684,7 +1686,7 @@ impl DiffSurface {
                         rail.fill(*kind, theme, window);
                         for (slot, no) in [old_no, new_no].into_iter().enumerate() {
                             if let Some(no) = no {
-                                let right_edge = geo.left + (slot + 1) as f32 * geo.numw;
+                                let right_edge = geo.left + EDGE + (slot + 1) as f32 * geo.numw;
                                 paint_number(
                                     numbers, *no, *kind, right_edge, y, metrics, theme, window, cx,
                                 );
@@ -1692,7 +1694,7 @@ impl DiffSurface {
                         }
                         paint_sign(
                             *kind,
-                            geo.left + 2. * geo.numw,
+                            geo.left + EDGE + 2. * geo.numw,
                             y,
                             &geo,
                             metrics,
@@ -1721,14 +1723,22 @@ impl DiffSurface {
                                 numbers,
                                 cell.no,
                                 cell.kind,
-                                x + geo.numw,
+                                x + EDGE + geo.numw,
                                 y,
                                 metrics,
                                 theme,
                                 window,
                                 cx,
                             );
-                            paint_sign(cell.kind, x + geo.numw, y, &geo, metrics, window, cx);
+                            paint_sign(
+                                cell.kind,
+                                x + EDGE + geo.numw,
+                                y,
+                                &geo,
+                                metrics,
+                                window,
+                                cx,
+                            );
                         }
                     }
                 }
@@ -2150,6 +2160,11 @@ fn shape_code(
     line
 }
 
+/// The change's edge stroke down a gutter's outer side, and the room the
+/// numbers leave it.
+const EDGE_STROKE: f32 = 3.;
+const EDGE: f32 = EDGE_STROKE + 2.;
+
 /// One row's gutter rail and code fill. Changed lines speak through three
 /// redundant channels — fill, tinted rail, sign.
 struct Rail {
@@ -2181,7 +2196,7 @@ impl Rail {
                 theme.del_fg
             };
             window.paint_quad(fill(
-                rect(self.x, self.y, self.x + 3., self.y + LINE_H),
+                rect(self.x, self.y, self.x + EDGE_STROKE, self.y + LINE_H),
                 Theme::fade(edge, 0.9),
             ));
         }

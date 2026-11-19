@@ -23,10 +23,48 @@ pub fn truncated(text: impl Into<SharedString>) -> Truncated {
 /// color of the moment: a hover style that sets a text color replaces the
 /// element's whole text style while it applies, and re-reading the size
 /// and weight then would paint a line the layout never measured.
+#[derive(Clone)]
 pub struct Face {
-    font: Font,
-    font_size: Pixels,
-    line_height: Pixels,
+    pub(super) font: Font,
+    pub(super) font_size: Pixels,
+    pub(super) line_height: Pixels,
+}
+
+/// Lay out `text` as one line that gives way: its content size is the whole
+/// line, and the layout grants what it can.
+pub(super) fn measure(text: &SharedString, window: &mut Window) -> (LayoutId, Face) {
+    let text_style = window.text_style();
+    let face = Face {
+        font: text_style.font(),
+        font_size: text_style.font_size.to_pixels(window.rem_size()),
+        line_height: window.line_height(),
+    };
+    let full = window
+        .text_system()
+        .shape_line(
+            text.clone(),
+            face.font_size,
+            &[text_style.to_run(text.len())],
+            None,
+        )
+        .width
+        .ceil();
+    let mut style = Style {
+        flex_shrink: 1.,
+        ..Style::default()
+    };
+    style.min_size.width = px(0.).into();
+    let line_height = face.line_height;
+    let id = window.request_measured_layout(style, move |known, _available, _, _| {
+        // Its content size is the whole line, whatever space is on
+        // offer: the layout grants the final width (a flex row shrinks
+        // it past the explicit zero minimum above, a block parent
+        // stretches it to its own width) and paint cuts to fit. Sizing
+        // to the offered space instead would collapse it to nothing
+        // whenever a parent is probed at zero width.
+        size(known.width.unwrap_or(full), line_height)
+    });
+    (id, face)
 }
 
 impl Element for Truncated {
@@ -48,38 +86,7 @@ impl Element for Truncated {
         window: &mut Window,
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let text_style = window.text_style();
-        let face = Face {
-            font: text_style.font(),
-            font_size: text_style.font_size.to_pixels(window.rem_size()),
-            line_height: window.line_height(),
-        };
-        let full = window
-            .text_system()
-            .shape_line(
-                self.text.clone(),
-                face.font_size,
-                &[text_style.to_run(self.text.len())],
-                None,
-            )
-            .width
-            .ceil();
-        let mut style = Style {
-            flex_shrink: 1.,
-            ..Style::default()
-        };
-        style.min_size.width = px(0.).into();
-        let line_height = face.line_height;
-        let id = window.request_measured_layout(style, move |known, _available, _, _| {
-            // Its content size is the whole line, whatever space is on
-            // offer: the layout grants the final width (a flex row shrinks
-            // it past the explicit zero minimum above, a block parent
-            // stretches it to its own width) and paint cuts to fit. Sizing
-            // to the offered space instead would collapse it to nothing
-            // whenever a parent is probed at zero width.
-            size(known.width.unwrap_or(full), line_height)
-        });
-        (id, face)
+        measure(&self.text, window)
     }
 
     fn prepaint(

@@ -15,8 +15,10 @@ use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, h_flex, icon, input::field, rich, segmented, tooltip, truncated, trunk_label, v_flex,
-    IconName, NodeExt as _, Segment, Tabbable as _,
+    btn, h_flex, icon,
+    input::{field, grip},
+    rich, segmented, selectable, tooltip, truncated, trunk_label, v_flex, IconName, NodeExt as _,
+    Segment, Tabbable as _,
 };
 use crate::views::workbench::WorkbenchView;
 
@@ -82,6 +84,7 @@ impl WorkbenchView {
         self.tray(false, "Describe this change", cx)
             .child(
                 div()
+                    .relative()
                     .flex()
                     .min_h(px(84.))
                     .px(px(12.))
@@ -93,7 +96,9 @@ impl WorkbenchView {
                     .text_size(px(TEXT_M))
                     .line_height(px(20.))
                     .when(saving, |el| el.opacity(0.6))
-                    .child(self.header.editor.clone()),
+                    .debug_selector(|| "describe-field".into())
+                    .child(self.header.editor.clone())
+                    .child(grip(&self.header.editor, "Resize description", window, cx)),
             )
             .child(row)
             .into_any_element()
@@ -604,10 +609,13 @@ impl WorkbenchView {
                     .line_height(gpui::relative(1.5))
                     .text_color(if empty { t.text3 } else { t.text2 })
                     .when(empty, |el| el.italic())
+                    .debug_selector(|| "squash-description".into())
                     .child(if empty {
-                        "(no description — describe it afterwards)".to_owned()
+                        "(no description — describe it afterwards)".into_any_element()
                     } else {
-                        combined
+                        selectable("squash-description-text", combined)
+                            .wrap()
+                            .into_any_element()
                     }),
             );
         }

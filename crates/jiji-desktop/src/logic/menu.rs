@@ -23,9 +23,21 @@ pub enum ClipboardOp {
     SelectAll,
 }
 
+/// What to do about a misspelled word, from its menu.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpellChoice {
+    /// Put this in its place.
+    Use(String),
+    /// Stop flagging it in this field.
+    Ignore,
+    /// Add it to the user's dictionary.
+    Learn,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuAction {
     Clipboard(ClipboardOp),
+    Spell(SpellChoice),
     CopyText(String),
     NewChild(String),
     Edit(String),
@@ -91,6 +103,8 @@ pub struct MenuItem {
     pub shortcut: Option<&'static str>,
     pub danger: bool,
     pub disabled: bool,
+    /// Set in bold: a spelling guess, apart from the commands.
+    pub strong: bool,
     pub action: Option<MenuAction>,
     /// A submenu, when the item opens one instead of acting.
     pub children: Vec<MenuSection>,
@@ -107,6 +121,7 @@ impl MenuItem {
             shortcut: None,
             danger: false,
             disabled: false,
+            strong: false,
             action: Some(action),
             children: Vec::new(),
         }
@@ -147,6 +162,7 @@ impl MenuItem {
             shortcut: None,
             danger: false,
             disabled: false,
+            strong: false,
             action: None,
             children: vec![children],
         }
@@ -163,6 +179,9 @@ pub enum MenuTarget<'a> {
     Editable {
         has_selection: bool,
         read_only: bool,
+        /// What a misspelled word under the pointer might have been, best
+        /// first: present only on a misspelling.
+        guesses: Option<&'a [String]>,
     },
     Change {
         node: &'a GraphNode,
@@ -341,8 +360,72 @@ fn editor_items(
     items
 }
 
-fn editable_menu(has_selection: bool, read_only: bool) -> Vec<MenuSection> {
-    vec![
+/// The most guesses a misspelling's menu offers.
+const GUESSES: usize = 6;
+
+fn editable_menu(
+    has_selection: bool,
+    read_only: bool,
+    guesses: Option<&[String]>,
+) -> Vec<MenuSection> {
+    // A misspelling under the pointer leads with what it might have been,
+    // then the ways to leave it be, as Mac text fields do.
+    let mut spelling = Vec::new();
+    if let Some(guesses) = guesses {
+        spelling.push(if guesses.is_empty() {
+            vec![MenuItem::plain(
+                "spell.none",
+                "No Guesses Found",
+                MenuAction::Spell(SpellChoice::Ignore),
+            )
+            .disabled(true)]
+        } else {
+            guesses
+                .iter()
+                .take(GUESSES)
+                .map(|guess| MenuItem {
+                    strong: true,
+                    ..MenuItem::plain(
+                        "spell.guess",
+                        guess.clone(),
+                        MenuAction::Spell(SpellChoice::Use(guess.clone())),
+                    )
+                })
+                .collect()
+        });
+        spelling.push(vec![
+            MenuItem::plain(
+                "spell.ignore",
+                "Ignore Spelling",
+                MenuAction::Spell(SpellChoice::Ignore),
+            ),
+            MenuItem::plain(
+                "spell.learn",
+                "Learn Spelling",
+                MenuAction::Spell(SpellChoice::Learn),
+            ),
+        ]);
+    }
+    let copy = MenuItem::new(
+        "edit.copy",
+        "Copy",
+        IconName::Copy,
+        MenuAction::Clipboard(ClipboardOp::Copy),
+    )
+    .shortcut("⌘C")
+    .disabled(!has_selection);
+    let select_all = vec![MenuItem::new(
+        "edit.selectAll",
+        "Select All",
+        IconName::TextSelect,
+        MenuAction::Clipboard(ClipboardOp::SelectAll),
+    )
+    .shortcut("⌘A")];
+    // Text to read offers what reading can do with it.
+    if read_only {
+        return vec![vec![copy], select_all];
+    }
+    spelling.extend([
         vec![
             MenuItem::new(
                 "edit.cut",
@@ -351,32 +434,19 @@ fn editable_menu(has_selection: bool, read_only: bool) -> Vec<MenuSection> {
                 MenuAction::Clipboard(ClipboardOp::Cut),
             )
             .shortcut("⌘X")
-            .disabled(!has_selection || read_only),
-            MenuItem::new(
-                "edit.copy",
-                "Copy",
-                IconName::Copy,
-                MenuAction::Clipboard(ClipboardOp::Copy),
-            )
-            .shortcut("⌘C")
             .disabled(!has_selection),
+            copy,
             MenuItem::new(
                 "edit.paste",
                 "Paste",
                 IconName::Clipboard,
                 MenuAction::Clipboard(ClipboardOp::Paste),
             )
-            .shortcut("⌘V")
-            .disabled(read_only),
+            .shortcut("⌘V"),
         ],
-        vec![MenuItem::new(
-            "edit.selectAll",
-            "Select All",
-            IconName::TextSelect,
-            MenuAction::Clipboard(ClipboardOp::SelectAll),
-        )
-        .shortcut("⌘A")],
-    ]
+        select_all,
+    ]);
+    spelling
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -971,9 +1041,10 @@ pub fn build_menu(ctx: &MenuContext) -> Vec<MenuSection> {
     if let MenuTarget::Editable {
         has_selection,
         read_only,
+        guesses,
     } = ctx.target
     {
-        return editable_menu(has_selection, read_only);
+        return editable_menu(has_selection, read_only, guesses);
     }
     let mut sections = Vec::new();
     if !ctx.selection.trim().is_empty() {
@@ -1284,6 +1355,7 @@ mod tests {
             target: MenuTarget::Editable {
                 has_selection: false,
                 read_only: false,
+                guesses: None,
             },
             editors: &[],
             can_undo: false,

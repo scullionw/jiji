@@ -10,6 +10,7 @@ mod evolution;
 mod graph;
 mod header;
 mod inspector;
+mod motion;
 
 pub use graph::VIEW_PRESETS;
 
@@ -146,6 +147,8 @@ pub struct WorkbenchView {
     diff_width: f32,
     /// The selection the scroller last brought into view.
     revealed: Option<String>,
+    /// Rows moving to where the last rewrite put them, while they move.
+    motion: Option<motion::Motion>,
     view_menu: ViewMenu,
     /// What the diff surface currently measures (set by the diff pane).
     shown: Option<ShownDiff>,
@@ -299,6 +302,7 @@ impl WorkbenchView {
             bounds: Rc::default(),
             diff_width: f32::INFINITY,
             revealed: None,
+            motion: None,
             view_menu: ViewMenu {
                 popover: PopoverState::new(cx),
                 busy: false,
@@ -334,7 +338,19 @@ impl WorkbenchView {
             if snapshot.repo_path != self.snapshot.repo_path {
                 self.view_menu.saved = model.store.saved_views(&snapshot.repo_path);
             }
-            self.model = Rc::new(build_graph_model(&snapshot));
+            let model = Rc::new(build_graph_model(&snapshot));
+            // A rewrite moves the rows it moved, unless motion is reduced.
+            self.motion = (!cx.reduce_motion())
+                .then(|| {
+                    motion::Motion::between(
+                        (&self.snapshot, &self.model),
+                        (&snapshot, &model),
+                        |row| self.row_height(row),
+                        cx.background_executor().now(),
+                    )
+                })
+                .flatten();
+            self.model = model;
             self.snapshot = snapshot;
             self.focus_model = None;
             // Rows moved under the selection: bring it back into view.
@@ -1670,6 +1686,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_rewrite_moves_the_rows_it_moved_then_holds_still(cx: &mut TestAppContext) {
+        use std::time::Duration;
+
+        let (dir, model, window) = mock_workbench("graph-motion", cx);
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let top = |id: &str, cx: &mut gpui::VisualTestContext| {
+            let selector: &'static str = format!("graph-row-{id}").leak();
+            cx.debug_bounds(selector)
+                .map(|bounds| f32::from(bounds.top()))
+        };
+        let frame = |ms: u64, cx: &mut gpui::VisualTestContext| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.update(|window, cx| window.simulate_next_frame(cx))
+        };
+        let abandon = |id: &'static str, cx: &mut gpui::VisualTestContext| {
+            model.update(cx, |model, cx| {
+                model
+                    .mutate(cx, move |backend, path| backend.abandon_change(path, id))
+                    .detach()
+            });
+            cx.run_until_parked();
+        };
+        let before = top("mvkortsq", &mut cx).expect("the row is drawn");
+
+        // With motion: abandoning the change above it moves the row up,
+        // from where it stood, and the abandoned row folds away.
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        abandon("lwnouzpy", &mut cx);
+        assert_eq!(top("mvkortsq", &mut cx), Some(before));
+        frame(16, &mut cx);
+        cx.run_until_parked();
+        frame(50, &mut cx);
+        cx.run_until_parked();
+        let partway = top("mvkortsq", &mut cx).unwrap();
+        frame(120, &mut cx);
+        cx.run_until_parked();
+        let after = top("mvkortsq", &mut cx).unwrap();
+        assert!(
+            after < partway && partway < before,
+            "{after} < {partway} < {before}"
+        );
+        // Then it holds still, asking for nothing.
+        assert_eq!(
+            frame(16, &mut cx),
+            0,
+            "a settled graph keeps asking for frames"
+        );
+
+        // Under Reduce Motion a rewrite is in place on the frame it lands.
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        let moving = top("nzpwlxvr", &mut cx).unwrap();
+        abandon("mvkortsq", &mut cx);
+        assert_eq!(top("nzpwlxvr", &mut cx), Some(after));
+        assert!(moving > after);
+        assert_eq!(frame(16, &mut cx), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
     fn a_split_is_made_from_the_keyboard_alone(cx: &mut TestAppContext) {
         let (dir, model, window) = mock_workbench("keyboard-split", cx);
         let keys = window.into();
@@ -1700,9 +1775,9 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert!(view.header.split.contains_key(VIEWPORT), "nothing checked");
         });
-        // Past the file's hunks, the other file, the description and
-        // Cancel to Split, now on offer; Return makes the split.
-        crate::testing::press(keys, "tab tab tab tab tab enter", cx);
+        // Past the file's hunks, the other file, the description, its
+        // grip and Cancel to Split, now on offer; Return makes the split.
+        crate::testing::press(keys, "tab tab tab tab tab tab enter", cx);
         let done = model.read_with(cx, |model, _| model.ui().last_mutation.clone());
         assert!(done.is_some(), "the split did not run");
         // The tray closes, and the keys are back on More.

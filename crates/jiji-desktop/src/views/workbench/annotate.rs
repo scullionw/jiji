@@ -567,7 +567,7 @@ impl WorkbenchView {
                             .bg(t.bg3),
                     );
                 }
-                skeleton.into_any_element()
+                crate::ui::motion::breathing("annotate-skeleton", skeleton).into_any_element()
             }
         };
         Some(

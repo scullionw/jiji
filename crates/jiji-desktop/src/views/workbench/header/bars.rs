@@ -1,7 +1,10 @@
 //! The header's two bars: the title with its verbs, then the facts about
 //! the change and the controls for how its diff is shown.
 
-use gpui::{div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, Hsla, Role, Window};
+use gpui::{
+    div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, HighlightStyle, Hsla, Role,
+    Window,
+};
 use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot};
 
 use super::{title_or_none, Confirm, Tray};
@@ -17,8 +20,8 @@ use crate::ui::focus::FocusRow;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, diffstat, from_now, h_flex, icon, icon_btn, label_box, middot, node_mark, popover,
-    popover_layer, scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Mark,
-    Tabbable as _, Tabular as _, LABEL_H,
+    popover_layer, scrollbar, selectable, tag, text_width, tooltip, truncated, v_flex, IconName,
+    Mark, Tabbable as _, Tabular as _, LABEL_H,
 };
 use crate::views::workbench::diffpane::status_glyph;
 use crate::views::workbench::WorkbenchView;
@@ -120,7 +123,8 @@ impl WorkbenchView {
                     .text_size(px(TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(tooltip(title.clone()))
-                    .child(truncated(title)),
+                    .debug_selector(|| "change-title".into())
+                    .child(selectable("title", title)),
             );
             if has_body {
                 let open = self.header.body_open;
@@ -485,7 +489,8 @@ impl WorkbenchView {
                     .tooltip(tooltip(
                         "Divergent change: several visible commits share this change id",
                     ))
-                    .child(node.change_id.clone())
+                    .debug_selector(|| "change-id".into())
+                    .child(selectable("change-id", node.change_id.clone()))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("??"))
                     .into_any_element(),
             );
@@ -497,24 +502,30 @@ impl WorkbenchView {
                     .flex_shrink_0()
                     .font_family(mono.clone())
                     .tooltip(tooltip("This copy's commit id"))
-                    .child(node.commit_id.clone())
+                    .debug_selector(|| "commit-id".into())
+                    .child(selectable("commit-id", node.commit_id.clone()))
                     .into_any_element(),
             );
         } else {
+            // The typed part of the id carries the weight, in its line's
+            // hue, as jj prints it.
+            let prefix = short_id(&node.id, 2).len();
             who.push(
-                h_flex()
+                div()
                     .id("fact-ids")
                     .flex_shrink_0()
                     .font_family(mono.clone())
                     .text_color(t.text2)
                     .tooltip(tooltip("Change id"))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(line.unwrap_or(t.text1))
-                            .child(short_id(&node.id, 2).to_owned()),
-                    )
-                    .child(node.id.chars().skip(2).collect::<String>())
+                    .debug_selector(|| "change-id".into())
+                    .child(selectable("change-id", node.id.clone()).highlights([(
+                        0..prefix,
+                        HighlightStyle {
+                            font_weight: Some(FontWeight::BOLD),
+                            color: Some(line.unwrap_or(t.text1)),
+                            ..Default::default()
+                        },
+                    )]))
                     .into_any_element(),
             );
             if identity {
@@ -524,7 +535,11 @@ impl WorkbenchView {
                         .flex_shrink_0()
                         .font_family(mono.clone())
                         .tooltip(tooltip(format!("Commit id {}", node.commit_id)))
-                        .child(short_id(&node.commit_id, 8).to_owned())
+                        .debug_selector(|| "commit-id".into())
+                        .child(selectable(
+                            "commit-id",
+                            short_id(&node.commit_id, 8).to_owned(),
+                        ))
                         .into_any_element(),
                 );
             }

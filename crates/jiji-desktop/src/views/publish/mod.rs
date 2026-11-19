@@ -1098,7 +1098,12 @@ impl PublishView {
                 h_flex()
                     .gap(px(8.))
                     .min_h(px(28.))
-                    .child(dot(color, 7.))
+                    // The job at work keeps a slow heartbeat.
+                    .child(if status.live && !terminal {
+                        crate::ui::motion::pulse_dot(color, 7.).into_any_element()
+                    } else {
+                        dot(color, 7.).into_any_element()
+                    })
                     .child(
                         div()
                             .flex_shrink_0()

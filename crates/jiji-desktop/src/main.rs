@@ -4,6 +4,7 @@
 //! launcher forwards to it); without, it is the app.
 
 mod app;
+mod appkit;
 mod diagnostics;
 mod diff;
 mod headless;
@@ -25,14 +26,34 @@ use crate::app::AppModel;
 use crate::shell::{placement, Shell};
 use crate::store::Store;
 
-/// SF Mono when it is installed (it ships with Xcode and Terminal, not
-/// with the system), else Menlo, which every Mac has.
+/// The system's monospaced face: SF Mono, under the hidden name AppKit's
+/// `monospacedSystemFont` and the webview's `ui-monospace` use. It is on
+/// every Mac whether or not SF Mono is installed as a named font.
+const SYSTEM_MONO: &str = ".AppleSystemUIFontMonospaced";
+
+/// Code is SF Mono on every Mac, as it was in the webview.
 fn mono_font(cx: &App) -> SharedString {
-    let names = cx.text_system().all_font_names();
-    for candidate in ["SF Mono", "SFMono-Regular"] {
-        if names.iter().any(|name| name == candidate) {
-            return candidate.into();
-        }
+    let text = cx.text_system();
+    pick_mono(&text.all_font_names(), |family| {
+        // A family that fails to load resolves to a fallback, which is
+        // known by another name.
+        let id = text.resolve_font(&gpui::font(family));
+        text.get_font_for_id(id)
+            .is_some_and(|font| font.family.as_ref() == family)
+    })
+}
+
+/// SF Mono by name when it is installed (Xcode and Terminal bring it),
+/// else the system's own, else Menlo, which every Mac has.
+fn pick_mono(installed: &[String], loads: impl Fn(&str) -> bool) -> SharedString {
+    if let Some(name) = ["SF Mono", "SFMono-Regular"]
+        .into_iter()
+        .find(|name| installed.iter().any(|installed| installed == name))
+    {
+        return name.into();
+    }
+    if loads(SYSTEM_MONO) {
+        return SYSTEM_MONO.into();
     }
     "Menlo".into()
 }
@@ -106,6 +127,7 @@ fn main() {
     application.run(move |cx: &mut App| {
         ui::tooltip::init(cx);
         ui::input::bind_keys(cx);
+        ui::select::bind_keys(cx);
         shell::bind_keys(cx);
         views::workbench::bind_keys(cx);
         views::bind_keys(cx);
@@ -114,7 +136,15 @@ fn main() {
         views::search::bind_keys(cx);
         diff::view::bind_keys(cx);
         shell::register_app_actions(cx);
-        cx.set_menus(shell::menus());
+        cx.set_menus(shell::menus(false));
+
+        // Screenshots of a scripted run are the same every time: motion
+        // holds still there unless a step lets it run.
+        if script.is_empty() {
+            ui::motion::follow_system(cx);
+        } else {
+            ui::motion::hold(cx);
+        }
 
         let mut store = Store::open();
         // What the Tauri app left, before anything reads the store: an
@@ -215,6 +245,26 @@ fn percent_decode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_is_sf_mono_on_a_mac_without_it_installed() {
+        let named = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        // Installed by name: that face.
+        assert_eq!(
+            pick_mono(&named(&["Menlo", "SF Mono"]), |_| true),
+            "SF Mono"
+        );
+        // Not installed (this Mac): the system's monospaced face, which is
+        // SF Mono too.
+        assert_eq!(pick_mono(&named(&["Menlo"]), |_| true), SYSTEM_MONO);
+        // Only if that will not load, Menlo.
+        assert_eq!(pick_mono(&named(&["Menlo"]), |_| false), "Menlo");
+    }
 
     #[test]
     fn file_urls_decode_to_paths() {

@@ -15,6 +15,7 @@ use crate::logic::split::{
 use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, RADIUS_M, RADIUS_S, TEXT_S, TEXT_XS};
 use crate::ui::focus::FocusRow;
+use crate::ui::input::grip;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, h_flex, icon, scrollbar, segmented, tooltip, truncated, v_flex, IconName, Segment,
@@ -166,6 +167,7 @@ impl WorkbenchView {
                     .child(self.label("Description for the split-off change", cx))
                     .child(
                         div()
+                            .relative()
                             .flex()
                             .px(px(8.))
                             .py(px(6.))
@@ -176,7 +178,14 @@ impl WorkbenchView {
                             .font_family(t.mono.clone())
                             .text_size(px(TEXT_S))
                             .line_height(px(18.))
-                            .child(self.header.split_desc.clone()),
+                            .debug_selector(|| "split-description-field".into())
+                            .child(self.header.split_desc.clone())
+                            .child(grip(
+                                &self.header.split_desc,
+                                "Resize description",
+                                window,
+                                cx,
+                            )),
                     );
                 if summary.whole + summary.partial > 0 {
                     let mut items = vec![(

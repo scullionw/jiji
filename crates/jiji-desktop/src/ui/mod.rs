@@ -9,12 +9,16 @@ pub mod focus;
 pub mod icon;
 pub mod input;
 mod marks;
+pub mod motion;
 mod page;
 mod pinned;
 mod popover;
 pub mod scroll;
+pub mod select;
+mod spelling;
 pub mod splitter;
 mod text;
+mod textlayout;
 mod time;
 pub mod tooltip;
 pub mod truncate;
@@ -38,6 +42,7 @@ pub use self::page::{
 pub use self::pinned::pinned;
 pub use self::popover::{menu_label, menu_row, popover, popover_layer, PopoverState};
 pub use self::scroll::{pan_scrollbar, scrollbar, vertical_only, wheel_first, AxisLock, ScrollY};
+pub use self::select::selectable;
 pub use self::text::{
     diffstat, label_box, middot, ref_label, rich, tag, text_width, text_width_in, trunk_label,
     LABEL_H,

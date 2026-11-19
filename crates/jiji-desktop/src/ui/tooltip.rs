@@ -28,8 +28,8 @@ struct TooltipGuard {
     /// raised under.
     epoch: u64,
     last_input: Option<Instant>,
-    /// A tooltip drew since the last input.
-    showing: bool,
+    /// The tooltip that drew since the last input, if one did.
+    showing: Option<SharedString>,
 }
 
 impl Global for TooltipGuard {}
@@ -38,9 +38,16 @@ fn dismiss(window: &mut Window, cx: &mut App) {
     let guard = cx.default_global::<TooltipGuard>();
     guard.epoch += 1;
     guard.last_input = Some(Instant::now());
-    if std::mem::take(&mut guard.showing) {
+    if guard.showing.take().is_some() {
         window.refresh();
     }
+}
+
+/// The words of the tooltip on screen.
+#[cfg(test)]
+pub fn showing(cx: &App) -> Option<SharedString> {
+    cx.try_global::<TooltipGuard>()
+        .and_then(|guard| guard.showing.clone())
 }
 
 /// Start watching keys on behalf of every tooltip. Call once at startup.
@@ -81,7 +88,7 @@ impl Render for TooltipView {
         if self.born != Some(guard.epoch) {
             return div();
         }
-        guard.showing = true;
+        guard.showing = Some(self.text.clone());
         let t = theme(cx);
         // Offset off the pointer so the tip never sits under it.
         div().pt(px(14.)).pl(px(6.)).child(

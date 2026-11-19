@@ -64,47 +64,24 @@ pub fn accessibility(_window: &Window) -> Option<String> {
 }
 
 /// `[[window contentView] accessibilityChildren]` for each of the app's
-/// windows, through the Objective-C runtime the process already links.
+/// windows.
 #[cfg(feature = "headless")]
 fn wake_accessibility() {
-    use std::ffi::{c_char, c_void};
+    use crate::appkit::objc::{class, sel, send, Id, Sel};
 
-    type Id = *mut c_void;
-    type Sel = *mut c_void;
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const c_char) -> Id;
-        fn sel_registerName(name: *const c_char) -> Sel;
-        fn objc_msgSend();
-    }
-    // objc_msgSend has no one signature: each call takes the method's.
-    let message = objc_msgSend as unsafe extern "C" fn();
-    // SAFETY: each of these is objc_msgSend at the signature of the methods
-    // sent through it below: an object or a count back, a count in.
-    let (send, send_at, count): (
-        unsafe extern "C" fn(Id, Sel) -> Id,
-        unsafe extern "C" fn(Id, Sel, usize) -> Id,
-        unsafe extern "C" fn(Id, Sel) -> usize,
-    ) = unsafe {
-        (
-            std::mem::transmute(message),
-            std::mem::transmute(message),
-            std::mem::transmute(message),
-        )
-    };
     // SAFETY: AppKit messages sent on the main thread, where the script runs,
-    // to the shared application and the windows it owns.
+    // to the shared application and the windows it owns, each at its own
+    // signature: an object or a count back, a count in.
     unsafe {
-        let selector = |name: &std::ffi::CStr| sel_registerName(name.as_ptr());
-        let app = send(
-            objc_getClass(c"NSApplication".as_ptr()),
-            selector(c"sharedApplication"),
-        );
-        let windows = send(app, selector(c"windows"));
-        for index in 0..count(windows, selector(c"count")) {
-            let window = send_at(windows, selector(c"objectAtIndex:"), index);
-            let view = send(window, selector(c"contentView"));
-            send(view, selector(c"accessibilityChildren"));
+        let get: unsafe extern "C" fn(Id, Sel) -> Id = send();
+        let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = send();
+        let count: unsafe extern "C" fn(Id, Sel) -> usize = send();
+        let app = get(class(c"NSApplication"), sel(c"sharedApplication"));
+        let windows = get(app, sel(c"windows"));
+        for index in 0..count(windows, sel(c"count")) {
+            let window = at(windows, sel(c"objectAtIndex:"), index);
+            let view = get(window, sel(c"contentView"));
+            get(view, sel(c"accessibilityChildren"));
         }
     }
 }

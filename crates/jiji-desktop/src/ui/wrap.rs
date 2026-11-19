@@ -8,10 +8,12 @@
 //! its content size and wraps only to the width the layout finally grants.
 
 use gpui::{
-    point, px, size, App, AvailableSpace, Bounds, Element, ElementId, Font, GlobalElementId, Hsla,
+    point, px, size, App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, Hsla,
     InspectorElementId, LayoutId, Pixels, SharedString, Size, Style, TextAlign, TextRun, Window,
     WrappedLine,
 };
+
+use super::truncate::Face;
 
 /// The narrowest a paragraph is ever really laid out.
 const NARROWEST: Pixels = px(120.);
@@ -23,15 +25,6 @@ pub struct Wrapped {
 /// `text` as a paragraph that wraps to the width it is given.
 pub fn wrapped(text: impl Into<SharedString>) -> Wrapped {
     Wrapped { text: text.into() }
-}
-
-/// The face the paragraph was measured in; paint keeps it and takes only
-/// the color of the moment (see `truncate::Face`).
-#[derive(Clone)]
-pub struct Face {
-    font: Font,
-    font_size: Pixels,
-    line_height: Pixels,
 }
 
 fn shape(
@@ -64,6 +57,49 @@ fn extent(lines: &[WrappedLine], line_height: Pixels) -> Size<Pixels> {
     })
 }
 
+/// Lay out `text` as a paragraph: its natural size while there is room,
+/// wrapped to the width the layout grants when there is not.
+pub(super) fn measure(text: &SharedString, window: &mut Window) -> (LayoutId, Face) {
+    let text_style = window.text_style();
+    let face = Face {
+        font: text_style.font(),
+        font_size: text_style.font_size.to_pixels(window.rem_size()),
+        line_height: window.line_height(),
+    };
+    let color = text_style.color;
+    let natural = extent(&shape(text, &face, color, None, window), face.line_height);
+    let natural = size(natural.width.ceil(), natural.height.max(face.line_height));
+    let mut style = Style {
+        flex_shrink: 1.,
+        ..Style::default()
+    };
+    style.min_size.width = px(0.).into();
+    let (text, measured) = (text.clone(), face.clone());
+    let id = window.request_measured_layout(style, move |known, available, window, _| {
+        // The width to wrap to: one the layout has fixed, or a definite
+        // space it offers.
+        let width = known.width.or(match available.width {
+            AvailableSpace::Definite(width) => Some(width),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+        });
+        match width {
+            // Narrower than any paragraph: the engine is probing how
+            // small the row could get, not granting a width — and the
+            // height answered here would be taken as the row's own.
+            Some(width) if width < NARROWEST => {
+                size(known.width.unwrap_or(natural.width), natural.height)
+            }
+            Some(width) if width < natural.width => {
+                let lines = shape(&text, &measured, color, Some(width), window);
+                size(width, extent(&lines, measured.line_height).height)
+            }
+            Some(width) if known.width.is_some() => size(width, natural.height),
+            _ => natural,
+        }
+    });
+    (id, face)
+}
+
 impl Element for Wrapped {
     type RequestLayoutState = Face;
     type PrepaintState = ();
@@ -83,47 +119,7 @@ impl Element for Wrapped {
         window: &mut Window,
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let text_style = window.text_style();
-        let face = Face {
-            font: text_style.font(),
-            font_size: text_style.font_size.to_pixels(window.rem_size()),
-            line_height: window.line_height(),
-        };
-        let color = text_style.color;
-        let natural = extent(
-            &shape(&self.text, &face, color, None, window),
-            face.line_height,
-        );
-        let natural = size(natural.width.ceil(), natural.height.max(face.line_height));
-        let mut style = Style {
-            flex_shrink: 1.,
-            ..Style::default()
-        };
-        style.min_size.width = px(0.).into();
-        let (text, measured) = (self.text.clone(), face.clone());
-        let id = window.request_measured_layout(style, move |known, available, window, _| {
-            // The width to wrap to: one the layout has fixed, or a definite
-            // space it offers.
-            let width = known.width.or(match available.width {
-                AvailableSpace::Definite(width) => Some(width),
-                AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-            });
-            match width {
-                // Narrower than any paragraph: the engine is probing how
-                // small the row could get, not granting a width — and the
-                // height answered here would be taken as the row's own.
-                Some(width) if width < NARROWEST => {
-                    size(known.width.unwrap_or(natural.width), natural.height)
-                }
-                Some(width) if width < natural.width => {
-                    let lines = shape(&text, &measured, color, Some(width), window);
-                    size(width, extent(&lines, measured.line_height).height)
-                }
-                Some(width) if known.width.is_some() => size(width, natural.height),
-                _ => natural,
-            }
-        });
-        (id, face)
+        measure(&self.text, window)
     }
 
     fn prepaint(

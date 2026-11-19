@@ -74,11 +74,16 @@ JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png" \
 ```
 
 `click`, `dclick`, `rclick`, `move`, `drag`, `press`/`hold`/`release` (a drag
-in parts), `scroll`, `key`, `type`, `wait`, `shot`, `a11y`, `resize`, `quit`;
-prefixes `shift-`, `alt-`, `cmd-`. Coordinates are window points;
-screenshots are at the display's scale. A `key` is pressed and released,
-as a keyboard does it: Space and Return press a focused control on the
-release.
+in parts), `scroll`, `key`, `type`, `wait`, `shot`, `a11y`, `resize`,
+`motion=on`, `quit`; prefixes `shift-`, `alt-`, `cmd-`. Coordinates are
+window points; screenshots are at the display's scale. A `key` is pressed
+and released, as a keyboard does it: Space and Return press a focused
+control on the release.
+
+A scripted run holds motion still, as Reduce Motion does, so its
+screenshots are the same every time; `motion=on` lets it run from that
+step. A `shot` waits a beat before it captures, longer than a tray's
+unfold or a graph move takes.
 
 `a11y=/abs/path.json` is how to read what a screen reader is told without
 one: it turns the window's accessibility on, the way VoiceOver's first
@@ -125,10 +130,10 @@ Under `src/`:
 | `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
 | `diff/` | The diff surface: a flat row model laid out once per diff and shared by the cache and the screen, tree-sitter highlighting, the pictures of image diffs (GPUI's decoders, and the system's ImageIO for AVIF and HEIC), and one custom-painted element that windows, selects, finds and scrolls. |
-| `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, pane dividers, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. The keyboard's path through all of it (`focus`) and what assistive technology is told (`a11y`). |
+| `ui/` | Buttons, inputs (with IME, a resize grip and the system's spell checking), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, pane dividers, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, text the pointer selects and copies (`select`), a group heading that pins. The keyboard's path through all of it (`focus`), what assistive technology is told (`a11y`), and what moves and when (`motion`). |
 | `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings; where the window opens, and how it was left (its display, the frame it unzooms to, zoomed, full screen). |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
-| `theme.rs`, `store.rs`, `upgrade.rs`, `diagnostics.rs` | The ten palettes; the persisted preferences, and what the Tauri app left of them; the log and the record a panic leaves. |
+| `theme.rs`, `store.rs`, `upgrade.rs`, `diagnostics.rs`, `appkit.rs` | The ten palettes and the crossfade between them; the persisted preferences, and what the Tauri app left of them; the log and the record a panic leaves; what the app asks AppKit for where GPUI has no call (the About panel, Reduce Motion, the spell checker). |
 
 ## Design
 
@@ -210,6 +215,17 @@ One look, stated once so new surfaces keep it. The tokens are in
   figures (`ui::Tabular`) or the mono face, so columns hold still as they
   change. Ids are always mono; a change id's unique prefix carries the
   weight.
+- **Motion tells, briefly.** Something moves only while something is
+  happening or changing shape: a fetch turns its icon, a working job's
+  dot pulses, a placeholder breathes while its read is out, a tray
+  unfolds (100 ms), graph rows move to where a rewrite put them (160 ms),
+  a new palette crosses over (200 ms) — all decelerating, none while
+  idle. Opening a section, a view or an overlay, and closing anything, is
+  instant. Under Reduce Motion everything is still (`ui::motion`).
+- **Text reads like text.** A change's title, its ids, its description
+  and a squash's resulting description select and copy as a Mac label's
+  do (`ui::selectable`); the description editor is the one field the
+  system's spell checker watches.
 - **Text keeps its floors.** text2 at 8:1 or better and text3 at 5.5:1
   on bg0–bg2; hierarchy comes from weight, size and the three steps,
   never from fading. Sentence case, no letter-spaced caps.
@@ -303,6 +319,16 @@ Things this code works around, so the next change does not rediscover them:
   built. The active descendant must lie inside the focused element, so a
   list whose keys stay in a text field (the palette) speaks its highlight
   through a live region (`ui::a11y::spoken`).
+- **GPUI knows Reduce Motion but never reads it.** `App::reduce_motion`
+  stays off until the app sets it: `ui::motion` follows NSWorkspace's
+  setting at launch and whenever the window comes forward.
+- **A sprite animation is the compositor's.** An SVG's timed
+  transformation (the fetch spinner, a job's pulse) turns on a visible
+  window's display link without drawing any view again; a headless run
+  and a test draw it at rest.
+- **A test window runs animation frames only when the test steps them**
+  (`Window::simulate_next_frame`, after advancing the clock). Tests hold
+  motion still, as scripted runs do; one about motion lets it run.
 - **A panic cannot be contained to a view.** Frames and events arrive
   through `extern "C"` AppKit callbacks, which abort on an unwind. Catching
   one sooner leaves GPUI broken: the entity being updated is dropped from

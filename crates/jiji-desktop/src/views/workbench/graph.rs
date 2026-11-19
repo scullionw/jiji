@@ -12,6 +12,7 @@ use gpui::{
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
 use jiji_forge::RepoPrState;
 
+use super::motion::{self, Motion};
 use super::{ShownDiff, WorkbenchView};
 use crate::app::WorkbenchMode;
 use crate::logic::graph::{
@@ -24,6 +25,7 @@ use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
 use crate::logic::text::counted;
 use crate::store::SavedView;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::ui::motion::ease_out;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, keyboard_on, label_box,
@@ -144,6 +146,10 @@ const REF_MAX: f32 = 120.;
 const REF_MIN: f32 = 44.;
 /// A label's padding and hairlines.
 const LABEL_PAD: f32 = 12.;
+
+/// Rows a rewrite took away keep their own element ids while they fold,
+/// apart from the rows drawn in their place.
+const GONE_KEYS: usize = 1 << 20;
 
 /// How wide `chars` monospace characters run at `size`.
 fn mono_width_at(chars: f32, size: f32) -> f32 {
@@ -620,7 +626,9 @@ impl WorkbenchView {
             );
 
         let body = match mode {
-            WorkbenchMode::Graph => self.render_graph(width, keys, cx).into_any_element(),
+            WorkbenchMode::Graph => self
+                .render_graph(width, keys, window, cx)
+                .into_any_element(),
             WorkbenchMode::Focus => self.render_focus(width, keys, cx).into_any_element(),
         };
         v_flex().size_full().child(head).child(
@@ -1049,8 +1057,10 @@ impl WorkbenchView {
 
     // ── Rows ──
 
+    #[allow(clippy::too_many_arguments)]
     fn row_style<'a>(
         &'a self,
+        snapshot: &'a RepoSnapshot,
         model: &GraphModel,
         width: f32,
         selected: &'a HashSet<String>,
@@ -1060,7 +1070,7 @@ impl WorkbenchView {
     ) -> RowStyle<'a> {
         let full = full_lanes_for(width, model.column_count);
         RowStyle {
-            snapshot: &self.snapshot,
+            snapshot,
             theme: theme(cx),
             emphasized,
             selected,
@@ -1661,6 +1671,7 @@ impl WorkbenchView {
         &mut self,
         width: f32,
         keys: GraphKeys,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let model = self.model.clone();
@@ -1686,31 +1697,103 @@ impl WorkbenchView {
             ui.focused_workstream.as_deref(),
         );
 
-        let mut tops = Vec::with_capacity(model.rows.len() + 1);
-        let mut total = 0.;
-        for row in &model.rows {
-            tops.push(total);
-            total += self.row_height(row);
+        // A move that has played out is over; until then it asks for
+        // frames, and none once it is.
+        let now = cx.background_executor().now();
+        if self
+            .motion
+            .as_ref()
+            .is_some_and(|motion| motion.progress(now) >= 1.)
+        {
+            self.motion = None;
         }
-        tops.push(total);
+        let progress = self.motion.as_ref().map(|motion| motion.progress(now));
+
+        let tops = motion::tops(&model, |row| self.row_height(row));
+        let total = tops[model.rows.len()];
         let scroll_top: f32 = (-self.scroll.offset().y).into();
         let viewport: f32 = self.scroll.bounds().size.height.into();
         let viewport = if viewport > 0. { viewport } else { 900. };
-        let shown = rows_in_view(&tops, scroll_top, viewport);
+        let mut shown = rows_in_view(&tops, scroll_top, viewport);
+        // Rows on their way in from where they stood are drawn from the
+        // start of the move.
+        let known = self
+            .motion
+            .as_ref()
+            .map(|_| motion::row_keys(&snapshot, &model));
+        if let (Some(motion), Some(known)) = (&self.motion, &known) {
+            for (ix, key) in known.iter().enumerate() {
+                let arriving = key
+                    .as_deref()
+                    .is_some_and(|key| motion.came_from(key, scroll_top, scroll_top + viewport));
+                if arriving {
+                    shown = shown.start.min(ix)..shown.end.max(ix + 1);
+                }
+            }
+        }
         let first = shown.start;
 
-        let style = self.row_style(&model, width, &selected, emphasized, keys, cx);
+        let style = self.row_style(
+            &snapshot,
+            &model,
+            width,
+            &selected,
+            emphasized.clone(),
+            keys,
+            cx,
+        );
         let rows = self.rows(&model.rows[shown], first, &style, cx);
         let mut list = div().relative().w_full().h(px(total));
+        // The rows a rewrite took away fold where they stood, under the
+        // rows moving into their place.
+        if let (Some(motion), Some(progress)) = (&self.motion, progress) {
+            let old = self.row_style(
+                &motion.old_snapshot,
+                &motion.old_model,
+                width,
+                &selected,
+                emphasized,
+                keys,
+                cx,
+            );
+            for (ix, top) in &motion.gone {
+                let row = &motion.old_model.rows[*ix];
+                let height = self.row_height(row) * (1. - ease_out(progress));
+                list = list.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .top(px(*top))
+                        .h(px(height))
+                        .overflow_hidden()
+                        .opacity(1. - progress)
+                        .children(self.rows(std::slice::from_ref(row), GONE_KEYS + ix, &old, cx)),
+                );
+            }
+        }
         for (ix, row) in rows.into_iter().enumerate() {
+            let index = first + ix;
+            let (top, strength) = match (&self.motion, &known, progress) {
+                (Some(motion), Some(known), Some(progress)) => {
+                    motion.place(known[index].as_deref(), tops[index], progress)
+                }
+                _ => (tops[index], 1.),
+            };
+            let id = Motion::key(&snapshot, &model.rows[index]);
             list = list.child(
                 div()
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(tops[first + ix]))
+                    .top(px(top))
+                    .when(strength < 1., |el| el.opacity(strength))
+                    .debug_selector(|| format!("graph-row-{}", id.unwrap_or("elision")))
                     .child(row),
             );
+        }
+        if self.motion.is_some() {
+            window.request_animation_frame();
         }
         let mut body = v_flex().w_full().py(px(4.)).child(list);
         if snapshot.truncated {
@@ -1759,6 +1842,7 @@ impl WorkbenchView {
         };
         let selected = self.selected_ids(cx);
         let style = self.row_style(
+            &self.snapshot,
             &focus.graph,
             width,
             &selected,

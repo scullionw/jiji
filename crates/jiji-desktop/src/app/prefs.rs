@@ -208,7 +208,7 @@ impl AppModel {
         if theme::has_theme(cx) && theme::theme(cx).id == id {
             return;
         }
-        theme::set_theme(Theme::named(&id, self.mono_font.clone()), cx);
+        theme::fade_to(Theme::named(&id, self.mono_font.clone()), cx);
         cx.notify();
     }
 
@@ -711,6 +711,47 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[gpui::test]
+    fn a_new_palette_crosses_over_from_the_one_on_screen(cx: &mut gpui::TestAppContext) {
+        let dir = crate::testing::scratch("crossfade");
+        let model = crate::testing::install(&dir, cx);
+        let bg =
+            |cx: &mut gpui::TestAppContext| gpui::Rgba::from(cx.update(|cx| theme::theme(cx).bg1));
+        let light = bg(cx);
+        let dark = gpui::Rgba::from(Theme::named(theme::DEFAULT_DARK, "Menlo".into()).bg1);
+        let switch = |mode: ThemeMode, cx: &mut gpui::TestAppContext| {
+            model.update(cx, |model, cx| model.set_theme_mode(mode, cx));
+        };
+        let after = |ms: u64, cx: &mut gpui::TestAppContext| {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(ms));
+            cx.run_until_parked();
+        };
+
+        cx.update(|cx| cx.set_reduce_motion(false));
+        switch(ThemeMode::Dark, cx);
+        // Partway, every surface is between the two palettes.
+        after(100, cx);
+        let partway = bg(cx);
+        assert!(
+            dark.r < partway.r && partway.r < light.r,
+            "{} < {} < {}",
+            dark.r,
+            partway.r,
+            light.r
+        );
+        // Then exactly the new one, and nothing more is scheduled.
+        after(150, cx);
+        assert_eq!(bg(cx), dark);
+        assert_eq!(cx.update(|cx| theme::theme(cx).id), theme::DEFAULT_DARK);
+
+        // Under Reduce Motion the switch is instant.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        switch(ThemeMode::Light, cx);
+        assert_eq!(bg(cx), light);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn record() -> LicenseRecord {
         LicenseRecord {

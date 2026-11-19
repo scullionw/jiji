@@ -373,6 +373,8 @@ impl Shell {
                 .opacity(0.)
                 .group_hover(group, |style| style.opacity(1.))
                 .hover(|style| style.bg(t.bg_hover))
+                .debug_selector(move || format!("tab-close-{id}"))
+                .tooltip(tooltip("Close tab (⌘W)"))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     close_app.update(cx, |m, cx| m.close_tab(id, cx));
@@ -473,7 +475,15 @@ impl Shell {
                 .text_color(color)
                 .tabular()
                 .tooltip(tooltip(title))
-                .child(icon(IconName::Refresh, 12., color))
+                .child({
+                    let glyph = icon(IconName::Refresh, 12., color);
+                    // A fetch under way turns its icon.
+                    if busy {
+                        crate::ui::motion::spinning(glyph)
+                    } else {
+                        glyph
+                    }
+                })
                 .child(label.clone());
             el = if busy {
                 el.role(Role::Label).aria_value(label)
@@ -1140,6 +1150,31 @@ mod tests {
                 .0,
             "Fetch"
         );
+    }
+
+    #[gpui::test]
+    fn a_tab_s_close_button_names_its_shortcut_on_hover(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, VisualTestContext};
+
+        let dir = crate::testing::scratch("tab-close-tip");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        let id = model.read_with(cx, |model, _| model.active_id);
+        let selector: &'static str = format!("tab-close-{id}").leak();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let close = cx
+            .debug_bounds(selector)
+            .expect("the tab's close is laid out");
+        cx.simulate_mouse_move(close.center(), None, Modifiers::none());
+        cx.executor()
+            .advance_clock(crate::ui::tooltip::SHOW_DELAY * 2);
+        cx.run_until_parked();
+        let shown = cx.update(|_, cx| crate::ui::tooltip::showing(cx));
+        assert_eq!(shown.as_deref(), Some("Close tab (⌘W)"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

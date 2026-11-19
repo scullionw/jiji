@@ -280,7 +280,12 @@ impl Shell {
                     .on_click(move |_, _, cx| {
                         app.update(cx, |m, cx| m.go_to_section(Section::Publish, cx))
                     })
-                    .child(dot(color, 6.))
+                    // A job at work keeps a slow heartbeat.
+                    .child(if chip.pulse {
+                        crate::ui::motion::pulse_dot(color, 6.).into_any_element()
+                    } else {
+                        dot(color, 6.).into_any_element()
+                    })
                     .child(div().truncate().child(label)),
             );
             if chip.dismissable {

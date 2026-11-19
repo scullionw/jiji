@@ -1181,7 +1181,7 @@ impl WorkbenchView {
                     .bg(t.bg_hover),
             );
         }
-        el
+        crate::ui::motion::breathing("diff-skeleton", el)
     }
 
     pub(super) fn render_diff_pane(

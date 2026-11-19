@@ -16,6 +16,7 @@
 //!   press=X,Y   hold=X,Y   release=X,Y   (a drag in parts; alt-hold=…)
 //!   scroll=X,Y,DX,DY               key=cmd-k   type=some text
 //!   wait=MS     shot=/abs/path.png a11y=/abs/path.json   resize=W,H   quit
+//!   motion=on   (motion runs from here; a scripted run starts still)
 //!
 //! A `key` is pressed and released, as a keyboard does: Space and Return
 //! press a focused control on the release. `a11y` writes the tree a screen
@@ -58,6 +59,8 @@ pub enum Step {
     Shot(PathBuf),
     A11y(PathBuf),
     Resize(f32, f32),
+    /// Let motion run: a scripted run holds it still for its screenshots.
+    Motion,
     Quit,
 }
 
@@ -75,6 +78,7 @@ impl Step {
             | Step::Shot(_)
             | Step::A11y(_)
             | Step::Resize(..)
+            | Step::Motion
             | Step::Quit => None,
         }
     }
@@ -112,6 +116,10 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             }
             "quit" => {
                 steps.push(Step::Quit);
+                continue;
+            }
+            "motion" if value == "on" => {
+                steps.push(Step::Motion);
                 continue;
             }
             "wait" => {
@@ -395,6 +403,7 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
         Step::Resize(w, h) => {
             update(cx, &mut |window, _| window.resize(size(px(w), px(h))));
         }
+        Step::Motion => cx.update(crate::ui::motion::release),
         Step::Quit => cx.update(|cx| cx.quit()),
     }
 }
@@ -444,6 +453,8 @@ mod tests {
     fn steps_parse_with_modifiers_and_text_values() {
         let steps = parse("click=10,20; shift-click=1,2;type=a, b;key=cmd-k;wait=50;quit").unwrap();
         assert_eq!(steps.len(), 6);
+        assert_eq!(parse("motion=on").unwrap(), vec![Step::Motion]);
+        assert!(parse("motion=maybe").is_err());
         assert_eq!(
             parse("a11y=/tmp/tree.json").unwrap(),
             vec![Step::A11y("/tmp/tree.json".into())]

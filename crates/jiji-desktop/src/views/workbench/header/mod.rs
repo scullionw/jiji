@@ -26,8 +26,9 @@ use crate::logic::inspect::{
 use crate::logic::split::{self, selection_ready, split_payload, split_summary, Selection};
 use crate::theme::{theme, Theme, TEXT_M, TEXT_S};
 use crate::ui::focus::Return;
+use crate::ui::motion::unfold;
 use crate::ui::ScrollY as _;
-use crate::ui::{v_flex, InputEvent, NodeExt as _, PopoverState, TextInput};
+use crate::ui::{selectable, v_flex, InputEvent, NodeExt as _, PopoverState, TextInput};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -99,6 +100,7 @@ impl HeaderState {
             editor: cx.new(|cx| {
                 TextInput::new(window, cx)
                     .multiline(4, 12)
+                    .spell_checked()
                     .placeholder("Summary line")
                     .label("Description")
             }),
@@ -311,9 +313,10 @@ impl WorkbenchView {
             }
             Tray::Rebase | Tray::Compare => self.focus_filter_or_tray(window, cx),
             Tray::Split => {
-                self.header
-                    .split_desc
-                    .update(cx, |input, cx| input.set_text("", cx));
+                self.header.split_desc.update(cx, |input, cx| {
+                    input.set_text("", cx);
+                    input.set_rows(None, cx);
+                });
                 // The split panel reads the change's own diff.
                 if self.compare != CompareMode::Parent {
                     self.set_compare(CompareMode::Parent, cx);
@@ -358,6 +361,7 @@ impl WorkbenchView {
         self.header.more.close(window, cx);
         self.header.editor.update(cx, |input, cx| {
             input.set_text(text, cx);
+            input.set_rows(None, cx);
             input.set_disabled(false, cx);
             input.focus(window, cx);
         });
@@ -864,7 +868,8 @@ impl WorkbenchView {
             }
         }
         if editing {
-            header = header.child(self.render_editor(window, cx));
+            let editor = self.render_editor(window, cx);
+            header = header.child(unfold("unfold-editor", editor, window));
         }
         let body = node
             .description
@@ -885,7 +890,8 @@ impl WorkbenchView {
                     .text_size(px(TEXT_M))
                     .line_height(gpui::relative(1.55))
                     .text_color(t.text2)
-                    .child(body.to_owned()),
+                    .debug_selector(|| "description-body".into())
+                    .child(selectable("body", body.to_owned()).wrap()),
             );
         }
         if node.is_divergent {
@@ -912,7 +918,11 @@ impl WorkbenchView {
             Tray::Manage(name) => self.render_manage_tray(&snapshot, node, &name, window, cx),
             Tray::None | Tray::Edit => None,
         };
-        header.children(tray).into_any_element()
+        // Each tray unfolds as it opens, the next one too.
+        let key = gpui::SharedString::from(format!("unfold-{:?}", self.header.tray));
+        header
+            .children(tray.map(|tray| unfold(key, tray, window)))
+            .into_any_element()
     }
 }
 
@@ -962,6 +972,345 @@ mod tests {
                 (header.tray == super::Tray::Edit).then(|| header.editor.read(cx).text().to_owned())
             })
             .unwrap()
+    }
+
+    /// Press and release `button` `count` times at `at`, the platform's way:
+    /// the second press of a double-click is counted twice.
+    fn clicks(
+        cx: &mut gpui::VisualTestContext,
+        at: gpui::Point<gpui::Pixels>,
+        count: usize,
+        button: gpui::MouseButton,
+    ) {
+        for n in 1..=count {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button,
+                position: at,
+                modifiers: gpui::Modifiers::none(),
+                click_count: n,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                button,
+                position: at,
+                modifiers: gpui::Modifiers::none(),
+                click_count: n,
+            });
+        }
+        cx.run_until_parked();
+    }
+
+    /// Choose an Edit menu item, as the menu bar does: only when it is on
+    /// offer to the key window's focus.
+    fn choose(action: &dyn gpui::Action, cx: &mut gpui::VisualTestContext) -> bool {
+        cx.cx.update(|cx| {
+            let offered = cx.is_action_available(action);
+            if offered {
+                cx.dispatch_action(action);
+            }
+            offered
+        })
+    }
+
+    fn copied(cx: &mut gpui::VisualTestContext) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    #[gpui::test]
+    fn the_header_s_words_are_selected_and_copied_without_an_editor(cx: &mut TestAppContext) {
+        use crate::ui::input::{Copy, SelectAll};
+        use gpui::MouseButton::{Left, Right};
+
+        let dir = crate::testing::scratch("select-header");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let mut snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        // Trunk's change is immutable: there is no editor to copy from.
+        let trunk = snapshot
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "uvkmrtpz")
+            .unwrap();
+        trunk.description =
+            "release: cut 0.41 changelog\n\nShips the graph rewrite.\nNotes in CHANGELOG.md."
+                .into();
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        model.update(cx, |model, cx| {
+            model.select_node(Some("uvkmrtpz".into()), cx)
+        });
+        cx.run_until_parked();
+        let workbench = window
+            .update(cx, |shell, _, _| {
+                shell.section::<crate::views::workbench::WorkbenchView>()
+            })
+            .unwrap()
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        let at = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is on screen"))
+                .center()
+        };
+
+        // The title: a click gives it the keys with nothing to copy yet; a
+        // double-click takes a word, a triple-click the line.
+        let bounds = cx
+            .debug_bounds("change-title")
+            .expect("the title is on screen");
+        let title = gpui::point(bounds.right() - gpui::px(3.), bounds.center().y);
+        clicks(&mut cx, title, 1, Left);
+        assert!(!choose(&Copy, &mut cx));
+        clicks(&mut cx, title, 2, Left);
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(copied(&mut cx).as_deref(), Some("changelog"));
+        clicks(&mut cx, title, 3, Left);
+        assert!(choose(&Copy, &mut cx));
+        assert_eq!(
+            copied(&mut cx).as_deref(),
+            Some("release: cut 0.41 changelog")
+        );
+
+        // The ids, whole.
+        for (selector, id) in [("change-id", "uvkmrtpz"), ("commit-id", "e7c41a9f")] {
+            let place = at(selector, &mut cx);
+            clicks(&mut cx, place, 1, Left);
+            assert!(choose(&SelectAll, &mut cx));
+            assert!(choose(&Copy, &mut cx));
+            assert_eq!(copied(&mut cx).as_deref(), Some(id));
+        }
+
+        // A line of the body, through the context menu: reading text
+        // offers Copy and Select All, nothing that would change it.
+        workbench.update(&mut cx, |view, cx| {
+            view.header.body_open = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let body = at("description-body", &mut cx);
+        clicks(&mut cx, body, 3, Left);
+        clicks(&mut cx, body, 1, Right);
+        let offered: Vec<_> = model.read_with(&cx, |model, _| {
+            let menu = model.menu.as_ref().expect("the menu is open");
+            menu.sections
+                .iter()
+                .flatten()
+                .map(|item| (item.id, item.disabled))
+                .collect()
+        });
+        assert_eq!(offered, [("edit.copy", false), ("edit.selectAll", false)]);
+        cx.simulate_keystrokes("down enter");
+        let line = copied(&mut cx).expect("the menu's Copy copied");
+        assert!(
+            ["Ships the graph rewrite.", "Notes in CHANGELOG.md."].contains(&line.as_str()),
+            "{line}"
+        );
+
+        // Part of the squash preview.
+        model.update(&mut cx, |model, cx| {
+            model.select_node(Some("lwnouzpy".into()), cx);
+            model.send_intent(crate::app::UiIntent::Squash, cx);
+        });
+        cx.run_until_parked();
+        let combined = workbench.read_with(&cx, |view, _| {
+            let snapshot = &view.snapshot;
+            let node = crate::logic::inspect::find_node(snapshot, "lwnouzpy").unwrap();
+            let parent = crate::logic::inspect::find_node(snapshot, &node.parents[0]).unwrap();
+            crate::logic::inspect::combined_description(&parent.description, &node.description)
+        });
+        // Its first line: the parent's summary.
+        let bounds = cx
+            .debug_bounds("squash-description")
+            .expect("the preview is on screen");
+        let preview = gpui::point(bounds.left() + gpui::px(40.), bounds.top() + gpui::px(14.));
+        clicks(&mut cx, preview, 3, Left);
+        cx.simulate_keystrokes("cmd-c");
+        let part = copied(&mut cx).expect("the preview copied");
+        assert!(
+            !part.is_empty() && part.len() < combined.len() && combined.contains(&part),
+            "{part:?} of {combined:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Drag the grip on `field`'s bottom edge by `dy`.
+    fn drag_grip(cx: &mut gpui::VisualTestContext, field: &'static str, dy: f32) {
+        use gpui::{px, Modifiers, MouseButton};
+        let bounds = cx
+            .debug_bounds(field)
+            .unwrap_or_else(|| panic!("{field} is on screen"));
+        let from = gpui::point(bounds.right() - px(40.), bounds.bottom());
+        let to = gpui::point(from.x, from.y + px(dy));
+        cx.simulate_mouse_move(from, None, Modifiers::none());
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn height(cx: &mut gpui::VisualTestContext, field: &'static str) -> f32 {
+        cx.debug_bounds(field)
+            .unwrap_or_else(|| panic!("{field} is on screen"))
+            .size
+            .height
+            .into()
+    }
+
+    #[gpui::test]
+    fn both_description_editors_are_resized_by_hand_and_the_draft_stays(cx: &mut TestAppContext) {
+        // The mock backend, for a working copy whose diff can be split.
+        let dir = crate::testing::scratch("resize-editors");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        open_editor(&model, cx);
+        cx.simulate_keystrokes(window.into(), "cmd-a");
+        cx.simulate_input(window.into(), DRAFT);
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let field = "describe-field";
+        // Four rows of twenty points to start, the text's own.
+        let auto = height(&mut cx, field);
+
+        // Three rows taller by the grip, then two shorter.
+        drag_grip(&mut cx, field, 61.);
+        assert_eq!(height(&mut cx, field), auto + 60.);
+        drag_grip(&mut cx, field, -39.);
+        assert_eq!(height(&mut cx, field), auto + 20.);
+        assert_eq!(editor_text(window, &mut cx).as_deref(), Some(DRAFT));
+
+        // From the keyboard: Tab leaves the editor for its grip, ↓ adds a
+        // row, Home goes to the fewest. The draft is still the draft.
+        crate::testing::press(window.into(), "tab down", &mut cx);
+        assert_eq!(height(&mut cx, field), auto + 40.);
+        crate::testing::press(window.into(), "home", &mut cx);
+        assert_eq!(height(&mut cx, field), auto);
+        crate::testing::press(window.into(), "end", &mut cx);
+        assert!(height(&mut cx, field) > auto + 100.);
+        assert_eq!(editor_text(window, &mut cx).as_deref(), Some(DRAFT));
+
+        // A double-click on the grip gives the height back to the text.
+        let bounds = cx.debug_bounds(field).unwrap();
+        let on_grip = gpui::point(bounds.right() - gpui::px(40.), bounds.bottom());
+        cx.simulate_click(on_grip, gpui::Modifiers::none());
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: on_grip,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: on_grip,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 2,
+        });
+        cx.run_until_parked();
+        assert_eq!(height(&mut cx, field), auto);
+
+        // A height set by hand lasts while the tray is open: the next
+        // opening starts from the text's own.
+        drag_grip(&mut cx, field, 41.);
+        assert_eq!(height(&mut cx, field), auto + 40.);
+        cx.simulate_keystrokes("escape");
+        open_editor(&model, &mut cx);
+        assert_eq!(height(&mut cx, field), auto);
+
+        // The split's description field, the same way.
+        cx.simulate_keystrokes("escape");
+        model.update(&mut cx, |model, cx| {
+            model.send_intent(
+                UiIntent::Split {
+                    into: false,
+                    path: None,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let field = "split-description-field";
+        let auto = height(&mut cx, field);
+        drag_grip(&mut cx, field, 37.);
+        assert_eq!(height(&mut cx, field), auto + 36.);
+        drag_grip(&mut cx, field, -19.);
+        assert_eq!(height(&mut cx, field), auto + 18.);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_tray_unfolds_as_it_opens_and_goes_at_once(cx: &mut TestAppContext) {
+        use std::time::Duration;
+
+        let dir = crate::testing::scratch("unfold-tray");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let fold = |cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds("unfold")
+                .map(|bounds| f32::from(bounds.size.height))
+        };
+        let frame = |ms: u64, cx: &mut gpui::VisualTestContext| {
+            cx.executor().advance_clock(Duration::from_millis(ms));
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        };
+        let squash = |cx: &mut gpui::VisualTestContext| {
+            model.update(cx, |model, cx| model.send_intent(UiIntent::Squash, cx));
+            cx.run_until_parked();
+        };
+
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        squash(&mut cx);
+        // It opens from nothing, unfolds, and settles at its own height.
+        assert_eq!(fold(&mut cx), Some(0.));
+        frame(16, &mut cx);
+        frame(34, &mut cx);
+        let partway = fold(&mut cx).unwrap();
+        frame(80, &mut cx);
+        let open = fold(&mut cx).unwrap();
+        assert!(0. < partway && partway < open, "{partway} of {open}");
+        // Once open, nothing asks for frames.
+        let asked = cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(asked, 0, "an open tray keeps asking for frames");
+
+        // Closing is instant.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(fold(&mut cx), None);
+
+        // Under Reduce Motion it is open on the frame it opens on.
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        squash(&mut cx);
+        assert_eq!(fold(&mut cx), Some(open));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn only_the_describe_editor_is_spell_checked(cx: &mut TestAppContext) {
+        let (_model, window, dir) = editing("spell-checked", cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let workbench = shell
+                    .section::<crate::views::workbench::WorkbenchView>()
+                    .unwrap();
+                let header = &workbench.read(cx).header;
+                let checked: Vec<bool> = header
+                    .inputs()
+                    .iter()
+                    .map(|input| input.read(cx).is_spell_checked())
+                    .collect();
+                // The description; not a bookmark's name, a filter, or the
+                // split's carved-off description, which the old app left
+                // unchecked too.
+                assert_eq!(checked, [true, false, false, false, false]);
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

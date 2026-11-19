@@ -137,7 +137,7 @@ impl PublishView {
         list.into_any_element()
     }
 
-    pub(super) fn skeleton(&self, cx: &Context<Self>) -> gpui::Div {
+    pub(super) fn skeleton(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let bar = |width: f32| {
             div()
@@ -147,7 +147,7 @@ impl PublishView {
                 .rounded(px(RADIUS_S))
                 .bg(Theme::fade(t.text1, 0.08))
         };
-        v_flex().child(bar(1.)).child(bar(0.62))
+        crate::ui::motion::breathing("plan-skeleton", v_flex().child(bar(1.)).child(bar(0.62)))
     }
 
     pub(super) fn stacked(&self) -> gpui::Div {

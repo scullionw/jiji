@@ -406,10 +406,20 @@ impl BookmarksView {
             name = name.child(tag("trunk", t.accent_strong));
         }
         if !bookmark.is_local && bookmark.tracked {
-            name = name.child(tag("tracked", t.text3));
+            name = name.child(
+                tag("tracked", t.text3)
+                    .id(SharedString::from(format!("tracked-{key}")))
+                    .debug_selector(|| "bookmark-tracked".into())
+                    .tooltip(tooltip("jj tracks this remote branch")),
+            );
         }
         if bookmark.is_merged {
-            name = name.child(tag("merged", t.ok));
+            name = name.child(
+                tag("merged", t.ok)
+                    .id(SharedString::from(format!("merged-{key}")))
+                    .debug_selector(|| "bookmark-merged".into())
+                    .tooltip(tooltip("Already ancestry of trunk — deleting is cleanup")),
+            );
         }
         let mut ident = h_flex()
             .id(SharedString::from(format!("ident-{key}")))
@@ -854,5 +864,56 @@ impl Render for BookmarksView {
             ),
         )
         .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    use crate::shell::Shell;
+
+    #[gpui::test]
+    fn a_tracked_and_a_merged_bookmark_say_what_that_means_on_hover(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("bookmark-tips");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let mut snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        // A remote branch jj tracks, already in trunk's ancestry: both
+        // states at once.
+        let spike = snapshot
+            .bookmarks
+            .iter_mut()
+            .find(|bookmark| bookmark.name == "graph-spike")
+            .unwrap();
+        spike.tracked = true;
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        // Through the model, not ⌘4: the tooltip guard counts a key
+        // against the tooltips that follow it for a beat of real time.
+        model.update(cx, |model, cx| {
+            model.go_to_section(crate::app::Section::Bookmarks, cx)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        for (selector, words) in [
+            ("bookmark-tracked", "jj tracks this remote branch"),
+            (
+                "bookmark-merged",
+                "Already ancestry of trunk — deleting is cleanup",
+            ),
+        ] {
+            let tag = cx.debug_bounds(selector).expect("the tag is on screen");
+            cx.simulate_mouse_move(tag.center(), None, Modifiers::none());
+            cx.executor()
+                .advance_clock(crate::ui::tooltip::SHOW_DELAY * 2);
+            cx.run_until_parked();
+            let shown = cx.update(|_, cx| crate::ui::tooltip::showing(cx));
+            assert_eq!(shown.as_deref(), Some(words), "{selector}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

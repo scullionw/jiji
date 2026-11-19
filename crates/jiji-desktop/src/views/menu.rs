@@ -238,6 +238,12 @@ impl ContextMenu {
                 window.focus(&field, cx);
                 field.dispatch_action(action.as_ref(), window, cx);
             }
+            MenuAction::Spell(choice) => {
+                if let Some(field) = field {
+                    window.focus(&field, cx);
+                    field.dispatch_action(&input::Spell(choice), window, cx);
+                }
+            }
             action => self
                 .app
                 .update(cx, |model, cx| model.run_action(action, cx)),
@@ -308,6 +314,7 @@ impl ContextMenu {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .when(item.strong, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
                     .child(truncated(item.label.clone())),
             );
         if !item.children.is_empty() {
@@ -500,6 +507,7 @@ mod tests {
                     shortcut: None,
                     danger: false,
                     disabled,
+                    strong: false,
                     action: None,
                     children: Vec::new(),
                 },

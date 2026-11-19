@@ -113,6 +113,7 @@ pub fn register_app_actions(cx: &mut App) {
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &Help, cx| cx.open_url(REPO_URL));
+    cx.on_action(|_: &About, _| crate::appkit::about_panel(crate::host::update::CURRENT_VERSION));
     cx.on_action(|_: &CheckUpdates, cx| {
         app(cx).update(cx, |model, cx| model.check_for_update_now(cx));
     });
@@ -122,8 +123,9 @@ pub fn register_app_actions(cx: &mut App) {
 }
 
 /// The native menu bar. Items mirror the shell's actions and show the same
-/// shortcuts.
-pub fn menus() -> Vec<gpui::Menu> {
+/// shortcuts; the full-screen item names what it will do, as AppKit's own
+/// does.
+pub fn menus(full_screen: bool) -> Vec<gpui::Menu> {
     use crate::ui::input;
     use gpui::{Menu, MenuItem, OsAction, SystemMenuType};
     vec![
@@ -187,7 +189,14 @@ pub fn menus() -> Vec<gpui::Menu> {
                 MenuItem::action("Toggle Graph Panel", ToggleGraph),
                 MenuItem::action("Refresh", Refresh),
                 MenuItem::separator(),
-                MenuItem::action("Enter Full Screen", ToggleFullScreen),
+                MenuItem::action(
+                    if full_screen {
+                        "Exit Full Screen"
+                    } else {
+                        "Enter Full Screen"
+                    },
+                    ToggleFullScreen,
+                ),
             ],
         },
         Menu {
@@ -241,6 +250,8 @@ pub struct Shell {
     menu: Option<(u64, Entity<crate::views::menu::ContextMenu>)>,
     /// Waiting for the window to hold still before keeping where it is.
     window_settle: Option<Task<()>>,
+    /// The menu bar was last built for a full-screen window.
+    full_screen: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -275,11 +286,15 @@ impl Shell {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.app.update(cx, |model, _| model.window_activated());
+                    // Reduce Motion is changed in System Settings, away
+                    // from here.
+                    crate::ui::motion::follow_system(cx);
                 }
             }),
             // Where the window was left survives restarts, once it holds
             // still: every change starts the wait again.
             cx.observe_window_bounds(window, |this, window, cx| {
+                this.sync_full_screen(window, cx);
                 this.window_settle = Some(cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(placement::SETTLE).await;
                     let _ = this.update_in(cx, |this, window, cx| this.keep_window(window, cx));
@@ -330,6 +345,7 @@ impl Shell {
             register_trap: Trap::new(cx),
             menu: None,
             window_settle: None,
+            full_screen: false,
             _subscriptions: subscriptions,
         };
         this.sync(window, cx);
@@ -337,7 +353,19 @@ impl Shell {
         this
     }
 
+    /// Entering or leaving full screen resizes the window; the View menu's
+    /// item changes its name with it.
+    fn sync_full_screen(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let full_screen = window.is_fullscreen();
+        if full_screen != std::mem::replace(&mut self.full_screen, full_screen) {
+            cx.set_menus(menus(full_screen));
+        }
+    }
+
     fn keep_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The last resize of a transition can land before AppKit settles
+        // the window's style; by now it has.
+        self.sync_full_screen(window, cx);
         let seen = placement::seen(window, cx);
         self.app.update(cx, |model, _| {
             let state = placement::settle(model.store.window().as_ref(), seen);
@@ -715,18 +743,6 @@ impl Render for Shell {
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
             .on_action(|_: &ToggleFullScreen, window, _| window.toggle_fullscreen())
-            .on_action(|_: &About, window, cx| {
-                drop(window.prompt(
-                    gpui::PromptLevel::Info,
-                    "Jiji",
-                    Some(&format!(
-                        "Version {}\nA workbench for jj repositories.",
-                        crate::host::update::CURRENT_VERSION
-                    )),
-                    &["OK"],
-                    cx,
-                ));
-            })
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
@@ -854,6 +870,50 @@ mod tests {
         press(keys, "escape", cx);
         assert!(!open(cx).0);
         assert_eq!(focused(cx), Some(settings));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn about_is_the_system_panel_with_or_without_a_window(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("about-panel");
+        crate::testing::install(&dir, cx);
+        // The standard panel belongs to the app, not to a window.
+        cx.update(|cx| assert!(cx.is_action_available(&super::About)));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        cx.update(|cx| cx.dispatch_action(&super::About));
+        cx.run_until_parked();
+        // No alert of the app's own in its place.
+        let cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(!cx.has_pending_prompt());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_view_menu_offers_the_way_out_of_full_screen(cx: &mut TestAppContext) {
+        let (dir, _model, window) = mock_shell("full-screen-menu", cx);
+        let item = |cx: &mut TestAppContext| {
+            let menus = cx.update(|cx| cx.get_menus()).unwrap_or_default();
+            menus
+                .iter()
+                .find(|menu| menu.name == "View")
+                .and_then(|view| {
+                    view.items.iter().find_map(|item| match item {
+                        gpui::OwnedMenuItem::Action { name, .. }
+                            if name.contains("Full Screen") =>
+                        {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                })
+        };
+        cx.simulate_keystrokes(window.into(), "ctrl-cmd-f");
+        cx.run_until_parked();
+        assert_eq!(item(cx).as_deref(), Some("Exit Full Screen"));
+        cx.simulate_keystrokes(window.into(), "ctrl-cmd-f");
+        cx.run_until_parked();
+        assert_eq!(item(cx).as_deref(), Some("Enter Full Screen"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

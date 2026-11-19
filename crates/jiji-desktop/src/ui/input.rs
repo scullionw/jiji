@@ -15,11 +15,15 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollEvent, SharedString, Style, TextAlign,
-    TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    TextRun, UTF16Selection, UnderlineStyle, Window,
 };
-use unicode_segmentation::UnicodeSegmentation;
 
-use super::NodeExt as _;
+use super::spelling::{self, Spelling};
+use super::textlayout::{
+    lay_out, next_boundary, next_word, prev_boundary, prev_word, word_range, Layout,
+};
+use super::{keyboard_on, NodeExt as _};
+use crate::logic::menu::SpellChoice;
 use crate::theme::{theme, RADIUS_M, TEXT_S};
 
 actions!(
@@ -60,8 +64,20 @@ actions!(
         Submit,
         SubmitBack,
         Escape,
+        Shorter,
+        Taller,
+        Shortest,
+        Tallest,
     ]
 );
+
+/// The most rows a height set by hand runs to.
+const MOST_ROWS: usize = 24;
+
+/// A choice from a misspelled word's menu, for the field it was made in.
+#[derive(Clone, PartialEq, Debug, gpui::Action)]
+#[action(namespace = text_input, no_json)]
+pub struct Spell(pub SpellChoice);
 
 /// Key bindings for every text field in the app.
 pub fn bind_keys(cx: &mut App) {
@@ -119,6 +135,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-enter", SubmitBack, Some("TextInput && !multiline")),
         KeyBinding::new("cmd-enter", Submit, any),
         KeyBinding::new("escape", Escape, any),
+        KeyBinding::new("up", Shorter, Some("FieldGrip")),
+        KeyBinding::new("down", Taller, Some("FieldGrip")),
+        KeyBinding::new("home", Shortest, Some("FieldGrip")),
+        KeyBinding::new("end", Tallest, Some("FieldGrip")),
     ]);
 }
 
@@ -153,6 +173,18 @@ pub struct TextInput {
     multiline: bool,
     min_rows: usize,
     max_rows: usize,
+    /// A height set by hand with the grip, in rows; the text's own while
+    /// `None`.
+    rows: Option<usize>,
+    /// The grip is being dragged: where the pointer took it, and the rows
+    /// then.
+    resizing: Option<(Pixels, usize)>,
+    grip_focus: FocusHandle,
+    /// The system's spell checker and what it flagged, in a field that
+    /// asked for it.
+    spelling: Option<Spelling>,
+    /// The misspelled word a menu was opened on.
+    spell_target: Option<Range<usize>>,
     masked: bool,
     disabled: bool,
     selecting: bool,
@@ -164,141 +196,6 @@ pub struct TextInput {
     last_edit: Option<Instant>,
     /// Layout of the last paint, for hit-testing and vertical motion.
     layout: Option<Layout>,
-}
-
-struct Layout {
-    bounds: Bounds<Pixels>,
-    line_height: Pixels,
-    lines: Vec<LaidLine>,
-    scroll: Point<Pixels>,
-    content_height: Pixels,
-}
-
-struct LaidLine {
-    /// Byte offset of this paragraph in the display text.
-    start: usize,
-    /// Offset of its top from the content origin.
-    top: Pixels,
-    line: WrappedLine,
-    /// Byte offsets (paragraph-relative) where each visual row begins.
-    rows: Vec<usize>,
-}
-
-impl LaidLine {
-    fn row_of(&self, index: usize) -> usize {
-        match self.rows.binary_search(&index) {
-            Ok(row) => row,
-            Err(row) => row.saturating_sub(1),
-        }
-    }
-
-    fn row_end(&self, row: usize) -> usize {
-        self.rows.get(row + 1).copied().unwrap_or(self.line.len())
-    }
-
-    /// X of a paragraph-relative byte offset within its visual row.
-    fn x_in_row(&self, index: usize, row: usize) -> Pixels {
-        let layout = &self.line.unwrapped_layout;
-        layout.x_for_index(index) - layout.x_for_index(self.rows[row])
-    }
-
-    fn height(&self, line_height: Pixels) -> Pixels {
-        line_height * self.rows.len() as f32
-    }
-}
-
-impl Layout {
-    fn line_for(&self, index: usize) -> usize {
-        match self.lines.binary_search_by(|line| line.start.cmp(&index)) {
-            Ok(ix) => ix,
-            Err(ix) => ix.saturating_sub(1),
-        }
-    }
-
-    /// Content-space position of a display byte offset's caret.
-    fn caret(&self, index: usize) -> Point<Pixels> {
-        let Some(line) = self.lines.get(self.line_for(index)) else {
-            return Point::default();
-        };
-        let local = (index - line.start).min(line.line.len());
-        let row = line.row_of(local);
-        point(
-            line.x_in_row(local, row),
-            line.top + self.line_height * row as f32,
-        )
-    }
-
-    /// Display byte offset nearest a content-space position.
-    fn index_at(&self, position: Point<Pixels>) -> usize {
-        let Some(last) = self.lines.last() else {
-            return 0;
-        };
-        if position.y < px(0.) {
-            return 0;
-        }
-        if position.y >= last.top + last.height(self.line_height) {
-            return last.start + last.line.len();
-        }
-        let ix = self
-            .lines
-            .partition_point(|line| line.top <= position.y)
-            .saturating_sub(1);
-        let line = &self.lines[ix];
-        let row = (((position.y - line.top) / self.line_height) as usize).min(line.rows.len() - 1);
-        let layout = &line.line.unwrapped_layout;
-        let x = position.x.max(px(0.)) + layout.x_for_index(line.rows[row]);
-        let mut local = layout.closest_index_for_x(x);
-        // A click past a wrapped row's end belongs to that row, not the
-        // start of the next.
-        let end = line.row_end(row);
-        if local >= end && row + 1 < line.rows.len() {
-            local = prev_boundary(&line.line.text, end);
-        }
-        line.start + local.clamp(line.rows[row], line.line.len())
-    }
-}
-
-fn prev_boundary(text: &str, offset: usize) -> usize {
-    text[..offset.min(text.len())]
-        .grapheme_indices(true)
-        .next_back()
-        .map_or(0, |(ix, _)| ix)
-}
-
-fn next_boundary(text: &str, offset: usize) -> usize {
-    text[offset.min(text.len())..]
-        .grapheme_indices(true)
-        .nth(1)
-        .map_or(text.len(), |(ix, _)| offset + ix)
-}
-
-fn is_word(piece: &str) -> bool {
-    piece.chars().any(|c| c.is_alphanumeric() || c == '_')
-}
-
-fn prev_word(text: &str, offset: usize) -> usize {
-    text[..offset]
-        .split_word_bound_indices()
-        .rev()
-        .find(|(_, piece)| is_word(piece))
-        .map_or(0, |(ix, _)| ix)
-}
-
-fn next_word(text: &str, offset: usize) -> usize {
-    text[offset..]
-        .split_word_bound_indices()
-        .find(|(_, piece)| is_word(piece))
-        .map_or(text.len(), |(ix, piece)| offset + ix + piece.len())
-}
-
-fn word_range(text: &str, offset: usize) -> Range<usize> {
-    for (start, piece) in text.split_word_bound_indices() {
-        let end = start + piece.len();
-        if offset < end || end == text.len() {
-            return start..end;
-        }
-    }
-    0..0
 }
 
 const MASK: &str = "•";
@@ -324,6 +221,11 @@ impl TextInput {
             multiline: false,
             min_rows: 1,
             max_rows: 1,
+            rows: None,
+            resizing: None,
+            grip_focus: cx.focus_handle().tab_stop(true),
+            spelling: None,
+            spell_target: None,
             masked: false,
             disabled: false,
             selecting: false,
@@ -352,6 +254,14 @@ impl TextInput {
 
     pub fn label(mut self, text: impl Into<SharedString>) -> Self {
         self.label = Some(text.into());
+        self
+    }
+
+    /// Underline misspellings through the system's spell checker, and
+    /// offer its guesses on a right-click, as the user's spelling settings
+    /// have it. Prose fields only: names, revsets and keys are not words.
+    pub fn spell_checked(mut self) -> Self {
+        self.spelling = spelling::system().map(Spelling::new);
         self
     }
 
@@ -384,7 +294,43 @@ impl TextInput {
         self.undo.clear();
         self.redo.clear();
         self.scroll = Point::default();
+        if let Some(spelling) = &mut self.spelling {
+            spelling.typed_to = None;
+        }
+        self.check_spelling(cx);
         cx.notify();
+    }
+
+    /// Hold the editor at `rows` (within its limits), or give its height
+    /// back to the text.
+    pub fn set_rows(&mut self, rows: Option<usize>, cx: &mut Context<Self>) {
+        let (least, most) = self.row_limits();
+        self.rows = rows.map(|rows| rows.clamp(least, most));
+        cx.notify();
+    }
+
+    /// The rows a height set by hand runs between.
+    fn row_limits(&self) -> (usize, usize) {
+        (self.min_rows, MOST_ROWS.max(self.max_rows))
+    }
+
+    /// The rows on screen, as last painted.
+    fn rows_shown(&self) -> usize {
+        self.rows.unwrap_or_else(|| {
+            self.layout.as_ref().map_or(self.min_rows, |layout| {
+                (layout.bounds.size.height / layout.line_height).round() as usize
+            })
+        })
+    }
+
+    fn nudge_rows(&mut self, by: isize, cx: &mut Context<Self>) {
+        let rows = (self.rows_shown() as isize).saturating_add(by).max(1) as usize;
+        self.set_rows(Some(rows), cx);
+    }
+
+    #[cfg(test)]
+    pub fn is_spell_checked(&self) -> bool {
+        self.spelling.is_some()
     }
 
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
@@ -417,10 +363,43 @@ impl TextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selection = offset..offset;
         self.reversed = false;
+        self.left_word();
+        cx.notify();
+    }
+
+    /// The caret moved on: the word it was typing is finished.
+    fn left_word(&mut self) {
+        if let Some(spelling) = &mut self.spelling {
+            spelling.typed_to = None;
+        }
+    }
+
+    /// Check the text again once typing pauses.
+    fn respell(&mut self, cx: &mut Context<Self>) {
+        let Some(spelling) = &mut self.spelling else {
+            return;
+        };
+        spelling.pending = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(spelling::PAUSE).await;
+            let _ = this.update(cx, |this, cx| this.check_spelling(cx));
+        }));
+    }
+
+    fn check_spelling(&mut self, cx: &mut Context<Self>) {
+        // Mid-composition the text is not the user's yet; the composition's
+        // end is an edit, which checks again.
+        if self.marked.is_some() {
+            return;
+        }
+        let Some(spelling) = &mut self.spelling else {
+            return;
+        };
+        spelling.flagged = spelling.speller.misspelled(&self.text);
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.left_word();
         if self.reversed {
             self.selection.start = offset;
         } else {
@@ -510,6 +489,10 @@ impl TextInput {
         self.reversed = false;
         self.marked = None;
         self.goal_x = None;
+        if let Some(spelling) = &mut self.spelling {
+            spelling.edited(range, &new_text);
+        }
+        self.respell(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -725,6 +708,8 @@ impl TextInput {
         self.reversed = false;
         self.marked = None;
         self.last_edit = None;
+        self.left_word();
+        self.check_spelling(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -802,19 +787,65 @@ impl TextInput {
         }
     }
 
-    /// Right-click: the clipboard menu, on the selection as it stands.
+    /// Right-click: the clipboard menu, on the selection as it stands. On
+    /// a misspelled word it takes the word and leads with the checker's
+    /// guesses, as Mac text does.
     fn on_context(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         if self.disabled {
             return;
         }
         window.focus(&self.focus, cx);
+        let offset = self.index_for_mouse(event.position);
+        self.spell_target = self
+            .spelling
+            .as_ref()
+            .and_then(|spelling| spelling.word_at(offset));
+        let guesses = self.spell_target.clone().map(|word| {
+            self.selection = word.clone();
+            self.reversed = false;
+            cx.notify();
+            self.spelling
+                .as_ref()
+                .map(|spelling| spelling.speller.guesses(&self.text, word))
+                .unwrap_or_default()
+        });
         // A masked field never gives its text away.
         let has_selection = !self.selection.is_empty() && !self.masked;
         let position = event.position;
         crate::app::app(cx).update(cx, |model, cx| {
-            model.open_editable_menu(has_selection, false, position, cx)
+            model.open_editable_menu(has_selection, false, guesses, position, cx)
         });
+    }
+
+    fn spell(&mut self, action: &Spell, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(word) = self
+            .spell_target
+            .take()
+            .filter(|word| word.end <= self.text.len())
+        else {
+            return;
+        };
+        let Some(speller) = self.spelling.as_ref().map(|s| s.speller.clone()) else {
+            return;
+        };
+        match &action.0 {
+            SpellChoice::Use(guess) => {
+                // One undo step, whatever came just before.
+                self.last_edit = None;
+                self.edit(word, guess, cx);
+                self.last_edit = None;
+                self.check_spelling(cx);
+            }
+            SpellChoice::Ignore => {
+                speller.ignore(&self.text[word]);
+                self.check_spelling(cx);
+            }
+            SpellChoice::Learn => {
+                speller.learn(&self.text[word]);
+                self.check_spelling(cx);
+            }
+        }
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -978,6 +1009,9 @@ impl EntityInputHandler for TextInput {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.reversed = false;
+        if let Some(spelling) = &mut self.spelling {
+            spelling.edited(range, new_text);
+        }
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -1081,6 +1115,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::submit_back))
             .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::spell))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1122,6 +1157,145 @@ pub fn field(input: &Entity<TextInput>, window: &Window, cx: &App) -> Div {
     el
 }
 
+/// The handle along a multi-line field's bottom edge that sets its height
+/// by hand, as a text area's resize corner does: drag it, or Tab to it and
+/// move it with ↑ and ↓ (Home and End for its limits); a double-click
+/// gives the height back to the text. The draft is never touched. Put it in
+/// the field's `relative()` chrome, after the input.
+pub fn grip(
+    input: &Entity<TextInput>,
+    name: impl Into<SharedString>,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement {
+    let t = theme(cx);
+    let state = input.read(cx);
+    let (least, most) = state.row_limits();
+    let lit = keyboard_on(&state.grip_focus, window) || state.resizing.is_some();
+    let (ink, accent) = (t.text3, t.accent);
+    let nudge = |by: isize| {
+        let input = input.clone();
+        move |_: &dyn gpui::Action, _: &mut Window, cx: &mut App| {
+            input.update(cx, |input, cx| input.nudge_rows(by, cx))
+        }
+    };
+    let (press, release, drag, reset) =
+        (input.clone(), input.clone(), input.clone(), input.clone());
+    div()
+        .id("field-grip")
+        .key_context("FieldGrip")
+        .track_focus(&state.grip_focus)
+        .role(Role::Splitter)
+        .aria_label(name)
+        .aria_orientation(gpui::Orientation::Horizontal)
+        .aria_numeric_value(state.rows_shown() as f64)
+        .aria_min_numeric_value(least as f64)
+        .aria_max_numeric_value(most as f64)
+        .aria_numeric_value_step(1.)
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom(px(-4.))
+        .h(px(9.))
+        .cursor(CursorStyle::ResizeUpDown)
+        .on_action({
+            let nudge = nudge(-1);
+            move |action: &Shorter, window, cx| nudge(action, window, cx)
+        })
+        .on_action({
+            let nudge = nudge(1);
+            move |action: &Taller, window, cx| nudge(action, window, cx)
+        })
+        .on_action({
+            let nudge = nudge(-(MOST_ROWS as isize));
+            move |action: &Shortest, window, cx| nudge(action, window, cx)
+        })
+        .on_action({
+            let nudge = nudge(MOST_ROWS as isize);
+            move |action: &Tallest, window, cx| nudge(action, window, cx)
+        })
+        // A press drags; it never takes the keys, as no control's press
+        // does.
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            window.prevent_default();
+            press.update(cx, |input, cx| {
+                input.resizing = Some((event.position.y, input.rows_shown()));
+                cx.notify();
+            });
+        })
+        .on_click(move |event, _, cx| {
+            if event.click_count() == 2 {
+                reset.update(cx, |input, cx| input.set_rows(None, cx));
+            }
+        })
+        .child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, (), window, cx| {
+                    // Moves and releases are taken window-wide while the
+                    // grip is held, so it follows a pointer that leaves it.
+                    if drag.read(cx).resizing.is_some() {
+                        let drag = drag.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            drag.update(cx, |input, cx| {
+                                let Some((from, rows)) = input.resizing else {
+                                    return;
+                                };
+                                if event.pressed_button != Some(MouseButton::Left) {
+                                    input.resizing = None;
+                                    cx.notify();
+                                    return;
+                                }
+                                let line = input
+                                    .layout
+                                    .as_ref()
+                                    .map_or(px(18.), |layout| layout.line_height);
+                                let by = ((event.position.y - from) / line).round() as isize;
+                                input.set_rows(Some((rows as isize + by).max(1) as usize), cx);
+                            });
+                        });
+                        let release = release.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == gpui::DispatchPhase::Bubble
+                                && event.button == MouseButton::Left
+                            {
+                                release.update(cx, |input, cx| {
+                                    input.resizing = None;
+                                    cx.notify();
+                                });
+                            }
+                        });
+                    }
+                    // While held, the field's bottom edge is the accent's
+                    // rule; the corner always carries the grip's mark.
+                    if lit {
+                        let inset = px(RADIUS_M);
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(bounds.left() + inset, bounds.center().y - px(1.)),
+                                size(bounds.size.width - inset * 2., px(2.)),
+                            ),
+                            accent,
+                        ));
+                    }
+                    let corner = point(bounds.right() - px(4.), bounds.center().y - px(1.));
+                    for reach in [9., 5.] {
+                        let mut path = gpui::PathBuilder::stroke(px(1.));
+                        path.move_to(point(corner.x - px(reach), corner.y));
+                        path.line_to(point(corner.x, corner.y - px(reach)));
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, ink);
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
+
 struct TextElement {
     input: Entity<TextInput>,
 }
@@ -1132,42 +1306,11 @@ struct Prepaint {
     caret: Option<Bounds<Pixels>>,
     selection_color: Hsla,
     caret_color: Hsla,
-}
-
-/// Shape the display text and locate each paragraph's visual rows.
-fn lay_out(
-    text: SharedString,
-    runs: &[TextRun],
-    font_size: Pixels,
-    wrap_width: Option<Pixels>,
-    line_height: Pixels,
-    window: &mut Window,
-) -> (Vec<LaidLine>, Pixels) {
-    let shaped = window
-        .text_system()
-        .shape_text(text, font_size, runs, wrap_width, None)
-        .unwrap_or_default();
-    let mut lines = Vec::with_capacity(shaped.len());
-    let mut start = 0;
-    let mut top = px(0.);
-    for line in shaped {
-        let mut rows = vec![0];
-        for boundary in line.wrap_boundaries() {
-            let glyph = &line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
-            rows.push(glyph.index);
-        }
-        let len = line.len();
-        let laid = LaidLine {
-            start,
-            top,
-            line,
-            rows,
-        };
-        top += laid.height(line_height);
-        start += len + 1;
-        lines.push(laid);
-    }
-    (lines, top)
+    /// The runs of misspelled words, and how far down a run its baseline
+    /// sits.
+    misspelled: Vec<Bounds<Pixels>>,
+    baseline: Pixels,
+    misspelled_color: Hsla,
 }
 
 impl Element for TextElement {
@@ -1204,7 +1347,7 @@ impl Element for TextElement {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let font = text_style.font();
-        let (min_rows, max_rows) = (input.min_rows, input.max_rows);
+        let (min_rows, max_rows, held) = (input.min_rows, input.max_rows, input.rows);
         let entity = self.input.clone();
         let id = window.request_measured_layout(style, move |known, available, window, cx| {
             let width = known.width.or(match available.width {
@@ -1220,12 +1363,12 @@ impl Element for TextElement {
                 underline: None,
                 strikethrough: None,
             };
-            let (lines, _) = lay_out(text, &[run], font_size, width, line_height, window);
-            let rows: usize = lines.iter().map(|line| line.rows.len()).sum();
-            size(
-                width.unwrap_or(px(200.)),
-                line_height * rows.clamp(min_rows, max_rows) as f32,
-            )
+            let rows = held.unwrap_or_else(|| {
+                let (lines, _) = lay_out(text, &[run], font_size, width, line_height, window);
+                let rows: usize = lines.iter().map(|line| line.rows.len()).sum();
+                rows.clamp(min_rows, max_rows)
+            });
+            size(width.unwrap_or(px(200.)), line_height * rows as f32)
         });
         (id, ())
     }
@@ -1338,47 +1481,25 @@ impl Element for TextElement {
         }
 
         let origin = bounds.origin - layout.scroll;
-        let mut selections = Vec::new();
-        if !selection.is_empty() {
-            for line in &layout.lines {
-                let end = line.start + line.line.len();
-                if selection.end < line.start || selection.start > end {
-                    continue;
-                }
-                let from = selection.start.max(line.start) - line.start;
-                let to = selection.end.min(end) - line.start;
-                for row in line.row_of(from)..=line.row_of(to) {
-                    let row_start = line.rows[row];
-                    let row_end = line.row_end(row);
-                    let a = from.max(row_start);
-                    let b = to.min(row_end);
-                    if a > b {
-                        continue;
-                    }
-                    let mut right = line.x_in_row(b, row);
-                    // A selected line break shows as a sliver past the
-                    // row's last glyph.
-                    if (b == row_end && to > row_end)
-                        || (b == line.line.len() && selection.end > end)
-                    {
-                        right += px(4.);
-                    }
-                    let left = line.x_in_row(a, row);
-                    if right <= left {
-                        continue;
-                    }
-                    selections.push(Bounds::from_corners(
-                        origin + point(left, line.top + line_height * row as f32),
-                        origin + point(right, line.top + line_height * (row + 1) as f32),
-                    ));
-                }
-            }
-        }
+        let selections = layout.boxes(selection.clone(), origin);
         let caret = (focused && selection.is_empty() && !input.disabled).then(|| {
             Bounds::new(
                 origin + point(caret.x, caret.y + px(1.)),
                 size(px(1.5), line_height - px(2.)),
             )
+        });
+        let misspelled = match &input.spelling {
+            Some(spelling) if !empty => spelling
+                .shown()
+                .flat_map(|word| layout.boxes(word, origin))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Where a row's baseline sits, as a line paints it: its glyphs
+        // centred in the row.
+        let baseline = layout.lines.first().map_or(line_height, |line| {
+            let glyphs = &line.line.unwrapped_layout;
+            (line_height - glyphs.ascent - glyphs.descent) / 2. + glyphs.ascent
         });
         Prepaint {
             layout,
@@ -1386,6 +1507,9 @@ impl Element for TextElement {
             caret,
             selection_color: t.selection,
             caret_color: t.accent_strong,
+            misspelled,
+            baseline,
+            misspelled_color: t.danger,
         }
     }
 
@@ -1426,6 +1550,9 @@ impl Element for TextElement {
                     cx,
                 );
             }
+            for word in &prepaint.misspelled {
+                spelling::paint_dots(*word, prepaint.baseline, prepaint.misspelled_color, window);
+            }
             if let Some(caret) = prepaint.caret {
                 window.paint_quad(fill(caret, prepaint.caret_color));
             }
@@ -1447,6 +1574,114 @@ impl Element for TextElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_prose_field_underlines_misspellings_and_offers_their_guesses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = crate::testing::scratch("spelling");
+        let model = crate::testing::install(&dir, cx);
+        let (input, cx) = cx.add_window_view(|window, cx| {
+            TextInput::new(window, cx).multiline(4, 12).spell_checked()
+        });
+        cx.update(|window, cx| {
+            let focus = input.read(cx).focus.clone();
+            window.focus(&focus, cx);
+        });
+        let flagged = |cx: &mut gpui::VisualTestContext| {
+            input.read_with(cx, |input, _| {
+                let spelling = input.spelling.as_ref().unwrap();
+                (
+                    spelling.flagged.clone(),
+                    spelling.shown().collect::<Vec<_>>(),
+                )
+            })
+        };
+        let pause = |cx: &mut gpui::VisualTestContext| {
+            cx.executor().advance_clock(spelling::PAUSE);
+            cx.run_until_parked();
+        };
+
+        // Checked once typing pauses.
+        cx.simulate_input("fix teh bug");
+        assert!(flagged(cx).0.is_empty());
+        pause(cx);
+        assert_eq!(flagged(cx), (vec![4..7], vec![4..7]));
+        // A word still being typed is not judged until it is finished.
+        cx.simulate_input(" wrod");
+        pause(cx);
+        assert_eq!(flagged(cx), (vec![4..7, 12..16], vec![4..7]));
+        cx.simulate_keystrokes("left");
+        assert_eq!(flagged(cx).1, [4..7, 12..16]);
+
+        // A right-click on a misspelling takes the word, and the menu
+        // leads with its guesses and the ways to leave it be.
+        let on = |offset: usize, cx: &mut gpui::VisualTestContext| {
+            input.read_with(cx, |input, _| {
+                let layout = input.layout.as_ref().unwrap();
+                layout.bounds.origin + layout.caret(offset) + point(px(0.), layout.line_height / 2.)
+            })
+        };
+        let teh = on(5, cx);
+        cx.simulate_mouse_down(teh, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            input.read_with(cx, |input, _| input.selection.clone()),
+            4..7
+        );
+        let menu: Vec<(&str, String)> = model.read_with(cx, |model, _| {
+            model
+                .menu
+                .as_ref()
+                .unwrap()
+                .sections
+                .iter()
+                .flatten()
+                .map(|item| (item.id, item.label.clone()))
+                .collect()
+        });
+        let words: Vec<&str> = menu.iter().map(|(_, label)| label.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "the",
+                "ten",
+                "tea",
+                "Ignore Spelling",
+                "Learn Spelling",
+                "Cut",
+                "Copy",
+                "Paste",
+                "Select All"
+            ]
+        );
+
+        // Choosing a guess puts it in place, as one step undo takes back.
+        cx.dispatch_action(Spell(SpellChoice::Use("the".into())));
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text.clone()),
+            "fix the bug wrod"
+        );
+        assert_eq!(flagged(cx).0, [12..16]);
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(
+            input.read_with(cx, |input, _| input.text.clone()),
+            "fix teh bug wrod"
+        );
+
+        // Ignoring a word stops flagging it in this field.
+        let wrod = on(13, cx);
+        cx.simulate_mouse_down(wrod, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.dispatch_action(Spell(SpellChoice::Ignore));
+        assert_eq!(flagged(cx).0, [4..7]);
+
+        // A field that did not ask is never checked: its menu is the
+        // clipboard's alone.
+        let plain = cx.update(|window, cx| cx.new(|cx| TextInput::new(window, cx)));
+        plain.read_with(cx, |plain, _| assert!(plain.spelling.is_none()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[gpui::test]
     fn a_field_tells_its_name_value_and_placeholder_and_keeps_a_key_to_itself(
@@ -1492,35 +1727,5 @@ mod tests {
             assert_eq!(key.value(), None);
         });
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn grapheme_boundaries_step_over_clusters() {
-        let text = "ae\u{301}🇨🇦z";
-        assert_eq!(next_boundary(text, 0), 1);
-        assert_eq!(next_boundary(text, 1), 4);
-        assert_eq!(next_boundary(text, 4), 12);
-        assert_eq!(prev_boundary(text, 12), 4);
-        assert_eq!(prev_boundary(text, 0), 0);
-        assert_eq!(next_boundary(text, text.len()), text.len());
-    }
-
-    #[test]
-    fn word_motion_skips_punctuation_and_space() {
-        let text = "fix(graph): lane colors";
-        assert_eq!(next_word(text, 0), 3);
-        assert_eq!(next_word(text, 3), 9);
-        assert_eq!(next_word(text, 9), 16);
-        assert_eq!(prev_word(text, text.len()), 17);
-        assert_eq!(prev_word(text, 12), 4);
-        assert_eq!(prev_word(text, 2), 0);
-    }
-
-    #[test]
-    fn double_click_selects_the_word_under_the_pointer() {
-        let text = "push main now";
-        assert_eq!(word_range(text, 6), 5..9);
-        assert_eq!(word_range(text, 0), 0..4);
-        assert_eq!(word_range(text, text.len()), 10..13);
     }
 }
