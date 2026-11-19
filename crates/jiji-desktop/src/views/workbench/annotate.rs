@@ -4,13 +4,17 @@
 //! (revealing it under a transient revset when the current lens does not
 //! draw it). Replaces the diff surface while open; any selection move —
 //! including that jump — closes it.
+//!
+//! From the keyboard the lines are one stop: ↑ and ↓ step from run to run
+//! (each run's origin is what there is to follow), and Return or Space
+//! follows the one the keyboard is on.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, AnyElement, Context, FontWeight, ScrollEvent, SharedString,
-    UniformListScrollHandle, Window,
+    actions, div, prelude::*, px, uniform_list, AnyElement, App, Context, FocusHandle, FontWeight,
+    KeyBinding, Role, ScrollEvent, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
 };
 use jiji_core::snapshot::FileAnnotation;
 
@@ -19,9 +23,21 @@ use crate::diff::model::LINE_H;
 use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, TEXT_S, TEXT_XS};
 use crate::ui::{
-    from_now, h_flex, icon, icon_btn, label_box, pan_scrollbar, short_age, tooltip, truncated,
-    v_flex, vertical_only, wheel_first, AxisLock, IconName,
+    from_now, h_flex, icon, icon_btn, keyboard_on, label_box, pan_scrollbar, ring, short_age,
+    tooltip, truncated, v_flex, vertical_only, wheel_first, AxisLock, IconName, NodeExt as _,
 };
+
+actions!(annotate, [OriginUp, OriginDown, OriginFollow]);
+
+pub(super) fn bind_keys(cx: &mut App) {
+    let lines = Some("Annotate");
+    cx.bind_keys([
+        KeyBinding::new("up", OriginUp, lines),
+        KeyBinding::new("down", OriginDown, lines),
+        KeyBinding::new("enter", OriginFollow, lines),
+        KeyBinding::new("space", OriginFollow, lines),
+    ]);
+}
 
 const GUTTER_W: f32 = 224.;
 /// The line-number column, and the room kept clear after the longest line.
@@ -29,12 +45,11 @@ const NUMBER_W: f32 = 40.;
 const CODE_PAD_R: f32 = 16.;
 const CODE_SIZE: f32 = 12.;
 
-#[derive(Default)]
 pub(super) struct AnnotateState {
     /// What the pane was last asked for: change, path, operation. A new
     /// operation refetches — the change may have been rewritten under it.
     key: Option<(String, String, String)>,
-    data: Option<Arc<FileAnnotation>>,
+    pub(super) data: Option<Arc<FileAnnotation>>,
     error: Option<String>,
     seq: u64,
     /// Hovering any line tints its whole origin's runs — the fastest way
@@ -47,6 +62,34 @@ pub(super) struct AnnotateState {
     /// column, as the last frame measured it.
     pub(super) max_pan: f32,
     wheel: AxisLock,
+    /// The lines' one stop on the keyboard's path.
+    pub(super) focus: FocusHandle,
+    /// The run the keyboard is on, by its first line.
+    pub(super) cursor: Option<usize>,
+}
+
+impl AnnotateState {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            key: None,
+            data: None,
+            error: None,
+            seq: 0,
+            hover: None,
+            scroll: UniformListScrollHandle::new(),
+            pan: 0.,
+            max_pan: 0.,
+            wheel: AxisLock::default(),
+            focus: cx.focus_handle().tab_stop(true),
+            cursor: None,
+        }
+    }
+}
+
+/// Where a run of one origin's lines begins.
+pub(super) fn run_starts(view: &FileAnnotation) -> impl Iterator<Item = usize> + '_ {
+    (0..view.lines.len())
+        .filter(|&index| index == 0 || view.lines[index - 1].origin != view.lines[index].origin)
 }
 
 impl WorkbenchView {
@@ -59,6 +102,7 @@ impl WorkbenchView {
                 self.annotate.data = None;
                 self.annotate.error = None;
                 self.annotate.hover = None;
+                self.annotate.cursor = None;
             }
             return;
         };
@@ -77,6 +121,7 @@ impl WorkbenchView {
             self.annotate.data = None;
             self.annotate.hover = None;
             self.annotate.pan = 0.;
+            self.annotate.cursor = None;
         }
         self.annotate.key = Some(key);
         self.annotate.error = None;
@@ -112,6 +157,52 @@ impl WorkbenchView {
         .detach();
     }
 
+    /// Step the keyboard to the next run (`forward`) or the one before,
+    /// starting from the first run on screen when it is on none yet.
+    fn step_origin(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.annotate.data.clone() else {
+            return;
+        };
+        let starts: Vec<usize> = run_starts(&view).collect();
+        let Some(&first) = starts.first() else {
+            return;
+        };
+        let next = match self.annotate.cursor {
+            None => {
+                let top = self.annotate.scroll.0.borrow().base_handle.top_item();
+                starts
+                    .iter()
+                    .copied()
+                    .find(|&start| start >= top)
+                    .unwrap_or(first)
+            }
+            Some(at) if forward => starts.iter().copied().find(|&s| s > at).unwrap_or(at),
+            Some(at) => starts.iter().rev().copied().find(|&s| s < at).unwrap_or(at),
+        };
+        self.annotate.cursor = Some(next);
+        self.annotate
+            .scroll
+            .scroll_to_item(next, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// Return on a run: go to the change its lines came from.
+    fn follow_origin(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.annotate.data.clone() else {
+            return;
+        };
+        let origin = self
+            .annotate
+            .cursor
+            .or_else(|| run_starts(&view).next())
+            .and_then(|at| view.lines.get(at))
+            .and_then(|line| view.origins.get(line.origin as usize));
+        if let Some(origin) = origin {
+            let id = origin.id.clone();
+            self.app.update(cx, |model, cx| model.reveal_change(id, cx));
+        }
+    }
+
     /// Pan the code to `pan`, within what the widest line allows.
     fn pan_annotate(&mut self, pan: f32, cx: &mut Context<Self>) {
         let pan = pan.clamp(0., self.annotate.max_pan);
@@ -121,11 +212,19 @@ impl WorkbenchView {
         }
     }
 
-    fn annotate_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn annotate_rows(
+        &mut self,
+        range: Range<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let t = theme(cx);
         let Some(view) = self.annotate.data.clone() else {
             return Vec::new();
         };
+        let focused = self.annotate.focus.is_focused(window);
+        let ringed = keyboard_on(&self.annotate.focus, window);
+        let cursor = self.annotate.cursor;
         let hover = self.annotate.hover;
         let pan = self.annotate.pan;
         let tint = Theme::blend(t.accent, 0.07, t.bg1);
@@ -141,8 +240,27 @@ impl WorkbenchView {
             let group = SharedString::from(format!("annotate-{index}"));
             // The gutter is the pane's one verb: jump to the change this
             // line came from.
+            let here = cursor == Some(index);
             let mut gutter = h_flex()
                 .id(("annotate-origin", index))
+                .when(run_start, |gutter| {
+                    gutter
+                        .role(Role::Button)
+                        .aria_label(format!(
+                            "{}, {}, {}{}",
+                            origin.change_id,
+                            origin.author,
+                            from_now(&origin.timestamp),
+                            if origin.summary.is_empty() {
+                                String::new()
+                            } else {
+                                format!(", {}", origin.summary)
+                            }
+                        ))
+                        .aria_description("Go to this change")
+                })
+                .when(focused && here, |gutter| gutter.aria_active_descendant())
+                .when(ringed && here, |gutter| gutter.shadow(ring(t.accent)))
                 .w(px(GUTTER_W))
                 .h_full()
                 .flex_shrink_0()
@@ -372,18 +490,32 @@ impl WorkbenchView {
                         cx.stop_propagation();
                         this.pan_annotate(this.annotate.pan - dx, cx);
                     }));
-                let mut lines = div().relative().flex_1().min_h_0().child(
-                    vertical_only(uniform_list(
-                        "annotate-lines",
-                        view.lines.len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            this.annotate_rows(range, cx)
-                        }),
-                    ))
-                    .debug_selector(|| "annotate-lines".into())
-                    .track_scroll(&self.annotate.scroll)
-                    .size_full(),
-                );
+                let mut lines = div()
+                    .id("annotate-body")
+                    .role(Role::Group)
+                    .aria_label("Lines and the changes they came from")
+                    .key_context("Annotate")
+                    .track_focus(&self.annotate.focus)
+                    .on_action(cx.listener(|this, _: &OriginUp, _, cx| this.step_origin(false, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &OriginDown, _, cx| this.step_origin(true, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &OriginFollow, _, cx| this.follow_origin(cx)))
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        vertical_only(uniform_list(
+                            "annotate-lines",
+                            view.lines.len(),
+                            cx.processor(|this, range: Range<usize>, window, cx| {
+                                this.annotate_rows(range, window, cx)
+                            }),
+                        ))
+                        .debug_selector(|| "annotate-lines".into())
+                        .track_scroll(&self.annotate.scroll)
+                        .size_full(),
+                    );
                 // Without a trackpad, the thumb is the way sideways: it runs
                 // under the code column, which is all that pans.
                 if max_pan > 0. {
@@ -420,7 +552,10 @@ impl WorkbenchView {
                 }
                 body.child(pan_first).into_any_element()
             }
-            (None, Some(error)) => note(error.clone(), t.warn).into_any_element(),
+            (None, Some(error)) => note(error.clone(), t.warn)
+                .id("annotate-error")
+                .alert(error.clone())
+                .into_any_element(),
             (None, None) => {
                 let mut skeleton = v_flex().gap(px(9.)).p(px(16.));
                 for width in [1., 0.86, 0.64, 0.78, 0.42] {
@@ -438,6 +573,8 @@ impl WorkbenchView {
         Some(
             v_flex()
                 .id("annotate")
+                .role(Role::Region)
+                .aria_label("File annotation")
                 .flex_1()
                 .min_w_0()
                 .min_h_0()

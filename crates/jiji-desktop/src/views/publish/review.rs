@@ -14,6 +14,7 @@ use crate::theme::{theme, RADIUS_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, h_flex, input::field, plan_panel, ref_label, scrollbar, tooltip, truncated, v_flex,
+    Tabbable as _,
 };
 
 const MAX_REVIEW_ROWS: usize = 100;
@@ -418,6 +419,10 @@ impl PublishView {
                         .child(
                             div()
                                 .id(SharedString::from(format!("review-title-{number}")))
+                                .role(gpui::Role::Link)
+                                .aria_label(format!("#{number} {}", pr.title))
+                                .aria_description("Open on GitHub")
+                                .tabbable(cx)
                                 .min_w_0()
                                 .text_size(px(TEXT_M))
                                 .text_color(t.text1)

@@ -74,9 +74,16 @@ JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png" \
 ```
 
 `click`, `dclick`, `rclick`, `move`, `drag`, `press`/`hold`/`release` (a drag
-in parts), `scroll`, `key`, `type`, `wait`, `shot`, `resize`, `quit`;
+in parts), `scroll`, `key`, `type`, `wait`, `shot`, `a11y`, `resize`, `quit`;
 prefixes `shift-`, `alt-`, `cmd-`. Coordinates are window points;
-screenshots are at the display's scale.
+screenshots are at the display's scale. A `key` is pressed and released,
+as a keyboard does it: Space and Return press a focused control on the
+release.
+
+`a11y=/abs/path.json` is how to read what a screen reader is told without
+one: it turns the window's accessibility on, the way VoiceOver's first
+question does, and writes the tree GPUI hands AccessKit — each node's
+role, name, value and states, and which one has focus.
 
 The `headless` feature turns on GPUI's `test-support`, which is where its
 offscreen renderer lives, so it stays out of ordinary and shipping builds:
@@ -95,6 +102,12 @@ the test lets them (`src/testing.rs`). That is where navigation belongs —
 what survives a switch of section or tab, which tab an open lands in —
 since those go wrong between views rather than inside a function.
 
+A key that presses a control needs its release too: GPUI's
+`simulate_keystrokes` sends none, so keyboard tests go through
+`testing::press`. GPUI's test windows never build an accessibility tree;
+a test checks what an element tells AccessKit (`Element::write_a11y_info`),
+and a headless run's `a11y` step shows the whole tree.
+
 These tests open real repositories, made for the test and without remotes,
 or the mock backend's (`testing::install_mock`: conflicts, a merge tool,
 every kind of diff, and a backend a test can make fail by hiding `.jj`).
@@ -112,7 +125,7 @@ Under `src/`:
 | `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
 | `diff/` | The diff surface: a flat row model laid out once per diff and shared by the cache and the screen, tree-sitter highlighting, the pictures of image diffs (GPUI's decoders, and the system's ImageIO for AVIF and HEIC), and one custom-painted element that windows, selects, finds and scrolls. |
-| `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. |
+| `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, pane dividers, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. The keyboard's path through all of it (`focus`) and what assistive technology is told (`a11y`). |
 | `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings; where the window opens, and how it was left (its display, the frame it unzooms to, zoomed, full screen). |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
 | `theme.rs`, `store.rs`, `upgrade.rs`, `diagnostics.rs` | The ten palettes; the persisted preferences, and what the Tauri app left of them; the log and the record a panic leaves. |
@@ -200,6 +213,27 @@ One look, stated once so new surfaces keep it. The tokens are in
 - **Text keeps its floors.** text2 at 8:1 or better and text3 at 5.5:1
   on bg0–bg2; hierarchy comes from weight, size and the three steps,
   never from fading. Sentence case, no letter-spaced caps.
+- **The keyboard has a mark; the pointer has none.** Every control is a
+  stop on Tab's path (`ui::Tabbable`), and the one the keyboard is on
+  wears two pixels of accent just inside its edge (`ui::ring`): over the
+  fill, under the content, so nothing moves. A filled button rings in its
+  label's ink with the accent's halo outside; a lone checkbox takes the
+  halo alone. A click presses a control without taking the keys from
+  where they were, as AppKit's buttons do. A list (the graph, the file
+  tree, annotate's origins, a tray's destinations) is one stop whose
+  arrows travel it, and its current row wears the ring; a divider is a
+  stop its arrows move, a document one its keys scroll. Controls that
+  show on hover show while Tab is among them. A floating panel holds Tab
+  until it closes, then focus goes back to where it was.
+- **Everything says what it is.** GPUI tells assistive technology only
+  about elements with an id and a role, so each control names itself —
+  its label, or its tooltip's words when it shows an icon, with any
+  shortcut the tooltip mentions — and says whether it is open, held or
+  checked; lists, trees and tab lists state their shape and what is
+  selected; panels are dialogs. What changes on its own is a live region:
+  a failure is an alert, read out at once; a count, a mutation just run,
+  or where a highlight moved is a status, read out when the reader is
+  free.
 
 ## GPUI notes
 
@@ -251,6 +285,24 @@ Things this code works around, so the next change does not rediscover them:
   smooth-mouse case, not the trackpad one. Scroll down before scrolling
   sideways in a script; a sideways scroll fresh from launch only covers a
   gesture's first report.
+- **Space and Return press a focused element on the key's release**, and
+  only an element that tracks focus and has a click listener. A binding
+  for either key in a context the control sits in runs first: one that
+  should leave a control inside it its keys propagates (`TrayEnter`).
+- **A press focuses whatever focusable element it lands on**, unless the
+  press prevents default; `ui::Tabbable` does, so a click leaves the keys
+  where they were.
+- **An invisible element is not painted, so it is no tab stop.** A
+  control that shows on hover hides with opacity, never `invisible()`.
+- **Focus is never scrolled into view.** Only `list()` honours GPUI's
+  autoscroll; a row holding tab stops in a scroller brings itself into
+  view when Tab arrives (`ui::focus::FocusRow`).
+- **Accessibility exists only for an element with an id and a role**, and
+  only once an assistive app has asked. In a debug build two nodes with
+  one id, or two claiming the active descendant, panic as the tree is
+  built. The active descendant must lie inside the focused element, so a
+  list whose keys stay in a text field (the palette) speaks its highlight
+  through a live region (`ui::a11y::spoken`).
 - **A panic cannot be contained to a view.** Frames and events arrive
   through `extern "C"` AppKit callbacks, which abort on an unwind. Catching
   one sooner leaves GPUI broken: the entity being updated is dropped from

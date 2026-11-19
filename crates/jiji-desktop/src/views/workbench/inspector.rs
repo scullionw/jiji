@@ -13,10 +13,12 @@ use crate::logic::bookmarks::bookmark_key;
 use crate::logic::graph::resolve_focused_workstream;
 use crate::logic::inspect::{find_node, sync_label};
 use crate::theme::{theme, ROW_H, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::focus::FocusRow;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, group_head, h_flex, icon, icon_btn, input::field, kbd, lead_bar, page_bar, ref_label,
-    scrollbar, tooltip, truncated, v_flex, IconName, InputEvent, TextInput, PAGE_PAD,
+    scrollbar, tooltip, truncated, v_flex, IconName, InputEvent, NodeExt as _, Tabbable as _,
+    TextInput, PAGE_PAD,
 };
 use crate::views::menu;
 
@@ -40,7 +42,11 @@ impl InspectorState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<WorkbenchView>) -> Self {
         Self {
             edit: None,
-            rename: cx.new(|cx| TextInput::new(window, cx).placeholder("Bookmark name")),
+            rename: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("Bookmark name")
+                    .label("Bookmark name")
+            }),
             error: None,
             busy: false,
             scroll: ScrollHandle::new(),
@@ -216,9 +222,23 @@ impl WorkbenchView {
             // actually visible in the graph.
             if let Some(head) = stream.node_ids.first().cloned() {
                 let app = self.app.clone();
-                row = row.on_click(move |_, _, cx| {
-                    app.update(cx, |model, cx| model.jump_to_change(&head, cx))
-                });
+                row = row
+                    .role(gpui::Role::Button)
+                    .aria_label(format!(
+                        "{}, {}{}",
+                        stream.title,
+                        crate::logic::text::counted(stream.node_ids.len(), "change"),
+                        stream
+                            .bookmark
+                            .as_ref()
+                            .map(|name| format!(", {name}"))
+                            .unwrap_or_default()
+                    ))
+                    .aria_selected(current)
+                    .tabbable(cx)
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |model, cx| model.jump_to_change(&head, cx))
+                    });
             }
             card = card.child(row.child(meta));
         }
@@ -320,6 +340,10 @@ impl WorkbenchView {
                     if drawn {
                         let (app, id) = (self.app.clone(), bookmark.target.clone());
                         name = name
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("{}, {sync_text}", bookmark.name))
+                            .aria_description(format!("Go to {}", bookmark.target))
+                            .tabbable(cx)
                             .cursor_pointer()
                             .hover(|style| style.text_color(t.accent_strong))
                             .tooltip(tooltip(format!("Go to {}", bookmark.target)))
@@ -327,6 +351,7 @@ impl WorkbenchView {
                                 app.update(cx, |model, cx| model.jump_to_change(&id, cx))
                             });
                     }
+                    let focus_row = FocusRow::new(("inspector-bm-row", index), window, cx);
                     let row = row
                         .id(("inspector-bm", index))
                         .group(group.clone())
@@ -349,9 +374,12 @@ impl WorkbenchView {
                         // Rename and delete reveal on row hover, like
                         // quiet contextual controls.
                         let (rename, delete) = (bookmark.clone(), bookmark.clone());
+                        if !focus_row.holds_focus(window, cx) {
+                            actions = actions
+                                .opacity(0.)
+                                .group_hover(group, |style| style.opacity(1.));
+                        }
                         actions = actions
-                            .opacity(0.)
-                            .group_hover(group, |style| style.opacity(1.))
                             .child(
                                 icon_btn(("inspector-bm-rename", index), IconName::Edit)
                                     .size(22., 11.)
@@ -375,7 +403,12 @@ impl WorkbenchView {
                                     })),
                             );
                     }
-                    card = card.child(row.child(actions));
+                    card = card.child(focus_row.row(
+                        row.child(actions),
+                        &self.inspector.scroll,
+                        window,
+                        cx,
+                    ));
                     continue;
                 }
             };
@@ -384,6 +417,8 @@ impl WorkbenchView {
         if let Some(error) = &self.inspector.error {
             card = card.child(
                 div()
+                    .id("inspector-error")
+                    .alert(error.clone())
                     .mt(px(4.))
                     .px(px(PAGE_PAD))
                     .text_size(px(TEXT_XS))

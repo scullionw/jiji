@@ -17,7 +17,7 @@ use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_S, TEXT_XS, TO
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, checkbox, h_flex, icon, menu_row, popover, popover_layer, scrollbar, segmented, v_flex,
-    IconName,
+    IconName, Segment,
 };
 use crate::views::publish::{Mode, Page, PublishView};
 
@@ -358,11 +358,12 @@ impl PublishView {
                         .child("Merge method")
                         .child(segmented(
                             "land-method",
+                            "Merge method",
                             vec![
-                                (None, "Auto".into(), None),
-                                (Some(MergeMethod::Squash), "Squash".into(), None),
-                                (Some(MergeMethod::Rebase), "Rebase".into(), None),
-                                (Some(MergeMethod::Merge), "Merge".into(), None),
+                                Segment::text(None, "Auto"),
+                                Segment::text(Some(MergeMethod::Squash), "Squash"),
+                                Segment::text(Some(MergeMethod::Rebase), "Rebase"),
+                                Segment::text(Some(MergeMethod::Merge), "Merge"),
                             ],
                             &method,
                             cx,
@@ -382,6 +383,7 @@ impl PublishView {
                                 .gap(px(8.))
                                 .child(checkbox(
                                     "land-bypass",
+                                    "Bypass checks & reviews",
                                     Some(bypass),
                                     cx,
                                     cx.listener(|this, _, _, cx| {
@@ -707,24 +709,23 @@ impl PublishView {
             .border_b_1()
             .border_color(t.border2);
         if connected && stack.submit_head.is_some() {
-            let mut options: Vec<(Mode, SharedString, Option<IconName>)> = Vec::new();
+            let mut options = Vec::new();
             if stack.head_bookmark.is_some() && stack.pr_count > 0 {
-                options.push((Mode::Land, "Land".into(), None));
+                options.push(Segment::text(Mode::Land, "Land"));
             }
-            options.push((
+            options.push(Segment::text(
                 Mode::Publish,
                 if stack.pr_count > 0 {
                     "Update"
                 } else {
                     "Publish"
-                }
-                .into(),
-                None,
+                },
             ));
             let view = cx.entity().downgrade();
             let (bookmark, submit) = (stack.head_bookmark.clone(), stack.submit_head.clone());
             head = head.child(segmented(
                 "stack-mode",
+                "Stack action",
                 options,
                 &self.mode,
                 cx,
@@ -748,9 +749,11 @@ impl PublishView {
                     btn("stack-more", "More")
                         .ghost()
                         .on(self.mode == Mode::Ship || self.more.is_open())
+                        .expanded(self.more.is_open())
+                        .tooltip("More stack actions")
                         .trailing(icon(IconName::ChevronDown, 12., t.text3))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.more.toggle();
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.more.toggle(window, cx);
                             cx.notify();
                         })),
                 );
@@ -765,16 +768,22 @@ impl PublishView {
                     ship = if executing {
                         ship.opacity(0.5)
                     } else {
-                        ship.on_click(cx.listener(move |this, _, _, cx| {
+                        ship.on_click(cx.listener(move |this, _, window, cx| {
+                            this.more.close(window, cx);
                             this.load_ship_plan(head_change.clone(), cx)
                         }))
                     };
                     more = more.child(popover_layer(
                         Anchor::TopRight,
                         30.,
-                        popover(cx).min_w(px(220.)).p(px(4.)).child(ship),
-                        cx.listener(|this, _, _, cx| {
-                            this.more.close();
+                        self.more.panel(
+                            "stack-more-menu",
+                            gpui::Role::Menu,
+                            "More stack actions",
+                            popover(cx).min_w(px(220.)).p(px(4.)).child(ship),
+                        ),
+                        cx.listener(|this, _, window, cx| {
+                            this.more.close(window, cx);
                             cx.notify();
                         }),
                     ));
@@ -801,8 +810,8 @@ impl PublishView {
                         btn("plan-connect", "Connect GitHub")
                             .primary()
                             .large()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.connection.open();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.connection.open(window, cx);
                                 cx.notify();
                             })),
                     ),

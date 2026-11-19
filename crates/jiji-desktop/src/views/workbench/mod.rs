@@ -33,7 +33,8 @@ use crate::logic::graph::{
 use crate::logic::inspect::{find_node, is_ancestor, stack_position, CompareMode};
 use crate::shell::Dismiss;
 use crate::store::SavedView;
-use crate::theme::{theme, RAIL_W};
+use crate::theme::RAIL_W;
+use crate::ui::splitter::{self, moved, splitter, Narrower, Narrowest, Wider, Widest, STEP};
 use crate::ui::{bounds_probe, PopoverState, TextInput};
 
 actions!(
@@ -64,7 +65,9 @@ actions!(
 );
 
 pub fn bind_keys(cx: &mut App) {
+    annotate::bind_keys(cx);
     diffpane::bind_keys(cx);
+    splitter::bind_keys(cx);
     // Bare keys belong to the workbench only while nothing is being typed.
     let bare = Some("Workbench && !TextInput");
     // Page and Home/End travel the selection while the graph has focus;
@@ -127,6 +130,7 @@ pub struct WorkbenchView {
     app: Entity<AppModel>,
     focus: FocusHandle,
     graph_focus: FocusHandle,
+    divider_focus: FocusHandle,
     snapshot: Arc<RepoSnapshot>,
     model: Rc<GraphModel>,
     /// The focus lane's model and the workstream it was built for.
@@ -266,7 +270,7 @@ impl WorkbenchView {
         let mut this = Self {
             drag: dnd::DragState::default(),
             washes: dnd::Washes::default(),
-            annotate: annotate::AnnotateState::default(),
+            annotate: annotate::AnnotateState::new(cx),
             evolution,
             inspector,
             surface,
@@ -275,14 +279,17 @@ impl WorkbenchView {
                 tree_on,
                 tree_width,
                 find_input,
-                cx.focus_handle(),
+                cx.focus_handle().tab_stop(true),
+                cx.focus_handle().tab_stop(true),
             ),
             header,
             model: Rc::new(build_graph_model(&snapshot)),
             snapshot,
             app,
             focus: cx.focus_handle(),
-            graph_focus: cx.focus_handle(),
+            // The graph is one stop: its arrows travel the selection.
+            graph_focus: cx.focus_handle().tab_stop(true),
+            divider_focus: cx.focus_handle().tab_stop(true),
             focus_model: None,
             mode,
             density,
@@ -293,7 +300,7 @@ impl WorkbenchView {
             diff_width: f32::INFINITY,
             revealed: None,
             view_menu: ViewMenu {
-                popover: PopoverState::default(),
+                popover: PopoverState::new(cx),
                 busy: false,
                 error: None,
                 saving: false,
@@ -622,7 +629,7 @@ impl WorkbenchView {
     /// selection.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.view_menu.popover.is_open() {
-            self.view_menu.popover.close();
+            self.view_menu.popover.close(window, cx);
             cx.notify();
             return;
         }
@@ -666,14 +673,32 @@ impl WorkbenchView {
 
     // ── The split ──
 
-    fn shown_width(&self) -> f32 {
+    /// How narrow and how wide the graph pane can be in this window: the
+    /// diff keeps its minimum, and the graph's own gives way to it.
+    fn graph_limits(&self) -> (f32, f32) {
         let available: f32 = self.bounds.get().size.width.into();
         let limit = if available > 0. {
             GRAPH_MAX.min((available - DIFF_MIN).max(0.))
         } else {
             GRAPH_MAX
         };
-        self.graph_width.clamp(GRAPH_MIN.min(limit), limit)
+        (GRAPH_MIN.min(limit), limit)
+    }
+
+    fn shown_width(&self) -> f32 {
+        let (min, max) = self.graph_limits();
+        self.graph_width.clamp(min, max)
+    }
+
+    /// The divider moved from the keyboard, from where it stands on screen;
+    /// the width is kept at once, as a drag's is when it ends.
+    fn nudge_graph(&mut self, by: f32, cx: &mut Context<Self>) {
+        let (min, max) = self.graph_limits();
+        self.graph_width = moved(self.shown_width(), min, max, by);
+        let width = self.graph_width.round();
+        self.app
+            .update(cx, |model, _| model.store.set_pref("pane.graph", &width));
+        cx.notify();
     }
 
     fn drag_divider(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -750,7 +775,6 @@ impl WorkbenchView {
 
 impl Render for WorkbenchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = theme(cx);
         // The first frame has no viewport to scroll within; reveal again
         // once one exists.
         if self.revealed.is_none() {
@@ -859,34 +883,34 @@ impl Render for WorkbenchView {
                         .h_full()
                         .child(self.render_graph_pane(width, window, cx)),
                 )
-                .child(
-                    // The divider: a hairline with a wider grip around it.
-                    div()
-                        .id("graph-divider")
-                        .relative()
-                        .w(px(1.))
-                        .flex_shrink_0()
-                        .h_full()
-                        .bg(if resizing { t.accent } else { t.border2 })
-                        .child(
-                            div()
-                                .id("graph-divider-grip")
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .left(px(-3.))
-                                .w(px(7.))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.resizing = true;
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_click(cx.listener(Self::divider_click)),
-                        ),
-                );
+                .child({
+                    let (min, max) = self.graph_limits();
+                    let press = cx.listener(|this: &mut Self, _: &gpui::MouseDownEvent, _, cx| {
+                        this.resizing = true;
+                        cx.notify();
+                    });
+                    let click = cx.listener(Self::divider_click);
+                    splitter(
+                        "graph-divider",
+                        "Resize graph panel",
+                        &self.divider_focus,
+                        width,
+                        min,
+                        max,
+                        resizing,
+                        window,
+                        cx,
+                        |grip| grip.on_mouse_down(MouseButton::Left, press).on_click(click),
+                    )
+                    .on_action(cx.listener(|this, _: &Narrower, _, cx| this.nudge_graph(-STEP, cx)))
+                    .on_action(cx.listener(|this, _: &Wider, _, cx| this.nudge_graph(STEP, cx)))
+                    .on_action(cx.listener(|this, _: &Narrowest, _, cx| {
+                        this.nudge_graph(f32::NEG_INFINITY, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &Widest, _, cx| this.nudge_graph(f32::INFINITY, cx)),
+                    )
+                });
         }
         root.child(
             div()
@@ -1542,6 +1566,228 @@ mod tests {
         let reading = menu_for(&model, window, on_header(&compared), cx);
         assert!(reading.contains(&"diff.copyPath"), "{reading:?}");
         assert!(changing(&reading).is_empty(), "{reading:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Whether `handle` has the keys in `window`.
+    fn has_keys(
+        window: WindowHandle<Shell>,
+        handle: impl Fn(&super::WorkbenchView) -> gpui::FocusHandle,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        let view = workbench(window, cx);
+        window
+            .update(cx, |_, window, cx| handle(view.read(cx)).is_focused(window))
+            .unwrap()
+    }
+
+    /// Tab from wherever the keys are until `handle` has them.
+    fn tab_to(
+        window: WindowHandle<Shell>,
+        handle: impl Fn(&super::WorkbenchView) -> gpui::FocusHandle + Copy,
+        cx: &mut TestAppContext,
+    ) {
+        for _ in 0..40 {
+            if has_keys(window, handle, cx) {
+                return;
+            }
+            crate::testing::press(window.into(), "tab", cx);
+        }
+        panic!("Tab never got there");
+    }
+
+    #[gpui::test]
+    fn the_file_tree_is_one_stop_its_keys_travel_and_fold(cx: &mut TestAppContext) {
+        let (dir, _model, window) = mock_workbench("keyboard-tree", cx);
+        let keys = window.into();
+        let tree = |view: &super::WorkbenchView| view.diff.tree_focus.clone();
+        tab_to(window, tree, cx);
+        // The ring rides the row the keys start from, the file being read.
+        let view = workbench(window, cx);
+        window
+            .update(cx, |_, window, cx| {
+                let focus = view.read(cx).diff.tree_focus.clone();
+                assert!(crate::ui::keyboard_on(&focus, window));
+            })
+            .unwrap();
+        // ↓ from the file being read to the next folder; Return folds it,
+        // Space opens it again.
+        crate::testing::press(keys, "down", cx);
+        let folder = view.read_with(cx, |view, _| view.diff.tree_cursor.clone().unwrap());
+        assert_eq!(folder, "src/lib/styles");
+        let folded = |cx: &mut TestAppContext| {
+            view.read_with(cx, |view, _| view.diff.tree_collapsed.contains(&folder))
+        };
+        crate::testing::press(keys, "enter", cx);
+        assert!(folded(cx));
+        crate::testing::press(keys, "space", cx);
+        assert!(!folded(cx));
+        // Shift-Tab leaves the tree for the control before it; Tab is back.
+        crate::testing::press(keys, "shift-tab", cx);
+        assert!(!has_keys(window, tree, cx));
+        crate::testing::press(keys, "tab", cx);
+        assert!(has_keys(window, tree, cx));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn an_annotate_origin_is_followed_from_the_keyboard(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("keyboard-annotate", cx);
+        let keys = window.into();
+        let working = model.read_with(cx, |model, _| {
+            model.snapshot().unwrap().working_copy.clone()
+        });
+        model.update(cx, |model, cx| {
+            model.open_annotate(working, VIEWPORT.into(), cx)
+        });
+        cx.run_until_parked();
+        let lines = |view: &super::WorkbenchView| view.annotate.focus.clone();
+        tab_to(window, lines, cx);
+        let view = workbench(window, cx);
+        // Where each run of one origin's lines begins, and its origin.
+        let runs: Vec<(usize, String)> = view.read_with(cx, |view, _| {
+            let data = view.annotate.data.clone().expect("the file is annotated");
+            super::annotate::run_starts(&data)
+                .map(|at| (at, data.origins[data.lines[at].origin as usize].id.clone()))
+                .collect()
+        });
+        assert!(runs.len() > 1, "{runs:?}");
+        // ↓ lands on the first run, then steps to the next; ↑ steps back.
+        let cursor = |cx: &mut TestAppContext| view.read_with(cx, |view, _| view.annotate.cursor);
+        crate::testing::press(keys, "down", cx);
+        assert_eq!(cursor(cx), Some(runs[0].0));
+        crate::testing::press(keys, "down down up", cx);
+        assert_eq!(cursor(cx), Some(runs[1].0));
+        // Return goes to the change the run came from.
+        crate::testing::press(keys, "enter", cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(
+                model.ui().selected_node.as_deref(),
+                Some(runs[1].1.as_str())
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_split_is_made_from_the_keyboard_alone(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("keyboard-split", cx);
+        let keys = window.into();
+        let view = workbench(window, cx);
+        let focused = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| window.focused(cx))
+                .unwrap()
+        };
+        // From the graph: the divider, then the working copy's verbs —
+        // Describe, New, Bookmark — and More, which Space opens.
+        let graph = view.read_with(cx, |view, _| view.graph_focus.clone());
+        window
+            .update(cx, |_, window, cx| window.focus(&graph, cx))
+            .unwrap();
+        crate::testing::press(keys, "tab tab tab tab tab", cx);
+        let more = focused(cx);
+        crate::testing::press(keys, "space", cx);
+        assert!(view.read_with(cx, |view, _| view.header.more.is_open()));
+        // The menu's arrows walk it: Rebase, then Split, which Space picks.
+        crate::testing::press(keys, "down down space", cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.header.tray, super::header::Tray::Split);
+            assert!(!view.header.more.is_open());
+        });
+        // Into the tray: past its two modes to the first file, checked.
+        crate::testing::press(keys, "tab tab tab space", cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.header.split.contains_key(VIEWPORT), "nothing checked");
+        });
+        // Past the file's hunks, the other file, the description and
+        // Cancel to Split, now on offer; Return makes the split.
+        crate::testing::press(keys, "tab tab tab tab tab enter", cx);
+        let done = model.read_with(cx, |model, _| model.ui().last_mutation.clone());
+        assert!(done.is_some(), "the split did not run");
+        // The tray closes, and the keys are back on More.
+        assert_eq!(
+            view.read_with(cx, |view, _| view.header.tray.clone()),
+            super::header::Tray::None
+        );
+        assert_eq!(focused(cx), more);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_dividers_move_from_the_keyboard_and_the_widths_are_kept(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("keyboard-dividers", cx);
+        let keys = window.into();
+        let view = workbench(window, cx);
+        let widths = |cx: &mut TestAppContext| {
+            view.read_with(cx, |view, _| (view.shown_width(), view.diff.tree_width))
+        };
+        let (graph, tree) = widths(cx);
+        let (min, max) = view.read_with(cx, |view, _| view.graph_limits());
+
+        tab_to(window, |view| view.divider_focus.clone(), cx);
+        crate::testing::press(keys, "right", cx);
+        assert_eq!(widths(cx).0, graph + 16.);
+        crate::testing::press(keys, "left left", cx);
+        assert_eq!(widths(cx).0, graph - 16.);
+        crate::testing::press(keys, "home", cx);
+        assert_eq!(widths(cx).0, min);
+        crate::testing::press(keys, "end", cx);
+        assert_eq!(widths(cx).0, max);
+        crate::testing::press(keys, "left", cx);
+
+        tab_to(window, |view| view.diff.tree_divider.clone(), cx);
+        crate::testing::press(keys, "right right", cx);
+        assert_eq!(widths(cx).1, tree + 32.);
+        crate::testing::press(keys, "home", cx);
+        assert_eq!(widths(cx).1, super::diffpane::TREE_MIN);
+        crate::testing::press(keys, "end left", cx);
+        assert_eq!(widths(cx).1, super::diffpane::TREE_MAX - 16.);
+
+        // Both are kept as they moved, and a relaunch reads them back.
+        let kept = |key: &str| crate::store::Store::at(dir.join("data")).pref::<f32>(key);
+        assert_eq!(kept("pane.graph"), Some(max - 16.));
+        assert_eq!(kept("pane.filetree"), Some(super::diffpane::TREE_MAX - 16.));
+        drop(model);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn typing_in_a_field_types_and_tab_leaves_it(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("keyboard-typing", cx);
+        let keys = window.into();
+        let view = workbench(window, cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.open_editor(window, cx))
+            })
+            .unwrap();
+        let selected = |cx: &mut TestAppContext| {
+            model.read_with(cx, |model, _| model.ui().selected_node.clone())
+        };
+        let before = selected(cx);
+        // The workbench's bare keys, Space and the arrows are text here.
+        crate::testing::press(keys, "j k g w space left right", cx);
+        cx.simulate_input(keys, "@");
+        let (text, mode, editing) = view.read_with(cx, |view, cx| {
+            (
+                view.header.editor.read(cx).text().to_owned(),
+                view.mode,
+                view.header.tray.clone(),
+            )
+        });
+        assert_eq!(text, "jkgw @");
+        assert_eq!(mode, crate::app::WorkbenchMode::Graph);
+        assert_eq!(editing, super::header::Tray::Edit);
+        assert_eq!(selected(cx), before);
+        // Tab moves on, as from any field: the editor keeps its text.
+        crate::testing::press(keys, "tab", cx);
+        let still_in = window
+            .update(cx, |_, window, cx| {
+                view.read(cx).header.editor.read(cx).is_focused(window)
+            })
+            .unwrap();
+        assert!(!still_in);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

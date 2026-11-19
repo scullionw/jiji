@@ -3,7 +3,7 @@
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, quad, BorderStyle, Bounds, Context, Entity,
-    FontWeight, Hsla, PathBuilder, Pixels, Point, Render, ScrollHandle, Window,
+    FontWeight, Hsla, PathBuilder, Pixels, Point, Render, Role, ScrollHandle, Window,
 };
 
 use crate::app::{app, AppModel};
@@ -13,7 +13,8 @@ use crate::theme::{
 };
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    btn, h_flex, icon, kbd, scrollbar, tooltip, truncated, v_flex, IconName, Tabular as _,
+    btn, h_flex, icon, kbd, ring, scrollbar, tooltip, truncated, v_flex, IconName, NodeExt as _,
+    Tabbable as _, Tabular as _,
 };
 
 pub struct WelcomeView {
@@ -293,10 +294,13 @@ impl Render for WelcomeView {
             )
             .child(match error {
                 Some(error) => div()
+                    .id("welcome-error")
+                    .alert(error.clone())
                     .text_size(px(TEXT_S))
                     .text_color(t.danger)
                     .child(error),
                 None => div()
+                    .id("welcome-hint")
                     .text_size(px(TEXT_S))
                     .text_color(t.text3)
                     .child("A plain Git repository works too: Jiji offers to set jj up in it."),
@@ -306,6 +310,7 @@ impl Render for WelcomeView {
             // A plain list: rows reach a little past the column on both
             // sides, so their text keeps the column's edge.
             let mut list = v_flex().mx(px(-10.));
+            let accent = t.accent;
             for (ix, repo) in recents.into_iter().enumerate() {
                 let group = format!("recent-{ix}");
                 let open_app = self.app.clone();
@@ -313,6 +318,10 @@ impl Render for WelcomeView {
                 let (open_path, forget_path) = (repo.path.clone(), repo.path.clone());
                 let row = h_flex()
                     .id(("recent", ix))
+                    .role(Role::Button)
+                    .aria_label(format!("Open {}", repo.name))
+                    .aria_description(repo.path.clone())
+                    .tabbable(cx)
                     .group(group.clone())
                     .h(px(36.))
                     .pl(px(10.))
@@ -363,6 +372,9 @@ impl Render for WelcomeView {
                     .child(
                         div()
                             .id(("forget", ix))
+                            .role(Role::Button)
+                            .aria_label(format!("Remove {} from recent repositories", repo.name))
+                            .tabbable_styled(move |style| style.opacity(1.).shadow(ring(accent)))
                             .flex()
                             .flex_shrink_0()
                             .items_center()

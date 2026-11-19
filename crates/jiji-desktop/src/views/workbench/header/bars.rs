@@ -1,7 +1,7 @@
 //! The header's two bars: the title with its verbs, then the facts about
 //! the change and the controls for how its diff is shown.
 
-use gpui::{div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, Hsla, Window};
+use gpui::{div, prelude::*, px, Anchor, AnyElement, Context, FontWeight, Hsla, Role, Window};
 use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot};
 
 use super::{title_or_none, Confirm, Tray};
@@ -13,11 +13,12 @@ use crate::logic::inspect::{
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
 use crate::logic::text::{counted, file_title, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_HEAD, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::ui::focus::FocusRow;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, diffstat, from_now, h_flex, icon, icon_btn, label_box, middot, node_mark, popover,
     popover_layer, scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Mark,
-    Tabular as _, LABEL_H,
+    Tabbable as _, Tabular as _, LABEL_H,
 };
 use crate::views::workbench::diffpane::status_glyph;
 use crate::views::workbench::WorkbenchView;
@@ -112,6 +113,9 @@ impl WorkbenchView {
             bar = bar.child(
                 div()
                     .id("change-title")
+                    .role(Role::Heading)
+                    .aria_level(1)
+                    .aria_label(title.clone())
                     .min_w_0()
                     .text_size(px(TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
@@ -130,6 +134,8 @@ impl WorkbenchView {
                         },
                     )
                     .size(22., 13.)
+                    .label("Full description")
+                    .expanded(open)
                     .tooltip(if open {
                         "Hide full description"
                     } else {
@@ -200,6 +206,7 @@ impl WorkbenchView {
                         "Create or move a bookmark onto this change (jj bookmark)",
                     )
                     .on(self.header.tray == Tray::Bookmark)
+                    .expanded(self.header.tray == Tray::Bookmark)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_tray(Tray::Bookmark, window, cx)
                     })),
@@ -210,6 +217,7 @@ impl WorkbenchView {
         bar.child(
             icon_btn("close-change", IconName::Close)
                 .size(24., 13.)
+                .label("Clear selection")
                 .tooltip("Close (esc)")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.app.update(cx, |model, cx| model.select_node(None, cx));
@@ -247,11 +255,12 @@ impl WorkbenchView {
             btn("action-more", if labelled { "More" } else { "" })
                 .ghost()
                 .on(open)
+                .expanded(open)
                 .disabled(acting)
                 .tooltip("More change actions")
                 .trailing(icon(IconName::ChevronDown, 12., t.text3))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.header.more.toggle();
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.header.more.toggle(window, cx);
                     cx.notify();
                 })),
         );
@@ -268,6 +277,9 @@ impl WorkbenchView {
             let hover = if danger { t.danger_dim } else { t.bg_hover };
             let mut row = h_flex()
                 .id(id)
+                .role(Role::MenuItem)
+                .aria_label(label.trim_end_matches('…'))
+                .tabbable_in(t.accent)
                 .h(px(28.))
                 .gap(px(8.))
                 .px(px(8.))
@@ -305,7 +317,7 @@ impl WorkbenchView {
                   _: &gpui::ClickEvent,
                   window: &mut Window,
                   cx: &mut Context<Self>| {
-                this.header.more.close();
+                this.header.more.close(window, cx);
                 this.toggle_tray(tray.clone(), window, cx);
             }
         };
@@ -355,8 +367,8 @@ impl WorkbenchView {
                 .tooltip(tooltip(
                     "How this change was rewritten over time (jj evolog) — a scrubbable timeline of its versions",
                 ))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.header.more.close();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.header.more.close(window, cx);
                     let Some(id) = this.header.node.clone() else {
                         return;
                     };
@@ -387,9 +399,11 @@ impl WorkbenchView {
         anchor.child(popover_layer(
             Anchor::TopRight,
             30.,
-            panel,
-            cx.listener(|this, _, _, cx| {
-                this.header.more.close();
+            self.header
+                .more
+                .panel("more-menu", Role::Menu, "More change actions", panel),
+            cx.listener(|this, _, window, cx| {
+                this.header.more.close(window, cx);
                 cx.notify();
             }),
         ))
@@ -429,6 +443,7 @@ impl WorkbenchView {
         &mut self,
         snapshot: &RepoSnapshot,
         node: &GraphNode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme(cx);
@@ -605,6 +620,9 @@ impl WorkbenchView {
             let target = id.to_owned();
             h_flex()
                 .id(("relation", key))
+                .role(Role::Button)
+                .aria_label(tip.clone())
+                .tabbable_in(t.accent)
                 .flex_shrink_0()
                 .gap(px(2.))
                 .h(px(20.))
@@ -658,7 +676,7 @@ impl WorkbenchView {
             .text_size(px(TEXT_S))
             .text_color(t.text3)
             .child(facts)
-            .child(self.render_view_controls(snapshot, node, cx))
+            .child(self.render_view_controls(snapshot, node, window, cx))
     }
 
     /// A bookmark on this change: its chip (click to rename or delete a
@@ -703,14 +721,21 @@ impl WorkbenchView {
             );
         chip = if manageable {
             let name = mark.name.clone();
-            chip.cursor_pointer()
+            chip.role(Role::Button)
+                .aria_label(format!("Bookmark {full}, {sync_text}"))
+                .aria_description("Rename or delete")
+                .aria_expanded(armed)
+                .tabbable(cx)
+                .cursor_pointer()
                 .hover(|style| style.bg(t.bg_hover))
                 .tooltip(tooltip(format!("{full} — {sync_text} · rename or delete")))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.toggle_tray(Tray::Manage(name.clone()), window, cx)
                 }))
         } else {
-            chip.tooltip(tooltip(format!("{full} — {sync_text}")))
+            chip.role(Role::Label)
+                .aria_value(format!("Bookmark {full}, {sync_text}"))
+                .tooltip(tooltip(format!("{full} — {sync_text}")))
         };
         let mut out = vec![chip.into_any_element()];
         let Some(pr) = pr_for_bookmark(mark, prs) else {
@@ -728,6 +753,10 @@ impl WorkbenchView {
         let url = pr.url.clone();
         let mut pr_chip = label_box(fg, Theme::fade(fg, 0.42))
             .id(("pr-chip", key))
+            .role(Role::Link)
+            .aria_label(format!("{}, {}", badge.title, badge.tone.word()))
+            .aria_description("Open on GitHub")
+            .tabbable(cx)
             .gap(px(4.))
             .cursor_pointer()
             .hover(|style| style.bg(t.bg_hover))
@@ -763,6 +792,9 @@ impl WorkbenchView {
                 .unwrap_or_else(|| format!("Re-run the failed GitHub Actions jobs on #{number}"));
             let mut rerun = div()
                 .id(("rerun-ci", key))
+                .role(Role::Button)
+                .aria_label(label)
+                .aria_description(tip.clone())
                 .flex_shrink_0()
                 .h(px(LABEL_H))
                 .px(px(5.))
@@ -773,6 +805,7 @@ impl WorkbenchView {
                 .child(label);
             if !busy {
                 rerun = rerun
+                    .tabbable(cx)
                     .cursor_pointer()
                     .hover(|style| style.bg(t.accent_dim))
                     .on_click(cx.listener(move |this, _, _, cx| this.rerun_ci(number, cx)));
@@ -786,6 +819,7 @@ impl WorkbenchView {
         &mut self,
         snapshot: &RepoSnapshot,
         node: &GraphNode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme(cx);
@@ -803,6 +837,14 @@ impl WorkbenchView {
         let mut compare = h_flex().flex_shrink_0().child({
             let mut chip = h_flex()
                 .id("compare-chip")
+                .role(Role::Button)
+                .aria_label(format!(
+                    "Compare: {}",
+                    self.compare_label(snapshot, from.as_deref())
+                ))
+                .aria_description(tip.clone())
+                .aria_expanded(self.header.tray == Tray::Compare)
+                .tabbable(cx)
                 .gap(px(5.))
                 .h(px(22.))
                 .px(px(7.))
@@ -833,6 +875,9 @@ impl WorkbenchView {
             compare = compare.child(
                 div()
                     .id("compare-reset")
+                    .role(Role::Button)
+                    .aria_label("Back to the parent diff")
+                    .tabbable(cx)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -854,13 +899,17 @@ impl WorkbenchView {
             .gap(px(4.))
             .min_h(px(24.))
             .child(compare)
-            .children(self.render_files_menu(cx))
+            .children(self.render_files_menu(window, cx))
             .child(self.tree_toggle(cx))
             .child(self.layout_toggle(cx))
     }
 
     /// "N files +a −r": the jump-to-a-file menu.
-    pub(super) fn render_files_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_files_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let t = theme(cx);
         let files = self.surface.read(cx).files();
         self.diff.current()?;
@@ -879,6 +928,12 @@ impl WorkbenchView {
         };
         let mut button = h_flex()
             .id("files-button")
+            .role(Role::Button)
+            .aria_label(format!(
+                "Jump to a file: {}, {added} added, {removed} removed",
+                counted(count, "file")
+            ))
+            .aria_expanded(open)
             .gap(px(6.))
             .h(px(24.))
             .px(px(7.))
@@ -901,78 +956,85 @@ impl WorkbenchView {
                 button = button.bg(t.bg_hover);
             }
             button = button
+                .tabbable(cx)
                 .cursor_pointer()
                 .hover(|style| style.bg(t.bg_hover).text_color(t.text1))
                 .tooltip(tooltip("Jump to a file"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.header.files.toggle();
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.header.files.toggle(window, cx);
                     cx.notify();
                 }));
         }
         let mut anchor = div().relative().child(button);
         if open {
+            let kept: Vec<FocusRow> = (0..count)
+                .map(|index| FocusRow::new(("jump-file-row", index), window, cx))
+                .collect();
+            let files = self.surface.read(cx).files();
             let mut list = v_flex().p(px(4.));
-            for (index, file) in files.iter().enumerate() {
+            for ((index, file), kept) in files.iter().enumerate().zip(kept) {
                 let (glyph, hue) = status_glyph(file.status, &t);
                 let (dir, name) = split_path(&file.path);
-                list = list.child(
-                    h_flex()
-                        .id(("jump-file", index))
-                        .w_full()
-                        .h(px(26.))
-                        .gap(px(8.))
-                        .px(px(8.))
-                        .rounded(px(RADIUS_S))
-                        .font_family(t.mono.clone())
-                        .text_size(px(TEXT_S))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(t.bg_hover))
-                        // The directory gives way first; the whole path, and
-                        // where a rename came from, are on hover.
-                        .tooltip(tooltip(file_title(
-                            &file.path,
-                            file.renamed_from.as_deref(),
-                        )))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.header.files.close();
-                            this.jump_to_file(index, cx);
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .w(px(12.))
-                                .flex_shrink_0()
-                                .text_size(px(TEXT_XS))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hue)
-                                .child(glyph),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_color(t.text3)
-                                        .child(truncated(dir.to_owned())),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_color(t.text1)
-                                        .child(name.to_owned()),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap(px(6.))
-                                .text_size(px(TEXT_XS))
-                                .children(stat("+", file.added, t.add_fg))
-                                .children(stat("−", file.removed, t.del_fg)),
-                        ),
-                );
+                let row = h_flex()
+                    .id(("jump-file", index))
+                    .role(Role::MenuItem)
+                    .aria_label(file_title(&file.path, file.renamed_from.as_deref()))
+                    .tabbable_in(t.accent)
+                    .w_full()
+                    .h(px(26.))
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .rounded(px(RADIUS_S))
+                    .font_family(t.mono.clone())
+                    .text_size(px(TEXT_S))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.bg_hover))
+                    // The directory gives way first; the whole path, and
+                    // where a rename came from, are on hover.
+                    .tooltip(tooltip(file_title(
+                        &file.path,
+                        file.renamed_from.as_deref(),
+                    )))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.header.files.close(window, cx);
+                        this.jump_to_file(index, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_shrink_0()
+                            .text_size(px(TEXT_XS))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hue)
+                            .child(glyph),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_color(t.text3)
+                                    .child(truncated(dir.to_owned())),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(t.text1)
+                                    .child(name.to_owned()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(px(6.))
+                            .text_size(px(TEXT_XS))
+                            .children(stat("+", file.added, t.add_fg))
+                            .children(stat("−", file.removed, t.del_fg)),
+                    );
+                list = list.child(kept.stop(row, &self.header.files_scroll, window, cx));
             }
             let panel = popover(cx)
                 .relative()
@@ -989,9 +1051,11 @@ impl WorkbenchView {
             anchor = anchor.child(popover_layer(
                 Anchor::TopRight,
                 26.,
-                panel,
-                cx.listener(|this, _, _, cx| {
-                    this.header.files.close();
+                self.header
+                    .files
+                    .panel("files-panel", Role::Menu, "Jump to a file", panel),
+                cx.listener(|this, _, window, cx| {
+                    this.header.files.close(window, cx);
                     cx.notify();
                 }),
             ));

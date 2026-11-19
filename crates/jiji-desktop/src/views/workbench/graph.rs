@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, quad, Anchor, AnyElement, App, BorderStyle, Bounds,
-    Context, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, Stateful, TextAlign, TextRun,
-    Window,
+    Context, Div, FontWeight, Hsla, MouseButton, PathBuilder, Pixels, Role, Stateful, TextAlign,
+    TextRun, Window,
 };
 use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SnapshotView, WorkstreamSummary};
 use jiji_forge::RepoPrState;
@@ -26,9 +26,10 @@ use crate::store::SavedView;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, label_box, lead_bar,
-    lead_bar_in, menu_label, popover, popover_layer, ref_label, scrollbar, segmented, short_age,
-    tag, tooltip, truncated, v_flex, IconName, Tabular as _,
+    absolute_time, btn, empty_state, h_flex, icon, icon_btn, input::field, keyboard_on, label_box,
+    lead_bar, lead_bar_in, menu_label, popover, popover_layer, ref_label, ring, scrollbar,
+    segmented, short_age, tag, tooltip, truncated, v_flex, IconName, NodeExt as _, Segment,
+    Tabbable as _, Tabular as _,
 };
 use crate::views::menu;
 
@@ -257,6 +258,17 @@ struct RowStyle<'a> {
     authors: bool,
     /// The width the rows lay out in.
     width: f32,
+    /// The row the keyboard travels from (the selection's anchor), and
+    /// whether the pane has the keys — from the keyboard, for the ring.
+    anchor: Option<String>,
+    keys: GraphKeys,
+}
+
+/// Whether the graph pane has focus, and whether the keyboard gave it.
+#[derive(Clone, Copy)]
+pub(super) struct GraphKeys {
+    focused: bool,
+    ringed: bool,
 }
 
 impl RowStyle<'_> {
@@ -503,6 +515,36 @@ impl GutterPaint {
     }
 }
 
+/// What a graph row says to assistive technology: its title and change id,
+/// then what sets it apart, then its bookmarks — what a sighted reader
+/// takes from the row at a glance.
+fn row_name(node: &GraphNode, title: &str, working_copy: bool, immutable: bool) -> String {
+    let mut name = format!(
+        "{}, {}",
+        if title.is_empty() {
+            "No description yet"
+        } else {
+            title
+        },
+        node.id.chars().take(8).collect::<String>()
+    );
+    let marks = [
+        (working_copy, "working copy"),
+        (node.has_conflict, "conflicted"),
+        (node.is_divergent, "divergent"),
+        (immutable, "immutable"),
+    ];
+    for word in marks.iter().filter(|(on, _)| *on).map(|(_, word)| *word) {
+        name.push_str(", ");
+        name.push_str(word);
+    }
+    for bookmark in &node.bookmarks {
+        name.push_str(", ");
+        name.push_str(bookmark);
+    }
+    name
+}
+
 fn gutter_canvas(paint: GutterPaint, width: f32, height: f32) -> impl IntoElement {
     canvas(
         |_, _, _| (),
@@ -525,6 +567,10 @@ impl WorkbenchView {
         let t = theme(cx);
         let mode = self.mode;
         let classic = self.density == RowDensity::Classic;
+        let keys = GraphKeys {
+            focused: self.graph_focus.is_focused(window),
+            ringed: keyboard_on(&self.graph_focus, window),
+        };
         let head = h_flex()
             .h(px(TOOLBAR_H))
             .flex_shrink_0()
@@ -537,9 +583,10 @@ impl WorkbenchView {
             .child(div().flex_1())
             .child(segmented(
                 "workbench-mode",
+                "Workbench view",
                 vec![
-                    (WorkbenchMode::Graph, "Graph".into(), None),
-                    (WorkbenchMode::Focus, "Focus".into(), None),
+                    Segment::text(WorkbenchMode::Graph, "Graph"),
+                    Segment::text(WorkbenchMode::Focus, "Focus"),
                 ],
                 &mode,
                 cx,
@@ -562,6 +609,8 @@ impl WorkbenchView {
                 )
                 .size(26., 14.)
                 .on(classic)
+                .label("Classic rows")
+                .pressed(classic)
                 .tooltip(if classic {
                     "Classic rows — switch to compact, jj-dense rows"
                 } else {
@@ -571,12 +620,15 @@ impl WorkbenchView {
             );
 
         let body = match mode {
-            WorkbenchMode::Graph => self.render_graph(width, cx).into_any_element(),
-            WorkbenchMode::Focus => self.render_focus(width, cx).into_any_element(),
+            WorkbenchMode::Graph => self.render_graph(width, keys, cx).into_any_element(),
+            WorkbenchMode::Focus => self.render_focus(width, keys, cx).into_any_element(),
         };
         v_flex().size_full().child(head).child(
             div()
                 .id("graph-pane")
+                .role(Role::ListBox)
+                .aria_label("Change graph")
+                .a11y(|node| node.set_multiselectable())
                 .key_context("GraphPane")
                 .track_focus(&self.graph_focus)
                 .relative()
@@ -617,8 +669,8 @@ impl WorkbenchView {
         }
     }
 
-    fn toggle_view_menu(&mut self, cx: &mut Context<Self>) {
-        self.view_menu.popover.toggle();
+    fn toggle_view_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.view_menu.popover.toggle(window, cx);
         if self.view_menu.popover.is_open() {
             self.view_menu.error = None;
             self.view_menu.saving = false;
@@ -634,7 +686,7 @@ impl WorkbenchView {
         cx.notify();
     }
 
-    fn apply_view(&mut self, view: SnapshotView, cx: &mut Context<Self>) {
+    fn apply_view(&mut self, view: SnapshotView, window: &mut Window, cx: &mut Context<Self>) {
         if self.view_menu.busy {
             return;
         }
@@ -644,12 +696,12 @@ impl WorkbenchView {
         let task = self
             .app
             .update(cx, |model, cx| model.set_snapshot_view(view, true, cx));
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.view_menu.busy = false;
                 match result {
-                    Ok(()) => this.view_menu.popover.close(),
+                    Ok(()) => this.view_menu.popover.close(window, cx),
                     // The backend's refusal, inline: the graph keeps
                     // rendering what it was.
                     Err(error) => this.view_menu.error = Some(error.message),
@@ -660,10 +712,10 @@ impl WorkbenchView {
         .detach();
     }
 
-    pub(super) fn apply_revset(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_revset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let revset = self.view_menu.revset.read(cx).text().trim().to_owned();
         if !revset.is_empty() {
-            self.apply_view(SnapshotView::Custom { revset }, cx);
+            self.apply_view(SnapshotView::Custom { revset }, window, cx);
         }
     }
 
@@ -723,6 +775,11 @@ impl WorkbenchView {
         let (label, count) = self.trigger_label();
         let mut trigger = h_flex()
             .id("view-menu")
+            .role(Role::Button)
+            .aria_label(format!("Graph view: {label}"))
+            .aria_description("Change what the graph shows")
+            .aria_expanded(open)
+            .tabbable(cx)
             .gap(px(6.))
             .h(px(26.))
             .px(px(8.))
@@ -734,7 +791,7 @@ impl WorkbenchView {
             .cursor_pointer()
             .hover(|style| style.bg(t.bg_hover))
             .tooltip(tooltip("Change what the graph shows"))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_view_menu(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_view_menu(window, cx)))
             .child(div().min_w_0().child(truncated(label)))
             .children(count.map(|count| {
                 div()
@@ -756,8 +813,19 @@ impl WorkbenchView {
 
         let busy = self.view_menu.busy;
         let current = self.snapshot.view.clone();
+        // One lens among several: a radio button, ticked when on screen.
         let preset_row =
             |id: gpui::ElementId, label: String, desc: String, mono: bool, on: bool| {
+                let named = h_flex()
+                    .id(id)
+                    .role(Role::RadioButton)
+                    .aria_label(label.clone())
+                    .aria_description(desc.clone())
+                    .aria_toggled(if on {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    });
                 let mut text = v_flex().flex_1().min_w_0().child(
                     div()
                         .truncate()
@@ -774,8 +842,8 @@ impl WorkbenchView {
                     sub = sub.font_family(t.mono.clone());
                 }
                 text = text.child(sub);
-                h_flex()
-                    .id(id)
+                named
+                    .when(!busy, |el| el.tabbable_in(t.accent))
                     .flex_1()
                     .min_w_0()
                     .gap(px(8.))
@@ -798,9 +866,13 @@ impl WorkbenchView {
             .flex()
             .flex_col()
             .child(menu_label("Show", cx));
+        let mut lenses = v_flex()
+            .id("lenses")
+            .role(Role::RadioGroup)
+            .aria_label("Show");
         for (ix, (view, label, desc)) in VIEW_PRESETS.iter().enumerate() {
             let target = view.clone();
-            panel = panel.child(
+            lenses = lenses.child(
                 preset_row(
                     ("lens", ix).into(),
                     (*label).to_owned(),
@@ -808,9 +880,12 @@ impl WorkbenchView {
                     false,
                     *view == current,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.apply_view(target.clone(), cx))),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.apply_view(target.clone(), window, cx)
+                })),
             );
         }
+        panel = panel.child(lenses);
 
         let saved = self.view_menu.saved.clone();
         if !saved.is_empty() {
@@ -848,12 +923,15 @@ impl WorkbenchView {
                                 as_view == current,
                             )
                             .on_click(cx.listener(
-                                move |this, _, _, cx| this.apply_view(target.clone(), cx),
+                                move |this, _, window, cx| {
+                                    this.apply_view(target.clone(), window, cx)
+                                },
                             )),
                         )
                         .child(
                             icon_btn(("rename-saved", ix), IconName::Edit)
                                 .size(22., 12.)
+                                .label(format!("Rename view {}", view.name))
                                 .tooltip("Rename view")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.view_menu.error = None;
@@ -869,6 +947,7 @@ impl WorkbenchView {
                         .child(
                             icon_btn(("delete-saved", ix), IconName::Trash)
                                 .size(22., 12.)
+                                .label(format!("Delete view {}", view.name))
                                 .tooltip("Delete view")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if this.view_menu.renaming.as_deref() == Some(&delete_name) {
@@ -923,6 +1002,9 @@ impl WorkbenchView {
             panel = panel.child(
                 div()
                     .id("save-as-view")
+                    .role(Role::Button)
+                    .aria_label("Save as view")
+                    .tabbable(cx)
                     .px(px(8.))
                     .pb(px(6.))
                     .text_size(px(TEXT_S))
@@ -942,6 +1024,8 @@ impl WorkbenchView {
         if let Some(error) = &self.view_menu.error {
             panel = panel.child(
                 div()
+                    .id("view-menu-error")
+                    .alert(error.clone())
                     .px(px(8.))
                     .pb(px(6.))
                     .text_size(px(TEXT_XS))
@@ -953,9 +1037,11 @@ impl WorkbenchView {
         anchor.child(popover_layer(
             Anchor::TopLeft,
             28.,
-            panel,
-            cx.listener(|this, _, _, cx| {
-                this.view_menu.popover.close();
+            self.view_menu
+                .popover
+                .panel("view-menu-panel", Role::Dialog, "Graph view", panel),
+            cx.listener(|this, _, window, cx| {
+                this.view_menu.popover.close(window, cx);
                 cx.notify();
             }),
         ))
@@ -969,6 +1055,7 @@ impl WorkbenchView {
         width: f32,
         selected: &'a HashSet<String>,
         emphasized: Option<String>,
+        keys: GraphKeys,
         cx: &App,
     ) -> RowStyle<'a> {
         let full = full_lanes_for(width, model.column_count);
@@ -984,6 +1071,8 @@ impl WorkbenchView {
             comparison: self.shown.as_ref().filter(|shown| shown.from.is_some()),
             authors: width > AUTHOR_MIN_PANE,
             width,
+            anchor: self.app.read(cx).ui().selected_node.clone(),
+            keys,
         }
     }
 
@@ -1331,11 +1420,24 @@ impl WorkbenchView {
 
         let id = node.id.clone();
         let focus = self.graph_focus.clone();
+        let anchor = style.anchor.as_deref() == Some(node.id.as_str());
         // Row states paint edge to edge behind the content; the tree's
         // rails run straight through them, like a table row, not a
         // picked-up card.
         let mut el = h_flex()
             .id(("node", key))
+            .role(Role::ListBoxOption)
+            .aria_label(row_name(node, title, row.is_working_copy, is_base))
+            .aria_description(format!(
+                "{} · {}",
+                node.author,
+                absolute_time(&node.timestamp)
+            ))
+            .aria_selected(selected)
+            .when(style.keys.focused && anchor, |el| {
+                el.aria_active_descendant()
+            })
+            .when(style.keys.ringed && anchor, |el| el.shadow(ring(t.accent)))
             .relative()
             .w_full()
             .h(px(height))
@@ -1555,7 +1657,12 @@ impl WorkbenchView {
 
     /// Every workstream in one tree. Only the rows near the viewport are
     /// built; the rest are just height.
-    fn render_graph(&mut self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_graph(
+        &mut self,
+        width: f32,
+        keys: GraphKeys,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let model = self.model.clone();
         let snapshot = self.snapshot.clone();
         if model.rows.is_empty() {
@@ -1592,7 +1699,7 @@ impl WorkbenchView {
         let shown = rows_in_view(&tops, scroll_top, viewport);
         let first = shown.start;
 
-        let style = self.row_style(&model, width, &selected, emphasized, cx);
+        let style = self.row_style(&model, width, &selected, emphasized, keys, cx);
         let rows = self.rows(&model.rows[shown], first, &style, cx);
         let mut list = div().relative().w_full().h(px(total));
         for (ix, row) in rows.into_iter().enumerate() {
@@ -1631,7 +1738,12 @@ impl WorkbenchView {
     /// One workstream at a time: the chain under its own band, the
     /// immutable base it sits on in a recessed zone below, the other lanes
     /// as a list.
-    fn render_focus(&mut self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_focus(
+        &mut self,
+        width: f32,
+        keys: GraphKeys,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let t = theme(cx);
         let snapshot = self.snapshot.clone();
         let focused = self.app.read(cx).ui().focused_workstream.clone();
@@ -1646,7 +1758,14 @@ impl WorkbenchView {
             ));
         };
         let selected = self.selected_ids(cx);
-        let style = self.row_style(&focus.graph, width, &selected, Some(lane.id.clone()), cx);
+        let style = self.row_style(
+            &focus.graph,
+            width,
+            &selected,
+            Some(lane.id.clone()),
+            keys,
+            cx,
+        );
         // The chain runs edge to edge under the workstream's own band; the
         // immutable base(s) and their terminal `~` rows sit in a recessed
         // zone below.
@@ -1964,5 +2083,25 @@ mod tests {
             view_label(&SnapshotView::Custom { revset: "x".into() }),
             "Custom revset"
         );
+    }
+
+    #[test]
+    fn a_row_says_what_a_glance_at_it_takes_in() {
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new("/repo"));
+        let node = |id: &str| snapshot.nodes.iter().find(|node| node.id == id).unwrap();
+        let working = node(&snapshot.working_copy);
+        assert_eq!(
+            row_name(working, "", true, false),
+            format!("No description yet, {}, working copy", &working.id[..8])
+        );
+        let conflicted = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.has_conflict && !node.bookmarks.is_empty())
+            .expect("the mock has a bookmarked conflict");
+        let name = row_name(conflicted, "the title", false, false);
+        assert!(name.starts_with("the title, "), "{name}");
+        assert!(name.contains(", conflicted"), "{name}");
+        assert!(name.ends_with(&conflicted.bookmarks.join(", ")), "{name}");
     }
 }

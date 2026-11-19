@@ -1,7 +1,7 @@
 //! The split tray: carve a change in two by file, hunk or line, or move
 //! the picked part into another change.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, Toggled, Window};
 use jiji_core::snapshot::{FileDiff, GraphNode, RepoSnapshot};
 
 use super::title_or_none;
@@ -14,8 +14,12 @@ use crate::logic::split::{
 };
 use crate::logic::text::{counted, short_id};
 use crate::theme::{theme, RADIUS_M, RADIUS_S, TEXT_S, TEXT_XS};
+use crate::ui::focus::FocusRow;
 use crate::ui::ScrollY as _;
-use crate::ui::{btn, h_flex, icon, scrollbar, segmented, tooltip, truncated, v_flex, IconName};
+use crate::ui::{
+    btn, h_flex, icon, scrollbar, segmented, tooltip, truncated, v_flex, IconName, Segment,
+    Tabbable as _,
+};
 use crate::views::workbench::WorkbenchView;
 
 impl WorkbenchView {
@@ -45,7 +49,7 @@ impl WorkbenchView {
         let Some(files) = files else {
             let cancel = self.cancel_button("Cancel", cx);
             return self
-                .tray(false, cx)
+                .tray(false, "Split this change", cx)
                 .child(title)
                 .child(quiet("Loading the file list…"))
                 .child(self.confirm_row(String::new(), vec![cancel], cx))
@@ -54,7 +58,7 @@ impl WorkbenchView {
         if !movable(&files) {
             let cancel = self.cancel_button("Cancel", cx);
             return self
-                .tray(false, cx)
+                .tray(false, "Split this change", cx)
                 .child(title)
                 .child(quiet(
                     "This change touches no files — there is nothing to split or move.",
@@ -113,9 +117,10 @@ impl WorkbenchView {
         let this = cx.entity().downgrade();
         let mut controls = h_flex().mt(px(8.)).gap(px(8.)).flex_wrap().child(segmented(
             "split-mode",
+            "Where the checked selection goes",
             vec![
-                (false, "Into a new change".into(), None),
-                (true, "Into an existing change".into(), None),
+                Segment::text(false, "Into a new change"),
+                Segment::text(true, "Into an existing change"),
             ],
             &into,
             cx,
@@ -135,7 +140,10 @@ impl WorkbenchView {
         if into {
             controls = controls.children(self.dest_filter(window, cx));
         }
-        let mut tray = self.tray(false, cx).child(title).child(controls);
+        let mut tray = self
+            .tray(false, "Split this change", cx)
+            .child(title)
+            .child(controls);
 
         if !into && !splittable(&files) {
             tray = tray.child(quiet(
@@ -151,7 +159,7 @@ impl WorkbenchView {
                     },
                     cx,
                 ))
-                .child(self.split_file_list(&files, cx));
+                .child(self.split_file_list(&files, window, cx));
             if !into {
                 let focused = self.header.split_desc.read(cx).is_focused(window);
                 tray = tray
@@ -229,7 +237,8 @@ impl WorkbenchView {
                     tray = tray.child(self.consequences(items, cx));
                 }
             } else {
-                let list = self.dest_list("No matching destination", cx);
+                let list =
+                    self.dest_list("Move destination", "No matching destination", window, cx);
                 tray = tray
                     .child(self.label("Destination — the change the selection moves into", cx))
                     .child(list);
@@ -353,6 +362,7 @@ impl WorkbenchView {
     pub(super) fn split_file_list(
         &mut self,
         files: &[FileDiff],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -383,29 +393,43 @@ impl WorkbenchView {
             };
             cell
         };
-        let row = |id: gpui::ElementId, indent: f32, on: bool| {
-            let mut row = h_flex()
-                .id(id)
-                .flex_1()
-                .min_w_0()
-                .h(px(24.))
-                .gap(px(8.))
-                .pl(px(8. + indent))
-                .pr(px(8.))
-                .rounded(px(RADIUS_S))
-                .text_size(px(TEXT_S));
-            if !acting {
-                row = row.cursor_pointer();
-            }
-            if on {
-                row.bg(t.accent_dim)
-            } else {
-                row.hover(|style| style.bg(t.bg_hover))
-            }
-        };
+        // A row checks or unchecks as a whole: to assistive technology and
+        // the keyboard it is the checkbox, named for what it carries.
+        let row =
+            |id: gpui::ElementId, indent: f32, on: bool, state: Option<bool>, name: String| {
+                let mut row = h_flex()
+                    .id(id)
+                    .role(Role::CheckBox)
+                    .aria_label(name)
+                    .aria_toggled(match state {
+                        Some(true) => Toggled::True,
+                        Some(false) => Toggled::False,
+                        None => Toggled::Mixed,
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(24.))
+                    .gap(px(8.))
+                    .pl(px(8. + indent))
+                    .pr(px(8.))
+                    .rounded(px(RADIUS_S))
+                    .text_size(px(TEXT_S));
+                if !acting {
+                    row = row.tabbable_in(t.accent).cursor_pointer();
+                }
+                if on {
+                    row.bg(t.accent_dim)
+                } else {
+                    row.hover(|style| style.bg(t.bg_hover))
+                }
+            };
         let expander = |id: gpui::ElementId, label: String, open: bool| {
             h_flex()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .aria_expanded(open)
+                .tabbable_in(t.accent)
                 .flex_shrink_0()
                 .gap(px(4.))
                 .h(px(20.))
@@ -430,7 +454,10 @@ impl WorkbenchView {
         let stat = |sign: &str, n: u32, color: Hsla| {
             (n > 0).then(|| div().text_color(color).child(format!("{sign}{n}")))
         };
-        let mut list = v_flex();
+        let mut list = v_flex()
+            .id("split-checklist")
+            .role(Role::Group)
+            .aria_label("Files and hunks to split off");
         let mut key = 0usize;
         for file in files {
             let pick = self.header.split.get(&file.path);
@@ -447,49 +474,57 @@ impl WorkbenchView {
             };
             let path = file.path.clone();
             key += 1;
-            let mut line = h_flex().gap(px(4.)).child(
-                row(("split-file", key).into(), 0., checked)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.header.acting {
-                            split::toggle_file(&mut this.header.split, &path);
-                            cx.notify();
-                        }
-                    }))
-                    .child(check(if checked {
-                        Some(true)
-                    } else if partial {
-                        None
-                    } else {
-                        Some(false)
-                    }))
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .flex_shrink_0()
-                            .font_family(t.mono.clone())
-                            .text_size(px(TEXT_XS))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(hue)
-                            .child(glyph),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .font_family(t.mono.clone())
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_color(t.text3)
-                                    .child(truncated(dir.to_owned())),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_color(t.text1)
-                                    .child(name.to_owned()),
-                            ),
-                    ),
+            let state = if checked {
+                Some(true)
+            } else if partial {
+                None
+            } else {
+                Some(false)
+            };
+            let kept = FocusRow::new(("split-file-line", key), window, cx);
+            let mut line = h_flex().id(("split-file-line", key)).gap(px(4.)).child(
+                row(
+                    ("split-file", key).into(),
+                    0.,
+                    checked,
+                    state,
+                    file.path.clone(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.header.acting {
+                        split::toggle_file(&mut this.header.split, &path);
+                        cx.notify();
+                    }
+                }))
+                .child(check(state))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex_shrink_0()
+                        .font_family(t.mono.clone())
+                        .text_size(px(TEXT_XS))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hue)
+                        .child(glyph),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(t.mono.clone())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_color(t.text3)
+                                .child(truncated(dir.to_owned())),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(t.text1)
+                                .child(name.to_owned()),
+                        ),
+                ),
             );
             if hunky {
                 let path = file.path.clone();
@@ -512,7 +547,7 @@ impl WorkbenchView {
                     })),
                 );
             }
-            list = list.child(line);
+            list = list.child(kept.row(line, &self.header.split_scroll, window, cx));
             if !hunks_open {
                 continue;
             }
@@ -530,21 +565,29 @@ impl WorkbenchView {
                 let lines_open = liney && self.header.split_lines_open.contains(&line_key);
                 let (path, count) = (file.path.clone(), hunks.len());
                 key += 1;
-                let mut line = h_flex().gap(px(4.)).child(
-                    row(("split-hunk", key).into(), 22., on)
+                let state = if on {
+                    Some(true)
+                } else if half {
+                    None
+                } else {
+                    Some(false)
+                };
+                let name = format!(
+                    "Hunk {} of {}, {}, {added} added, {removed} removed",
+                    index + 1,
+                    hunks.len(),
+                    hunk_label(hunk)
+                );
+                let kept = FocusRow::new(("split-hunk-line", key), window, cx);
+                let mut line = h_flex().id(("split-hunk-line", key)).gap(px(4.)).child(
+                    row(("split-hunk", key).into(), 22., on, state, name)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.header.acting {
                                 split::toggle_hunk(&mut this.header.split, &path, index, count);
                                 cx.notify();
                             }
                         }))
-                        .child(check(if on {
-                            Some(true)
-                        } else if half {
-                            None
-                        } else {
-                            Some(false)
-                        }))
+                        .child(check(state))
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -593,7 +636,7 @@ impl WorkbenchView {
                         })),
                     );
                 }
-                list = list.child(line);
+                list = list.child(kept.row(line, &self.header.split_scroll, window, cx));
                 if !lines_open {
                     continue;
                 }
@@ -604,40 +647,51 @@ impl WorkbenchView {
                     let added = source.kind == jiji_core::snapshot::DiffLineKind::Added;
                     let target = file.clone();
                     key += 1;
-                    list = list.child(
-                        h_flex().child(
-                            row(("split-line", key).into(), 44., line_on)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.header.acting {
-                                        split::toggle_line(
-                                            &mut this.header.split,
-                                            &target,
-                                            index,
-                                            line_index,
-                                        );
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(check(Some(line_on)))
-                                .child(
-                                    div()
-                                        .w(px(10.))
-                                        .flex_shrink_0()
-                                        .font_family(t.mono.clone())
-                                        .text_color(if added { t.add_fg } else { t.del_fg })
-                                        .child(if added { "+" } else { "−" }),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .font_family(t.mono.clone())
-                                        .text_size(px(TEXT_XS))
-                                        .text_color(t.text2)
-                                        .child(truncated(line_text(source))),
-                                ),
+                    let name = format!(
+                        "{} line: {}",
+                        if added { "Added" } else { "Removed" },
+                        line_text(source)
+                    );
+                    let kept = FocusRow::new(("split-line-row", key), window, cx);
+                    let line = h_flex().id(("split-line-row", key)).child(
+                        row(
+                            ("split-line", key).into(),
+                            44.,
+                            line_on,
+                            Some(line_on),
+                            name,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.header.acting {
+                                split::toggle_line(
+                                    &mut this.header.split,
+                                    &target,
+                                    index,
+                                    line_index,
+                                );
+                                cx.notify();
+                            }
+                        }))
+                        .child(check(Some(line_on)))
+                        .child(
+                            div()
+                                .w(px(10.))
+                                .flex_shrink_0()
+                                .font_family(t.mono.clone())
+                                .text_color(if added { t.add_fg } else { t.del_fg })
+                                .child(if added { "+" } else { "−" }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(t.mono.clone())
+                                .text_size(px(TEXT_XS))
+                                .text_color(t.text2)
+                                .child(truncated(line_text(source))),
                         ),
                     );
+                    list = list.child(kept.row(line, &self.header.split_scroll, window, cx));
                 }
             }
         }

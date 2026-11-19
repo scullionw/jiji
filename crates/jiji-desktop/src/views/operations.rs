@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight,
-    MouseButton, MouseDownEvent, ScrollHandle, SharedString, Window,
+    MouseButton, MouseDownEvent, Role, ScrollHandle, SharedString, Window,
 };
 use jiji_core::snapshot::{OpEffectKind, OperationItem};
 
@@ -17,12 +17,13 @@ use crate::logic::ops::{
 use crate::logic::text::{abbreviate_hashes, short_id, short_user_host};
 use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::focus::FocusRow;
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, consequences, group_head, h_flex, icon, label_box, node_mark, page_bar_marked,
     plan_actions, plan_panel, plan_title, scrollbar, tag, tooltip, truncated, v_flex, wrapped,
-    IconName, Mark, Tabular as _, PAGE_PAD,
+    IconName, Mark, Tabbable as _, Tabular as _, PAGE_PAD,
 };
 
 /// The clock gutter down the journal's leading edge.
@@ -93,7 +94,11 @@ impl OperationsView {
             .as_ref()
             .is_some_and(|(open, kind)| open == op_id && *kind == action);
         self.confirm = (!same).then(|| (op_id.to_owned(), action));
-        window.focus(&self.focus, cx);
+        // ⌘↵ confirms from anywhere on the page; a press from the keyboard
+        // is on the page already and stays on the button it pressed.
+        if !self.focus.contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
     }
 
@@ -241,6 +246,12 @@ impl OperationsView {
             ),
         };
         plan_panel(cx)
+            .id("op-confirm")
+            .role(Role::AlertDialog)
+            .aria_label(match action {
+                OpAction::Restore => "Confirm restore",
+                OpAction::Revert => "Confirm revert",
+            })
             .mt(px(8.))
             .mb(px(4.))
             .child(plan_title(title, context, cx))
@@ -271,6 +282,7 @@ impl OperationsView {
         index: usize,
         (up, down): (bool, bool),
         ops: &[OperationItem],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -288,6 +300,7 @@ impl OperationsView {
             .filter(|(open, _)| *open == op.id)
             .map(|(_, action)| *action);
         let group = SharedString::from(format!("op-{}", op.id));
+        let focus_row = FocusRow::new(("op-row", index), window, cx);
 
         // Each operation is a station on the journal's line, colored by
         // what it did; the current one is where the repo is now.
@@ -347,9 +360,10 @@ impl OperationsView {
         head = head.child(div().flex_1());
         if actionable {
             // Time-travel actions are hover-revealed so the journal stays
-            // calm; an open panel keeps its row's on screen.
+            // calm; an open panel keeps its row's on screen, and so does
+            // Tab among them.
             let mut actions = h_flex().flex_shrink_0().gap(px(4.));
-            if confirm.is_none() {
+            if confirm.is_none() && !focus_row.holds_focus(window, cx) {
                 actions = actions
                     .opacity(0.)
                     .group_hover(group.clone(), |style| style.opacity(1.));
@@ -361,6 +375,7 @@ impl OperationsView {
                         .small()
                         .icon(IconName::Restore)
                         .armed(confirm == Some(OpAction::Restore))
+                        .expanded(confirm == Some(OpAction::Restore))
                         .tooltip("Restore the repo to this point")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.toggle(&id, OpAction::Restore, window, cx)
@@ -373,6 +388,7 @@ impl OperationsView {
                     .small()
                     .icon(IconName::Undo)
                     .armed(confirm == Some(OpAction::Revert))
+                    .expanded(confirm == Some(OpAction::Revert))
                     .tooltip(if op.is_current {
                         "Undo this operation"
                     } else {
@@ -453,8 +469,22 @@ impl OperationsView {
             .text_color(if quiet { t.text3 } else { t.text2 })
             .tooltip(tooltip(crate::ui::absolute_time(&op.timestamp)))
             .child(clock_time(&op.timestamp, clock));
-        div()
+        // What a row's Restore and Revert act on, for a reader that meets
+        // the buttons first.
+        let spoken = format!(
+            "{}, {}{}",
+            if op.description.is_empty() {
+                "root()".to_owned()
+            } else {
+                abbreviate_hashes(&op.description)
+            },
+            clock_time(&op.timestamp, clock),
+            if op.is_current { ", current" } else { "" }
+        );
+        let row = div()
             .id(("op-row", index))
+            .role(Role::Group)
+            .aria_label(spoken)
             .group(group)
             .flex()
             .flex_row()
@@ -469,13 +499,15 @@ impl OperationsView {
             })
             .child(time)
             .child(self.rail(up, down, 11., glyph, cx))
-            .child(body)
+            .child(body);
+        focus_row
+            .row(row, &self.scroll, window, cx)
             .into_any_element()
     }
 }
 
 impl Render for OperationsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let Some(snapshot) = self.app.read(cx).snapshot().cloned() else {
             return div().into_any_element();
@@ -498,7 +530,7 @@ impl Render for OperationsView {
                 let (up, down) = (i > 0, i < last);
                 match row {
                     TimelineRow::Op(op) => {
-                        day = day.child(self.render_op(op, index, (up, down), ops, cx));
+                        day = day.child(self.render_op(op, index, (up, down), ops, window, cx));
                         index += 1;
                     }
                     TimelineRow::Snapshots(run) => {
@@ -517,6 +549,10 @@ impl Render for OperationsView {
                         day = day.child(
                             div()
                                 .id(SharedString::from(format!("op-run-{key}")))
+                                .role(Role::Button)
+                                .aria_label(format!("{} working-copy snapshots", run.len()))
+                                .aria_expanded(expanded)
+                                .tabbable(cx)
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -552,7 +588,14 @@ impl Render for OperationsView {
                         if expanded {
                             for (j, op) in run.iter().enumerate() {
                                 let below = j < run.len() - 1 || down;
-                                day = day.child(self.render_op(op, index, (true, below), ops, cx));
+                                day = day.child(self.render_op(
+                                    op,
+                                    index,
+                                    (true, below),
+                                    ops,
+                                    window,
+                                    cx,
+                                ));
                                 index += 1;
                             }
                         } else {

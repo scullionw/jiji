@@ -16,9 +16,11 @@ use crate::logic::inspect::summary_of;
 use crate::logic::search::{file_hit_label, search_status, HitTone, MIN_QUERY_LENGTH};
 use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, RADIUS_M, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::a11y::spoken;
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    icon, kbd, popover, scrollbar, short_age, truncated, IconName, InputEvent, TextInput,
+    icon, kbd, popover, scrollbar, short_age, truncated, IconName, InputEvent, NodeExt as _,
+    TextInput,
 };
 
 actions!(history_search, [SearchUp, SearchDown, SearchHold]);
@@ -67,6 +69,7 @@ impl Search {
         let input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .placeholder("Search history for text or a filename…")
+                .label("Search history")
                 .with_text(&seed)
         });
         input.update(cx, |input, cx| {
@@ -250,6 +253,9 @@ impl Search {
         }
         let mut row = div()
             .id(("search-hit", index))
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(hit_name(hit))
+            .aria_selected(index == self.active)
             .flex()
             .flex_col()
             .flex_shrink_0()
@@ -283,6 +289,8 @@ impl Render for Search {
 
         let mut list = div()
             .id("search-list")
+            .role(gpui::Role::ListBox)
+            .aria_label("Matching changes")
             .flex()
             .flex_col()
             .flex_1()
@@ -316,7 +324,11 @@ impl Render for Search {
             ));
         }
         if let Some(error) = &self.error {
-            list = list.child(note(error.clone(), t.warn));
+            list = list.child(
+                note(error.clone(), t.warn)
+                    .id("search-error")
+                    .alert(error.clone()),
+            );
         }
         let status = if self.searching {
             Some("Searching…".to_owned())
@@ -324,7 +336,23 @@ impl Render for Search {
             self.result.as_ref().map(search_status)
         };
 
+        let highlighted = self
+            .hits()
+            .get(self.active)
+            .map(|hit| {
+                format!(
+                    "{}, {} of {}",
+                    hit_name(hit),
+                    self.active + 1,
+                    self.hits().len()
+                )
+            })
+            .unwrap_or_default();
         let panel = popover(cx)
+            .id("history-search")
+            .role(gpui::Role::Dialog)
+            .aria_label("Search history")
+            .a11y(|node| node.set_modal())
             .key_context("HistorySearch")
             .on_action(cx.listener(|this, _: &SearchUp, _, cx| this.travel(-1, cx)))
             .on_action(cx.listener(|this, _: &SearchDown, _, cx| this.travel(1, cx)))
@@ -371,6 +399,8 @@ impl Render for Search {
             )
             .child(
                 div()
+                    .id("search-status")
+                    .status(status.clone().unwrap_or_default())
                     .flex()
                     .flex_row()
                     .items_center()
@@ -382,7 +412,8 @@ impl Render for Search {
                     .text_size(px(TEXT_XS))
                     .text_color(t.text3)
                     .children(status),
-            );
+            )
+            .child(spoken("search-highlight", highlighted));
 
         let app = self.app.clone();
         div()
@@ -401,6 +432,25 @@ impl Render for Search {
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .child(panel)
     }
+}
+
+/// What a hit says to assistive technology: the change, then what in it
+/// matched.
+fn hit_name(hit: &SearchHit) -> String {
+    let title = summary_of(&hit.description);
+    let mut text = format!(
+        "{}, {}",
+        if title.is_empty() {
+            "no description"
+        } else {
+            title
+        },
+        short_id(&hit.id, 8)
+    );
+    for file in hit.files.iter().take(3) {
+        text.push_str(&format!(", {} {}", file.path, file_hit_label(file).0));
+    }
+    text
 }
 
 pub fn build(window: &mut Window, cx: &mut App) -> AnyView {

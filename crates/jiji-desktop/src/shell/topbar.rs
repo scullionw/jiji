@@ -4,8 +4,8 @@
 //! the window's one Settings control.
 
 use gpui::{
-    div, prelude::*, px, Anchor, AnyElement, Context, Div, FontWeight, MouseButton, SharedString,
-    Window,
+    div, prelude::*, px, Anchor, AnyElement, Context, Div, FontWeight, MouseButton, Role,
+    SharedString, Window,
 };
 use jiji_core::snapshot::SyncState;
 
@@ -16,8 +16,8 @@ use crate::theme::{
     theme, theme_defs, Scheme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::{
-    btn, h_flex, icon, icon_btn, input::field, kbd, menu_label, popover, popover_layer, segmented,
-    tooltip, v_flex, IconName, Tabular as _,
+    btn, h_flex, icon, icon_btn, input::field, kbd, menu_label, popover, popover_layer, ring,
+    segmented, tooltip, v_flex, IconName, NodeExt as _, Segment, Tabbable as _, Tabular as _,
 };
 
 /// "just now", "3m ago", "2h ago" — minutes-granular like the chip's
@@ -165,6 +165,7 @@ impl Shell {
                     "{} graph panel (⌘⇧B)",
                     if graph_collapsed { "Show" } else { "Hide" }
                 ))
+                .expanded(!graph_collapsed)
                 .on_click(move |_, _, cx| app.update(cx, |m, cx| m.toggle_graph_panel(cx))),
             );
         }
@@ -204,8 +205,9 @@ impl Shell {
                     .child(self.render_tabs(cx)),
             )
             .child(div().flex_1())
-            .child(controls)
+            // Ahead of the controls, so Tab reads the bar left to right.
             .child(self.render_command_field(field_left, field_w, has_repo, cx))
+            .child(controls)
     }
 
     /// The one way into everything the app can do or find: it opens the
@@ -227,6 +229,12 @@ impl Shell {
         };
         h_flex()
             .id("command-field")
+            .role(Role::Button)
+            .aria_label("Command palette")
+            .aria_description(label)
+            .aria_keyshortcuts("⌘K")
+            .aria_expanded(open)
+            .tabbable(cx)
             .absolute()
             .top(px(BAND_TOP + ((BAND_H - 26.) / 2.).floor()))
             .left(px(left))
@@ -270,6 +278,8 @@ impl Shell {
 
         let mut strip = h_flex()
             .id("tab-strip")
+            .role(Role::TabList)
+            .aria_label("Open repositories")
             .h_full()
             .max_w_full()
             .gap(px(2.))
@@ -280,6 +290,10 @@ impl Shell {
             let app = self.app.clone();
             let close_app = self.app.clone();
             let middle_app = self.app.clone();
+            let name_text = match &title.hint {
+                Some(hint) => format!("{} ({hint})", title.label),
+                None => title.label.to_string(),
+            };
             let label = h_flex()
                 .min_w_0()
                 .max_w(px(200.))
@@ -296,6 +310,10 @@ impl Shell {
                 });
             let mut tab = h_flex()
                 .id(("tab", id))
+                .role(Role::Tab)
+                .aria_label(name_text.clone())
+                .aria_selected(active)
+                .tabbable(cx)
                 .group(group.clone())
                 .relative()
                 .flex_shrink_1()
@@ -313,6 +331,7 @@ impl Shell {
                 })
                 .whitespace_nowrap()
                 .cursor_pointer()
+                .when_some(path.clone(), |tab, path| tab.aria_description(path))
                 .tooltip(tooltip(path.unwrap_or_else(|| "New tab".into())))
                 .on_click(move |_, _, cx| app.update(cx, |m, cx| m.activate_tab(id, cx)))
                 .on_mouse_down(MouseButton::Middle, move |_, _, cx| {
@@ -338,9 +357,13 @@ impl Shell {
                     .hover(|style| style.text_color(t.text1))
             };
             // The close affordance keeps its footprint (no layout shift)
-            // and only surfaces under the pointer.
+            // and only surfaces under the pointer, or with the keys on it.
+            let accent = t.accent;
             let close = div()
                 .id(("tab-close", id))
+                .role(Role::Button)
+                .aria_label(format!("Close {name_text}"))
+                .tabbable_styled(move |style| style.opacity(1.).shadow(ring(accent)))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -406,6 +429,8 @@ impl Shell {
             row = row.child(
                 h_flex()
                     .id("trunk")
+                    .role(Role::Label)
+                    .aria_value(format!("Trunk: {name} — {state}"))
                     .gap(px(6.))
                     .h(px(24.))
                     .px(px(6.))
@@ -440,6 +465,7 @@ impl Shell {
                 .unwrap_or(label);
             let mut el = h_flex()
                 .id("upstream-chip")
+                .aria_description(title.clone())
                 .gap(px(5.))
                 .h(px(24.))
                 .px(px(6.))
@@ -448,7 +474,12 @@ impl Shell {
                 .tabular()
                 .tooltip(tooltip(title))
                 .child(icon(IconName::Refresh, 12., color))
-                .child(label);
+                .child(label.clone());
+            el = if busy {
+                el.role(Role::Label).aria_value(label)
+            } else {
+                el.role(Role::Button).aria_label(label).tabbable(cx)
+            };
             if !busy {
                 el = el
                     .cursor_pointer()
@@ -472,6 +503,7 @@ impl Shell {
                 .ghost()
                 .icon(IconName::Key)
                 .on(open)
+                .expanded(open)
                 .tooltip("Register Jiji")
                 .on_click(move |_, _, cx| {
                     app.update(cx, |m, cx| {
@@ -492,10 +524,21 @@ impl Shell {
 
     fn license_layer(&self, panel: Div, cx: &mut Context<Self>) -> impl IntoElement {
         let app = self.app.clone();
+        let registered = self.app.read(cx).license.registered;
+        let name = if registered {
+            "Replace your key"
+        } else {
+            "Register Jiji"
+        };
         popover_layer(
             Anchor::TopRight,
             30.,
-            panel,
+            self.register_trap.hold(
+                panel
+                    .id("register-panel")
+                    .role(Role::Dialog)
+                    .aria_label(name),
+            ),
             cx.listener(move |this, _, _, cx| {
                 this.license_error = None;
                 app.update(cx, |m, cx| m.close_registration(cx));
@@ -561,6 +604,8 @@ impl Shell {
         if let Some(error) = &self.license_error {
             panel = panel.child(
                 div()
+                    .id("license-error")
+                    .alert(error.clone())
                     .text_size(px(TEXT_S))
                     .text_color(t.danger)
                     .child(error.clone()),
@@ -571,6 +616,9 @@ impl Shell {
             return panel.child(
                 div()
                     .id("license-cancel")
+                    .role(Role::Button)
+                    .aria_label("Cancel")
+                    .tabbable(cx)
                     .text_size(px(TEXT_S))
                     .text_color(t.accent_strong)
                     .cursor_pointer()
@@ -585,6 +633,9 @@ impl Shell {
         let buy = |id: &'static str, name: &'static str, price: String, url: &'static str| {
             v_flex()
                 .id(id)
+                .role(Role::Link)
+                .aria_label(format!("Buy {name}, {price}"))
+                .tabbable(cx)
                 .flex_1()
                 .gap(px(1.))
                 .px(px(10.))
@@ -654,17 +705,21 @@ impl Shell {
         let model = self.app.read(cx);
         // A registered copy replacing its key does so from here.
         let replacing = model.license.registered && model.registration_open;
-        let anchor = div().relative().child(
-            icon_btn("settings", IconName::Settings)
-                .size(26., 15.)
-                .on(open || replacing)
-                .tooltip("Settings")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings_menu.toggle();
-                    this.cli_error = None;
-                    cx.notify();
-                })),
-        );
+        let anchor = div()
+            .relative()
+            .debug_selector(|| "settings-button".into())
+            .child(
+                icon_btn("settings", IconName::Settings)
+                    .size(26., 15.)
+                    .on(open || replacing)
+                    .expanded(open || replacing)
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.settings_menu.toggle(window, cx);
+                        this.cli_error = None;
+                        cx.notify();
+                    })),
+            );
         if replacing {
             let panel = self.license_panel(window, cx);
             return anchor.child(self.license_layer(panel, cx));
@@ -693,10 +748,22 @@ impl Shell {
             model.license.display_key.clone(),
         );
 
+        // A choice among several: a radio button, ticked when it is the one.
         let row =
             |id: gpui::ElementId, label: SharedString, hint: Option<SharedString>, on: bool| {
                 let mut el = h_flex()
                     .id(id)
+                    .role(Role::RadioButton)
+                    .aria_label(match &hint {
+                        Some(hint) => SharedString::from(format!("{label}, {hint}")),
+                        None => label.clone(),
+                    })
+                    .aria_toggled(if on {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .tabbable_in(t.accent)
                     .gap(px(8.))
                     .h(px(26.))
                     .px(px(8.))
@@ -727,13 +794,16 @@ impl Shell {
         panel = panel.child(self.render_appearance(cx));
 
         let mut launch = section().child(menu_label("Preferred editor", cx));
+        let choices = |id: &'static str, name: &'static str| {
+            v_flex().id(id).role(Role::RadioGroup).aria_label(name)
+        };
         if editors.is_empty() {
             launch = launch.child(note(
                 "No editor command-line tools found on this machine.".into(),
             ));
         } else {
             let app = self.app.clone();
-            launch = launch.child(
+            let mut group = choices("editor-choices", "Preferred editor").child(
                 row(
                     "editor-last".into(),
                     "Last used".into(),
@@ -745,7 +815,7 @@ impl Shell {
             for (ix, editor) in editors.iter().enumerate() {
                 let app = self.app.clone();
                 let id = editor.id;
-                launch = launch.child(
+                group = group.child(
                     row(
                         ("editor", ix).into(),
                         editor.label.into(),
@@ -757,13 +827,15 @@ impl Shell {
                     }),
                 );
             }
+            launch = launch.child(group);
         }
         if !terminals.is_empty() {
             launch = launch.child(menu_label("Terminal", cx));
+            let mut group = choices("terminal-choices", "Terminal");
             for (ix, terminal) in terminals.iter().enumerate() {
                 let app = self.app.clone();
                 let id = terminal.id;
-                launch = launch.child(
+                group = group.child(
                     row(
                         ("terminal", ix).into(),
                         terminal.label.into(),
@@ -775,6 +847,7 @@ impl Shell {
                     }),
                 );
             }
+            launch = launch.child(group);
         }
         panel = panel.child(launch);
 
@@ -782,9 +855,10 @@ impl Shell {
         let mut machine = section().child(menu_label("Check upstream", cx)).child(
             div().px(px(8.)).pb(px(6.)).child(segmented(
                 "upstream-interval",
+                "Check upstream",
                 UPSTREAM_INTERVALS
                     .iter()
-                    .map(|&(minutes, label)| (minutes, SharedString::from(label), None))
+                    .map(|&(minutes, label)| Segment::text(minutes, label))
                     .collect(),
                 &interval,
                 cx,
@@ -842,6 +916,8 @@ impl Shell {
             if let Some(error) = &self.cli_error {
                 machine = machine.child(
                     div()
+                        .id("cli-error")
+                        .alert(error.clone())
                         .px(px(8.))
                         .pb(px(6.))
                         .text_size(px(TEXT_XS))
@@ -874,6 +950,9 @@ impl Shell {
                 .child(
                     div()
                         .id("license-replace")
+                        .role(Role::Button)
+                        .aria_label("Replace key")
+                        .tabbable(cx)
                         .text_color(t.accent_strong)
                         .cursor_pointer()
                         .hover(|style| style.text_color(t.text1))
@@ -883,8 +962,8 @@ impl Shell {
                             el.tooltip(tooltip(format!("Key {display_key}")))
                         })
                         .child("Replace key…")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings_menu.close();
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.settings_menu.close(window, cx);
                             app.update(cx, |m, cx| m.open_registration(cx));
                         })),
                 );
@@ -901,9 +980,10 @@ impl Shell {
         anchor.child(popover_layer(
             Anchor::TopRight,
             30.,
-            panel,
-            cx.listener(|this, _, _, cx| {
-                this.settings_menu.close();
+            self.settings_menu
+                .panel("settings-panel", Role::Dialog, "Settings", panel),
+            cx.listener(|this, _, window, cx| {
+                this.settings_menu.close(window, cx);
                 cx.notify();
             }),
         ))
@@ -935,8 +1015,8 @@ impl Shell {
                             .child("Ten palettes come with a license."),
                     )
                     .child(btn("unlock-themes", "Unlock").small().on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.settings_menu.close();
+                        move |this, _, window, cx| {
+                            this.settings_menu.close(window, cx);
                             app.update(cx, |m, cx| m.open_registration(cx));
                             cx.notify();
                         },
@@ -946,10 +1026,11 @@ impl Shell {
         let app = self.app.clone();
         section = section.child(div().px(px(8.)).pb(px(4.)).child(segmented(
             "theme-mode",
+            "Appearance",
             vec![
-                (ThemeMode::System, "System".into(), Some(IconName::SunMoon)),
-                (ThemeMode::Light, "Light".into(), Some(IconName::Sun)),
-                (ThemeMode::Dark, "Dark".into(), Some(IconName::Moon)),
+                Segment::text(ThemeMode::System, "System").with_icon(IconName::SunMoon),
+                Segment::text(ThemeMode::Light, "Light").with_icon(IconName::Sun),
+                Segment::text(ThemeMode::Dark, "Dark").with_icon(IconName::Moon),
             ],
             &mode,
             cx,
@@ -963,7 +1044,11 @@ impl Shell {
             ("Dark", Scheme::Dark, pref.dark.as_str()),
             ("Light", Scheme::Light, pref.light.as_str()),
         ] {
-            let mut swatches = h_flex().gap(px(6.));
+            let mut swatches = h_flex()
+                .id(SharedString::from(format!("swatches-{label}")))
+                .role(Role::RadioGroup)
+                .aria_label(format!("{label} palette"))
+                .gap(px(6.));
             for def in defs.iter().filter(|def| def.scheme == scheme) {
                 let selected = def.id == current;
                 let app = self.app.clone();
@@ -971,6 +1056,14 @@ impl Shell {
                 swatches = swatches.child(
                     div()
                         .id(SharedString::from(format!("swatch-{id}")))
+                        .role(Role::RadioButton)
+                        .aria_label(def.label)
+                        .aria_toggled(if selected {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .tabbable(cx)
                         .flex()
                         .items_end()
                         .w(px(40.))

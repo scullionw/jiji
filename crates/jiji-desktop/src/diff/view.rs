@@ -366,7 +366,8 @@ impl DiffSurface {
             doc: Arc::new(DiffDoc::empty()),
             folded: None,
             collapsed: Vec::new(),
-            focus: cx.focus_handle(),
+            // A stop of its own: Space, the page keys and ⌘C read it.
+            focus: cx.focus_handle().tab_stop(true),
             split,
             scroll_y: 0.,
             pan: Vec::new(),
@@ -2808,14 +2809,24 @@ impl Element for DiffElement {
 }
 
 impl Render for DiffSurface {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Copy is on offer only while there is something to copy: the
         // menu bar greys Edit ▸ Copy out otherwise, as it does for a field.
         let selected = self.selection.is_some_and(|s| s.anchor != s.head);
+        // With the keys on it from the keyboard, the document wears the
+        // ring around its edge, over what it paints.
+        let ringed = crate::ui::keyboard_on(&self.focus, window);
+        let accent = crate::theme::theme(cx).accent;
         gpui::div()
             .id("diff-surface")
+            .role(gpui::Role::Document)
+            .aria_label(format!(
+                "Diff, {}",
+                crate::logic::text::counted(self.doc.files.len(), "file")
+            ))
             .key_context("DiffSurface")
             .track_focus(&self.focus)
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -2828,6 +2839,15 @@ impl Render for DiffSurface {
             .on_action(cx.listener(Self::next_file))
             .on_action(cx.listener(Self::prev_file))
             .child(DiffElement { view: cx.entity() })
+            .when(ringed, |el| {
+                el.child(
+                    gpui::div()
+                        .absolute()
+                        .inset_0()
+                        .border_2()
+                        .border_color(accent),
+                )
+            })
     }
 }
 

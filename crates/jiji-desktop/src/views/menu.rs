@@ -16,7 +16,8 @@ use gpui::{
 use crate::app::AppModel;
 use crate::logic::menu::{ClipboardOp, MenuAction, MenuItem, MenuSection};
 use crate::theme::{theme, RADIUS_S, TEXT_M, TEXT_S};
-use crate::ui::{bounds_probe, icon, input, popover, truncated, IconName};
+use crate::ui::a11y::spoken;
+use crate::ui::{bounds_probe, icon, input, popover, truncated, IconName, NodeExt as _};
 
 const ITEM_H: f32 = 26.;
 const PAD: f32 = 4.;
@@ -270,8 +271,20 @@ impl ContextMenu {
             Level::Top => ("menu-item", index),
             Level::Sub => ("submenu-item", index),
         };
+        let (disabled, opens) = (item.disabled, !item.children.is_empty());
         let mut el = div()
             .id(id)
+            .role(gpui::Role::MenuItem)
+            .aria_label(item.label.clone())
+            .when_some(item.shortcut, |el, keys| el.aria_keyshortcuts(keys))
+            .a11y(move |node| {
+                if disabled {
+                    node.set_disabled();
+                }
+                if opens {
+                    node.set_has_popup(gpui::accesskit::HasPopup::Menu);
+                }
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -335,9 +348,23 @@ impl ContextMenu {
         .into_any_element()
     }
 
-    fn render_panel(&self, rows: &[Row], level: Level, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_panel(
+        &self,
+        rows: &[Row],
+        level: Level,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let t = theme(cx);
         let mut panel = popover(cx)
+            .id(match level {
+                Level::Top => "context-menu",
+                Level::Sub => "context-submenu",
+            })
+            .role(gpui::Role::Menu)
+            .aria_label(match level {
+                Level::Top => "Context menu",
+                Level::Sub => "Submenu",
+            })
             .flex()
             .flex_col()
             .p(px(PAD))
@@ -363,9 +390,18 @@ impl ContextMenu {
 
 impl Render for ContextMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The menu leaves focus where it was, so the item the arrows reach
+        // is read out.
+        let highlighted = match &self.sub {
+            Some(sub) => sub.active.and_then(|ix| sub.rows.get(ix)),
+            None => self.active.and_then(|ix| self.rows.get(ix)),
+        }
+        .map(|row| row.item.label.to_string())
+        .unwrap_or_default();
         let panel = self
             .render_panel(&self.rows, Level::Top, cx)
-            .child(bounds_probe(self.panel.clone()));
+            .child(bounds_probe(self.panel.clone()))
+            .child(spoken("menu-highlight", highlighted));
         // The flyout hugs its parent row: to the right of the panel, or to
         // its left when the right side runs out.
         let flyout = self.sub.as_ref().map(|sub| {

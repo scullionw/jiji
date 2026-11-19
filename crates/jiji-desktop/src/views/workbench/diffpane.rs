@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Bounds, Context, CursorStyle, Entity, Focusable, FontWeight,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle, SharedString, Window,
+    div, prelude::*, px, AnyElement, Bounds, Context, Entity, Focusable, FontWeight, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle, Window,
 };
 use jiji_core::snapshot::{ChangeDiff, FileStatus};
 
@@ -23,14 +23,16 @@ use crate::logic::inspect::{range_compare_from, resolve_compare_from, CompareMod
 use crate::logic::text::short_id;
 use crate::logic::tree::{active_row_key, build_tree_rows, visible_tree_rows, TreeFile, TreeRow};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
+use crate::ui::splitter::{moved, splitter, Narrower, Narrowest, Wider, Widest, STEP};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    bounds_probe, diffstat, empty_state, h_flex, icon, icon_btn, lead_bar, popover, scrollbar,
-    segmented, tooltip, truncated, v_flex, IconName, InputEvent, TextInput,
+    bounds_probe, diffstat, empty_state, h_flex, icon, icon_btn, keyboard_on, lead_bar, popover,
+    ring, scrollbar, segmented, tooltip, truncated, v_flex, IconName, InputEvent, NodeExt as _,
+    Segment, Tabbable as _, TextInput,
 };
 
-const TREE_MIN: f32 = 160.;
-const TREE_MAX: f32 = 400.;
+pub(super) const TREE_MIN: f32 = 160.;
+pub(super) const TREE_MAX: f32 = 400.;
 const TREE_INITIAL: f32 = 220.;
 const TREE_ROW_H: f32 = 26.;
 /// Five seven-point blocks and their four gaps (`ui::diffstat`).
@@ -85,12 +87,13 @@ pub(super) struct DiffState {
     seq: u64,
     pub(super) layout: DiffLayout,
     pub(super) tree_on: bool,
-    tree_width: f32,
+    pub(super) tree_width: f32,
     tree_resizing: bool,
     pub(super) tree_rows: Rc<Vec<TreeRow>>,
     pub(super) tree_collapsed: HashSet<String>,
     pub(super) tree_scroll: ScrollHandle,
     pub(super) tree_focus: gpui::FocusHandle,
+    pub(super) tree_divider: gpui::FocusHandle,
     /// The row keyboard travel is on (a directory's or a file's path).
     pub(super) tree_cursor: Option<String>,
     /// The row last brought into view for the file being read.
@@ -111,9 +114,11 @@ impl DiffState {
         tree_width: f32,
         find_input: Entity<TextInput>,
         tree_focus: gpui::FocusHandle,
+        tree_divider: gpui::FocusHandle,
     ) -> Self {
         Self {
             tree_focus,
+            tree_divider,
             tree_cursor: None,
             tree_revealed: None,
             want: None,
@@ -615,6 +620,16 @@ impl WorkbenchView {
             return;
         }
         self.diff.tree_resizing = false;
+        self.keep_tree_width(cx);
+    }
+
+    /// The tree's divider moved from the keyboard.
+    fn nudge_tree(&mut self, by: f32, cx: &mut Context<Self>) {
+        self.diff.tree_width = moved(self.diff.tree_width, TREE_MIN, TREE_MAX, by);
+        self.keep_tree_width(cx);
+    }
+
+    fn keep_tree_width(&mut self, cx: &mut Context<Self>) {
         let width = self.diff.tree_width.round();
         self.app
             .update(cx, |model, _| model.store.set_pref("pane.filetree", &width));
@@ -707,6 +722,7 @@ impl WorkbenchView {
         icon_btn("toggle-tree", IconName::ListTree)
             .size(24., 13.)
             .on(on)
+            .pressed(on)
             .tooltip(if on {
                 "Hide the file tree"
             } else {
@@ -719,17 +735,10 @@ impl WorkbenchView {
         let this = cx.entity().downgrade();
         segmented(
             "diff-layout",
+            "Diff layout",
             vec![
-                (
-                    DiffLayout::Unified,
-                    SharedString::default(),
-                    Some(IconName::DiffUnified),
-                ),
-                (
-                    DiffLayout::Split,
-                    SharedString::default(),
-                    Some(IconName::DiffSplit),
-                ),
+                Segment::icon(DiffLayout::Unified, IconName::DiffUnified, "Unified diff"),
+                Segment::icon(DiffLayout::Split, IconName::DiffSplit, "Side-by-side diff"),
             ],
             &self.diff.layout,
             cx,
@@ -863,12 +872,16 @@ impl WorkbenchView {
             }
             self.diff.tree_revealed = Some(active.clone());
         }
-        // The keyboard's place shows only while the tree has the keys.
+        // The keyboard's place: where travel starts, the cursor or else the
+        // file being read. It wears the ring while the keyboard drives the
+        // tree, and is what assistive technology reads as focused.
+        let focused = self.diff.tree_focus.is_focused(window);
         let cursor = self
             .diff
             .tree_cursor
             .clone()
-            .filter(|_| self.diff.tree_focus.is_focused(window));
+            .unwrap_or_else(|| active.clone());
+        let ringed = keyboard_on(&self.diff.tree_focus, window);
         // Counts close each row as the five-block diffstat, in a column of
         // its own so names keep one width; the numbers are in the tooltip.
         let stat = |added: u32, removed: u32| {
@@ -881,6 +894,8 @@ impl WorkbenchView {
         };
         let mut tree = div()
             .id("file-tree")
+            .role(gpui::Role::Tree)
+            .aria_label("Changed files")
             .key_context("FileTree")
             .track_focus(&self.diff.tree_focus)
             .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.tree_key(TreeKey::Down, cx)))
@@ -915,8 +930,14 @@ impl WorkbenchView {
             // Rows run edge to edge, like the graph's: the one on screen
             // takes the selection fill and the leading bar. Each is a child
             // of the scroller, which is what lets it scroll a row into view.
+            let here = cursor == row.path();
             let base = h_flex()
                 .id(("tree-row", ix))
+                .role(gpui::Role::TreeItem)
+                .aria_level(depth + 1)
+                .aria_selected(active == row.path())
+                .when(focused && here, |el| el.aria_active_descendant())
+                .when(ringed && here, |el| el.shadow(ring(t.accent)))
                 .relative()
                 .w_full()
                 .h(px(TREE_ROW_H))
@@ -930,6 +951,13 @@ impl WorkbenchView {
                     let open = !self.diff.tree_collapsed.contains(&dir.path);
                     let path = dir.path.clone();
                     let mut el = base
+                        .aria_label(dir.label.clone())
+                        .aria_expanded(open)
+                        .aria_description(format!(
+                            "{}, {}",
+                            dir.path,
+                            crate::logic::text::counted(dir.file_count, "file")
+                        ))
                         .tooltip(tooltip(dir.path.clone()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if !this.diff.tree_collapsed.remove(&path) {
@@ -969,11 +997,6 @@ impl WorkbenchView {
                                 .child(stat(dir.added, dir.removed)),
                         );
                     }
-                    let el = if cursor.as_deref() == Some(dir.path.as_str()) {
-                        el.border_1().border_color(t.accent)
-                    } else {
-                        el
-                    };
                     if active == dir.path {
                         el.bg(t.selected).child(lead_bar(cx))
                     } else {
@@ -985,6 +1008,8 @@ impl WorkbenchView {
                     let index = file.index;
                     let gone = file.status == FileStatus::Removed;
                     let mut el = base
+                        .aria_label(file.name.clone())
+                        .aria_description(file.title())
                         .tooltip(tooltip(file.title()))
                         .on_click(cx.listener(move |this, _, _, cx| this.jump_to_file(index, cx)))
                         .on_mouse_down(
@@ -1032,11 +1057,6 @@ impl WorkbenchView {
                             .children(mark)
                             .child(stat(file.added, file.removed)),
                     );
-                    let el = if cursor.as_deref() == Some(file.path.as_str()) {
-                        el.border_1().border_color(t.accent)
-                    } else {
-                        el
-                    };
                     if active == file.path {
                         el.bg(t.selected).child(lead_bar(cx))
                     } else {
@@ -1068,10 +1088,13 @@ impl WorkbenchView {
         let t = theme(cx);
         let (current, count) = self.surface.read(cx).find_position();
         let typed = !self.diff.find_input.read(cx).is_empty();
-        let position = match (typed, count) {
-            (false, _) => String::new(),
-            (true, 0) => "0/0".to_owned(),
-            (true, count) => format!("{}/{count}", current + 1),
+        let (position, spoken) = match (typed, count) {
+            (false, _) => (String::new(), String::new()),
+            (true, 0) => ("0/0".to_owned(), "No matches".to_owned()),
+            (true, count) => (
+                format!("{}/{count}", current + 1),
+                format!("Match {} of {count}", current + 1),
+            ),
         };
         let nav = |id: &'static str, glyph: IconName, tip: &'static str, enabled: bool| {
             icon_btn(id, glyph)
@@ -1080,6 +1103,9 @@ impl WorkbenchView {
                 .tooltip(tip)
         };
         popover(cx)
+            .id("find-bar")
+            .role(gpui::Role::Search)
+            .aria_label("Find in diff")
             .key_context("FindBar")
             .absolute()
             .top(px(8.))
@@ -1102,6 +1128,8 @@ impl WorkbenchView {
             )
             .child(
                 div()
+                    .id("find-position")
+                    .status(spoken)
                     .flex_shrink_0()
                     .min_w(px(28.))
                     .text_size(px(TEXT_XS))
@@ -1269,6 +1297,10 @@ impl WorkbenchView {
             .child(bounds_probe(self.diff.bounds.clone()));
         if tree_visible {
             let resizing = self.diff.tree_resizing;
+            let press = cx.listener(|this: &mut Self, _: &MouseDownEvent, _, cx| {
+                this.diff.tree_resizing = true;
+                cx.notify();
+            });
             surface_area = surface_area
                 .child(
                     div()
@@ -1278,29 +1310,26 @@ impl WorkbenchView {
                         .child(self.render_tree(window, cx)),
                 )
                 .child(
-                    div()
-                        .relative()
-                        .w(px(1.))
-                        .flex_shrink_0()
-                        .h_full()
-                        .bg(if resizing { t.accent } else { t.border2 })
-                        .child(
-                            div()
-                                .id("tree-divider-grip")
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .left(px(-3.))
-                                .w(px(7.))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.diff.tree_resizing = true;
-                                        cx.notify();
-                                    }),
-                                ),
-                        ),
+                    splitter(
+                        "tree-divider",
+                        "Resize file tree",
+                        &self.diff.tree_divider,
+                        self.diff.tree_width,
+                        TREE_MIN,
+                        TREE_MAX,
+                        resizing,
+                        window,
+                        cx,
+                        |grip| grip.on_mouse_down(MouseButton::Left, press),
+                    )
+                    .on_action(cx.listener(|this, _: &Narrower, _, cx| this.nudge_tree(-STEP, cx)))
+                    .on_action(cx.listener(|this, _: &Wider, _, cx| this.nudge_tree(STEP, cx)))
+                    .on_action(cx.listener(|this, _: &Narrowest, _, cx| {
+                        this.nudge_tree(f32::NEG_INFINITY, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &Widest, _, cx| this.nudge_tree(f32::INFINITY, cx)),
+                    ),
                 );
         }
         let mut right = div().relative().flex_1().min_w_0().h_full().child(body);
@@ -1326,6 +1355,8 @@ impl WorkbenchView {
         if let Some(error) = &self.diff.resolve_error {
             pane = pane.child(
                 div()
+                    .id("resolve-error")
+                    .alert(error.clone())
                     .flex_shrink_0()
                     .px(px(16.))
                     .py(px(6.))
@@ -1340,6 +1371,7 @@ impl WorkbenchView {
         if let Some(error) = &self.diff.error {
             pane = pane.child(
                 h_flex()
+                    .id("diff-error")
                     .flex_shrink_0()
                     .gap(px(8.))
                     .px(px(16.))
@@ -1350,10 +1382,20 @@ impl WorkbenchView {
                     .border_b_1()
                     .border_color(t.border2)
                     .child(icon(IconName::Conflicts, 14., t.danger))
-                    .child(div().flex_1().min_w_0().child(error.clone()))
+                    .child(
+                        div()
+                            .id("diff-error-text")
+                            .alert(error.clone())
+                            .flex_1()
+                            .min_w_0()
+                            .child(error.clone()),
+                    )
                     .child(
                         div()
                             .id("diff-retry")
+                            .role(gpui::Role::Button)
+                            .aria_label("Retry")
+                            .tabbable(cx)
                             .flex_shrink_0()
                             .px(px(6.))
                             .rounded(px(RADIUS_S))

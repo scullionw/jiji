@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     actions, div, prelude::*, px, AnyView, App, Context, Entity, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Subscription, Task, Window,
+    Focusable, FontWeight, KeyBinding, MouseButton, MouseDownEvent, Orientation, Role,
+    Subscription, Task, Window,
 };
 
 use crate::app::{app, AppEvent, AppModel, Section, UiIntent, SECTIONS};
 use crate::theme::{theme, FONT_UI, RADIUS_M, RAIL_W, TEXT_M};
-use crate::ui::{icon, popover, tooltip, v_flex, IconName, PopoverState};
+use crate::ui::focus::{FocusNext, FocusPrev, Return, Trap};
+use crate::ui::{icon, popover, tooltip, v_flex, IconName, PopoverState, Tabbable as _};
 
 actions!(
     jiji,
@@ -64,6 +66,7 @@ const BREADCRUMB_LIFE: Duration = Duration::from_secs(8);
 
 /// Shortcuts that work from anywhere in the window.
 pub fn bind_keys(cx: &mut App) {
+    crate::ui::focus::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-o", OpenRepo, None),
@@ -226,6 +229,14 @@ pub struct Shell {
     license_input: Entity<crate::ui::TextInput>,
     palette: Option<AnyView>,
     search: Option<AnyView>,
+    /// Where focus goes back to when the palette, history search or the
+    /// registration panel closes.
+    palette_back: Return,
+    search_back: Return,
+    register_back: Return,
+    /// The registration panel was open at the last sync.
+    registering: bool,
+    register_trap: Trap,
     /// The context menu on screen, by the opening it was built for.
     menu: Option<(u64, Entity<crate::views::menu::ContextMenu>)>,
     /// Waiting for the window to hold still before keeping where it is.
@@ -283,6 +294,18 @@ impl Shell {
                     }
                 },
             ),
+            // The focused control went away (its row was deleted, the panel
+            // it sat in closed): the keys go to the nearest thing still on
+            // screen that takes them, the section rather than the window.
+            cx.on_focus_lost(window, |this, window, cx| {
+                match window
+                    .focus_lost_restore_target(cx)
+                    .filter(|target| *target != this.focus)
+                {
+                    Some(target) => window.focus(&target, cx),
+                    None => this.rest_focus(window, cx),
+                }
+            }),
         ];
         let mut this = Self {
             app: model,
@@ -293,19 +316,24 @@ impl Shell {
             undoing: false,
             breadcrumb_at: None,
             breadcrumb_timer: None,
-            settings_menu: PopoverState::default(),
+            settings_menu: PopoverState::new(cx),
             license_error: None,
             license_busy: false,
             cli_error: None,
             license_input,
             palette: None,
             search: None,
+            palette_back: Return::default(),
+            search_back: Return::default(),
+            register_back: Return::default(),
+            registering: false,
+            register_trap: Trap::new(cx),
             menu: None,
             window_settle: None,
             _subscriptions: subscriptions,
         };
         this.sync(window, cx);
-        window.focus(&this.focus, cx);
+        this.rest_focus(window, cx);
         this
     }
 
@@ -330,6 +358,7 @@ impl Shell {
         };
         let breadcrumb = model.ui().last_mutation.as_ref().map(|crumb| crumb.at);
         let (palette_open, search_open) = (model.palette_open, model.search_open);
+        let registering = model.registration_open;
         let menu_seq = model.menu.as_ref().map(|menu| menu.seq);
         window.set_window_title(&title);
 
@@ -363,17 +392,32 @@ impl Shell {
         }
 
         if palette_open && self.palette.is_none() {
+            self.palette_back.take(window, cx);
             self.palette = Some(crate::views::palette::build(window, cx));
         } else if !palette_open && self.palette.take().is_some() {
             self.rest_focus(window, cx);
+            self.palette_back.give_back(window, cx);
         }
         if self.menu.as_ref().map(|(seq, _)| *seq) != menu_seq {
             self.menu = crate::views::menu::build(&self.app, window, cx);
         }
         if search_open && self.search.is_none() {
+            self.search_back.take(window, cx);
             self.search = Some(crate::views::search::build(window, cx));
         } else if !search_open && self.search.take().is_some() {
             self.rest_focus(window, cx);
+            self.search_back.give_back(window, cx);
+        }
+        // The registration panel opens with its key field ready to paste
+        // into, and gives focus back when it closes.
+        if registering != std::mem::replace(&mut self.registering, registering) {
+            if registering {
+                self.register_back.take(window, cx);
+                self.license_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+            } else {
+                self.register_back.give_back(window, cx);
+            }
         }
     }
 
@@ -393,7 +437,7 @@ impl Shell {
             .update(cx, |model, cx| model.go_to_section(SECTIONS[index], cx));
     }
 
-    fn activate_license(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn activate_license(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.license_busy {
             return;
         }
@@ -404,9 +448,9 @@ impl Shell {
         let task = self
             .app
             .update(cx, |model, cx| model.activate_license(key, cx));
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.license_busy = false;
                 match result {
                     Ok(()) => {
@@ -416,7 +460,7 @@ impl Shell {
                         // place, its footer naming the licence and its
                         // palettes now unlocked.
                         this.app.update(cx, |m, cx| m.close_registration(cx));
-                        this.settings_menu.open();
+                        this.settings_menu.open(window, cx);
                     }
                     Err(message) => this.license_error = Some(message),
                 }
@@ -449,7 +493,7 @@ impl Shell {
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_menu.is_open() {
-            self.settings_menu.close();
+            self.settings_menu.close(window, cx);
             cx.notify();
             return;
         }
@@ -468,7 +512,6 @@ impl Shell {
             }
         });
         if !handled {
-            let _ = window;
             cx.propagate();
         }
     }
@@ -486,7 +529,13 @@ impl Shell {
         // hidden behind a section switch.
         let conflicts = snapshot.conflicts.len();
         let items = SECTIONS.map(|section| (section, section.glyph()));
+        // To assistive technology the rail is what it does: a vertical tab
+        // list whose tabs switch the section filling the window.
         let mut rail = v_flex()
+            .id("rail")
+            .role(Role::TabList)
+            .aria_label("Sections")
+            .aria_orientation(Orientation::Vertical)
             .w(px(RAIL_W))
             .flex_shrink_0()
             .items_center()
@@ -497,8 +546,14 @@ impl Shell {
         for (ix, (section, glyph)) in items.into_iter().enumerate() {
             let is_active = section == active;
             let group = format!("rail-{ix}");
+            let shortcut = format!("⌘{}", ix + 1);
             let mut item = div()
                 .id(("rail", ix))
+                .role(Role::Tab)
+                .aria_label(section.label())
+                .aria_selected(is_active)
+                .aria_keyshortcuts(shortcut.clone())
+                .tabbable(cx)
                 .group(group.clone())
                 .relative()
                 .flex()
@@ -507,7 +562,7 @@ impl Shell {
                 .size(px(32.))
                 .rounded(px(RADIUS_M + 1.))
                 .cursor_pointer()
-                .tooltip(tooltip(format!("{} (⌘{})", section.label(), ix + 1)))
+                .tooltip(tooltip(format!("{} ({shortcut})", section.label())))
                 .on_click(cx.listener(move |this, _, _, cx| this.go_to(ix, cx)));
             item = if is_active {
                 // The current section: its glyph in its own hue on a tint
@@ -524,6 +579,7 @@ impl Shell {
                 )
             };
             if section == Section::Conflicts && conflicts > 0 {
+                item = item.aria_description(crate::logic::text::counted(conflicts, "conflict"));
                 item = item.child(
                     div()
                         .absolute()
@@ -672,6 +728,8 @@ impl Render for Shell {
                 ));
             })
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
             // A right-click nothing more specific answered.
             .on_mouse_down(
                 MouseButton::Right,
@@ -711,5 +769,128 @@ impl Render for Shell {
             .children(self.search.clone())
             .children(self.menu.as_ref().map(|(_, menu)| menu.clone()))
             .child(self.render_drop_overlay(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gpui::{TestAppContext, WindowHandle};
+
+    use super::Shell;
+    use crate::app::{AppModel, ThemeMode};
+    use crate::testing::press;
+
+    fn mock_shell(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        std::path::PathBuf,
+        gpui::Entity<AppModel>,
+        WindowHandle<Shell>,
+    ) {
+        let dir = crate::testing::scratch(name);
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        (dir, model, window)
+    }
+
+    #[gpui::test]
+    fn settings_open_change_and_close_from_the_keyboard(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_shell("keyboard-settings", cx);
+        let keys = window.into();
+        let focused = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| window.focused(cx))
+                .unwrap()
+        };
+
+        // From the section, back through the rail's six tabs to the title
+        // bar's last control: Settings, ringed, since the keyboard took it.
+        press(
+            keys,
+            "shift-tab shift-tab shift-tab shift-tab shift-tab shift-tab",
+            cx,
+        );
+        let rail_first = focused(cx);
+        press(keys, "shift-tab", cx);
+        let settings = focused(cx).expect("Settings has the keys");
+        assert_ne!(Some(&settings), rail_first.as_ref());
+        window
+            .update(cx, |_, window, _| assert!(window.last_input_was_keyboard()))
+            .unwrap();
+
+        // Space opens it, and the panel takes the keys.
+        press(keys, "space", cx);
+        let open = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |shell, window, cx| {
+                    let menu = &shell.settings_menu;
+                    (menu.is_open(), menu.holds_focus(window, cx))
+                })
+                .unwrap()
+        };
+        assert_eq!(open(cx), (true, true));
+
+        // Tab enters at Appearance's first choice; the second is Light.
+        press(keys, "tab tab space", cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(model.theme_mode(), ThemeMode::Light)
+        });
+
+        // Tab and Shift-Tab come round inside the open panel, never past it.
+        for key in ["tab", "shift-tab"] {
+            for _ in 0..24 {
+                press(keys, key, cx);
+                assert_eq!(open(cx), (true, true), "after {key}");
+            }
+        }
+
+        // Escape closes it, and the keys go back to Settings.
+        press(keys, "escape", cx);
+        assert!(!open(cx).0);
+        assert_eq!(focused(cx), Some(settings));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_click_presses_a_control_without_taking_the_keys(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, VisualTestContext};
+
+        let (dir, _model, window) = mock_shell("click-keeps-focus", cx);
+        let before = window
+            .update(cx, |_, window, cx| window.focused(cx))
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let settings = cx
+            .debug_bounds("settings-button")
+            .expect("Settings is on screen");
+        cx.simulate_click(settings.center(), Modifiers::none());
+        let (open, after, keyboard) = window
+            .update(&mut cx, |shell, window, cx| {
+                (
+                    shell.settings_menu.is_open(),
+                    window.focused(cx),
+                    window.last_input_was_keyboard(),
+                )
+            })
+            .unwrap();
+        // It opened; the panel has the keys (so Tab enters it), and with
+        // the mouse in hand nothing wears the ring.
+        assert!(open);
+        assert_ne!(after, before);
+        assert!(!keyboard);
+
+        // Escape gives the keys back to the section, not to the button.
+        cx.simulate_keystrokes("escape");
+        let back = window
+            .update(&mut cx, |_, window, cx| window.focused(cx))
+            .unwrap();
+        assert_eq!(back, before);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -2,7 +2,7 @@
 //! divergence notice, compare, squash and abandon confirmations, rebase,
 //! and bookmark create and manage.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, Window};
 use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot};
 
 use super::{kind_glyph, title_or_none, Confirm};
@@ -16,7 +16,7 @@ use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, h_flex, icon, input::field, rich, segmented, tooltip, truncated, trunk_label, v_flex,
-    IconName,
+    IconName, NodeExt as _, Segment, Tabbable as _,
 };
 use crate::views::workbench::WorkbenchView;
 
@@ -38,6 +38,9 @@ impl WorkbenchView {
             hint = hint.child("Unsaved draft restored ·").child(
                 div()
                     .id("discard-draft")
+                    .role(Role::Button)
+                    .aria_label("Discard draft")
+                    .tabbable(cx)
                     .text_color(t.accent_strong)
                     .cursor_pointer()
                     .hover(|style| style.text_color(t.text1))
@@ -53,6 +56,8 @@ impl WorkbenchView {
         if let Some(error) = &self.header.error {
             row = row.child(
                 div()
+                    .id("editor-error")
+                    .alert(error.clone())
                     .min_w_0()
                     .max_w(px(360.))
                     .text_size(px(TEXT_XS))
@@ -74,7 +79,7 @@ impl WorkbenchView {
                     .on_click(cx.listener(|this, _, window, cx| this.save_description(window, cx))),
             );
         let focused = self.header.editor.read(cx).is_focused(window);
-        self.tray(false, cx)
+        self.tray(false, "Describe this change", cx)
             .child(
                 div()
                     .flex()
@@ -123,9 +128,12 @@ impl WorkbenchView {
                 ),
                 cx,
             )));
-        let small = |id: gpui::ElementId, label: &'static str, color: Hsla| {
+        let small = |id: gpui::ElementId, label: &'static str, name: String, color: Hsla| {
             div()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(name)
+                .tabbable_in(t.accent)
                 .h(px(18.))
                 .px(px(5.))
                 .rounded(px(RADIUS_S))
@@ -143,6 +151,9 @@ impl WorkbenchView {
             let mut group = h_flex().gap(px(2.)).child(
                 div()
                     .id(("copy", ix))
+                    .role(Role::Button)
+                    .aria_label(format!("Go to copy {commit}"))
+                    .tabbable(cx)
                     .h(px(18.))
                     .px(px(5.))
                     .rounded(px(RADIUS_S))
@@ -159,6 +170,7 @@ impl WorkbenchView {
                 small(
                     ("copy-compare", ix).into(),
                     "Compare",
+                    format!("Compare with copy {commit}"),
                     if comparing { t.accent_strong } else { t.text2 },
                 )
                 .tooltip(tooltip(format!(
@@ -170,17 +182,23 @@ impl WorkbenchView {
             );
             if sibling.kind != NodeKind::Immutable && !acting {
                 group = group.child(
-                    small(("copy-abandon", ix).into(), "Abandon", t.danger)
-                        .tooltip(tooltip(format!("Abandon copy {commit} and keep this one")))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.header.diverge_confirm =
-                                if this.header.diverge_confirm.as_ref() == Some(&confirm_id) {
-                                    None
-                                } else {
-                                    Some(confirm_id.clone())
-                                };
-                            cx.notify();
-                        })),
+                    small(
+                        ("copy-abandon", ix).into(),
+                        "Abandon",
+                        format!("Abandon copy {commit}"),
+                        t.danger,
+                    )
+                    .aria_expanded(self.header.diverge_confirm.as_ref() == Some(&sibling.id))
+                    .tooltip(tooltip(format!("Abandon copy {commit} and keep this one")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.header.diverge_confirm =
+                            if this.header.diverge_confirm.as_ref() == Some(&confirm_id) {
+                                None
+                            } else {
+                                Some(confirm_id.clone())
+                            };
+                        cx.notify();
+                    })),
                 );
             }
             note = note.child(group);
@@ -188,6 +206,8 @@ impl WorkbenchView {
         if let Some(error) = &self.header.diverge_error {
             note = note.child(
                 div()
+                    .id("diverge-error")
+                    .alert(error.clone())
                     .min_w_0()
                     .text_color(t.danger)
                     .child(truncated(error.clone())),
@@ -269,6 +289,11 @@ impl WorkbenchView {
                       selected: bool| {
             let mut row = h_flex()
                 .id(id)
+                .role(Role::ListBoxOption)
+                .aria_label(name)
+                .aria_description(note.clone())
+                .aria_selected(selected)
+                .tabbable_in(t.accent)
                 .w_full()
                 .h(px(26.))
                 .gap(px(8.))
@@ -315,6 +340,9 @@ impl WorkbenchView {
             }
         };
         let mut presets = v_flex()
+            .id("compare-presets")
+            .role(Role::ListBox)
+            .aria_label("Comparison preset")
             .mt(px(8.))
             .p(px(2.))
             .rounded(px(RADIUS_M))
@@ -367,9 +395,9 @@ impl WorkbenchView {
             );
         }
         let filter = self.dest_filter(window, cx);
-        let list = self.dest_list("No matching change", cx);
+        let list = self.dest_list("Comparison base change", "No matching change", window, cx);
         let close = self.cancel_button("Close", cx);
-        self.tray(false, cx)
+        self.tray(false, "Compare this change against another point", cx)
             .child(self.tray_title(
                 &format!("Compare **{}**", short_id(&node.id, 4)),
                 "pick what the diff is measured against — read-only, nothing is rewritten".into(),
@@ -544,7 +572,14 @@ impl WorkbenchView {
             }
         };
         let mut tray = self
-            .tray(danger, cx)
+            .tray(
+                danger,
+                match confirm {
+                    Confirm::Squash => "Confirm squash",
+                    Confirm::Abandon => "Confirm abandon",
+                },
+                cx,
+            )
             .child(title)
             .child(self.consequences(items, cx));
         if confirm == Confirm::Squash {
@@ -554,6 +589,9 @@ impl WorkbenchView {
             tray = tray.child(self.label("Resulting description", cx)).child(
                 div()
                     .id("squash-description")
+                    .role(Role::Label)
+                    .aria_label("Resulting description")
+                    .aria_value(combined.clone())
                     .px(px(12.))
                     .py(px(8.))
                     .max_h(px(120.))
@@ -610,13 +648,10 @@ impl WorkbenchView {
             let id = node.id.clone();
             controls = controls.child(segmented(
                 "rebase-mode",
+                "Rebase scope",
                 vec![
-                    (
-                        false,
-                        format!("With {}", counted(count, "descendant")).into(),
-                        None,
-                    ),
-                    (true, "Only this change".into(), None),
+                    Segment::text(false, format!("With {}", counted(count, "descendant"))),
+                    Segment::text(true, "Only this change"),
                 ],
                 &alone,
                 cx,
@@ -702,7 +737,7 @@ impl WorkbenchView {
             ));
         }
         let has_dest = dest.is_some();
-        let list = self.dest_list("No matching destination", cx);
+        let list = self.dest_list("Rebase destination", "No matching destination", window, cx);
         let buttons = vec![
             self.cancel_button("Cancel", cx),
             btn(
@@ -721,7 +756,7 @@ impl WorkbenchView {
             .into_any_element(),
         ];
         let mut tray = self
-            .tray(false, cx)
+            .tray(false, "Rebase this change", cx)
             .child(self.tray_title(
                 &format!("Rebase **{}**", short_id(&node.id, 4)),
                 format!("\u{201c}{}\u{201d}", title_or_none(&node.description)),
@@ -756,7 +791,7 @@ impl WorkbenchView {
         let acting = self.header.acting;
         let empty = self.header.bookmark_name.read(cx).text().trim().is_empty();
         let mut tray = self
-            .tray(false, cx)
+            .tray(false, "Bookmark this change", cx)
             .child(self.tray_title(
                 &format!("Bookmark **{}**", short_id(&node.id, 4)),
                 format!("\u{201c}{}\u{201d}", title_or_none(&node.description)),
@@ -789,7 +824,12 @@ impl WorkbenchView {
             .filter(|b| b.is_local && b.target != node.id)
             .collect();
         if !movable.is_empty() {
-            let mut list = v_flex().max_h(px(160.)).id("move-bookmarks").scroll_y();
+            let mut list = v_flex()
+                .max_h(px(160.))
+                .id("move-bookmarks")
+                .role(Role::List)
+                .aria_label("Move an existing bookmark here")
+                .scroll_y();
             for (ix, mark) in movable.into_iter().enumerate() {
                 let mut notes = Vec::new();
                 match move_direction(snapshot, &mark.target, &node.id) {
@@ -808,6 +848,9 @@ impl WorkbenchView {
                 let name = mark.name.clone();
                 let mut row = h_flex()
                     .id(("move-bookmark", ix))
+                    .role(Role::Button)
+                    .aria_label(format!("Move {} here", mark.name))
+                    .aria_description(note.clone())
                     .w_full()
                     .h(px(26.))
                     .gap(px(8.))
@@ -843,6 +886,7 @@ impl WorkbenchView {
                     row = row.opacity(0.6);
                 } else {
                     row = row
+                        .tabbable(cx)
                         .cursor_pointer()
                         .hover(|style| style.bg(t.bg_hover).text_color(t.text1))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -907,7 +951,7 @@ impl WorkbenchView {
             self.cancel_button("Close", cx),
         ];
         Some(
-            self.tray(false, cx)
+            self.tray(false, format!("Manage bookmark {}", mark.name), cx)
                 .child(self.tray_title(&format!("**{}**", mark.name), context, cx))
                 .child(
                     h_flex()

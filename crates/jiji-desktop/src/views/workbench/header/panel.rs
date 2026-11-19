@@ -17,17 +17,38 @@ use crate::shell::Dismiss;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::vertical_only;
 use crate::ui::{
-    btn, h_flex, input::field, ref_label, rich, tooltip, truncated, trunk_label, v_flex,
+    btn, h_flex, input::field, keyboard_on, ref_label, rich, ring, tooltip, truncated, trunk_label,
+    v_flex, NodeExt as _,
 };
 use crate::views::workbench::{TrayConfirm, TrayDown, TrayEnter, TrayUp, WorkbenchView};
 
 impl WorkbenchView {
-    pub(super) fn tray(&self, danger: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The tray's panel: a dialog named `name` (an alert dialog when it
+    /// asks before rewriting), tinted when what it asks for is destructive.
+    /// When it holds a destination
+    /// list it is a stop of its own, whose arrows travel the list.
+    pub(super) fn tray(
+        &self,
+        danger: bool,
+        name: impl Into<gpui::SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let t = theme(cx);
+        let listed = match self.header.tray {
+            Tray::Rebase | Tray::Compare => true,
+            Tray::Split => self.header.split_into,
+            _ => false,
+        };
         div()
             .id("tray")
+            .role(if matches!(self.header.tray, Tray::Confirm(_)) {
+                gpui::Role::AlertDialog
+            } else {
+                gpui::Role::Dialog
+            })
+            .aria_label(name)
             .key_context("Tray")
-            .track_focus(&self.header.tray_focus)
+            .track_focus(&self.header.tray_focus.clone().tab_stop(listed))
             .flex()
             .flex_col()
             .px(px(16.))
@@ -43,9 +64,14 @@ impl WorkbenchView {
             .on_action(
                 cx.listener(|this, _: &TrayConfirm, window, cx| this.tray_submit(true, window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &TrayEnter, window, cx| this.tray_submit(false, window, cx)),
-            )
+            // Return on a control inside the tray presses that control.
+            .on_action(cx.listener(|this, _: &TrayEnter, window, cx| {
+                if this.header.tray_focus.is_focused(window) {
+                    this.tray_submit(false, window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &TrayUp, _, cx| this.move_dest(-1, cx)))
             .on_action(cx.listener(|this, _: &TrayDown, _, cx| this.move_dest(1, cx)))
     }
@@ -116,6 +142,7 @@ impl WorkbenchView {
             row = row.child(
                 div()
                     .id("tray-error")
+                    .alert(error.clone())
                     .min_w_0()
                     .max_w(px(360.))
                     .text_size(px(TEXT_XS))
@@ -137,11 +164,14 @@ impl WorkbenchView {
     }
 
     /// One row of a destination list: marker, short id, title, bookmarks.
+    /// The picked one is what the keyboard travels from; `ringed` while the
+    /// keyboard holds the tray.
     pub(super) fn dest_row(
         snapshot: &RepoSnapshot,
         node: &GraphNode,
         key: usize,
         selected: bool,
+        ringed: bool,
         theme: &Theme,
         cx: &App,
     ) -> Stateful<Div> {
@@ -152,6 +182,14 @@ impl WorkbenchView {
         };
         let mut row = h_flex()
             .id(("dest", key))
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(format!(
+                "{}, {}",
+                title_or_none(&node.description),
+                short_id(&node.id, 8)
+            ))
+            .aria_selected(selected)
+            .when(ringed, |row| row.shadow(ring(theme.accent)))
             .w_full()
             .h(px(26.))
             .gap(px(8.))
@@ -206,11 +244,22 @@ impl WorkbenchView {
         }
     }
 
-    /// The scrolling destination list of the open tray.
-    pub(super) fn dest_list(&mut self, empty: &'static str, cx: &mut Context<Self>) -> AnyElement {
+    /// The scrolling destination list of the open tray, named `name`.
+    pub(super) fn dest_list(
+        &mut self,
+        name: &'static str,
+        empty: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = theme(cx);
         let ids = Rc::new(self.visible_dests(cx));
+        let focused = self.header.tray_focus.is_focused(window);
+        let ringed = keyboard_on(&self.header.tray_focus, window);
         let frame = div()
+            .id("dest-frame")
+            .role(gpui::Role::ListBox)
+            .aria_label(name)
             .mt(px(2.))
             .p(px(2.))
             .rounded(px(RADIUS_M))
@@ -238,14 +287,11 @@ impl WorkbenchView {
                 let ids = ids.clone();
                 move |this, range: Range<usize>, _, cx| {
                     let t = theme(cx);
-                    let picked = if compare {
-                        match &this.compare {
-                            CompareMode::Change(id) => Some(id.clone()),
-                            _ => None,
-                        }
-                    } else {
-                        this.header.dest.clone()
-                    };
+                    // The comparison on screen, until the keys pick another.
+                    let picked = this.header.dest.clone().or_else(|| match &this.compare {
+                        CompareMode::Change(id) if compare => Some(id.clone()),
+                        _ => None,
+                    });
                     let mut rows = Vec::with_capacity(range.len());
                     for ix in range {
                         let id = ids[ix].clone();
@@ -255,17 +301,27 @@ impl WorkbenchView {
                         };
                         let selected = picked.as_deref() == Some(id.as_str());
                         let hover_id = id.clone();
-                        let row = Self::dest_row(&this.snapshot, node, ix, selected, &t, cx)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if compare {
-                                    this.set_compare(CompareMode::Change(id.clone()), cx);
-                                    this.close_tray(window, cx);
-                                } else {
-                                    this.header.dest = Some(id.clone());
-                                    cx.notify();
-                                }
-                            }))
-                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let row = Self::dest_row(
+                            &this.snapshot,
+                            node,
+                            ix,
+                            selected,
+                            ringed && selected,
+                            &t,
+                            cx,
+                        )
+                        .when(focused && selected, |row| row.aria_active_descendant())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if compare {
+                                this.set_compare(CompareMode::Change(id.clone()), cx);
+                                this.close_tray(window, cx);
+                            } else {
+                                this.header.dest = Some(id.clone());
+                                cx.notify();
+                            }
+                        }))
+                        .on_hover(cx.listener(
+                            move |this, hovered: &bool, _, cx| {
                                 let next = hovered.then(|| hover_id.clone());
                                 if (*hovered || this.header.dest_hover.as_ref() == Some(&hover_id))
                                     && this.header.dest_hover != next
@@ -273,7 +329,8 @@ impl WorkbenchView {
                                     this.header.dest_hover = next;
                                     cx.notify();
                                 }
-                            }));
+                            },
+                        ));
                         rows.push(row.into_any_element());
                     }
                     rows

@@ -15,14 +15,18 @@
 //!   move=X,Y    drag=X0,Y0,X1,Y1   alt-drag=…
 //!   press=X,Y   hold=X,Y   release=X,Y   (a drag in parts; alt-hold=…)
 //!   scroll=X,Y,DX,DY               key=cmd-k   type=some text
-//!   wait=MS     shot=/abs/path.png resize=W,H   quit
+//!   wait=MS     shot=/abs/path.png a11y=/abs/path.json   resize=W,H   quit
+//!
+//! A `key` is pressed and released, as a keyboard does: Space and Return
+//! press a focused control on the release. `a11y` writes the tree a screen
+//! reader would read (see `headless::accessibility`).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{
-    point, px, size, AnyWindowHandle, App, AppContext as _, AsyncApp, InputEvent, Keystroke,
-    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    point, px, size, AnyWindowHandle, App, AppContext as _, AsyncApp, InputEvent, KeyUpEvent,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, Window,
 };
 
@@ -52,6 +56,7 @@ pub enum Step {
     Type(String),
     Wait(u64),
     Shot(PathBuf),
+    A11y(PathBuf),
     Resize(f32, f32),
     Quit,
 }
@@ -68,6 +73,7 @@ impl Step {
             | Step::Type(_)
             | Step::Wait(_)
             | Step::Shot(_)
+            | Step::A11y(_)
             | Step::Resize(..)
             | Step::Quit => None,
         }
@@ -98,6 +104,10 @@ pub fn parse(script: &str) -> Result<Vec<Step>, String> {
             }
             "shot" => {
                 steps.push(Step::Shot(PathBuf::from(value)));
+                continue;
+            }
+            "a11y" => {
+                steps.push(Step::A11y(PathBuf::from(value)));
                 continue;
             }
             "quit" => {
@@ -320,7 +330,8 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
                 gpui::OperatingSystem::Mac,
             ) {
                 Ok(keystroke) => {
-                    window.dispatch_keystroke(keystroke, cx);
+                    window.dispatch_keystroke(keystroke.clone(), cx);
+                    window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
                 }
                 Err(err) => eprintln!("jiji: bad key `{key}`: {err}"),
             });
@@ -355,6 +366,29 @@ async fn run_step(step: Step, window: AnyWindowHandle, cx: &mut AsyncApp) {
                 &mut |window, _| match crate::headless::screenshot(window, &path) {
                     Ok(()) => println!("wrote {}", path.display()),
                     Err(err) => eprintln!("jiji: shot failed: {err}"),
+                },
+            );
+        }
+        Step::A11y(path) => {
+            // The first ask turns accessibility on; the tree is built by the
+            // frames after it.
+            update(cx, &mut |window, _| {
+                crate::headless::accessibility(window);
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            update(
+                cx,
+                &mut |window, _| match crate::headless::accessibility(window) {
+                    Some(tree) => match std::fs::write(&path, tree) {
+                        Ok(()) => println!("wrote {}", path.display()),
+                        Err(err) => eprintln!("jiji: a11y dump failed: {err}"),
+                    },
+                    None => eprintln!(
+                        "jiji: no accessibility tree to write: {}",
+                        crate::headless::HOW
+                    ),
                 },
             );
         }
@@ -410,6 +444,10 @@ mod tests {
     fn steps_parse_with_modifiers_and_text_values() {
         let steps = parse("click=10,20; shift-click=1,2;type=a, b;key=cmd-k;wait=50;quit").unwrap();
         assert_eq!(steps.len(), 6);
+        assert_eq!(
+            parse("a11y=/tmp/tree.json").unwrap(),
+            vec![Step::A11y("/tmp/tree.json".into())]
+        );
         assert!(matches!(
             steps[1],
             Step::Click { modifiers, count: 1, .. } if modifiers.shift

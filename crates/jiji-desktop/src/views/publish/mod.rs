@@ -30,7 +30,8 @@ use crate::shell::Dismiss;
 use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS};
 use crate::ui::{
     btn, dot, empty_state, h_flex, icon, icon_btn, input::field, popover, popover_layer, ref_label,
-    segmented, v_flex, IconName, InputEvent, PopoverState, TextInput,
+    segmented, v_flex, IconName, InputEvent, NodeExt as _, PopoverState, Segment, Tabbable as _,
+    TextInput,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,11 +162,24 @@ impl PublishView {
         let token = cx.new(|cx| {
             TextInput::new(window, cx)
                 .placeholder("github_pat_…")
+                .label("GitHub personal access token")
                 .masked()
         });
-        let query = cx.new(|cx| TextInput::new(window, cx).placeholder("Find a stack…"));
-        let review_name = cx.new(|cx| TextInput::new(window, cx).placeholder("Local bookmark"));
-        let lookup = cx.new(|cx| TextInput::new(window, cx).placeholder("PR number"));
+        let query = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .placeholder("Find a stack…")
+                .label("Find a stack")
+        });
+        let review_name = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .placeholder("Local bookmark")
+                .label("Local bookmark name")
+        });
+        let lookup = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .placeholder("PR number")
+                .label("Pull request number")
+        });
         let subscriptions = vec![
             cx.observe_in(&app, window, |this, _, _, cx| {
                 this.sync(cx);
@@ -215,13 +229,13 @@ impl PublishView {
             token,
             connecting: false,
             action_error: None,
-            connection: PopoverState::default(),
+            connection: PopoverState::new(cx),
             page: Page::Stacks,
             selected: None,
             query,
             show_local: false,
             mode: Mode::Land,
-            more: PopoverState::default(),
+            more: PopoverState::new(cx),
             open: HashSet::new(),
             plan_head: None,
             plan: None,
@@ -591,6 +605,13 @@ impl PublishView {
             .child(
                 h_flex()
                     .id(SharedString::from(format!("disclosure-{name}")))
+                    .role(gpui::Role::Button)
+                    .aria_label(match &aside {
+                        Some(aside) => format!("{label}, {aside}"),
+                        None => label.to_owned(),
+                    })
+                    .aria_expanded(open)
+                    .tabbable(cx)
                     .gap(px(6.))
                     .h(px(26.))
                     .cursor_pointer()
@@ -677,10 +698,23 @@ impl PublishView {
             .border_color(t.border2)
             .text_size(px(TEXT_S))
             .text_color(if error { t.danger } else { t.text2 })
-            .child(div().flex_1().min_w_0().child(text));
+            .child(
+                div()
+                    .id(id)
+                    .map(|el| {
+                        if error {
+                            el.alert(text.clone())
+                        } else {
+                            el.status(text.clone())
+                        }
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .child(text),
+            );
         if let Some((label, run)) = action {
             line = line.child(self.text_button(
-                id,
+                (id, 1usize),
                 label,
                 move |this, window, cx| run(this, window, cx),
                 cx,
@@ -697,15 +731,19 @@ impl PublishView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
+        let label = label.into();
         div()
             .id(id.into())
+            .role(gpui::Role::Button)
+            .aria_label(label.trim_end_matches(['↗', ' ', '…']).to_owned())
+            .tabbable(cx)
             .flex_shrink_0()
             .cursor_pointer()
             .text_size(px(TEXT_S))
             .text_color(t.accent_strong)
             .hover(|style| style.text_color(t.text1))
             .on_click(cx.listener(move |this, _, window, cx| run(this, window, cx)))
-            .child(label.into())
+            .child(label)
             .into_any_element()
     }
 
@@ -745,10 +783,10 @@ impl PublishView {
         }
     }
 
-    fn dismiss(&mut self, cx: &mut Context<Self>) {
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.connection.is_open() || self.more.is_open() {
-            self.connection.close();
-            self.more.close();
+            self.connection.close(window, cx);
+            self.more.close(window, cx);
             cx.notify();
         } else if self.review_for.is_some() {
             self.close_review_panel(cx);
@@ -797,13 +835,10 @@ impl PublishView {
         let view = cx.entity().downgrade();
         let tabs = segmented(
             "publish-pages",
+            "Publish views",
             vec![
-                (Page::Stacks, format!("Stacks  {stack_count}").into(), None),
-                (
-                    Page::Review,
-                    format!("Pull requests  {review_count}").into(),
-                    None,
-                ),
+                Segment::text(Page::Stacks, format!("Stacks  {stack_count}")),
+                Segment::text(Page::Review, format!("Pull requests  {review_count}")),
             ],
             &self.page,
             cx,
@@ -827,19 +862,27 @@ impl PublishView {
             )
             .ghost()
             .on(self.connection.is_open())
+            .expanded(self.connection.is_open())
+            .tooltip("GitHub connection")
             .trailing(icon(IconName::ChevronDown, 12., t.text3))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.connection.toggle();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.connection.toggle(window, cx);
                 cx.notify();
             })),
         );
         if self.connection.is_open() {
+            let panel = self.render_connection(window, cx);
             connection = connection.child(popover_layer(
                 Anchor::TopRight,
                 30.,
-                self.render_connection(window, cx),
-                cx.listener(|this, _, _, cx| {
-                    this.connection.close();
+                self.connection.panel(
+                    "connection-panel",
+                    gpui::Role::Dialog,
+                    "GitHub connection",
+                    panel,
+                ),
+                cx.listener(|this, _, window, cx| {
+                    this.connection.close(window, cx);
                     cx.notify();
                 }),
             ));
@@ -885,11 +928,7 @@ impl PublishView {
         )
     }
 
-    fn render_connection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let t = theme(cx);
         let (phase, auth, forge_error) = {
             let forge = &self.app.read(cx).forge;
@@ -958,7 +997,14 @@ impl PublishView {
                 )))
         };
         if let Some(error) = self.action_error.clone().or(forge_error) {
-            panel = panel.child(div().mt(px(10.)).text_color(t.danger).child(error));
+            panel = panel.child(
+                div()
+                    .id("connection-error")
+                    .alert(error.clone())
+                    .mt(px(10.))
+                    .text_color(t.danger)
+                    .child(error),
+            );
         }
         panel
     }
@@ -1135,7 +1181,7 @@ impl Render for PublishView {
             .size_full()
             .flex()
             .flex_col()
-            .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(cx.listener(|this, _: &FindStack, window, cx| {
                 if this.page == Page::Stacks {
                     this.query.update(cx, |input, cx| input.focus(window, cx));
@@ -1184,8 +1230,8 @@ impl Render for PublishView {
                 true,
                 Some((
                     "Connection settings",
-                    Box::new(|this, _, cx| {
-                        this.connection.open();
+                    Box::new(|this, window, cx| {
+                        this.connection.open(window, cx);
                         cx.notify();
                     }),
                 )),

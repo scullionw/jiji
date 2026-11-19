@@ -4,7 +4,7 @@
 
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight,
-    MouseButton, MouseDownEvent, ScrollHandle, SharedString, Window,
+    MouseButton, MouseDownEvent, Role, ScrollHandle, SharedString, Window,
 };
 use jiji_core::snapshot::{ConflictItem, ConflictKind, ConflictSide, RepoSnapshot};
 
@@ -18,7 +18,7 @@ use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     all_clear, btn, group_head, h_flex, icon, page_bar_marked, scrollbar, tooltip, truncated,
-    v_flex, wrapped, IconName, PAGE_PAD,
+    v_flex, wrapped, IconName, NodeExt as _, Tabbable as _, PAGE_PAD,
 };
 
 /// The rows' shared left inset: the glyph column plus its gap.
@@ -181,6 +181,10 @@ impl ConflictsView {
             summary = summary.group_hover(group.clone(), |style| style.text_color(t.accent_strong));
             let (app, id) = (self.app.clone(), node.id.clone());
             head = head
+                .role(Role::Button)
+                .aria_label(format!("{}, {}", item.summary, node.id))
+                .aria_description("Open in the workbench")
+                .tabbable(cx)
                 .cursor_pointer()
                 .tooltip(tooltip(format!("Open {} in the workbench", node.id)))
                 .on_click(move |_, _, cx| app.update(cx, |model, cx| model.jump_to_change(&id, cx)))
@@ -419,6 +423,9 @@ impl ConflictsView {
                             }
                             let (app, id) = (self.app.clone(), id.clone());
                             chip = chip
+                                .role(Role::Button)
+                                .aria_label(format!("Go to {id} {title}"))
+                                .tabbable(cx)
                                 .cursor_pointer()
                                 .hover(|style| {
                                     style
@@ -487,6 +494,8 @@ impl ConflictsView {
         if let Some((_, message)) = self.error.as_ref().filter(|(of, _)| *of == item.id) {
             row = row.child(
                 div()
+                    .id(SharedString::from(format!("conflict-error-{}", item.id)))
+                    .alert(message.clone())
                     .pl(px(INSET))
                     .text_size(px(TEXT_XS))
                     .text_color(t.danger)

@@ -11,7 +11,7 @@ use crate::theme::{theme, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
     dot, h_flex, icon, kbd, lead_bar, node_mark, scrollbar, tooltip, truncated, v_flex, IconName,
-    Mark, Tabular as _,
+    Mark, Tabbable as _, Tabular as _,
 };
 use crate::views::publish::PublishView;
 
@@ -63,6 +63,7 @@ impl PublishView {
             )
         };
         let id = SharedString::from(format!("stack-{}", stack.key));
+        let spoken = format!("{}, {label}, {count}", stack.title);
         let mut row = if stack.pr_count == 0 {
             // Local work is all one state — the group says it — so a row
             // is the title and how much is in it.
@@ -123,10 +124,15 @@ impl PublishView {
         } else {
             row.hover(|style| style.bg(t.bg_hover))
         };
+        let row = row
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(spoken)
+            .aria_selected(selected);
         if self.executing() {
             row.opacity(0.6).into_any_element()
         } else {
-            row.cursor_pointer()
+            row.tabbable(cx)
+                .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.select_stack(&key, cx)))
                 .into_any_element()
         }
@@ -181,6 +187,8 @@ impl PublishView {
         };
         let mut list = v_flex()
             .id("stack-list")
+            .role(gpui::Role::ListBox)
+            .aria_label("Stacks")
             .flex_1()
             .min_h_0()
             .scroll_y()
@@ -200,6 +208,10 @@ impl PublishView {
             list = list.child(
                 heading("Local work", shown_local.len())
                     .id("local-heading")
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Local work, {}", shown_local.len()))
+                    .aria_expanded(open)
+                    .tabbable(cx)
                     .cursor_pointer()
                     .hover(|style| style.text_color(t.text2))
                     .on_click(cx.listener(|this, _, _, cx| {

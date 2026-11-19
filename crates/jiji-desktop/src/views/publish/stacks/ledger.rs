@@ -13,6 +13,7 @@ use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
     h_flex, icon, ref_label, scrollbar, tooltip, truncated, trunk_label, v_flex, IconName,
+    Tabbable as _,
 };
 use crate::views::publish::PublishView;
 
@@ -124,6 +125,10 @@ impl PublishView {
             line = line.child(
                 div()
                     .id(SharedString::from(format!("seg-pr-{key}")))
+                    .role(gpui::Role::Link)
+                    .aria_label(format!("Pull request #{number}"))
+                    .aria_description("Open on GitHub")
+                    .tabbable(cx)
                     .flex_shrink_0()
                     .font_family(t.mono.clone())
                     .text_size(px(TEXT_S))
@@ -232,6 +237,10 @@ impl PublishView {
             meta = meta.child(
                 h_flex()
                     .id(SharedString::from(format!("seg-changes-{key}")))
+                    .role(gpui::Role::Button)
+                    .aria_label(crate::logic::text::counted(segment.changes.len(), "change"))
+                    .aria_expanded(open)
+                    .tabbable(cx)
                     .flex_shrink_0()
                     .gap(px(3.))
                     .cursor_pointer()
@@ -271,6 +280,10 @@ impl PublishView {
                 changes = changes.child(
                     h_flex()
                         .id(SharedString::from(format!("seg-change-{key}-{cx_index}")))
+                        .role(gpui::Role::Button)
+                        .aria_label(format!("{title}, {}", change.id))
+                        .aria_description("Review this change on the workbench")
+                        .tabbable(cx)
                         .gap(px(8.))
                         .h(px(26.))
                         .mx(px(-6.))

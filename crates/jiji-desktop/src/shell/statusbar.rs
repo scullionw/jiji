@@ -2,7 +2,7 @@
 //! away), what a drag would do, or the repo's latest operation — plus the
 //! activity chips that stay visible from every section.
 
-use gpui::{div, prelude::*, px, Context, FontWeight};
+use gpui::{div, prelude::*, px, Context, FontWeight, Role};
 
 use super::Shell;
 use crate::app::Section;
@@ -10,7 +10,7 @@ use crate::logic::autoland::{self, ChipTone};
 use crate::logic::inspect::Tone;
 use crate::logic::text::{abbreviate_hashes, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, STATUSBAR_H, TEXT_XS};
-use crate::ui::{dot, h_flex, icon, tooltip, IconName, Tabular as _};
+use crate::ui::{dot, h_flex, icon, tooltip, IconName, NodeExt as _, Tabbable as _, Tabular as _};
 
 impl Shell {
     pub(super) fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -20,9 +20,12 @@ impl Shell {
         let ui = model.ui();
         let quiet_dot = Theme::fade(t.text3, 0.7);
         let msg = |text: String| div().min_w_0().truncate().text_color(t.text2).child(text);
-        let dismiss = |id: &'static str| {
+        let dismiss = |id: &'static str, name: &'static str| {
             div()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(name)
+                .tabbable_in(t.accent)
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -68,6 +71,7 @@ impl Shell {
                 .child(
                     div()
                         .id("status-error")
+                        .alert(error.clone())
                         .min_w_0()
                         .truncate()
                         .text_color(t.danger)
@@ -75,7 +79,7 @@ impl Shell {
                         .child(error.lines().next().unwrap_or_default().to_owned()),
                 )
                 .child(
-                    dismiss("error-dismiss")
+                    dismiss("error-dismiss", "Dismiss error")
                         .tooltip(tooltip("Dismiss"))
                         .on_click(move |_, _, cx| app.update(cx, |m, cx| m.dismiss_error(cx))),
                 );
@@ -86,6 +90,10 @@ impl Shell {
             let op_id = crumb.outcome.operation_id.clone();
             let mut link = h_flex()
                 .id("breadcrumb")
+                .role(Role::Button)
+                .aria_label(crumb.outcome.summary.clone())
+                .aria_description("Show in Operations")
+                .tabbable_in(t.accent)
                 .gap(px(8.))
                 .min_w_0()
                 .text_color(t.text1)
@@ -114,11 +122,20 @@ impl Shell {
                         .child(short_id(op, 8).to_owned()),
                 );
             }
-            bar = bar.child(dot(t.accent, 6.)).child(link);
+            // What just happened is read out once, as it lands.
+            let mut line = h_flex()
+                .id("breadcrumb-line")
+                .status(crumb.outcome.summary.clone())
+                .gap(px(8.))
+                .min_w_0()
+                .child(dot(t.accent, 6.))
+                .child(link);
             if op_id.is_some() {
                 let undoing = self.undoing;
                 let mut undo = h_flex()
                     .id("breadcrumb-undo")
+                    .role(Role::Button)
+                    .aria_label(if undoing { "Undoing" } else { "Undo" })
                     .flex_shrink_0()
                     .gap(px(4.))
                     .h(px(18.))
@@ -131,23 +148,35 @@ impl Shell {
                 undo = if undoing {
                     undo.opacity(0.6)
                 } else {
-                    undo.cursor_pointer()
+                    undo.tabbable_in(t.accent)
+                        .aria_description("Revert this operation")
+                        .cursor_pointer()
                         .hover(|style| style.bg(t.accent_dim))
                         .tooltip(tooltip("Revert this operation"))
                         .on_click(cx.listener(|this, _, _, cx| this.undo(cx)))
                 };
-                bar = bar.child(undo);
+                line = line.child(undo);
             }
+            bar = bar.child(line);
         } else if model.crashed {
             // The panic that ended the last session is in the log; the tabs
             // it had open are back.
             let app = self.app.clone();
             bar = bar
                 .child(dot(t.warn, 6.))
-                .child(msg("The last session ended unexpectedly.".into()))
+                .child(
+                    div()
+                        .id("crash-notice")
+                        .status("The last session ended unexpectedly.")
+                        .min_w_0()
+                        .child(msg("The last session ended unexpectedly.".into())),
+                )
                 .child(
                     div()
                         .id("crash-log")
+                        .role(Role::Button)
+                        .aria_label("Show Log")
+                        .tabbable_in(t.accent)
                         .flex_shrink_0()
                         .flex()
                         .items_center()
@@ -163,7 +192,7 @@ impl Shell {
                         .child("Show Log"),
                 )
                 .child(
-                    dismiss("crash-dismiss")
+                    dismiss("crash-dismiss", "Dismiss")
                         .tooltip(tooltip("Dismiss"))
                         .on_click(move |_, _, cx| {
                             app.update(cx, |m, cx| m.dismiss_crash_notice(cx))
@@ -235,6 +264,10 @@ impl Shell {
             let mut wrap = h_flex().flex_shrink_0().gap(px(2.)).child(
                 h_flex()
                     .id(("autoland-chip", ix))
+                    .role(Role::Button)
+                    .aria_label(label.clone())
+                    .aria_description(autoland::story(status))
+                    .tabbable_in(t.accent)
                     .gap(px(5.))
                     .h(px(18.))
                     .px(px(6.))
@@ -254,7 +287,7 @@ impl Shell {
                 let app = self.app.clone();
                 let status = status.clone();
                 wrap = wrap.child(
-                    dismiss("autoland-dismiss")
+                    dismiss("autoland-dismiss", "Dismiss")
                         .id(("autoland-dismiss", ix))
                         .tooltip(tooltip("Dismiss"))
                         .on_click(move |_, _, cx| {
@@ -272,6 +305,12 @@ impl Shell {
             let app = self.app.clone();
             let mut el = h_flex()
                 .id("app-update")
+                .role(Role::Button)
+                .aria_label(if installing {
+                    "Updating".to_owned()
+                } else {
+                    format!("Restart to update to {version}")
+                })
                 .flex_shrink_0()
                 .gap(px(4.))
                 .h(px(18.))
@@ -287,6 +326,7 @@ impl Shell {
                 });
             if !installing {
                 el = el
+                    .tabbable_in(t.accent)
                     .cursor_pointer()
                     .hover(|style| style.bg(t.accent_dim))
                     .tooltip(tooltip(format!(

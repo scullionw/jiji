@@ -33,7 +33,7 @@ use crate::logic::text::short_id;
 use crate::theme::{theme, TEXT_S, TEXT_XS};
 use crate::ui::{
     absolute_time, btn, empty_state, from_now, h_flex, icon, icon_btn, label_box, short_age,
-    tooltip, truncated, v_flex, IconName,
+    tooltip, truncated, v_flex, IconName, NodeExt as _, Tabbable as _,
 };
 
 /// Warm every step's diff once the chain is known — capped so a
@@ -490,6 +490,8 @@ impl WorkbenchView {
         let span = self.evolution.span;
         let mut strip = h_flex()
             .id("evolution-timeline")
+            .role(gpui::Role::Group)
+            .aria_label("Version timeline")
             .items_end()
             .overflow_x_scroll()
             .track_scroll(&self.evolution.timeline_scroll)
@@ -535,9 +537,17 @@ impl WorkbenchView {
                     let _ = files;
                     weight = weight.child(self.stats(added, removed, cx));
                 }
+                let rewrite = format!(
+                    "The rewrite from {} to {}",
+                    short_id(&versions[index - 1].commit_id, 8),
+                    short_id(&version.commit_id, 8)
+                );
                 strip = strip.child(
                     v_flex()
                         .id(("evolution-step", index))
+                        .role(gpui::Role::Button)
+                        .aria_label(rewrite)
+                        .aria_selected(in_span)
                         .flex_shrink_0()
                         .w(px(72.))
                         .pb(px(21.))
@@ -598,6 +608,16 @@ impl WorkbenchView {
             strip = strip.child(
                 v_flex()
                     .id(("evolution-version", index))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!(
+                        "Version {} of {count}, {}, {}",
+                        index + 1,
+                        short_id(&version.commit_id, 8),
+                        tip[1]
+                    ))
+                    .aria_description(from_now(stamp(version)))
+                    .aria_selected(endpoint)
+                    .tabbable(cx)
                     .flex_shrink_0()
                     .items_center()
                     .w(px(58.))
@@ -717,6 +737,8 @@ impl WorkbenchView {
         if let Some(error) = &self.evolution.action_error {
             caption = caption.child(
                 div()
+                    .id("evolution-action-error")
+                    .alert(error.clone())
                     .min_w(px(40.))
                     .flex_shrink_1()
                     .text_color(t.danger)
@@ -803,7 +825,10 @@ impl WorkbenchView {
             skeleton.into_any_element()
         };
         if let Some(error) = &self.evolution.error {
-            return note(error.clone(), t.warn).into_any_element();
+            return note(error.clone(), t.warn)
+                .id("evolution-error")
+                .alert(error.clone())
+                .into_any_element();
         }
         if self.evolution.evolog.is_none() {
             return skeleton();
@@ -825,7 +850,10 @@ impl WorkbenchView {
         let held = key.as_ref().and_then(|key| self.evolution.diffs.get(key));
         match held {
             None | Some(Entry::Loading) => skeleton(),
-            Some(Entry::Failed(error)) => note(error.clone(), t.warn).into_any_element(),
+            Some(Entry::Failed(error)) => note(error.clone(), t.warn)
+                .id("evolution-step-error")
+                .alert(error.clone())
+                .into_any_element(),
             Some(Entry::Ready(held)) if held.prepared.diff().files.is_empty() => {
                 let span = self.evolution.span;
                 let pair = span.and_then(|span| {

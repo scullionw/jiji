@@ -1,9 +1,13 @@
 //! The furniture of a full pane: empty states, section openings, and the
 //! plan panel that states what a consequential action will do.
 
-use gpui::{div, prelude::*, px, App, Div, Entity, FontWeight, Hsla, SharedString, Window};
+use gpui::{
+    div, prelude::*, px, App, Div, Entity, FontWeight, Hsla, Role, SharedString, Stateful, Window,
+};
 
-use super::{h_flex, icon, truncated, v_flex, Btn, IconName, Tabular as _, TextInput};
+use super::{
+    h_flex, icon, truncated, v_flex, Btn, IconName, NodeExt as _, Tabular as _, TextInput,
+};
 use crate::theme::{theme, Theme, RADIUS_M, ROW_H, TEXT_M, TEXT_S, TOOLBAR_H};
 
 /// The gutter a page's bar, bands and rows share.
@@ -143,13 +147,18 @@ pub fn page_bar_marked(
                 .child(icon(glyph, 14., hue)),
         );
     }
+    let title = title.into();
     bar = bar.child(
         div()
+            .id("page-title")
+            .role(Role::Heading)
+            .aria_level(1)
+            .aria_label(title.clone())
             .flex_shrink_0()
             .text_size(px(crate::theme::TEXT_HEAD - 1.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(t.text1)
-            .child(title.into()),
+            .child(title),
     );
     if let Some(count) = count {
         bar = bar.child(
@@ -236,16 +245,19 @@ pub fn group_head(
     head
 }
 
-/// A notice across the top of a page: what went wrong, and the way to put
-/// it away.
+/// A notice across the top of a page: what went wrong, read out as it
+/// appears, and the way to put it away.
 pub fn page_notice(
     id: &'static str,
     text: impl Into<SharedString>,
     cx: &App,
     on_dismiss: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> Div {
+) -> Stateful<Div> {
     let t = theme(cx);
+    let text = text.into();
     h_flex()
+        .id("page-notice")
+        .alert(text.clone())
         .min_h(px(ROW_H))
         .gap(px(8.))
         .py(px(5.))
@@ -360,6 +372,8 @@ pub fn plan_actions(
     if let Some(error) = error {
         row = row.child(
             div()
+                .id("plan-error")
+                .alert(error.to_owned())
                 .min_w_0()
                 .max_w(px(340.))
                 .text_size(px(crate::theme::TEXT_XS))

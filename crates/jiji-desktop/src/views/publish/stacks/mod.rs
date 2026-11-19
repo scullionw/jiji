@@ -48,7 +48,7 @@ impl PublishView {
         self.ship_loading = false;
         self.land_method = None;
         self.land_bypass = false;
-        self.more.close();
+        self.more.reset();
         if self.connected(cx) {
             match (stack.pr_count > 0, stack.head_bookmark, stack.submit_head) {
                 (true, Some(bookmark), Some(_)) => self.load_land_plan(bookmark, cx),
@@ -220,7 +220,7 @@ impl PublishView {
             return;
         };
         self.mode = Mode::Ship;
-        self.more.close();
+        self.more.reset();
         self.ship_seq += 1;
         let seq = self.ship_seq;
         self.ship_for = Some(head_change.clone());

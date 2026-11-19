@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight,
-    MouseButton, ScrollHandle, SharedString, Window,
+    MouseButton, Role, ScrollHandle, SharedString, Window,
 };
 use jiji_core::snapshot::{BookmarkState, MutationOutcome, RepoSnapshot};
 use jiji_core::{BackendError, RepoBackend};
@@ -20,12 +20,13 @@ use crate::logic::text::short_id;
 use crate::shell::topbar::checked_age_label;
 use crate::shell::Dismiss;
 use crate::theme::{theme, TEXT_S, TEXT_XS};
+use crate::ui::focus::FocusRow;
 use crate::ui::pinned;
 use crate::ui::ScrollY as _;
 use crate::ui::{
     btn, checkbox, empty_state, group_head, h_flex, page_bar_marked, page_filter, page_notice,
     scrollbar, short_age, tag, tooltip, tray, truncated, v_flex, IconName, InputEvent,
-    Tabular as _, TextInput, PAGE_PAD,
+    Tabbable as _, Tabular as _, TextInput, PAGE_PAD,
 };
 use crate::views::menu;
 
@@ -87,7 +88,9 @@ impl BookmarksView {
         let app = app(cx);
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
         let filter = cx.new(|cx| {
-            TextInput::new(window, cx).placeholder("Filter by name, author, or description")
+            TextInput::new(window, cx)
+                .placeholder("Filter by name, author, or description")
+                .label("Filter bookmarks")
         });
         cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
             if *event == InputEvent::Change {
@@ -232,6 +235,7 @@ impl BookmarksView {
                 btn("bookmarks-cleanup", format!("Clean up merged ({merged})"))
                     .icon(IconName::Trash)
                     .armed(self.cleanup_open)
+                    .expanded(self.cleanup_open)
                     .disabled(self.busy)
                     .on_click(cx.listener(move |this, _, _, cx| this.open_cleanup(&snapshot, cx))),
             );
@@ -262,6 +266,10 @@ impl BookmarksView {
         for (index, bookmark) in merged.iter().enumerate() {
             let key = bookmark_key(bookmark);
             let on = self.checked.contains(&key);
+            let shown_name = match (&bookmark.remote, bookmark.is_local) {
+                (Some(remote), false) => format!("{}@{remote}", bookmark.name),
+                _ => bookmark.name.clone(),
+            };
             let toggle = cx.listener(move |this, _, _, cx| {
                 if !this.checked.remove(&key) {
                     this.checked.insert(key.clone());
@@ -273,15 +281,18 @@ impl BookmarksView {
                     .gap(px(8.))
                     .py(px(3.))
                     .text_color(t.text1)
-                    .child(checkbox(("cleanup", index), Some(on), cx, toggle))
+                    .child(checkbox(
+                        ("cleanup", index),
+                        shown_name.clone(),
+                        Some(on),
+                        cx,
+                        toggle,
+                    ))
                     .child(
                         div()
                             .max_w(gpui::relative(0.45))
                             .font_family(t.mono.clone())
-                            .child(truncated(match (&bookmark.remote, bookmark.is_local) {
-                                (Some(remote), false) => format!("{}@{remote}", bookmark.name),
-                                _ => bookmark.name.clone(),
-                            })),
+                            .child(truncated(shown_name)),
                     )
                     .child(div().text_size(px(TEXT_XS)).text_color(t.text3).child(
                         match (bookmark.is_local, bookmark.tracked) {
@@ -304,6 +315,7 @@ impl BookmarksView {
                     .text_color(t.text2)
                     .child(checkbox(
                         "cleanup-also-remote",
+                        "Also delete tracked ones on their remote",
                         Some(self.also_remote),
                         cx,
                         cx.listener(|this, _, _, cx| {
@@ -349,6 +361,7 @@ impl BookmarksView {
         bookmark: &BookmarkState,
         snapshot: &RepoSnapshot,
         name_w: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = theme(cx);
@@ -449,23 +462,42 @@ impl BookmarksView {
                         bookmark.target_description.clone()
                     })),
             );
+        // What the row says, in the order it says it.
+        let spoken = format!(
+            "{}, {}, at {} {}",
+            bookmark.name,
+            sync_text,
+            short_id(&bookmark.target, 8),
+            if bookmark.target_description.is_empty() {
+                "(no description)"
+            } else {
+                bookmark.target_description.as_str()
+            }
+        );
         if can_jump {
             let app = self.app.clone();
             let id = bookmark.target.clone();
             ident = ident
+                .role(Role::Button)
+                .aria_label(spoken)
+                .aria_description("Show in the workbench")
+                .tabbable(cx)
                 .cursor_pointer()
                 .tooltip(tooltip("Show in the workbench"))
                 .on_click(move |_, _, cx| {
                     app.update(cx, |model, cx| model.jump_to_change(&id, cx))
                 });
         } else {
-            ident = ident.tooltip(tooltip(
+            ident = ident.role(Role::Label).aria_value(spoken).tooltip(tooltip(
                 "Not drawn in the current view — switch the workbench view to see it",
             ));
         }
 
+        let focus_row = FocusRow::new(SharedString::from(format!("bm-row-{key}")), window, cx);
         let mut row = h_flex()
             .id(SharedString::from(format!("row-{key}")))
+            .role(Role::Group)
+            .aria_label(bookmark.name.clone())
             .group(group.clone())
             .h(px(BOOKMARK_ROW_H))
             .gap(px(12.))
@@ -480,6 +512,7 @@ impl BookmarksView {
                 menu::bookmark_menu(bookmark.name.clone(), bookmark.remote.clone()),
             )
             .child(ident);
+        row = focus_row.row(row, &self.scroll, window, cx);
         if self.busy {
             row = row.opacity(0.7);
         }
@@ -543,13 +576,15 @@ impl BookmarksView {
                 .into_any_element();
         }
 
-        // Actions surface on hover, like graph-row affordances; the meta
-        // yields to them so the row never jumps. Both always hold their
-        // place in the layout — only visibility follows the pointer.
+        // Actions surface on hover, like graph-row affordances, and while
+        // Tab is among them; the meta yields to them so the row never
+        // jumps. Both always hold their place in the layout — only what
+        // shows follows the pointer and the keys.
+        let shown = focus_row.holds_focus(window, cx);
         let mut actions = h_flex()
             .gap(px(4.))
-            .invisible()
-            .group_hover(group.clone(), |style| style.visible());
+            .opacity(if shown { 1. } else { 0. })
+            .group_hover(group.clone(), |style| style.opacity(1.));
         let small = |id: &'static str, label: &'static str| {
             btn(SharedString::from(format!("{id}-{key}")), label)
                 .small()
@@ -645,6 +680,7 @@ impl BookmarksView {
             .gap(px(10.))
             .text_size(px(TEXT_XS))
             .text_color(t.text3)
+            .when(shown, |meta| meta.invisible())
             .group_hover(group, |style| style.invisible())
             .tooltip(tooltip(format!(
                 "{} · {}",
@@ -688,6 +724,7 @@ impl BookmarksView {
         .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_group(
         &self,
         label: &str,
@@ -695,6 +732,7 @@ impl BookmarksView {
         bookmarks: &[&BookmarkState],
         snapshot: &RepoSnapshot,
         name_w: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // The heading stays put while its group scrolls under it.
@@ -706,7 +744,7 @@ impl BookmarksView {
         );
         let mut group = div();
         for bookmark in bookmarks {
-            group = group.child(self.render_row(bookmark, snapshot, name_w, cx));
+            group = group.child(self.render_row(bookmark, snapshot, name_w, window, cx));
         }
         pinned(heading, group)
     }
@@ -763,6 +801,7 @@ impl Render for BookmarksView {
                 &groups.local,
                 &snapshot,
                 name_w,
+                window,
                 cx,
             ));
         }
@@ -776,6 +815,7 @@ impl Render for BookmarksView {
                 bookmarks,
                 &snapshot,
                 name_w,
+                window,
                 cx,
             ));
         }

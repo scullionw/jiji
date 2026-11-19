@@ -16,6 +16,10 @@
 //! Both need GPUI's `test-support` (offscreen rendering, frame stepping),
 //! which a shipping build must not carry: they are compiled only with this
 //! crate's `headless` feature.
+//!
+//! A third is for reading what a screen reader would: [`accessibility`]
+//! turns the window's accessibility on, as VoiceOver's first question does,
+//! and writes the tree GPUI hands AccessKit.
 
 use std::path::Path;
 
@@ -38,6 +42,71 @@ pub fn screenshot(window: &Window, path: &Path) -> Result<(), String> {
 #[cfg(not(feature = "headless"))]
 pub fn screenshot(_window: &Window, _path: &Path) -> Result<(), String> {
     Err(format!("this build cannot take screenshots: {HOW}"))
+}
+
+/// Turn on the window's accessibility, if nothing has yet, by asking its
+/// content view for its children — what an assistive app asks first, and
+/// what makes AccessKit's adapter start GPUI building the tree. In process:
+/// nothing reaches the system's accessibility clients that they did not
+/// ask for. Returns the tree the last frame built, as GPUI's own debug
+/// dump; `None` until a frame has drawn with accessibility on.
+#[cfg(feature = "headless")]
+pub fn accessibility(window: &Window) -> Option<String> {
+    if !window.is_a11y_active() {
+        wake_accessibility();
+    }
+    window.debug_a11y_tree_json()
+}
+
+#[cfg(not(feature = "headless"))]
+pub fn accessibility(_window: &Window) -> Option<String> {
+    None
+}
+
+/// `[[window contentView] accessibilityChildren]` for each of the app's
+/// windows, through the Objective-C runtime the process already links.
+#[cfg(feature = "headless")]
+fn wake_accessibility() {
+    use std::ffi::{c_char, c_void};
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    // objc_msgSend has no one signature: each call takes the method's.
+    let message = objc_msgSend as unsafe extern "C" fn();
+    // SAFETY: each of these is objc_msgSend at the signature of the methods
+    // sent through it below: an object or a count back, a count in.
+    let (send, send_at, count): (
+        unsafe extern "C" fn(Id, Sel) -> Id,
+        unsafe extern "C" fn(Id, Sel, usize) -> Id,
+        unsafe extern "C" fn(Id, Sel) -> usize,
+    ) = unsafe {
+        (
+            std::mem::transmute(message),
+            std::mem::transmute(message),
+            std::mem::transmute(message),
+        )
+    };
+    // SAFETY: AppKit messages sent on the main thread, where the script runs,
+    // to the shared application and the windows it owns.
+    unsafe {
+        let selector = |name: &std::ffi::CStr| sel_registerName(name.as_ptr());
+        let app = send(
+            objc_getClass(c"NSApplication".as_ptr()),
+            selector(c"sharedApplication"),
+        );
+        let windows = send(app, selector(c"windows"));
+        for index in 0..count(windows, selector(c"count")) {
+            let window = send_at(windows, selector(c"objectAtIndex:"), index);
+            let view = send(window, selector(c"contentView"));
+            send(view, selector(c"accessibilityChildren"));
+        }
+    }
 }
 
 /// Deliver frames to a window the display never asks for any, the way

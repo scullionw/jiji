@@ -3,9 +3,11 @@
 
 use gpui::{
     anchored, canvas, deferred, div, point, prelude::*, px, Anchor, App, Bounds, DispatchPhase,
-    Div, ElementId, FontWeight, HitboxBehavior, MouseDownEvent, SharedString, Stateful, Window,
+    Div, ElementId, FontWeight, HitboxBehavior, MouseDownEvent, Role, SharedString, Stateful,
+    Window,
 };
 
+use super::focus::{Return, Tabbable as _, Trap};
 use super::{icon, truncated, IconName};
 use crate::theme::{theme, RADIUS_L, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS};
 
@@ -45,8 +47,12 @@ pub fn menu_row(
     cx: &App,
 ) -> Stateful<Div> {
     let t = theme(cx);
+    let label = label.into();
     let mut row = div()
         .id(id)
+        .role(Role::MenuItem)
+        .aria_label(label.clone())
+        .tabbable(cx)
         .flex()
         .flex_row()
         .items_center()
@@ -64,27 +70,86 @@ pub fn menu_row(
     row.child(div().flex_1().min_w_0().child(truncated(label)))
 }
 
-/// Whether a trigger's popover is open.
-#[derive(Default)]
+/// Whether a trigger's popover is open, and the keyboard's part in it: the
+/// panel takes focus when it opens, holds Tab while open, and gives focus
+/// back to where it was — the trigger, when the keyboard opened it — when
+/// it closes.
 pub struct PopoverState {
     open: bool,
+    trap: Trap,
+    back: Return,
 }
 
 impl PopoverState {
+    pub fn new(cx: &mut App) -> Self {
+        Self {
+            open: false,
+            trap: Trap::new(cx),
+            back: Return::default(),
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }
 
-    pub fn open(&mut self) {
-        self.open = true;
+    /// Whether focus is inside the open panel.
+    #[cfg(test)]
+    pub fn holds_focus(&self, window: &Window, cx: &App) -> bool {
+        self.trap.contains_focus(window, cx)
     }
 
-    pub fn close(&mut self) {
+    pub fn open(&mut self, window: &mut Window, cx: &mut App) {
+        if self.open {
+            return;
+        }
+        self.open = true;
+        self.back.take(window, cx);
+        self.trap.focus(window, cx);
+    }
+
+    pub fn close(&mut self, window: &mut Window, cx: &mut App) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        // Focus that already moved on from the panel stays where it went.
+        if window.focused(cx).is_none() || self.trap.contains_focus(window, cx) {
+            self.back.give_back(window, cx);
+        }
+    }
+
+    /// Closed because what it was opened over went away (a refresh), not
+    /// by the user: focus inside it falls back to the view, as for any
+    /// control that leaves the screen.
+    pub fn reset(&mut self) {
         self.open = false;
     }
 
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
+    pub fn toggle(&mut self, window: &mut Window, cx: &mut App) {
+        if self.open {
+            self.close(window, cx);
+        } else {
+            self.open(window, cx);
+        }
+    }
+
+    /// The open panel as what it is — a dialog, or a menu whose arrows
+    /// step through it as Tab does — named for assistive technology and
+    /// holding Tab.
+    pub fn panel(
+        &self,
+        id: impl Into<ElementId>,
+        role: Role,
+        name: impl Into<SharedString>,
+        panel: Div,
+    ) -> Stateful<Div> {
+        let panel = panel.id(id).role(role).aria_label(name.into());
+        self.trap.hold(if role == Role::Menu {
+            panel.key_context("Menu")
+        } else {
+            panel
+        })
     }
 }
 

@@ -2,8 +2,10 @@
 //! button in a popover, a panel, and a section page are the same object.
 //! Views add layout; they don't restyle the material.
 
+pub mod a11y;
 mod button;
 mod files;
+pub mod focus;
 pub mod icon;
 pub mod input;
 mod marks;
@@ -11,6 +13,7 @@ mod page;
 mod pinned;
 mod popover;
 pub mod scroll;
+pub mod splitter;
 mod text;
 mod time;
 pub mod tooltip;
@@ -21,8 +24,10 @@ use std::sync::Arc;
 
 use gpui::{div, prelude::*, px, App, Div, FontFeatures, Hsla};
 
-pub use self::button::{btn, checkbox, icon_btn, kbd, segmented, Btn};
+pub use self::a11y::NodeExt;
+pub use self::button::{btn, checkbox, icon_btn, kbd, segmented, Btn, Segment};
 pub use self::files::{file_glyph, file_icon};
+pub use self::focus::{keyboard_on, ring, Tabbable};
 pub use self::icon::{icon, IconName};
 pub use self::input::{InputEvent, TextInput};
 pub use self::marks::{line_of, mark_for, node_mark, Mark};

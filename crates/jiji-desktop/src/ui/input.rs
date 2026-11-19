@@ -14,11 +14,12 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, Div, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     InspectorElementId, KeyBinding, KeyContext, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, SharedString, Style, TextAlign,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollEvent, SharedString, Style, TextAlign,
     TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::NodeExt as _;
 use crate::theme::{theme, RADIUS_M, TEXT_S};
 
 actions!(
@@ -143,6 +144,9 @@ pub struct TextInput {
     focus: FocusHandle,
     text: String,
     placeholder: SharedString,
+    /// What the field is for, for assistive technology, when its
+    /// placeholder or the words beside it do not say.
+    label: Option<SharedString>,
     selection: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
@@ -301,7 +305,7 @@ const MASK: &str = "•";
 
 impl TextInput {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus = cx.focus_handle();
+        let focus = cx.focus_handle().tab_stop(true);
         cx.on_blur(&focus, window, |this, _window, cx| {
             this.selecting = false;
             cx.emit(InputEvent::Blur);
@@ -313,6 +317,7 @@ impl TextInput {
             focus,
             text: String::new(),
             placeholder: SharedString::default(),
+            label: None,
             selection: 0..0,
             reversed: false,
             marked: None,
@@ -342,6 +347,11 @@ impl TextInput {
 
     pub fn placeholder(mut self, text: impl Into<SharedString>) -> Self {
         self.placeholder = text.into();
+        self
+    }
+
+    pub fn label(mut self, text: impl Into<SharedString>) -> Self {
+        self.label = Some(text.into());
         self
     }
 
@@ -1006,12 +1016,35 @@ impl Render for TextInput {
         if self.multiline {
             context.add("multiline");
         }
-        div()
+        // A disabled field is passed over by Tab, as a disabled control is.
+        let focus = self.focus.clone().tab_stop(!self.disabled);
+        let role = if self.masked {
+            Role::PasswordInput
+        } else if self.multiline {
+            Role::MultilineTextInput
+        } else {
+            Role::TextInput
+        };
+        let mut field = div().id("text-input").role(role);
+        if let Some(label) = &self.label {
+            field = field.aria_label(label.clone());
+        }
+        if !self.placeholder.is_empty() {
+            field = field.aria_placeholder(self.placeholder.clone());
+        }
+        // A key's bullets are all anyone sees; nothing reads it out.
+        if !self.masked {
+            field = field.aria_value(self.text.clone());
+        }
+        if self.disabled {
+            field = field.a11y(|node| node.set_disabled());
+        }
+        field
             .flex()
             .flex_1()
             .min_w_0()
             .key_context(context)
-            .track_focus(&self.focus)
+            .track_focus(&focus)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -1414,6 +1447,52 @@ impl Element for TextElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_field_tells_its_name_value_and_placeholder_and_keeps_a_key_to_itself(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::accesskit::{Node, Role};
+
+        let dir = crate::testing::scratch("field-node");
+        crate::testing::install(&dir, cx);
+        let window = cx.add_empty_window();
+        let (query, key) = window.update(|window, cx| {
+            let query = cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("Find a stack…")
+                    .label("Find a stack")
+                    .with_text("main")
+            });
+            let key = cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("github_pat_…")
+                    .masked()
+                    .with_text("ghp_secret")
+            });
+            (query, key)
+        });
+        window.update(|window, cx| {
+            let read = |input: &Entity<TextInput>, window: &mut Window, cx: &mut App| {
+                input.update(cx, |input, cx| {
+                    let element = input.render(window, cx).into_element();
+                    let role = element.a11y_role();
+                    let mut node = Node::new(role.unwrap_or(Role::Unknown));
+                    element.write_a11y_info(&mut node);
+                    (role, node)
+                })
+            };
+            let (role, query) = read(&query, window, cx);
+            assert_eq!(role, Some(Role::TextInput));
+            assert_eq!(query.label(), Some("Find a stack"));
+            assert_eq!(query.value(), Some("main"));
+            assert_eq!(query.placeholder(), Some("Find a stack…"));
+            let (role, key) = read(&key, window, cx);
+            assert_eq!(role, Some(Role::PasswordInput));
+            assert_eq!(key.value(), None);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn grapheme_boundaries_step_over_clusters() {

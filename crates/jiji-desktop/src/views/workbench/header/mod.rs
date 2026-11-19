@@ -25,8 +25,9 @@ use crate::logic::inspect::{
 };
 use crate::logic::split::{self, selection_ready, split_payload, split_summary, Selection};
 use crate::theme::{theme, Theme, TEXT_M, TEXT_S};
+use crate::ui::focus::Return;
 use crate::ui::ScrollY as _;
-use crate::ui::{v_flex, InputEvent, PopoverState, TextInput};
+use crate::ui::{v_flex, InputEvent, NodeExt as _, PopoverState, TextInput};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -56,7 +57,7 @@ pub(super) struct HeaderState {
     /// A mutation from this header is in flight.
     acting: bool,
     error: Option<String>,
-    editor: Entity<TextInput>,
+    pub(super) editor: Entity<TextInput>,
     draft_restored: bool,
     /// The (repo, change, description) the open editor started from.
     editing_from: Option<(String, String, String)>,
@@ -68,18 +69,20 @@ pub(super) struct HeaderState {
     pub(super) dest_hover: Option<String>,
     /// Filters whichever destination list is open.
     filter: Entity<TextInput>,
-    split: Selection,
+    pub(super) split: Selection,
     split_hunks_open: HashSet<String>,
     split_lines_open: HashSet<String>,
     split_desc: Entity<TextInput>,
     pub(super) split_into: bool,
     diverge_confirm: Option<String>,
     diverge_error: Option<String>,
-    more: PopoverState,
+    pub(super) more: PopoverState,
     files: PopoverState,
     /// A CI re-run asked from this header: PR number, in flight, outcome.
     rerun: Option<(u64, bool, Option<String>)>,
     tray_focus: FocusHandle,
+    /// Where focus goes back to when the open tray closes.
+    back: Return,
     dest_scroll: UniformListScrollHandle,
     split_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
@@ -97,16 +100,23 @@ impl HeaderState {
                 TextInput::new(window, cx)
                     .multiline(4, 12)
                     .placeholder("Summary line")
+                    .label("Description")
             }),
             draft_restored: false,
             editing_from: None,
-            bookmark_name: cx.new(|cx| TextInput::new(window, cx).placeholder("new-bookmark-name")),
-            rename: cx.new(|cx| TextInput::new(window, cx)),
+            bookmark_name: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("new-bookmark-name")
+                    .label("Bookmark name")
+            }),
+            rename: cx.new(|cx| TextInput::new(window, cx).label("Bookmark name")),
             rebase_alone: false,
             dest: None,
             dest_hover: None,
             filter: cx.new(|cx| {
-                TextInput::new(window, cx).placeholder("filter by id, title, or bookmark")
+                TextInput::new(window, cx)
+                    .placeholder("filter by id, title, or bookmark")
+                    .label("Filter changes")
             }),
             split: Selection::new(),
             split_hunks_open: HashSet::new(),
@@ -115,14 +125,16 @@ impl HeaderState {
                 TextInput::new(window, cx)
                     .multiline(2, 6)
                     .placeholder("Summary line for the carved-out change")
+                    .label("Description of the new change")
             }),
             split_into: false,
             diverge_confirm: None,
             diverge_error: None,
-            more: PopoverState::default(),
-            files: PopoverState::default(),
+            more: PopoverState::new(cx),
+            files: PopoverState::new(cx),
             rerun: None,
             tray_focus: cx.focus_handle(),
+            back: Return::default(),
             dest_scroll: UniformListScrollHandle::new(),
             split_scroll: ScrollHandle::new(),
             files_scroll: ScrollHandle::new(),
@@ -195,10 +207,11 @@ impl WorkbenchView {
         header.split_into = false;
         header.diverge_confirm = None;
         header.diverge_error = None;
-        header.more.close();
-        header.files.close();
+        header.more.close(window, cx);
+        header.files.close(window, cx);
         if had_tray {
             window.focus(&self.focus, cx);
+            self.header.back.give_back(window, cx);
         }
     }
 
@@ -228,8 +241,8 @@ impl WorkbenchView {
     /// Whether Esc has a tray (or menu) to close here.
     pub(super) fn dismiss_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.header.more.is_open() || self.header.files.is_open() {
-            self.header.more.close();
-            self.header.files.close();
+            self.header.more.close(window, cx);
+            self.header.files.close(window, cx);
             cx.notify();
             return true;
         }
@@ -250,7 +263,16 @@ impl WorkbenchView {
         self.header.error = None;
         self.header.dest_hover = None;
         window.focus(&self.focus, cx);
+        self.header.back.give_back(window, cx);
         cx.notify();
+    }
+
+    /// A tray opens: remember where focus was, unless another tray was
+    /// open — focus goes back to where the first one was opened from.
+    fn hold_return(&mut self, window: &Window, cx: &App) {
+        if self.header.tray == Tray::None {
+            self.header.back.take(window, cx);
+        }
     }
 
     /// Open a tray (or close it when it is the one already open). Trays
@@ -261,11 +283,12 @@ impl WorkbenchView {
             return;
         }
         self.keep_open_draft(cx);
+        self.hold_return(window, cx);
         let header = &mut self.header;
         header.tray = tray.clone();
         header.error = None;
-        header.more.close();
-        header.files.close();
+        header.more.close(window, cx);
+        header.files.close(window, cx);
         header.dest = None;
         header.dest_hover = None;
         header.rebase_alone = false;
@@ -326,12 +349,13 @@ impl WorkbenchView {
             .draft_for(&repo, &id, &description)
             .map(str::to_owned);
         self.keep_open_draft(cx);
+        self.hold_return(window, cx);
         self.header.draft_restored = kept.is_some();
         let text = kept.unwrap_or_else(|| description.clone());
         self.header.editing_from = Some((repo, id, description));
         self.header.tray = Tray::Edit;
         self.header.error = None;
-        self.header.more.close();
+        self.header.more.close(window, cx);
         self.header.editor.update(cx, |input, cx| {
             input.set_text(text, cx);
             input.set_disabled(false, cx);
@@ -379,6 +403,7 @@ impl WorkbenchView {
                             this.header.editing_from = None;
                             this.header.tray = Tray::None;
                             window.focus(&this.focus, cx);
+                            this.header.back.give_back(window, cx);
                         }
                     }
                     Err(error) => this.header.error = Some(error.message),
@@ -460,7 +485,7 @@ impl WorkbenchView {
 
     fn move_dest(&mut self, delta: isize, cx: &mut Context<Self>) {
         let picking = match self.header.tray {
-            Tray::Rebase => true,
+            Tray::Rebase | Tray::Compare => true,
             Tray::Split => self.header.split_into,
             _ => false,
         };
@@ -498,6 +523,12 @@ impl WorkbenchView {
             Tray::Edit if command => self.save_description(window, cx),
             Tray::Confirm(confirm) if command => self.run_confirmed(confirm, window, cx),
             Tray::Rebase => self.submit_rebase(window, cx),
+            Tray::Compare => {
+                if let Some(dest) = self.header.dest.clone() {
+                    self.set_compare(CompareMode::Change(dest), cx);
+                    self.close_tray(window, cx);
+                }
+            }
             Tray::Split if command || self.header.split_into => self.submit_split(window, cx),
             _ => {}
         }
@@ -814,11 +845,13 @@ impl WorkbenchView {
             .border_b_1()
             .border_color(t.border2)
             .child(self.render_title_bar(node, &avail, window, cx))
-            .child(self.render_meta_bar(&snapshot, node, cx));
+            .child(self.render_meta_bar(&snapshot, node, window, cx));
         if self.header.tray == Tray::None {
             if let Some(error) = &self.header.error {
                 header = header.child(
                     div()
+                        .id("header-error")
+                        .alert(error.clone())
                         .px(px(16.))
                         .py(px(8.))
                         .border_t_1()

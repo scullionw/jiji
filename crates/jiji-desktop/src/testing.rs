@@ -9,11 +9,30 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{App, Entity, TestAppContext};
+use gpui::{
+    AnyWindowHandle, App, AppContext as _, Entity, InputEvent as _, KeyUpEvent, Keystroke,
+    TestAppContext,
+};
 
 use crate::app::AppModel;
 use crate::host::Host;
 use crate::store::Store;
+
+/// Press and release each of `keys` (space-separated, as GPUI's
+/// `simulate_keystrokes` takes them) the way a keyboard does: a focused
+/// control is pressed by Space or Return on the release, which
+/// `simulate_keystrokes` never sends.
+pub fn press(window: AnyWindowHandle, keys: &str, cx: &mut TestAppContext) {
+    for key in keys.split(' ') {
+        let keystroke = Keystroke::parse_with_os(key, gpui::OperatingSystem::Mac).unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_keystroke(keystroke.clone(), cx);
+            window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
 
 /// An empty directory of the test's own, under the system's temporary
 /// folder.

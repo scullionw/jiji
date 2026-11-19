@@ -16,8 +16,11 @@ use crate::logic::palette::{
     ThemeChoice,
 };
 use crate::theme::{theme, theme_defs, Theme, RADIUS_M, TEXT_M, TEXT_S, TEXT_XS};
+use crate::ui::a11y::spoken;
 use crate::ui::ScrollY as _;
-use crate::ui::{icon, kbd, popover, scrollbar, truncated, IconName, InputEvent, TextInput};
+use crate::ui::{
+    icon, kbd, popover, scrollbar, truncated, IconName, InputEvent, NodeExt as _, TextInput,
+};
 use crate::views::workbench::VIEW_PRESETS;
 
 actions!(palette, [PaletteUp, PaletteDown, PaletteHold]);
@@ -49,7 +52,11 @@ impl Palette {
         } else {
             "Type a command…"
         };
-        let input = cx.new(|cx| TextInput::new(window, cx).placeholder(placeholder));
+        let input = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .placeholder(placeholder)
+                .label("Search commands")
+        });
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
@@ -275,6 +282,9 @@ impl Palette {
         }
         let mut row = div()
             .id(("palette-row", index))
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(spoken_item(item))
+            .aria_selected(active)
             .flex()
             .flex_row()
             .items_center()
@@ -330,6 +340,8 @@ impl Render for Palette {
 
         let mut list = div()
             .id("palette-list")
+            .role(gpui::Role::ListBox)
+            .aria_label("Commands")
             .flex()
             .flex_col()
             .flex_1()
@@ -368,7 +380,22 @@ impl Render for Palette {
             list = list.child(self.render_row(item, index, cx));
         }
 
+        // Focus stays in the field while the arrows move the highlight, so
+        // where it went is read out.
+        let highlighted = match self.items.get(self.active) {
+            Some(item) => format!(
+                "{}, {} of {}",
+                spoken_item(item),
+                self.active + 1,
+                self.items.len()
+            ),
+            None => "No matching command".to_owned(),
+        };
         let panel = popover(cx)
+            .id("palette")
+            .role(gpui::Role::Dialog)
+            .aria_label("Command palette")
+            .a11y(|node| node.set_modal())
             .key_context("Palette")
             .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.travel(-1, cx)))
             .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.travel(1, cx)))
@@ -412,7 +439,8 @@ impl Render for Palette {
                     .min_h_0()
                     .child(list)
                     .child(scrollbar("palette-scroll", &self.scroll)),
-            );
+            )
+            .child(spoken("palette-highlight", highlighted));
 
         let app = self.app.clone();
         div()
@@ -433,6 +461,21 @@ impl Render for Palette {
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .child(panel)
     }
+}
+
+/// What a command says to assistive technology: its title, then the hint
+/// beside it and its shortcut.
+fn spoken_item(item: &PaletteItem) -> String {
+    let mut text = item.title.to_string();
+    if let Some(hint) = &item.hint {
+        text.push_str(", ");
+        text.push_str(hint);
+    }
+    if let Some(keys) = &item.shortcut {
+        text.push_str(", ");
+        text.push_str(keys);
+    }
+    text
 }
 
 pub fn build(window: &mut Window, cx: &mut App) -> AnyView {
