@@ -23,6 +23,15 @@ pub fn counted(count: usize, noun: &str) -> String {
     format!("{count} {noun}{}", plural_s(count))
 }
 
+/// A file as a tooltip names it: its path, and where a rename or a copy
+/// came from.
+pub fn file_title(path: &str, from: Option<&str>) -> String {
+    match from {
+        Some(from) => format!("{from} → {path}"),
+        None => path.to_owned(),
+    }
+}
+
 /// One square of a five-block diffstat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Block {
@@ -121,6 +130,15 @@ mod tests {
             diffstat_blocks(1, 1000),
             [Added, Removed, Removed, Removed, Removed]
         );
+    }
+
+    #[test]
+    fn a_rename_is_titled_by_both_its_paths() {
+        assert_eq!(
+            file_title("src/measure.ts", Some("src/rowHeight.ts")),
+            "src/rowHeight.ts → src/measure.ts"
+        );
+        assert_eq!(file_title("b.rs", None), "b.rs");
     }
 
     #[test]

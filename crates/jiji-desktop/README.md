@@ -111,7 +111,7 @@ Under `src/`:
 | `host/` | The backend the views call: repo sessions and their watchers, the forge workflows (publish, land, ship, auto-land), the CLI launcher, editor and terminal hand-offs, licensing, updates. Blocking; views run it on the background executor. |
 | `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
-| `diff/` | The diff surface: a flat row model, tree-sitter highlighting, and one custom-painted element that windows, selects, finds and scrolls. |
+| `diff/` | The diff surface: a flat row model laid out once per diff and shared by the cache and the screen, tree-sitter highlighting, the pictures of image diffs (GPUI's decoders, and the system's ImageIO for AVIF and HEIC), and one custom-painted element that windows, selects, finds and scrolls. |
 | `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. |
 | `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings; where the window opens, and how it was left (its display, the frame it unzooms to, zoomed, full screen). |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
@@ -179,7 +179,9 @@ One look, stated once so new surfaces keep it. The tokens are in
   case, carries no further mark; the files that came, went or moved say
   so in their side's hue. A changed line has a solid edge in its side's
   hue down the gutter. A "+a −r" count closes with the five-block
-  diffstat (`ui::diffstat`), the split read before the numbers are.
+  diffstat (`ui::diffstat`), the split read before the numbers are; in
+  the file tree the diffstat stands alone, in a column of its own, and
+  the numbers are on hover.
 - **A section is a page bar and a ledger** (`ui::page_bar_marked`,
   `ui::group_head`, `ui::page_notice`, `ui::tray`): the section's mark,
   name and count on the toolbar line with the page's filter and acts,
@@ -236,6 +238,15 @@ Things this code works around, so the next change does not rediscover them:
   keeps its dirty flag to itself. A headless run steps frames by hand and
   reads the flag from `App::debug_state` (`headless::pump_frames`), so it
   draws only when the app asked — a missed `cx.notify()` stays visible.
+- **A notify during paint asks for no frame.** GPUI notes the view as
+  dirty but schedules nothing while it draws. Paint that needs the next
+  frame (a tooltip it decided to show) calls
+  `window.request_animation_frame()`; one that needs a frame later (an
+  animation's next picture) sets a timer that notifies.
+- **`ScrollHandle::scroll_to_item` places the scroller's own children.**
+  Rows inside a list inside the scroller cannot be placed, and a request
+  for an index past the last child stays pending for good: the file
+  tree's rows are the scroller's children.
 - **A scripted `scroll` is one precise delta with no touch phase** — the
   smooth-mouse case, not the trackpad one. Scroll down before scrolling
   sideways in a script; a sideways scroll fresh from launch only covers a

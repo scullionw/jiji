@@ -23,7 +23,7 @@ use gpui::{
 };
 use jiji_core::snapshot::{MutationOutcome, RepoSnapshot, SnapshotView};
 
-pub use self::diffs::{DiffCache, DiffKey};
+pub use self::diffs::{DiffCache, DiffKey, DiffRead};
 pub use self::forge::{AutoLandUi, ForgePhase, ForgeUi, UpstreamUi, UPSTREAM_INTERVALS};
 pub use self::menu::OpenMenu;
 pub use self::prefs::{CliUi, LicenseUi, ThemeMode, UpdateUi};

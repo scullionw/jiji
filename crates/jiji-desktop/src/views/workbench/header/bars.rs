@@ -11,7 +11,7 @@ use crate::logic::inspect::{
     stack_position, summary_of, sync_label, ChangeActions, CompareMode, MoveDirection,
 };
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
-use crate::logic::text::{counted, short_id};
+use crate::logic::text::{counted, file_title, short_id};
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_HEAD, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
@@ -19,6 +19,7 @@ use crate::ui::{
     popover_layer, scrollbar, tag, text_width, tooltip, truncated, v_flex, IconName, Mark,
     Tabular as _, LABEL_H,
 };
+use crate::views::workbench::diffpane::status_glyph;
 use crate::views::workbench::WorkbenchView;
 
 /// The header gives way by the diff pane's width. At or under each of
@@ -912,12 +913,7 @@ impl WorkbenchView {
         if open {
             let mut list = v_flex().p(px(4.));
             for (index, file) in files.iter().enumerate() {
-                let (glyph, hue) = match file.status {
-                    jiji_core::snapshot::FileStatus::Added => ("A", t.add_fg),
-                    jiji_core::snapshot::FileStatus::Modified => ("M", t.text3),
-                    jiji_core::snapshot::FileStatus::Removed => ("D", t.del_fg),
-                    _ => ("R", t.accent_strong),
-                };
+                let (glyph, hue) = status_glyph(file.status, &t);
                 let (dir, name) = split_path(&file.path);
                 list = list.child(
                     h_flex()
@@ -931,6 +927,12 @@ impl WorkbenchView {
                         .text_size(px(TEXT_S))
                         .cursor_pointer()
                         .hover(|style| style.bg(t.bg_hover))
+                        // The directory gives way first; the whole path, and
+                        // where a rename came from, are on hover.
+                        .tooltip(tooltip(file_title(
+                            &file.path,
+                            file.renamed_from.as_deref(),
+                        )))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.header.files.close();
                             this.jump_to_file(index, cx);

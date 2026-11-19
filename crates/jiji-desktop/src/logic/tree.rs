@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use jiji_core::snapshot::FileStatus;
 
+use super::text::file_title;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirRow {
     /// Full repo-relative prefix, no trailing slash — unique among rows
@@ -25,6 +27,8 @@ pub struct DirRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
     pub path: String,
+    /// Where a rename or a copy came from.
+    pub renamed_from: Option<String>,
     pub name: String,
     pub depth: usize,
     /// Position in the diff's file order — the scroll target.
@@ -48,11 +52,32 @@ impl TreeRow {
             TreeRow::File(file) => file.depth,
         }
     }
+
+    /// The row's key: a directory's prefix or a file's path.
+    pub fn path(&self) -> &str {
+        match self {
+            TreeRow::Dir(dir) => &dir.path,
+            TreeRow::File(file) => &file.path,
+        }
+    }
+}
+
+impl FileRow {
+    /// What the row says on hover: its whole path — a rename's both — and
+    /// the counts its diffstat stands for.
+    pub fn title(&self) -> String {
+        let title = file_title(&self.path, self.renamed_from.as_deref());
+        if self.added + self.removed == 0 {
+            return title;
+        }
+        format!("{title} · +{} −{}", self.added, self.removed)
+    }
 }
 
 /// One file as the tree needs it.
 pub struct TreeFile<'a> {
     pub path: &'a str,
+    pub renamed_from: Option<&'a str>,
     pub status: FileStatus,
     pub has_conflict: bool,
     pub added: u32,
@@ -94,6 +119,7 @@ pub fn build_tree_rows(files: &[TreeFile]) -> Vec<TreeRow> {
         }
         node.files.push(FileRow {
             path: file.path.to_owned(),
+            renamed_from: file.renamed_from.map(str::to_owned),
             name: name.to_owned(),
             depth: 0,
             index,
@@ -216,6 +242,7 @@ mod tests {
     fn file(path: &str, added: u32) -> TreeFile<'_> {
         TreeFile {
             path,
+            renamed_from: None,
             status: FileStatus::Modified,
             has_conflict: false,
             added,
@@ -262,6 +289,36 @@ mod tests {
             panic!("file row");
         };
         assert_eq!(api.index, 3);
+    }
+
+    #[test]
+    fn a_renamed_file_names_where_it_came_from_on_hover() {
+        let files = [
+            TreeFile {
+                path: "src/diff/measure.ts",
+                renamed_from: Some("src/diff/rowHeight.ts"),
+                status: FileStatus::Renamed,
+                has_conflict: false,
+                added: 1,
+                removed: 2,
+            },
+            file("src/diff/plain.ts", 0),
+        ];
+        let rows = build_tree_rows(&files);
+        let titles: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row {
+                TreeRow::File(file) => Some(file.title()),
+                TreeRow::Dir(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "src/diff/rowHeight.ts → src/diff/measure.ts · +1 −2",
+                "src/diff/plain.ts"
+            ]
+        );
     }
 
     #[test]

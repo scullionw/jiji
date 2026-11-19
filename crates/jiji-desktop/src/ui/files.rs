@@ -37,9 +37,8 @@ pub fn file_glyph(name: &str) -> (IconName, FileHue) {
         | "kts" | "rb" | "ex" | "exs" | "hs" | "ml" | "lua" => {
             (IconName::FileCode, FileHue::Native)
         }
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "icns" | "bmp" | "tiff" | "avif" => {
-            (IconName::FileImage, FileHue::Image)
-        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "icns" | "bmp" | "tif" | "tiff"
+        | "avif" | "heic" | "heif" => (IconName::FileImage, FileHue::Image),
         "lock" => (IconName::FileLock, FileHue::Muted),
         _ => (IconName::File, FileHue::Muted),
     }

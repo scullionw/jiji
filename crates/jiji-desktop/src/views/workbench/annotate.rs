@@ -19,8 +19,8 @@ use crate::diff::model::LINE_H;
 use crate::logic::text::short_id;
 use crate::theme::{theme, Theme, TEXT_S, TEXT_XS};
 use crate::ui::{
-    from_now, h_flex, icon, icon_btn, label_box, short_age, tooltip, truncated, v_flex,
-    vertical_only, wheel_first, AxisLock, IconName,
+    from_now, h_flex, icon, icon_btn, label_box, pan_scrollbar, short_age, tooltip, truncated,
+    v_flex, vertical_only, wheel_first, AxisLock, IconName,
 };
 
 const GUTTER_W: f32 = 224.;
@@ -42,7 +42,10 @@ pub(super) struct AnnotateState {
     hover: Option<u32>,
     scroll: UniformListScrollHandle,
     /// How far the code is panned sideways; every line rides one offset.
-    pan: f32,
+    pub(super) pan: f32,
+    /// The farthest it pans: the widest line's overhang past the code
+    /// column, as the last frame measured it.
+    pub(super) max_pan: f32,
     wheel: AxisLock,
 }
 
@@ -107,6 +110,15 @@ impl WorkbenchView {
             });
         })
         .detach();
+    }
+
+    /// Pan the code to `pan`, within what the widest line allows.
+    fn pan_annotate(&mut self, pan: f32, cx: &mut Context<Self>) {
+        let pan = pan.clamp(0., self.annotate.max_pan);
+        if pan != self.annotate.pan {
+            self.annotate.pan = pan;
+            cx.notify();
+        }
     }
 
     fn annotate_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -347,6 +359,7 @@ impl WorkbenchView {
                     crate::ui::text_width_in("0", &t.mono, CODE_SIZE, FontWeight::NORMAL, window);
                 let room = (self.diff_width - GUTTER_W - NUMBER_W).max(0.);
                 let max_pan = (longest as f32 * advance + CODE_PAD_R - room).max(0.);
+                self.annotate.max_pan = max_pan;
                 self.annotate.pan = self.annotate.pan.clamp(0., max_pan);
                 // A sideways gesture is taken off the list before the list
                 // spends its drift on the rows.
@@ -357,13 +370,9 @@ impl WorkbenchView {
                             return;
                         }
                         cx.stop_propagation();
-                        let pan = (this.annotate.pan - dx).clamp(0., max_pan);
-                        if pan != this.annotate.pan {
-                            this.annotate.pan = pan;
-                            cx.notify();
-                        }
+                        this.pan_annotate(this.annotate.pan - dx, cx);
                     }));
-                let mut body = v_flex().relative().flex_1().min_h_0().child(
+                let mut lines = div().relative().flex_1().min_h_0().child(
                     vertical_only(uniform_list(
                         "annotate-lines",
                         view.lines.len(),
@@ -371,10 +380,32 @@ impl WorkbenchView {
                             this.annotate_rows(range, cx)
                         }),
                     ))
+                    .debug_selector(|| "annotate-lines".into())
                     .track_scroll(&self.annotate.scroll)
-                    .flex_1()
-                    .min_h_0(),
+                    .size_full(),
                 );
+                // Without a trackpad, the thumb is the way sideways: it runs
+                // under the code column, which is all that pans.
+                if max_pan > 0. {
+                    let this = cx.entity().downgrade();
+                    lines = lines.child(
+                        div()
+                            .debug_selector(|| "annotate-pan".into())
+                            .absolute()
+                            .left(px(GUTTER_W + NUMBER_W))
+                            .right_0()
+                            .bottom_0()
+                            .child(pan_scrollbar(
+                                "annotate-pan",
+                                self.annotate.pan,
+                                max_pan,
+                                move |pan, _, cx| {
+                                    let _ = this.update(cx, |this, cx| this.pan_annotate(pan, cx));
+                                },
+                            )),
+                    );
+                }
+                let mut body = v_flex().relative().flex_1().min_h_0().child(lines);
                 if view.truncated {
                     body = body.child(
                         note(

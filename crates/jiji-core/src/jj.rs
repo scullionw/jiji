@@ -125,12 +125,12 @@ const MAX_DIFF_FILE_BYTES: usize = 1 << 20;
 const MAX_DIFF_TOTAL_LINES: isize = 20_000;
 /// Per-side cap for inlining image bytes into a diff response; a larger
 /// image still gets an entry with its metadata, just no preview.
-const MAX_IMAGE_INLINE_BYTES: usize = 8 << 20;
+pub const MAX_IMAGE_INLINE_BYTES: usize = 8 << 20;
 /// Total inlined image bytes per change across all files — the image
 /// counterpart of `MAX_DIFF_TOTAL_LINES`, keeping one response (and any
 /// cache holding it) bounded when a change carries many images. Later
 /// images keep their metadata and drop the preview.
-const MAX_IMAGE_TOTAL_BYTES: usize = 16 << 20;
+pub const MAX_IMAGE_TOTAL_BYTES: usize = 16 << 20;
 /// Unified-diff context lines, matching jj's default.
 const DIFF_CONTEXT_LINES: usize = 3;
 /// Linking bases through elided history costs ancestry checks quadratic in

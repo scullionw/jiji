@@ -16,8 +16,8 @@ use super::{ShownDiff, WorkbenchView};
 use crate::app::WorkbenchMode;
 use crate::logic::graph::{
     emphasized_stream, full_lanes_for, gutter_width, lane_of, lane_tier, rail_x,
-    resolve_focused_workstream, row_bookmarks, row_gutter_width, sync_glyph, ElisionRow,
-    GraphModel, GraphRow, LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT,
+    resolve_focused_workstream, row_bookmarks, row_gutter_width, rows_in_view, sync_glyph,
+    ElisionRow, GraphModel, GraphRow, LaneTier, NodeRow, Rail, RowDensity, ELISION_ROW_HEIGHT,
 };
 use crate::logic::inspect::summary_of;
 use crate::logic::pr::{pr_badge, pr_for_bookmark, PrTone};
@@ -1589,17 +1589,11 @@ impl WorkbenchView {
         let scroll_top: f32 = (-self.scroll.offset().y).into();
         let viewport: f32 = self.scroll.bounds().size.height.into();
         let viewport = if viewport > 0. { viewport } else { 900. };
-        // A screenful stays built above and below, so a fling reveals
-        // rows that already exist.
-        let first = tops
-            .partition_point(|top| *top <= scroll_top - viewport)
-            .saturating_sub(1);
-        let last = tops
-            .partition_point(|top| *top < scroll_top + 2. * viewport)
-            .min(model.rows.len());
+        let shown = rows_in_view(&tops, scroll_top, viewport);
+        let first = shown.start;
 
         let style = self.row_style(&model, width, &selected, emphasized, cx);
-        let rows = self.rows(&model.rows[first..last], first, &style, cx);
+        let rows = self.rows(&model.rows[shown], first, &style, cx);
         let mut list = div().relative().w_full().h(px(total));
         for (ix, row) in rows.into_iter().enumerate() {
             list = list.child(

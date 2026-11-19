@@ -662,6 +662,21 @@ pub fn node_row_height(density: RowDensity) -> f32 {
     }
 }
 
+/// The rows a graph viewport has built, given each row's top and, last,
+/// the list's height: those on screen, and one either side for the list's
+/// padding and a row the edge cuts. A scroll re-renders the pane at the
+/// offset it then paints at, so however far a fling goes in one frame it
+/// never reveals a row that frame did not build; building more costs every
+/// frame of the fling.
+pub fn rows_in_view(tops: &[f32], scroll_top: f32, viewport: f32) -> std::ops::Range<usize> {
+    let rows = tops.len().saturating_sub(1);
+    let first = tops
+        .partition_point(|top| *top <= scroll_top)
+        .saturating_sub(2);
+    let last = (tops.partition_point(|top| *top < scroll_top + viewport) + 1).min(rows);
+    first..last
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneTier {
     Full,
@@ -731,6 +746,15 @@ pub fn row_bookmarks<'a>(snapshot: &'a RepoSnapshot, row: &NodeRow) -> Vec<&'a B
 mod tests {
     use super::*;
     use jiji_core::{MockBackend, RepoBackend};
+
+    #[test]
+    fn a_viewport_builds_its_rows_and_one_either_side() {
+        let tops: Vec<f32> = (0..=100).map(|row| row as f32 * 28.).collect();
+        assert_eq!(rows_in_view(&tops, 0., 280.), 0..11);
+        // Mid-list, at an offset that cuts a row: rows 20 to 30 show.
+        assert_eq!(rows_in_view(&tops, 570., 280.), 19..32);
+        assert_eq!(rows_in_view(&tops, 2520., 280.), 89..100);
+    }
 
     fn snapshot() -> RepoSnapshot {
         let dir = std::env::temp_dir().join(format!("jiji-graph-{}", std::process::id()));

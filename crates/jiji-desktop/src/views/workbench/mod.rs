@@ -257,11 +257,17 @@ impl WorkbenchView {
         // text is kept as the change's draft, as it is on every other way
         // out of the editor.
         subscriptions.push(cx.on_release(|this, cx| this.keep_open_draft(cx)));
+        let evolution = evolution::EvolutionState::new(layout == crate::app::DiffLayout::Split, cx);
+        subscriptions.push(
+            cx.subscribe_in(&evolution.surface, window, |this, _, event, _, cx| {
+                this.on_evolution_event(event, cx)
+            }),
+        );
         let mut this = Self {
             drag: dnd::DragState::default(),
             washes: dnd::Washes::default(),
             annotate: annotate::AnnotateState::default(),
-            evolution: evolution::EvolutionState::new(layout == crate::app::DiffLayout::Split, cx),
+            evolution,
             inspector,
             surface,
             diff: diffpane::DiffState::new(
@@ -713,7 +719,7 @@ impl WorkbenchView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selection = target.selection.unwrap_or_default();
+        let selection = target.selection.clone().unwrap_or_default();
         // Only a diff read at the repository, operation and comparison on
         // screen names a file to act on. While another selection loads, or
         // after a refresh failed, the dimmed diff is an older one, and its
@@ -730,8 +736,7 @@ impl WorkbenchView {
             });
             return;
         };
-        let line = (!target.on_header && (target.old_no.is_some() || target.new_no.is_some()))
-            .then_some((target.old_no, target.new_no));
+        let line = target.line();
         // A comparison's hunks are not the change's own, and a file's
         // discard would undo the change's edits rather than the span on
         // screen: reading verbs only. Acting happens on the change's own
@@ -978,6 +983,477 @@ mod tests {
             .copied()
             .filter(|id| CHANGING.contains(id))
             .collect()
+    }
+
+    /// The mock repo planted in a window, settled with the working copy's
+    /// diff on screen.
+    fn mock_workbench(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        std::path::PathBuf,
+        gpui::Entity<AppModel>,
+        WindowHandle<Shell>,
+    ) {
+        let dir = crate::testing::scratch(name);
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        (dir, model, window)
+    }
+
+    /// `lwnouzpy`'s evolution open on its middle rewrite (`9e12ff30` →
+    /// `b7f2c9d1`), whose diff is not the change's own: the step reworked
+    /// `VirtualDiffList.svelte` and added `virtual.test.ts`.
+    fn evolution_step(
+        model: &gpui::Entity<AppModel>,
+        window: WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+    ) -> gpui::Entity<crate::diff::view::DiffSurface> {
+        model.update(cx, |model, cx| {
+            model.select_node(Some("lwnouzpy".into()), cx);
+            model.open_evolution("lwnouzpy".into(), cx);
+        });
+        cx.run_until_parked();
+        let view = workbench(window, cx);
+        view.update(cx, |view, cx| assert!(view.scrub_evolution(-1, false, cx)));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let surface = view.evolution.surface.clone();
+            let paths: Vec<String> = surface
+                .read(cx)
+                .files()
+                .iter()
+                .map(|file| file.path.to_string())
+                .collect();
+            assert!(
+                paths.iter().any(|path| path.ends_with("virtual.test.ts")),
+                "{paths:?}"
+            );
+            surface
+        })
+    }
+
+    /// Choose an Edit menu item the way the menu bar does: it is offered
+    /// when the focused view answers it, and choosing it dispatches it
+    /// there. False when the item would be greyed out.
+    fn choose(action: &dyn gpui::Action, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            let offered = cx.is_action_available(action);
+            if offered {
+                cx.dispatch_action(action);
+            }
+            offered
+        })
+    }
+
+    /// Give `surface` the keys in the key window, the one the menu bar
+    /// acts on.
+    fn focus(
+        window: WindowHandle<Shell>,
+        surface: &gpui::Entity<crate::diff::view::DiffSurface>,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                window.focus(&gpui::Focusable::focus_handle(surface.read(cx), cx), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Edit ▸ Select All, then Edit ▸ Copy, on a focused diff that shows
+    /// `line`.
+    fn select_all_and_copy(
+        window: WindowHandle<Shell>,
+        surface: &gpui::Entity<crate::diff::view::DiffSurface>,
+        line: &str,
+        cx: &mut TestAppContext,
+    ) {
+        use crate::ui::input::{Copy, SelectAll};
+        focus(window, surface, cx);
+        // Nothing is selected yet: Copy is greyed out.
+        assert!(!choose(&Copy, cx));
+        assert!(choose(&SelectAll, cx));
+        let all = surface
+            .read_with(cx, |surface, _| surface.selected_text())
+            .expect("Select All selects the diff");
+        assert!(all.contains(line), "{all}");
+        assert!(choose(&Copy, cx));
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some(all.as_str()));
+    }
+
+    /// The menu on screen, item for item: what each says and does, what it
+    /// acts on, and whether it is on offer.
+    fn sections(
+        model: &gpui::Entity<AppModel>,
+        cx: &mut TestAppContext,
+    ) -> Vec<crate::logic::menu::MenuSection> {
+        model.read_with(cx, |model, _| {
+            model
+                .menu
+                .as_ref()
+                .map(|menu| menu.sections.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Right-click a file's row in the tree, and read back the menu.
+    fn tree_menu(
+        model: &gpui::Entity<AppModel>,
+        window: WindowHandle<Shell>,
+        path: &str,
+        cx: &mut TestAppContext,
+    ) -> Vec<crate::logic::menu::MenuSection> {
+        model.update(cx, |model, cx| model.close_menu(cx));
+        let view = workbench(window, cx);
+        let index = view
+            .read_with(cx, |view, cx| {
+                let files = view.surface.read(cx).files();
+                files.iter().position(|file| file.path.as_ref() == path)
+            })
+            .unwrap_or_else(|| panic!("{path} is in the tree"));
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_tree_menu(index, point(px(120.), px(300.)), window, cx)
+                })
+            })
+            .unwrap();
+        sections(model, cx)
+    }
+
+    #[gpui::test]
+    fn a_file_in_the_tree_offers_what_its_diff_header_offers(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("tree-menu", cx);
+        let working = model.read_with(cx, |model, _| {
+            model.snapshot().unwrap().working_copy.clone()
+        });
+        for (change, path) in [
+            // Modified, in the working copy.
+            (working.as_str(), VIEWPORT),
+            // Removed.
+            ("mvkortsq", "src/lib/components/diff/rowHeightCache.ts"),
+            // Conflicted.
+            ("pmwzqkvt", CONFLICTED),
+            // In an immutable change.
+            ("uvkmrtpz", "CHANGELOG.md"),
+        ] {
+            model.update(cx, |model, cx| model.select_node(Some(change.into()), cx));
+            cx.run_until_parked();
+            menu_for(&model, window, on_header(path), cx);
+            let header = sections(&model, cx);
+            let tree = tree_menu(&model, window, path, cx);
+            assert!(
+                tree.iter().flatten().any(|item| item.id == "diff.copyPath"),
+                "{path}"
+            );
+            assert_eq!(tree, header, "{path}");
+        }
+
+        // While another change's diff loads (one not read before), the
+        // tree's rows are the old diff's, and offer what its dimmed header
+        // does: nothing to change.
+        model.update(cx, |model, cx| {
+            model.select_node(Some("toznkvpq".into()), cx)
+        });
+        let loading = tree_menu(&model, window, "CHANGELOG.md", cx);
+        assert!(
+            loading
+                .iter()
+                .flatten()
+                .all(|item| !item.id.starts_with("diff.")),
+            "{loading:?}"
+        );
+        menu_for(&model, window, on_header("CHANGELOG.md"), cx);
+        assert_eq!(loading, sections(&model, cx));
+        cx.run_until_parked();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Whether the tree row for `key` lies wholly inside the tree's
+    /// viewport on the last frame.
+    fn tree_row_in_view(
+        view: &gpui::Entity<super::WorkbenchView>,
+        key: &str,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        view.read_with(cx, |view, _| {
+            let rows = crate::logic::tree::visible_tree_rows(
+                &view.diff.tree_rows,
+                &view.diff.tree_collapsed,
+            );
+            let index = rows
+                .iter()
+                .position(|row| row.path() == key)
+                .unwrap_or_else(|| panic!("{key} is a visible row"));
+            let scroll = &view.diff.tree_scroll;
+            let (row, viewport) = (scroll.bounds_for_item(index).unwrap(), scroll.bounds());
+            let top = row.top() + scroll.offset().y;
+            top >= viewport.top() && top + row.size.height <= viewport.bottom()
+        })
+    }
+
+    #[gpui::test]
+    fn the_tree_keeps_the_file_being_read_and_the_keyboard_in_view(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("tree-in-view");
+        let model = crate::testing::install(&dir, cx);
+        let repo = crate::testing::jj_repo(&dir, "wide");
+        // Sixty new files in two folders: a tree taller than its pane.
+        for folder in ["alpha", "omega"] {
+            std::fs::create_dir_all(Path::new(&repo).join(folder)).unwrap();
+            for n in 0..30 {
+                let file = Path::new(&repo)
+                    .join(folder)
+                    .join(format!("file{n:02}.txt"));
+                std::fs::write(file, "a line\n").unwrap();
+            }
+        }
+        let window = cx.add_window(Shell::new);
+        model.update(cx, |model, cx| model.open_repo_at(repo.clone(), cx));
+        cx.run_until_parked();
+        let view = workbench(window, cx);
+        let surface = view.read_with(cx, |view, _| view.surface.clone());
+        assert!(!tree_row_in_view(&view, "omega/file29.txt", cx));
+
+        // The file being read: the diff scrolled to its end.
+        let read = |cx: &mut TestAppContext| {
+            view.read_with(cx, |view, cx| {
+                let path = view.surface.read(cx).files()[view.diff.active_file]
+                    .path
+                    .clone();
+                let rows = &view.diff.tree_rows;
+                crate::logic::tree::active_row_key(rows, &view.diff.tree_collapsed, &path)
+                    .to_owned()
+            })
+        };
+        let to_end = |cx: &mut TestAppContext| {
+            surface.update(cx, |surface, cx| surface.scroll_to(0., cx));
+            cx.run_until_parked();
+            surface.update(cx, |surface, cx| surface.scroll_to(f32::MAX, cx));
+            cx.run_until_parked();
+        };
+        let keys = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    let focus = view.read(cx).diff.tree_focus.clone();
+                    window.focus(&focus, cx);
+                })
+                .unwrap();
+            cx.simulate_keystrokes(window.into(), "end");
+            let last = view.read_with(cx, |view, _| view.diff.tree_cursor.clone().unwrap());
+            assert!(tree_row_in_view(&view, &last, cx), "{last} after End");
+            cx.simulate_keystrokes(window.into(), "home");
+            assert!(tree_row_in_view(&view, "alpha", cx), "alpha after Home");
+        };
+
+        to_end(cx);
+        let reading = read(cx);
+        assert!(reading.starts_with("omega/"), "{reading}");
+        assert!(tree_row_in_view(&view, &reading, cx), "{reading}");
+        keys(cx);
+
+        // Folded, the directory stands in for the file being read, and is
+        // the row brought into view.
+        view.update(cx, |view, cx| {
+            view.diff.tree_collapsed.insert("omega".into());
+            cx.notify();
+        });
+        to_end(cx);
+        assert_eq!(read(cx), "omega");
+        assert!(tree_row_in_view(&view, "omega", cx));
+        keys(cx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_diff_seen_before_is_back_on_screen_in_the_same_frame(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("warm-diff", cx);
+        let paths = |cx: &mut TestAppContext| {
+            workbench(window, cx).read_with(cx, |view, cx| {
+                let files = view.surface.read(cx).files();
+                files
+                    .iter()
+                    .map(|file| file.path.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        model.update(cx, |model, cx| {
+            model.select_node(Some("mvkortsq".into()), cx)
+        });
+        cx.run_until_parked();
+        let measured = paths(cx);
+        model.update(cx, |model, cx| {
+            model.select_node(Some("pmwzqkvt".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_ne!(paths(cx), measured);
+
+        // Nothing runs between the click and the next frame: the cached
+        // diff is on the surface already, fresh, and nothing dims.
+        model.update(cx, |model, cx| {
+            model.select_node(Some("mvkortsq".into()), cx)
+        });
+        assert_eq!(paths(cx), measured);
+        workbench(window, cx).read_with(cx, |view, _| assert!(view.diff.fresh()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Right-click the evolution's diff over `target`, and read back the
+    /// menu.
+    fn evolution_menu(
+        model: &gpui::Entity<AppModel>,
+        surface: &gpui::Entity<crate::diff::view::DiffSurface>,
+        target: DiffTarget,
+        cx: &mut TestAppContext,
+    ) -> Vec<crate::logic::menu::MenuSection> {
+        model.update(cx, |model, cx| model.close_menu(cx));
+        surface.update(cx, |_, cx| {
+            cx.emit(DiffEvent::Context {
+                position: point(px(900.), px(300.)),
+                target,
+            })
+        });
+        sections(model, cx)
+    }
+
+    /// Choose a menu item by its id, as a click on it would, and read the
+    /// clipboard it filled.
+    fn copied(
+        model: &gpui::Entity<AppModel>,
+        menu: &[crate::logic::menu::MenuSection],
+        id: &str,
+        cx: &mut TestAppContext,
+    ) -> String {
+        let item = menu
+            .iter()
+            .flatten()
+            .find(|item| item.id == id)
+            .unwrap_or_else(|| panic!("{id} is on offer"));
+        let action = item.action.clone().expect("a copy acts");
+        model.update(cx, |model, cx| model.run_action(action, cx));
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("copied text")
+    }
+
+    #[gpui::test]
+    fn the_evolution_diff_offers_its_version_to_read_and_nothing_to_change(
+        cx: &mut TestAppContext,
+    ) {
+        const LIST: &str = "src/lib/components/diff/VirtualDiffList.svelte";
+        let (dir, model, window) = mock_workbench("evolution-menu", cx);
+        let surface = evolution_step(&model, window, cx);
+        // The step's first added line, in the file it reworked.
+        let on_added = DiffTarget {
+            path: Some(LIST.into()),
+            new_no: Some(3),
+            ..DiffTarget::default()
+        };
+        let menu = evolution_menu(&model, &surface, on_added.clone(), cx);
+        let ids: Vec<&str> = menu.iter().flatten().map(|item| item.id).collect();
+        assert!(changing(&ids).is_empty(), "{ids:?}");
+
+        let step = "--- a/src/lib/components/diff/VirtualDiffList.svelte\n\
+                    +++ b/src/lib/components/diff/VirtualDiffList.svelte\n\
+                    @@ -2,2 +2,3 @@\n   let { files, viewport } = $props();\n\
+                    -  const rows = $derived(files.flatMap(fileRows));\n\
+                    +  const rows = $derived(files.flatMap(fileRows).slice(range.first, range.last + 1));\n\
+                    +  const range = $derived(visibleRange(viewport, rows.length));\n";
+        assert_eq!(copied(&model, &menu, "diff.copyHunk", cx), step);
+        // The file as that version changed it, not as the change adds it
+        // today (whole, from /dev/null).
+        assert_eq!(copied(&model, &menu, "diff.copyFilePatch", cx), step);
+        assert_eq!(copied(&model, &menu, "diff.copyPath", cx), LIST);
+
+        // Widened, the span's diff has yet to arrive: the surface still
+        // holds the step's, and names no file until it does.
+        let view = workbench(window, cx);
+        view.update(cx, |view, cx| assert!(view.scrub_evolution(-1, true, cx)));
+        let loading = evolution_menu(&model, &surface, on_added.clone(), cx);
+        assert!(
+            loading
+                .iter()
+                .flatten()
+                .all(|item| !item.id.starts_with("diff.")),
+            "{loading:?}"
+        );
+        cx.run_until_parked();
+        let widened = evolution_menu(&model, &surface, on_added, cx);
+        assert!(widened
+            .iter()
+            .flatten()
+            .any(|item| item.id == "diff.copyFilePatch"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn annotate_reaches_its_last_column_by_a_dragged_thumb(cx: &mut TestAppContext) {
+        use gpui::{size, Modifiers, MouseButton, VisualTestContext};
+        let dir = crate::testing::scratch("annotate-pan");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        let working = snapshot.working_copy.clone();
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        // A pane narrow enough that the file's lines outrun its code column.
+        let window = cx.open_window(size(px(900.), px(700.)), Shell::new);
+        model.update(cx, |model, cx| {
+            model.open_annotate(working, VIEWPORT.into(), cx)
+        });
+        cx.run_until_parked();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let track = cx
+            .debug_bounds("annotate-pan")
+            .expect("the thumb is there when the lines outrun the pane");
+
+        // Grab the thumb at rest, at the track's left end, and drag it past
+        // the right end, the way a mouse would.
+        let at = point(track.left() + px(6.), track.center().y);
+        let none = Modifiers::none();
+        cx.simulate_mouse_move(at, None, none);
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_move(
+            point(track.right() + px(60.), at.y),
+            MouseButton::Left,
+            none,
+        );
+        cx.simulate_mouse_up(
+            point(track.right() + px(60.), at.y),
+            MouseButton::Left,
+            none,
+        );
+        let (pan, max) = workbench(window, &mut cx)
+            .read_with(&cx, |view, _| (view.annotate.pan, view.annotate.max_pan));
+        assert!(max > 0. && pan == max, "panned {pan} of {max}");
+
+        // The origins do not pan: the first line's still takes the graph to
+        // the change it came from.
+        let lines = cx.debug_bounds("annotate-lines").unwrap();
+        cx.simulate_click(point(lines.left() + px(40.), lines.top() + px(9.)), none);
+        model.read_with(&cx, |model, _| {
+            assert_eq!(model.ui().selected_node.as_deref(), Some("nzpwlxvr"));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn edit_copy_and_select_all_reach_a_focused_diff(cx: &mut TestAppContext) {
+        let (dir, model, window) = mock_workbench("edit-menu-diff", cx);
+        let main = workbench(window, cx).read_with(cx, |view, _| view.surface.clone());
+        select_all_and_copy(window, &main, "rows.slice", cx);
+
+        let evolution = evolution_step(&model, window, cx);
+        select_all_and_copy(
+            window,
+            &evolution,
+            "visibleRange(viewport, rows.length)",
+            cx,
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

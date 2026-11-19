@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, AnyElement, Bounds, Context, CursorStyle, Entity, Focusable, FontWeight,
-    MouseButton, MouseMoveEvent, Pixels, ScrollHandle, SharedString, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, ScrollHandle, SharedString, Window,
 };
 use jiji_core::snapshot::{ChangeDiff, FileStatus};
 
 use super::{ShownDiff, WorkbenchView};
-use crate::app::{DiffKey, DiffLayout, UiIntent};
-use crate::diff::view::{DiffEvent, ResolveOffer};
+use crate::app::{DiffKey, DiffLayout, DiffRead, UiIntent};
+use crate::diff::model::Prepared;
+use crate::diff::view::{DiffEvent, DiffTarget, ResolveOffer};
 use crate::logic::conflicts::{can_resolve, merge_tool_label};
 use crate::logic::inspect::{range_compare_from, resolve_compare_from, CompareMode};
 use crate::logic::text::short_id;
@@ -24,13 +25,16 @@ use crate::logic::tree::{active_row_key, build_tree_rows, visible_tree_rows, Tre
 use crate::theme::{theme, Theme, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
 use crate::ui::{
-    bounds_probe, empty_state, h_flex, icon, icon_btn, lead_bar, popover, scrollbar, segmented,
-    tooltip, truncated, v_flex, IconName, InputEvent, TextInput,
+    bounds_probe, diffstat, empty_state, h_flex, icon, icon_btn, lead_bar, popover, scrollbar,
+    segmented, tooltip, truncated, v_flex, IconName, InputEvent, TextInput,
 };
 
 const TREE_MIN: f32 = 160.;
 const TREE_MAX: f32 = 400.;
 const TREE_INITIAL: f32 = 220.;
+const TREE_ROW_H: f32 = 26.;
+/// Five seven-point blocks and their four gaps (`ui::diffstat`).
+const DIFFSTAT_W: f32 = 41.;
 
 gpui::actions!(
     file_tree,
@@ -83,13 +87,15 @@ pub(super) struct DiffState {
     pub(super) tree_on: bool,
     tree_width: f32,
     tree_resizing: bool,
-    tree_rows: Rc<Vec<TreeRow>>,
-    tree_collapsed: HashSet<String>,
-    tree_scroll: ScrollHandle,
-    tree_focus: gpui::FocusHandle,
+    pub(super) tree_rows: Rc<Vec<TreeRow>>,
+    pub(super) tree_collapsed: HashSet<String>,
+    pub(super) tree_scroll: ScrollHandle,
+    pub(super) tree_focus: gpui::FocusHandle,
     /// The row keyboard travel is on (a directory's or a file's path).
-    tree_cursor: Option<String>,
-    active_file: usize,
+    pub(super) tree_cursor: Option<String>,
+    /// The row last brought into view for the file being read.
+    tree_revealed: Option<String>,
+    pub(super) active_file: usize,
     find_open: bool,
     find_input: Entity<TextInput>,
     resolve_error: Option<String>,
@@ -109,6 +115,7 @@ impl DiffState {
         Self {
             tree_focus,
             tree_cursor: None,
+            tree_revealed: None,
             want: None,
             loaded: None,
             error: None,
@@ -145,7 +152,7 @@ impl DiffState {
     }
 }
 
-fn status_glyph(status: FileStatus, theme: &Theme) -> (&'static str, gpui::Hsla) {
+pub(super) fn status_glyph(status: FileStatus, theme: &Theme) -> (&'static str, gpui::Hsla) {
     match status {
         FileStatus::Added => ("A", theme.add_fg),
         // The usual case stays quiet; color marks the files that came or
@@ -303,6 +310,17 @@ impl WorkbenchView {
         let seq = self.diff.seq;
         self.diff.error = None;
         self.diff.slow = false;
+        let read = self
+            .app
+            .update(cx, |model, cx| model.fetch_diff(key.clone(), cx));
+        let pending = match read {
+            // Read and laid out before: on screen in this same frame.
+            DiffRead::Ready(prepared) => {
+                self.show_diff(key, prepared, cx);
+                return;
+            }
+            DiffRead::Pending(pending) => pending,
+        };
         let stale = self
             .diff
             .loaded
@@ -310,9 +328,6 @@ impl WorkbenchView {
             .is_some_and(|(loaded, _)| *loaded != key);
         self.surface
             .update(cx, |surface, cx| surface.set_stale(stale, cx));
-        let fetch = self
-            .app
-            .update(cx, |model, cx| model.fetch_diff(key.clone(), cx));
         // The skeleton appears only when the fetch outlasts this beat, so
         // it never flashes on a fast switch.
         cx.spawn(async move |this, cx| {
@@ -328,45 +343,54 @@ impl WorkbenchView {
         })
         .detach();
         cx.spawn(async move |this, cx| {
-            let result = fetch.await;
+            let result = pending.await;
             let _ = this.update(cx, |this, cx| {
                 if this.diff.seq != seq {
                     return;
                 }
                 this.diff.slow = false;
                 match result {
-                    Ok((diff, doc)) => {
-                        // A refetch of the same comparison (a new operation
-                        // landed) keeps the reader's place.
-                        let keep = this
-                            .diff
-                            .loaded
-                            .as_ref()
-                            .is_some_and(|(loaded, _)| loaded.same_comparison(&key));
-                        this.surface.update(cx, |surface, cx| {
-                            surface.set_doc(doc, keep, cx);
-                            surface.set_stale(false, cx);
-                        });
-                        if !keep {
-                            this.diff.tree_collapsed.clear();
-                            this.diff.active_file = 0;
-                        }
-                        this.shown = Some(ShownDiff {
-                            id: diff.id.clone(),
-                            from: diff.from.clone(),
-                        });
-                        this.diff.loaded = Some((key, diff));
-                        this.rebuild_tree(cx);
-                        this.refind(cx);
-                        this.sync_resolve_offer(cx);
-                        this.prefetch_neighbors(cx);
-                    }
+                    Ok(prepared) => this.show_diff(key, prepared, cx),
                     Err(error) => this.diff.error = Some(error.message),
                 }
                 cx.notify();
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Put a diff the selection asked for on the surface.
+    fn show_diff(&mut self, key: DiffKey, prepared: Prepared, cx: &mut Context<Self>) {
+        // A refetch of the same comparison (a new operation landed) keeps
+        // the reader's place.
+        let keep = self
+            .diff
+            .loaded
+            .as_ref()
+            .is_some_and(|(loaded, _)| loaded.same_comparison(&key));
+        self.surface.update(cx, |surface, cx| {
+            surface.set_doc(&prepared, keep, cx);
+            surface.set_stale(false, cx);
+        });
+        if !keep {
+            // Another comparison is another tree: folds and place start
+            // over.
+            self.diff.tree_collapsed.clear();
+            self.diff.tree_scroll.set_offset(gpui::Point::default());
+            self.diff.tree_revealed = None;
+            self.diff.active_file = 0;
+        }
+        let diff = prepared.diff().clone();
+        self.shown = Some(ShownDiff {
+            id: diff.id.clone(),
+            from: diff.from.clone(),
+        });
+        self.diff.loaded = Some((key, diff));
+        self.rebuild_tree(cx);
+        self.refind(cx);
+        self.sync_resolve_offer(cx);
+        self.prefetch_neighbors(cx);
         cx.notify();
     }
 
@@ -420,6 +444,7 @@ impl WorkbenchView {
             .iter()
             .map(|file| TreeFile {
                 path: &file.path,
+                renamed_from: file.renamed_from.as_deref(),
                 status: file.status,
                 has_conflict: file.has_conflict,
                 added: file.added,
@@ -727,10 +752,6 @@ impl WorkbenchView {
         if visible.is_empty() {
             return;
         }
-        let key_of = |row: &TreeRow| match row {
-            TreeRow::Dir(dir) => dir.path.clone(),
-            TreeRow::File(file) => file.path.clone(),
-        };
         // Travel starts from the cursor, else from the file being read.
         let start = self.diff.tree_cursor.clone().unwrap_or_else(|| {
             let active = self
@@ -744,7 +765,7 @@ impl WorkbenchView {
         });
         let index = visible
             .iter()
-            .position(|row| key_of(row) == start)
+            .position(|row| row.path() == start)
             .unwrap_or(0);
         let last = visible.len() - 1;
         let row = visible[index];
@@ -790,9 +811,34 @@ impl WorkbenchView {
                 }
             },
         };
-        self.diff.tree_cursor = Some(key_of(visible[target]));
+        self.diff.tree_cursor = Some(visible[target].path().to_owned());
         self.diff.tree_scroll.scroll_to_item(target);
         cx.notify();
+    }
+
+    /// A file row's right-click: the menu its diff header offers, through
+    /// the same door — so its actions, what they act on and whether they
+    /// are on offer while another diff loads are the header's.
+    pub(super) fn open_tree_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .surface
+            .read(cx)
+            .files()
+            .get(index)
+            .map(|file| file.path.to_string());
+        let target = DiffTarget {
+            file: Some(index),
+            path,
+            on_header: true,
+            ..DiffTarget::default()
+        };
+        self.open_diff_menu(position, target, window, cx);
     }
 
     fn render_tree(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -806,20 +852,52 @@ impl WorkbenchView {
             .map(|file| file.path.to_string())
             .unwrap_or_default();
         let active = active_row_key(&rows, &self.diff.tree_collapsed, &active_path).to_owned();
+        let visible = visible_tree_rows(&rows, &self.diff.tree_collapsed);
+        // The row standing for the file being read comes into view whenever
+        // it changes: the diff scrolled on, or a fold made a directory
+        // stand in for it. The scroller places it once this frame is laid
+        // out.
+        if self.diff.tree_revealed.as_deref() != Some(active.as_str()) {
+            if let Some(ix) = visible.iter().position(|row| row.path() == active) {
+                self.diff.tree_scroll.scroll_to_item(ix);
+            }
+            self.diff.tree_revealed = Some(active.clone());
+        }
         // The keyboard's place shows only while the tree has the keys.
         let cursor = self
             .diff
             .tree_cursor
             .clone()
             .filter(|_| self.diff.tree_focus.is_focused(window));
-        let stat = |sign: &str, count: u32, color: gpui::Hsla| {
-            (count > 0).then(|| div().text_color(color).child(format!("{sign}{count}")))
+        // Counts close each row as the five-block diffstat, in a column of
+        // its own so names keep one width; the numbers are in the tooltip.
+        let stat = |added: u32, removed: u32| {
+            div()
+                .w(px(DIFFSTAT_W))
+                .flex_shrink_0()
+                .when(added + removed > 0, |el| {
+                    el.child(diffstat(added, removed, cx))
+                })
         };
-        let mut list = v_flex().pt(px(4.)).pb(px(24.));
-        for (ix, row) in visible_tree_rows(&rows, &self.diff.tree_collapsed)
-            .into_iter()
-            .enumerate()
-        {
+        let mut tree = div()
+            .id("file-tree")
+            .key_context("FileTree")
+            .track_focus(&self.diff.tree_focus)
+            .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.tree_key(TreeKey::Down, cx)))
+            .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.tree_key(TreeKey::Up, cx)))
+            .on_action(cx.listener(|this, _: &TreeHome, _, cx| this.tree_key(TreeKey::Home, cx)))
+            .on_action(cx.listener(|this, _: &TreeEnd, _, cx| this.tree_key(TreeKey::End, cx)))
+            .on_action(cx.listener(|this, _: &TreeLeft, _, cx| this.tree_key(TreeKey::Left, cx)))
+            .on_action(cx.listener(|this, _: &TreeRight, _, cx| this.tree_key(TreeKey::Right, cx)))
+            .on_action(
+                cx.listener(|this, _: &TreeActivate, _, cx| this.tree_key(TreeKey::Activate, cx)),
+            )
+            .size_full()
+            .pt(px(4.))
+            .pb(px(24.))
+            .scroll_y()
+            .track_scroll(&self.diff.tree_scroll);
+        for (ix, row) in visible.into_iter().enumerate() {
             let depth = row.depth();
             let mut guides = h_flex().flex_shrink_0().h_full();
             for _ in 0..depth {
@@ -835,12 +913,13 @@ impl WorkbenchView {
                 );
             }
             // Rows run edge to edge, like the graph's: the one on screen
-            // takes the selection fill and the leading bar.
+            // takes the selection fill and the leading bar. Each is a child
+            // of the scroller, which is what lets it scroll a row into view.
             let base = h_flex()
                 .id(("tree-row", ix))
                 .relative()
                 .w_full()
-                .h(px(26.))
+                .h(px(TREE_ROW_H))
                 .pl(px(8.))
                 .pr(px(10.))
                 .text_size(px(TEXT_M))
@@ -882,12 +961,12 @@ impl WorkbenchView {
                             h_flex()
                                 .flex_shrink_0()
                                 .pl(px(8.))
-                                .gap(px(6.))
+                                .gap(px(8.))
                                 .font_family(t.mono.clone())
                                 .text_size(px(TEXT_XS))
-                                .child(div().text_color(t.text3).child(dir.file_count.to_string()))
-                                .children(stat("+", dir.added, t.add_fg))
-                                .children(stat("−", dir.removed, t.del_fg)),
+                                .text_color(t.text3)
+                                .child(dir.file_count.to_string())
+                                .child(stat(dir.added, dir.removed)),
                         );
                     }
                     let el = if cursor.as_deref() == Some(dir.path.as_str()) {
@@ -905,13 +984,16 @@ impl WorkbenchView {
                     let (glyph, hue) = status_glyph(file.status, &t);
                     let index = file.index;
                     let gone = file.status == FileStatus::Removed;
-                    let mut title = file.path.clone();
-                    if file.added > 0 || file.removed > 0 {
-                        title.push_str(&format!(" · +{} −{}", file.added, file.removed));
-                    }
                     let mut el = base
-                        .tooltip(tooltip(title))
+                        .tooltip(tooltip(file.title()))
                         .on_click(cx.listener(move |this, _, _, cx| this.jump_to_file(index, cx)))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_tree_menu(index, event.position, window, cx);
+                            }),
+                        )
                         .child(
                             // The file's kind in its language's hue, in the
                             // chevron's cell so names align with folders.
@@ -932,20 +1014,24 @@ impl WorkbenchView {
                     if file.has_conflict {
                         el = el.child(div().ml(px(6.)).child(crate::ui::dot(t.danger, 5.)));
                     }
-                    // What came, went or moved says so at the row's end; the
-                    // usual modified file carries no mark.
-                    if file.status != FileStatus::Modified {
-                        el = el.child(div().flex_1()).child(
-                            div()
-                                .flex_shrink_0()
-                                .pl(px(8.))
-                                .font_family(t.mono.clone())
-                                .text_size(px(TEXT_XS))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hue)
-                                .child(glyph),
-                        );
-                    }
+                    // What came, went or moved says so before the counts;
+                    // the usual modified file carries no mark.
+                    let mark = (file.status != FileStatus::Modified).then(|| {
+                        div()
+                            .font_family(t.mono.clone())
+                            .text_size(px(TEXT_XS))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hue)
+                            .child(glyph)
+                    });
+                    el = el.child(div().flex_1()).child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .pl(px(8.))
+                            .gap(px(8.))
+                            .children(mark)
+                            .child(stat(file.added, file.removed)),
+                    );
                     let el = if cursor.as_deref() == Some(file.path.as_str()) {
                         el.border_1().border_color(t.accent)
                     } else {
@@ -959,57 +1045,20 @@ impl WorkbenchView {
                 }
             };
             // A press anywhere on a row hands the tree the keys.
-            let (focus, key) = (
-                self.diff.tree_focus.clone(),
-                match row {
-                    TreeRow::Dir(dir) => dir.path.clone(),
-                    TreeRow::File(file) => file.path.clone(),
-                },
-            );
-            let el = el.on_mouse_down(
+            let (focus, key) = (self.diff.tree_focus.clone(), row.path().to_owned());
+            tree = tree.child(el.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     window.focus(&focus, cx);
                     this.diff.tree_cursor = Some(key.clone());
                     cx.notify();
                 }),
-            );
-            list = list.child(el);
+            ));
         }
         div()
             .relative()
             .size_full()
-            .child(
-                div()
-                    .id("file-tree")
-                    .key_context("FileTree")
-                    .track_focus(&self.diff.tree_focus)
-                    .on_action(
-                        cx.listener(|this, _: &TreeDown, _, cx| this.tree_key(TreeKey::Down, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeUp, _, cx| this.tree_key(TreeKey::Up, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeHome, _, cx| this.tree_key(TreeKey::Home, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeEnd, _, cx| this.tree_key(TreeKey::End, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeLeft, _, cx| this.tree_key(TreeKey::Left, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeRight, _, cx| this.tree_key(TreeKey::Right, cx)),
-                    )
-                    .on_action(cx.listener(|this, _: &TreeActivate, _, cx| {
-                        this.tree_key(TreeKey::Activate, cx)
-                    }))
-                    .size_full()
-                    .scroll_y()
-                    .track_scroll(&self.diff.tree_scroll)
-                    .child(list),
-            )
+            .child(tree)
             .child(scrollbar("file-tree-scrollbar", &self.diff.tree_scroll))
     }
 

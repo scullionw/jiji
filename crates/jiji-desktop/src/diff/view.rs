@@ -10,32 +10,34 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, fill, font, point, prelude::*, px, quad, relative, App, BorderStyle, Bounds,
-    ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, TransformationMatrix, Window,
+    actions, fill, font, point, prelude::*, px, quad, relative, AnyTooltip, AnyView, App,
+    BorderStyle, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, DispatchPhase,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, KeyBinding, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollEvent,
+    ShapedLine, SharedString, StrikethroughStyle, Style, Task, TextAlign, TextRun,
+    TransformationMatrix, Window,
 };
 use jiji_core::snapshot::FileStatus;
 
-use crate::diff::highlight::{Mark, Syn};
+use crate::diff::highlight::Syn;
 use crate::diff::model::{
-    DiffDoc, FileModel, Kind, Layout, Line, LineId, Row, GAP_H, HEADER_H, IMAGE_H, IMAGE_MAX_H,
-    LINE_H, NOTE_H, REGION_H, SIDE_H,
+    DiffDoc, FileModel, Kind, Layout, LineId, Prepared, Row, GAP_H, HEADER_H, IMAGE_MAX_H, LINE_H,
+    NOTE_H, REGION_H, SIDE_H,
 };
-use crate::logic::text::{diffstat_blocks, Block};
+use crate::diff::picture::{frame_at, PictureLoader};
+use crate::logic::text::{diffstat_blocks, file_title, Block};
 use crate::theme::{theme, Theme};
+use crate::ui::input::{Copy, SelectAll};
 use crate::ui::{AxisLock, IconName};
 
 actions!(
     diff,
     [
-        CopySelection,
-        SelectAll,
         PageDown,
         PageUp,
         ScrollTop,
@@ -45,11 +47,13 @@ actions!(
     ]
 );
 
-/// Keys that belong to the diff while it has focus.
+/// Keys that belong to the diff while it has focus. Copy and Select All
+/// are the text fields' own actions, so Edit ▸ Copy and Edit ▸ Select All
+/// in the menu bar reach a focused diff as they reach a field.
 pub fn bind_keys(cx: &mut App) {
     let diff = Some("DiffSurface");
     cx.bind_keys([
-        KeyBinding::new("cmd-c", CopySelection, diff),
+        KeyBinding::new("cmd-c", Copy, diff),
         KeyBinding::new("cmd-a", SelectAll, diff),
         KeyBinding::new("space", PageDown, diff),
         KeyBinding::new("pagedown", PageDown, diff),
@@ -98,6 +102,15 @@ pub struct DiffTarget {
     pub line_text: Option<String>,
     /// The current text selection, when there is one.
     pub selection: Option<String>,
+}
+
+impl DiffTarget {
+    /// The line under the pointer, by its old and new numbers; `None` on a
+    /// header or between lines.
+    pub fn line(&self) -> Option<(Option<u32>, Option<u32>)> {
+        (!self.on_header && (self.old_no.is_some() || self.new_no.is_some()))
+            .then_some((self.old_no, self.new_no))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,6 +248,18 @@ impl PanBar {
     }
 }
 
+/// A tooltip in waiting over a file header. Once the pointer has rested
+/// there a tooltip's delay, a header that could not show its path whole
+/// names it.
+struct HeaderTip {
+    file: usize,
+    due: bool,
+    /// The tooltip, and where the pointer was when it went up: where it
+    /// stays.
+    shown: Option<(AnyView, Point<Pixels>)>,
+    _wait: Task<()>,
+}
+
 /// Which code column a paint pass covers.
 #[derive(Clone, Copy, PartialEq)]
 enum Column {
@@ -282,7 +307,7 @@ fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Bounds<Pixels> {
 }
 
 pub struct DiffSurface {
-    doc: DiffDoc,
+    doc: Arc<DiffDoc>,
     /// The layouts with collapsed files' bodies left out; `None` while
     /// every file is expanded.
     folded: Option<(Layout, Layout)>,
@@ -299,6 +324,7 @@ pub struct DiffSurface {
     /// The file header under the pointer, and whether the pointer is on
     /// its Resolve button.
     header_hover: Option<(usize, bool)>,
+    tip: Option<HeaderTip>,
     /// The file under the pointer: the one whose sideways thumb shows.
     pointer_file: Option<usize>,
     /// The pointer is on that thumb.
@@ -314,15 +340,16 @@ pub struct DiffSurface {
     /// frame shapes nothing.
     shaped: HashMap<LineId, ShapedLine>,
     numbers: HashMap<(u32, u8), ShapedLine>,
-    /// Bumped whenever the document is replaced, so highlight results for
-    /// a previous document are dropped.
-    generation: u64,
     find: Vec<FindMatch>,
     find_current: usize,
     resolve: Option<ResolveOffer>,
     active_file: usize,
     /// Dim the content: what is shown is being replaced.
     stale: bool,
+    /// When this diff went on screen: where its animations' loops start.
+    shown_at: Instant,
+    /// The wake for the next frame of an animated picture on screen.
+    animating: Option<Task<()>>,
 }
 
 impl Focusable for DiffSurface {
@@ -336,7 +363,7 @@ impl EventEmitter<DiffEvent> for DiffSurface {}
 impl DiffSurface {
     pub fn new(split: bool, cx: &mut Context<Self>) -> Self {
         Self {
-            doc: DiffDoc::empty(),
+            doc: Arc::new(DiffDoc::empty()),
             folded: None,
             collapsed: Vec::new(),
             focus: cx.focus_handle(),
@@ -347,6 +374,7 @@ impl DiffSurface {
             drag: Drag::None,
             thumb_hover: false,
             header_hover: None,
+            tip: None,
             pointer_file: None,
             pan_hover: false,
             wheel: AxisLock::default(),
@@ -356,34 +384,37 @@ impl DiffSurface {
             geo: None,
             shaped: HashMap::new(),
             numbers: HashMap::new(),
-            generation: 0,
             find: Vec::new(),
             find_current: 0,
             resolve: None,
             active_file: 0,
             stale: false,
+            shown_at: Instant::now(),
+            animating: None,
         }
     }
 
     /// Put another diff on the surface. `keep_position` is for a refetch
     /// of the same comparison (an auto-refresh): the reader stays where
     /// they were, with the same files collapsed.
-    pub fn set_doc(&mut self, mut doc: DiffDoc, keep_position: bool, cx: &mut Context<Self>) {
-        self.generation += 1;
-        let generation = self.generation;
-        // Highlight every file off the main thread, one task per file, in
-        // file order so the top of the diff colors first. Each result
-        // lands as a plain repaint.
-        for job in std::mem::take(&mut doc.jobs) {
-            let work = cx.background_executor().spawn(async move { job.run() });
+    pub fn set_doc(&mut self, prepared: &Prepared, keep_position: bool, cx: &mut Context<Self>) {
+        let doc = prepared.doc().clone();
+        // Highlighting runs off the main thread, a file at a time; a diff
+        // shown before brings its colours with it. Each file that colours
+        // while this one is on screen repaints it.
+        for file in prepared.highlighting(cx.background_executor()) {
+            if file.peek().is_some() {
+                continue;
+            }
+            let (file, colored) = (file.clone(), doc.clone());
             cx.spawn(async move |this, cx| {
-                let marks = work.await;
-                this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.apply_marks(marks, cx);
+                file.await;
+                let _ = this.update(cx, |this, cx| {
+                    if Arc::ptr_eq(&this.doc, &colored) {
+                        this.shaped.clear();
+                        cx.notify();
                     }
-                })
-                .ok();
+                });
             })
             .detach();
         }
@@ -408,10 +439,12 @@ impl DiffSurface {
             self.pan = vec![0.; files];
             self.scroll_y = 0.;
             self.active_file = 0;
+            self.shown_at = Instant::now();
         }
         self.doc = doc;
         self.selection = None;
         self.drag = Drag::None;
+        self.tip = None;
         self.shaped.clear();
         self.find.clear();
         self.find_current = 0;
@@ -567,16 +600,6 @@ impl DiffSurface {
         self.selected_text().filter(|text| !text.contains('\n'))
     }
 
-    fn apply_marks(&mut self, marks: Vec<(LineId, Vec<Mark>)>, cx: &mut Context<Self>) {
-        for (id, marks) in marks {
-            if let Some(line) = self.doc.lines.get_mut(id as usize) {
-                line.marks = marks;
-            }
-            self.shaped.remove(&id);
-        }
-        cx.notify();
-    }
-
     fn layout(&self) -> &Layout {
         match (&self.folded, self.split) {
             (Some((_, split)), true) => split,
@@ -706,7 +729,7 @@ impl DiffSurface {
 
     // ── Actions ──
 
-    fn copy(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -826,6 +849,7 @@ impl DiffSurface {
     // ── Input ──
 
     fn on_scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        self.drop_tip(cx);
         let (dx, dy) = self.wheel.travel(event, LINE_H * 2.5);
         // Sideways travel pans the file under the pointer.
         let file = self.geo.map_or(0, |geo| {
@@ -875,6 +899,7 @@ impl DiffSurface {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        self.drop_tip(cx);
         let Some(geo) = self.geo else { return };
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         if let Some((file, on_resolve)) = self.header_at(x, y, window) {
@@ -1017,6 +1042,7 @@ impl DiffSurface {
     fn on_context(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         window.focus(&self.focus, cx);
+        self.drop_tip(cx);
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         let mut target = DiffTarget {
             selection: self.selected_text(),
@@ -1079,6 +1105,26 @@ impl DiffSurface {
             self.header_hover = header;
             cx.notify();
         }
+        let resting = header.map(|(file, _)| file);
+        if resting != self.tip.as_ref().map(|tip| tip.file) {
+            self.drop_tip(cx);
+            self.tip = resting.map(|file| HeaderTip {
+                file,
+                due: false,
+                shown: None,
+                _wait: cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(crate::ui::tooltip::SHOW_DELAY)
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(tip) = &mut this.tip {
+                            tip.due = true;
+                            cx.notify();
+                        }
+                    });
+                }),
+            });
+        }
         let pointer_file = inside
             .then(|| self.file_at(f32::from(event.position.y)))
             .flatten();
@@ -1137,6 +1183,13 @@ impl DiffSurface {
         }
     }
 
+    /// Take down a header's tooltip, shown or waiting.
+    fn drop_tip(&mut self, cx: &mut Context<Self>) {
+        if self.tip.take().is_some_and(|tip| tip.shown.is_some()) {
+            cx.notify();
+        }
+    }
+
     /// The text position under a window point. `side` pins the answer to
     /// the side a drag began on; otherwise the point picks it.
     fn hit(
@@ -1167,14 +1220,7 @@ impl DiffSurface {
         };
         let col = match (self.text_line(row, side), self.metrics.as_ref()) {
             (Some(id), Some(metrics)) => {
-                let line = shape_code(
-                    &mut self.shaped,
-                    &self.doc.lines,
-                    id,
-                    metrics,
-                    &theme,
-                    window,
-                );
+                let line = shape_code(&mut self.shaped, &self.doc, id, metrics, &theme, window);
                 let pan = self.pan_of(self.layout().file_of(row));
                 line.closest_index_for_x(px(x - (code_x + CODE_PAD_L - pan)))
             }
@@ -1269,6 +1315,9 @@ impl DiffSurface {
         let pan_bar = self.shown_pan_bar();
         let pan_hot = self.pan_hover || matches!(self.drag, Drag::Pan(_));
         let stale = self.stale;
+        // How far into their loops animated pictures are; `next_frame` is
+        // how soon the first of those on screen moves on.
+        let playing = self.shown_at.elapsed();
         let resolve = self.resolve.clone();
         let collapsed = self.collapsed.clone();
         // Find matches on the rows about to paint, by line.
@@ -1342,6 +1391,10 @@ impl DiffSurface {
             resolve: resolve.as_ref().filter(|_| files[file].has_conflict),
         };
 
+        // Headers that could not show their path whole this frame.
+        let mut clipped = Vec::new();
+        let mut next_frame: Option<Duration> = None;
+
         // Pass 1 — everything but code text: fills, gutter rails, numbers,
         // signs, seams and file headers.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -1350,7 +1403,10 @@ impl DiffSurface {
                 match &layout.rows[row] {
                     Row::Pad => {}
                     Row::FileHeader { file } => {
-                        header(*file as usize, y).paint(&geo, metrics, theme, window, cx)
+                        let file = *file as usize;
+                        if header(file, y).paint(&geo, metrics, theme, window, cx) {
+                            clipped.push(file);
+                        }
                     }
                     Row::Region { text, side } => {
                         // A conflict region opens with its ordinal; each
@@ -1495,13 +1551,18 @@ impl DiffSurface {
                                     theme.add_fg
                                 },
                             )];
-                            let picture = side
-                                .image
-                                .clone()
-                                .and_then(|image| image.use_render_image(window, cx));
-                            match picture {
-                                Some(picture) => {
-                                    let natural = picture.size(0);
+                            // Decoded the first time it is drawn; `None`
+                            // until then.
+                            let decoded =
+                                side.picture
+                                    .as_ref()
+                                    .map_err(|why| *why)
+                                    .and_then(|picture| {
+                                        window.use_asset::<PictureLoader>(picture, cx).transpose()
+                                    });
+                            match decoded {
+                                Ok(Some(decoded)) => {
+                                    let natural = decoded.image.size(0);
                                     let (w, h) = (
                                         natural.width.0 as f32 / window.scale_factor(),
                                         natural.height.0 as f32 / window.scale_factor(),
@@ -1514,13 +1575,21 @@ impl DiffSurface {
                                     let (w, h) = (w * scale, h * scale);
                                     let left = x + (box_w - w) / 2.;
                                     let top = y + 16. + (box_h - h) / 2.;
-                                    let frame = rect(left, top, left + w, top + h);
+                                    let area = rect(left, top, left + w, top + h);
+                                    if !decoded.opaque {
+                                        paint_checker(area, theme, window);
+                                    }
+                                    let (frame, holds) = frame_at(&decoded.image, playing);
+                                    if let Some(holds) = holds {
+                                        next_frame =
+                                            Some(next_frame.map_or(holds, |next| holds.min(next)));
+                                    }
                                     let _ = window.paint_image(
-                                        frame,
-                                        frame,
+                                        area,
+                                        area,
                                         gpui::Corners::default(),
-                                        picture,
-                                        0,
+                                        decoded.image,
+                                        frame,
                                         false,
                                     );
                                     caption.push((
@@ -1528,12 +1597,21 @@ impl DiffSurface {
                                         theme.text3,
                                     ));
                                 }
-                                None => {
-                                    let note = if side.image.is_some() {
-                                        "Loading…"
-                                    } else {
-                                        "Too large to preview"
+                                state => {
+                                    let note = match state {
+                                        Err(why) => why.note(&side.mime),
+                                        Ok(_) => "Loading…".to_owned(),
                                     };
+                                    let note = elide_end(&note, box_w - 16., &|text| {
+                                        label(
+                                            text.to_owned(),
+                                            &metrics.ui,
+                                            SMALL,
+                                            theme.text3,
+                                            window,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                     let shaped =
                                         label(note, &metrics.ui, SMALL, theme.text3, window);
                                     let left = x + (box_w - f32::from(shaped.width)) / 2.;
@@ -1567,7 +1645,6 @@ impl DiffSurface {
                             }
                             x += box_w + 16.;
                         }
-                        let _ = IMAGE_H;
                     }
                     Row::Note { text, danger } => {
                         let color = if *danger { theme.danger } else { theme.text3 };
@@ -1698,7 +1775,7 @@ impl DiffSurface {
                     min_id = min_id.min(id);
                     max_id = max_id.max(id);
                     let text = (!line.text.is_empty())
-                        .then(|| shape_code(shaped, lines, id, metrics, theme, window));
+                        .then(|| shape_code(shaped, doc, id, metrics, theme, window));
                     let x_at = |index: usize| {
                         origin_x
                             + text
@@ -1797,7 +1874,9 @@ impl DiffSurface {
             if layout.file_top(file) - scroll < 0. {
                 let pinned = (layout.file_bottom(file) - scroll - HEADER_H).min(0.);
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    header(file, geo.top + pinned).paint(&geo, metrics, theme, window, cx)
+                    if header(file, geo.top + pinned).paint(&geo, metrics, theme, window, cx) {
+                        clipped.push(file);
+                    }
                 });
             }
         }
@@ -1848,6 +1927,28 @@ impl DiffSurface {
         // What is shown is on its way out: dim it rather than blank it.
         if stale {
             window.paint_quad(fill(bounds, Theme::fade(theme.bg1, 0.4)));
+        }
+
+        // An animated picture on screen asks for a frame when its next one
+        // is due; with none on screen, nothing wakes the surface.
+        self.animating = next_frame.map(|due| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(due).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
+
+        // The pointer has rested on a header that was cut: name the path
+        // whole. The tooltip goes up from the next frame's prepaint, which
+        // a notify from paint would not bring.
+        if let Some(tip) = self.tip.as_mut() {
+            if tip.due && tip.shown.is_none() && clipped.contains(&tip.file) {
+                let file = &self.doc.files[tip.file];
+                let text = file_title(&file.path, file.renamed_from.as_deref());
+                let view = crate::ui::tooltip(text)(window, cx);
+                tip.shown = Some((view, window.mouse_position()));
+                window.request_animation_frame();
+            }
         }
     }
 
@@ -1940,6 +2041,31 @@ fn word_at(text: &str, col: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// A quiet checker under a picture that lets what is behind it show,
+/// drawn from the recess its box sits on, so transparency reads as
+/// transparency in every theme without shouting.
+fn paint_checker(area: Bounds<Pixels>, theme: &Theme, window: &mut Window) {
+    const CELL: f32 = 7.;
+    let dark = Theme::blend(theme.text1, 0.06, theme.recess);
+    let (left, top) = (f32::from(area.left()), f32::from(area.top()));
+    let (right, bottom) = (f32::from(area.right()), f32::from(area.bottom()));
+    window.paint_quad(fill(area, theme.recess));
+    let (mut row, mut y) = (0, top);
+    while y < bottom {
+        let (mut col, mut x) = (row % 2, left + (row % 2) as f32 * CELL);
+        while x < right {
+            window.paint_quad(fill(
+                rect(x, y, (x + CELL).min(right), (y + CELL).min(bottom)),
+                dark,
+            ));
+            col += 2;
+            x = left + col as f32 * CELL;
+        }
+        row += 1;
+        y = top + row as f32 * CELL;
+    }
+}
+
 /// A one-style line of chrome text. GPUI's frame cache keeps these cheap:
 /// the same label shaped on consecutive frames is a lookup.
 fn label(
@@ -1967,7 +2093,7 @@ fn label(
 /// was on screen recently.
 fn shape_code(
     shaped: &mut HashMap<LineId, ShapedLine>,
-    lines: &[Line],
+    doc: &DiffDoc,
     id: LineId,
     metrics: &Metrics,
     theme: &Theme,
@@ -1976,7 +2102,8 @@ fn shape_code(
     if let Some(line) = shaped.get(&id) {
         return line.clone();
     }
-    let line = &lines[id as usize];
+    let line = &doc.lines[id as usize];
+    let marks = doc.marks(id);
     let len = line.text.len();
     let run = |len: usize, class: Option<Syn>| {
         let mut font = metrics.code.clone();
@@ -1996,9 +2123,9 @@ fn shape_code(
             strikethrough: None,
         }
     };
-    let mut runs = Vec::with_capacity(line.marks.len() * 2 + 1);
+    let mut runs = Vec::with_capacity(marks.len() * 2 + 1);
     let mut at = 0;
-    for mark in &line.marks {
+    for mark in marks {
         let (start, end) = (
             mark.range.start as usize,
             (mark.range.end as usize).min(len),
@@ -2135,9 +2262,45 @@ fn resolve_label(offer: &ResolveOffer, file: &FileModel) -> String {
     }
 }
 
-/// One file header: the collapse chevron, status letter, path, where a
-/// rename came from, the conflict chip, the stats and — on a conflicted
-/// file — the Resolve button.
+/// `text` cut to `room` points from its start, "…" standing in for what
+/// went: a path keeps the end that names the file. `None` when nothing
+/// but the ellipsis would fit.
+fn elide_start(text: &str, room: f32, shape: &dyn Fn(&str) -> ShapedLine) -> Option<String> {
+    let whole = shape(text);
+    if f32::from(whole.width) <= room {
+        return Some(text.to_owned());
+    }
+    let keep = room - f32::from(shape("…").width);
+    if keep <= 0. {
+        return None;
+    }
+    let mut cut = whole
+        .index_for_x(whole.width - px(keep))
+        .map_or(text.len(), |at| at + 1);
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    (cut < text.len()).then(|| format!("…{}", &text[cut..]))
+}
+
+/// `text` cut to `room` points at its end.
+fn elide_end(text: &str, room: f32, shape: &dyn Fn(&str) -> ShapedLine) -> Option<String> {
+    let whole = shape(text);
+    if f32::from(whole.width) <= room {
+        return Some(text.to_owned());
+    }
+    let keep = room - f32::from(shape("…").width);
+    let mut cut = whole.index_for_x(px(keep.max(0.))).unwrap_or(0);
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let kept = text[..cut].trim_end();
+    (!kept.is_empty()).then(|| format!("{kept}…"))
+}
+
+/// One file header: the collapse chevron, the file's icon, its path, what
+/// came, went or moved, where a rename came from, the conflict mark, the
+/// counts and diffstat and — on a conflicted file — the Resolve button.
 struct HeaderPaint<'a> {
     file: &'a FileModel,
     index: usize,
@@ -2152,6 +2315,7 @@ struct HeaderPaint<'a> {
 }
 
 impl HeaderPaint<'_> {
+    /// Paint the header; true when its path did not fit whole.
     fn paint(
         &self,
         geo: &Geo,
@@ -2159,7 +2323,7 @@ impl HeaderPaint<'_> {
         theme: &Theme,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> bool {
         let (file, y) = (self.file, self.y);
         let height = HEADER_H - 1.;
         let fill_color = if self.hover.is_some() {
@@ -2176,152 +2340,18 @@ impl HeaderPaint<'_> {
             window.paint_quad(fill(rect(geo.left, y, geo.right, y + 1.), theme.border1));
         }
         let at = |x: f32| point(px(x), px(y));
-
-        // The chevron: the whole left run of the header is the collapse
-        // toggle.
-        let mut x = geo.left + 10.;
-        let chevron = if self.collapsed {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        };
-        let _ = window.paint_svg(
-            rect(x, y + (height - 12.) / 2., x + 12., y + (height + 12.) / 2.),
-            chevron.path(),
-            None,
-            TransformationMatrix::unit(),
-            if self.hover.is_some() {
-                theme.text2
-            } else {
-                theme.text3
-            },
-            cx,
-        );
-        x += 12. + 6.;
-
-        // The file's kind in its language's hue.
-        let (glyph, hue) = crate::ui::file_glyph(&file.name);
-        const GLYPH: f32 = 14.;
-        let _ = window.paint_svg(
-            rect(
-                x,
-                y + ((height - GLYPH) / 2.).round(),
-                x + GLYPH,
-                y + ((height - GLYPH) / 2.).round() + GLYPH,
-            ),
-            glyph.path(),
-            None,
-            TransformationMatrix::unit(),
-            theme.file_hue(hue),
-            cx,
-        );
-        x += GLYPH + 8.;
-
-        // Directory quiet, file name carrying the weight.
-        let gone = file.status == FileStatus::Removed;
-        let run = |len: usize, color: Hsla, weight: FontWeight, strike: bool| TextRun {
-            len,
-            font: Font {
-                weight,
-                ..metrics.code.clone()
-            },
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: strike.then_some(StrikethroughStyle {
-                thickness: px(1.),
-                color: Some(color),
-            }),
-        };
-        let name_color = if gone { theme.text2 } else { theme.text1 };
-        let runs: Vec<TextRun> = [
-            run(file.dir.len(), theme.text3, FontWeight::NORMAL, false),
-            run(file.name.len(), name_color, FontWeight::MEDIUM, gone),
-        ]
-        .into_iter()
-        .filter(|run| run.len > 0)
-        .collect();
-        let path = window
-            .text_system()
-            .shape_line(file.path.clone(), px(SMALL), &runs, None);
-        if let Some(current) = self.path_hit {
-            // The header when the file's path matched the query; stronger
-            // while it is the current match.
-            let name_x = x + f32::from(path.x_for_index(file.dir.len()));
-            window.paint_quad(quad(
-                rect(
-                    name_x - 2.,
-                    y + 6.,
-                    x + f32::from(path.width) + 2.,
-                    y + height - 6.,
-                ),
-                px(3.),
-                Theme::fade(theme.warn, if current { 0.55 } else { 0.28 }),
-                px(0.),
-                gpui::transparent_black(),
-                BorderStyle::default(),
-            ));
-        }
-        path.paint(at(x), px(height), TextAlign::Left, None, window, cx)
-            .ok();
-        x += f32::from(path.width) + 10.;
-
-        // What came or went says so in its side's hue; a modified file,
-        // the usual case, carries no word.
         let medium = Font {
             weight: FontWeight::MEDIUM,
             ..metrics.ui.clone()
         };
-        let word = match file.status {
-            FileStatus::Added => Some(("new file", theme.add_fg)),
-            FileStatus::Removed => Some(("deleted", theme.del_fg)),
-            FileStatus::Renamed => Some(("renamed", theme.accent_strong)),
-            FileStatus::Copied => Some(("copied", theme.accent_strong)),
-            FileStatus::Modified => None,
-        };
-        if let Some((word, hue)) = word {
-            let word = label(word, &medium, XS, hue, window);
-            word.paint(at(x), px(height), TextAlign::Left, None, window, cx)
-                .ok();
-            x += f32::from(word.width) + 6.;
-        }
-        if let Some(from) = &file.renamed_from {
-            let from = label(
-                format!("from {from}"),
-                &metrics.code,
-                XS,
-                theme.text3,
-                window,
-            );
-            from.paint(at(x), px(height), TextAlign::Left, None, window, cx)
-                .ok();
-            x += f32::from(from.width) + 8.;
-        }
-        if file.has_conflict {
-            let medium = Font {
-                weight: FontWeight::MEDIUM,
-                ..metrics.ui.clone()
-            };
-            let chip = if file.regions > 1 {
-                format!("{} conflicts", file.regions)
-            } else {
-                "conflict".to_owned()
-            };
-            label(chip, &medium, XS, theme.danger, window)
-                .paint(at(x), px(height), TextAlign::Left, None, window, cx)
-                .ok();
-        }
 
-        // The Resolve button, then +N −M to its left — all clear of the
-        // scroll thumb.
+        // The right end first — the Resolve button, then +N −M and the
+        // diffstat to its left, all clear of the scroll thumb — so the path
+        // knows how much of the line is its own.
         let mut right = geo.right - THUMB_ZONE - 4.;
         if let Some(offer) = self.resolve {
             let waiting = offer.waiting.as_deref() == Some(file.path.as_ref());
             let hot = waiting || (self.hover == Some(true) && !offer.disabled);
-            let medium = Font {
-                weight: FontWeight::MEDIUM,
-                ..metrics.ui.clone()
-            };
             let mut color = if hot {
                 theme.accent_strong
             } else {
@@ -2393,54 +2423,221 @@ impl HeaderPaint<'_> {
                 .ok();
             right -= 6.;
         }
+
+        // The chevron: the whole left run of the header is the collapse
+        // toggle.
+        let mut x = geo.left + 10.;
+        let chevron = if self.collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        let _ = window.paint_svg(
+            rect(x, y + (height - 12.) / 2., x + 12., y + (height + 12.) / 2.),
+            chevron.path(),
+            None,
+            TransformationMatrix::unit(),
+            if self.hover.is_some() {
+                theme.text2
+            } else {
+                theme.text3
+            },
+            cx,
+        );
+        x += 12. + 6.;
+
+        // The file's kind in its language's hue.
+        let (glyph, hue) = crate::ui::file_glyph(&file.name);
+        const GLYPH: f32 = 14.;
+        let _ = window.paint_svg(
+            rect(
+                x,
+                y + ((height - GLYPH) / 2.).round(),
+                x + GLYPH,
+                y + ((height - GLYPH) / 2.).round() + GLYPH,
+            ),
+            glyph.path(),
+            None,
+            TransformationMatrix::unit(),
+            theme.file_hue(hue),
+            cx,
+        );
+        x += GLYPH + 8.;
+
+        // Directory quiet, file name carrying the weight. What came or went
+        // says so in its side's hue; a modified file, the usual case,
+        // carries no word.
+        let gone = file.status == FileStatus::Removed;
+        let system = window.text_system().clone();
+        let shape_with = |font: Font, size: f32, color: Hsla, strike: bool| {
+            let system = system.clone();
+            move |text: &str| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font.clone(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: strike.then_some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: Some(color),
+                    }),
+                };
+                system.shape_line(text.to_owned().into(), px(size), &[run], None)
+            }
+        };
+        let dir_shape = shape_with(metrics.code.clone(), SMALL, theme.text3, false);
+        let name_shape = shape_with(
+            Font {
+                weight: FontWeight::MEDIUM,
+                ..metrics.code.clone()
+            },
+            SMALL,
+            if gone { theme.text2 } else { theme.text1 },
+            gone,
+        );
+        let from_shape = shape_with(metrics.code.clone(), XS, theme.text3, false);
+        let word = match file.status {
+            FileStatus::Added => Some(("new file", theme.add_fg)),
+            FileStatus::Removed => Some(("deleted", theme.del_fg)),
+            FileStatus::Renamed => Some(("renamed", theme.accent_strong)),
+            FileStatus::Copied => Some(("copied", theme.accent_strong)),
+            FileStatus::Modified => None,
+        }
+        .map(|(word, hue)| label(word, &medium, XS, hue, window));
+        let chip = file.has_conflict.then(|| {
+            let chip = if file.regions > 1 {
+                format!("{} conflicts", file.regions)
+            } else {
+                "conflict".to_owned()
+            };
+            label(chip, &medium, XS, theme.danger, window)
+        });
+        let width = |line: &ShapedLine| f32::from(line.width);
+        let fixed = word.as_ref().map_or(0., |word| width(word) + 6.)
+            + chip.as_ref().map_or(0., |chip| width(chip) + 8.);
+
+        // Fit the run into what the right end leaves. What gives way, in
+        // turn: where a rename came from, then the directory, then the
+        // name itself, each cut where it says least.
+        let room = right - 12. - x;
+        let (mut dir, mut name) = (file.dir.to_string(), Some(file.name.to_string()));
+        let mut from = file.renamed_from.as_ref().map(|from| from.to_string());
+        let need = |dir: &str, name: &Option<String>, from: &Option<String>| {
+            width(&dir_shape(dir))
+                + name.as_deref().map_or(0., |name| width(&name_shape(name)))
+                + 10.
+                + fixed
+                + from
+                    .as_deref()
+                    .map_or(0., |from| width(&from_shape(&format!("from {from}"))) + 8.)
+        };
+        let clipped = need(&dir, &name, &from) > room;
+        if clipped {
+            if let Some(whole) = from.take() {
+                let spare = room - need(&dir, &name, &None) - 8.;
+                let prefix = width(&from_shape("from "));
+                from = elide_start(&whole, spare - prefix, &from_shape)
+                    .filter(|kept| kept.chars().count() > 4);
+            }
+            if need(&dir, &name, &from) > room {
+                let spare = room - need("", &name, &from);
+                dir = elide_start(&dir, spare, &dir_shape).unwrap_or_default();
+            }
+            if need(&dir, &name, &from) > room {
+                let spare = room - need(&dir, &None, &from);
+                name = elide_end(&file.name, spare, &name_shape);
+            }
+        }
+
+        let dir = (!dir.is_empty()).then(|| dir_shape(&dir));
+        let name = name.map(|name| name_shape(&name));
+        if let Some(dir) = &dir {
+            dir.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
+            x += width(dir);
+        }
+        if let Some(name) = &name {
+            if let Some(current) = self.path_hit {
+                // The header when the file's path matched the query;
+                // stronger while it is the current match.
+                window.paint_quad(quad(
+                    rect(x - 2., y + 6., x + width(name) + 2., y + height - 6.),
+                    px(3.),
+                    Theme::fade(theme.warn, if current { 0.55 } else { 0.28 }),
+                    px(0.),
+                    gpui::transparent_black(),
+                    BorderStyle::default(),
+                ));
+            }
+            name.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
+            x += width(name);
+        }
+        x += 10.;
+        if let Some(word) = &word {
+            word.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
+            x += width(word) + 6.;
+        }
+        if let Some(from) = from {
+            let from = from_shape(&format!("from {from}"));
+            from.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
+            x += width(&from) + 8.;
+        }
+        if let Some(chip) = &chip {
+            chip.paint(at(x), px(height), TextAlign::Left, None, window, cx)
+                .ok();
+        }
+        clipped
     }
 }
 
-/// Every occurrence of `query` in the document, in reading order.
-/// Case-insensitive literal; offsets index the line as displayed.
+/// One character as the find bar compares it. These are the rules of a
+/// case-insensitive JavaScript regular expression without the `u` flag,
+/// which the find bar always used: a character stands for its uppercase
+/// when that is one character in the Basic Multilingual Plane, and not an
+/// ASCII letter standing in for a non-ASCII one. So σ, Σ and final ς are
+/// one letter, while ß is not "SS", the long ſ is not s, and the Kelvin
+/// sign is not k.
+fn fold(ch: char) -> char {
+    let bmp = |ch: char| u32::from(ch) <= 0xFFFF;
+    let mut upper = ch.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(up), None) if bmp(ch) && bmp(up) && (ch.is_ascii() || !up.is_ascii()) => up,
+        _ => ch,
+    }
+}
+
+/// Every occurrence of `query` in the document, in reading order: each
+/// file's path first (the header is a match surface too, for either name
+/// of a rename), then its lines top to bottom. Offsets index the line as
+/// painted. Matching folds case one character at a time (`fold`), so a
+/// match always spans as many characters as the query.
 pub fn find_in_doc(doc: &DiffDoc, query: &str) -> Vec<FindMatch> {
     let mut matches = Vec::new();
-    if query.is_empty() {
+    let needle: Vec<char> = query.chars().map(fold).collect();
+    if needle.is_empty() {
         return matches;
     }
-    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    // Byte ranges of every match in `text`, compared char by char so a
-    // case fold that changes a character's length cannot drift offsets.
+    // Byte ranges of every match in `text`, left to right, none overlapping.
     let occurrences = |text: &str| -> Vec<Range<u32>> {
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let chars: Vec<(usize, char)> =
+            text.char_indices().map(|(at, ch)| (at, fold(ch))).collect();
         let mut found = Vec::new();
         let mut start = 0;
-        while start < chars.len() {
-            let mut at = start;
-            let mut matched = 0;
-            while matched < needle.len() && at < chars.len() {
-                let mut lower = chars[at].1.to_lowercase();
-                let first = lower.next();
-                if first != Some(needle[matched]) {
-                    break;
-                }
-                matched += 1;
-                // A character whose lowercase is several characters must
-                // match them all.
-                let mut whole = true;
-                for extra in lower {
-                    if needle.get(matched) == Some(&extra) {
-                        matched += 1;
-                    } else {
-                        whole = false;
-                        break;
-                    }
-                }
-                if !whole {
-                    matched = usize::MAX;
-                    break;
-                }
-                at += 1;
-            }
-            if matched == needle.len() {
-                let end = chars.get(at).map_or(text.len(), |(byte, _)| *byte);
+        while start + needle.len() <= chars.len() {
+            let hit = chars[start..start + needle.len()]
+                .iter()
+                .zip(&needle)
+                .all(|((_, ch), want)| ch == want);
+            if hit {
+                let end = chars
+                    .get(start + needle.len())
+                    .map_or(text.len(), |(at, _)| *at);
                 found.push(chars[start].0 as u32..end as u32);
-                start = at.max(start + 1);
+                start += needle.len();
             } else {
                 start += 1;
             }
@@ -2516,8 +2713,21 @@ impl Element for DiffElement {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Self::PrepaintState {
+        let tip = self
+            .view
+            .read(cx)
+            .tip
+            .as_ref()
+            .and_then(|tip| tip.shown.clone());
+        if let Some((view, at)) = tip {
+            window.set_tooltip(AnyTooltip {
+                view,
+                mouse_position: at,
+                check_visible_and_update: std::rc::Rc::new(|_, _, _| true),
+            });
+        }
         let surface = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let mut strip = bounds;
         strip.origin.x = bounds.right() - px(THUMB_ZONE);
@@ -2599,6 +2809,9 @@ impl Element for DiffElement {
 
 impl Render for DiffSurface {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Copy is on offer only while there is something to copy: the
+        // menu bar greys Edit ▸ Copy out otherwise, as it does for a field.
+        let selected = self.selection.is_some_and(|s| s.anchor != s.head);
         gpui::div()
             .id("diff-surface")
             .key_context("DiffSurface")
@@ -2606,7 +2819,7 @@ impl Render for DiffSurface {
             .size_full()
             .flex()
             .flex_col()
-            .on_action(cx.listener(Self::copy))
+            .when(selected, |el| el.on_action(cx.listener(Self::copy)))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::page_up))
@@ -2633,6 +2846,190 @@ mod tests {
         assert_eq!(word_at(text, 15), (15, 16));
         // Past the end, nothing.
         assert_eq!(word_at(text, text.len()), (text.len(), text.len()));
+    }
+
+    /// A diff of files whose lines are all added, each named by its path
+    /// and, for a rename, where it came from.
+    fn diff_of(files: &[(&str, Option<&str>, &[&str])]) -> jiji_core::snapshot::ChangeDiff {
+        use jiji_core::snapshot::{
+            ChangeDiff, DiffHunk, DiffLine, DiffLineKind, DiffSegment, FileDiff, FileDiffContent,
+        };
+        let files = files
+            .iter()
+            .map(|(path, from, lines)| FileDiff {
+                path: (*path).into(),
+                status: if from.is_some() {
+                    FileStatus::Renamed
+                } else {
+                    FileStatus::Added
+                },
+                renamed_from: from.map(str::to_owned),
+                has_conflict: false,
+                content: FileDiffContent::Text {
+                    hunks: vec![DiffHunk {
+                        old_start: 0,
+                        new_start: 1,
+                        context: None,
+                        lines: lines
+                            .iter()
+                            .map(|text| DiffLine {
+                                kind: DiffLineKind::Added,
+                                segments: vec![DiffSegment {
+                                    text: (*text).into(),
+                                    changed: true,
+                                }],
+                                pair: None,
+                            })
+                            .collect(),
+                    }],
+                    truncated: false,
+                },
+            })
+            .collect();
+        ChangeDiff {
+            id: "x".into(),
+            from: None,
+            files,
+            truncated: false,
+        }
+    }
+
+    fn added_doc(path: &str, lines: &[&str]) -> DiffDoc {
+        DiffDoc::build(&diff_of(&[(path, None, lines)]))
+    }
+
+    #[gpui::test]
+    fn a_cut_header_names_its_whole_path_on_hover(cx: &mut gpui::TestAppContext) {
+        let dir = crate::testing::scratch("header-tip");
+        let _model = crate::testing::install(&dir, cx);
+        let (surface, cx) = cx.add_window_view(|_, cx| DiffSurface::new(false, cx));
+        let long = format!("src/{}measure.ts", "a/deeply/nested/directory/".repeat(40));
+        let diff = diff_of(&[
+            (&long, Some("src/lib/rowHeight.ts"), &["one"]),
+            ("b.rs", None, &["two"]),
+        ]);
+        let prepared = Prepared::new(Arc::new(diff));
+        surface.update(cx, |surface, cx| surface.set_doc(&prepared, false, cx));
+        cx.run_until_parked();
+        let rest_on = |y: f32, cx: &mut gpui::VisualTestContext| {
+            cx.simulate_mouse_move(point(px(240.), px(y)), None, gpui::Modifiers::none());
+            cx.executor().advance_clock(crate::ui::tooltip::SHOW_DELAY);
+            cx.run_until_parked();
+        };
+        let tip = |surface: &Entity<DiffSurface>, cx: &mut gpui::VisualTestContext| {
+            surface.read_with(cx, |surface, _| {
+                surface
+                    .tip
+                    .as_ref()
+                    .map(|tip| (tip.file, tip.shown.is_some()))
+            })
+        };
+
+        rest_on(HEADER_H / 2., cx);
+        assert_eq!(tip(&surface, cx), Some((0, true)));
+        // A path that fits says nothing more on hover.
+        let second = surface.read_with(cx, |surface, _| surface.layout().file_top(1));
+        rest_on(second + HEADER_H / 2., cx);
+        assert_eq!(tip(&surface, cx), Some((1, false)));
+        // A press takes the tooltip down.
+        rest_on(HEADER_H / 2., cx);
+        cx.simulate_mouse_down(
+            point(px(240.), px(HEADER_H / 2.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(tip(&surface, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn found_text<'a>(doc: &'a DiffDoc, found: &FindMatch) -> &'a str {
+        let (line, range) = found.line.clone().expect("a line match");
+        &doc.lines[line as usize].text[range.start as usize..range.end as usize]
+    }
+
+    #[test]
+    fn find_takes_sigma_in_every_form_in_paths_and_lines() {
+        let doc = added_doc("notes/ὀδυσσεύς.md", &["Ὀδυσσεύς · ΣΟΦΟΣ · σοφός"]);
+        let found = find_in_doc(&doc, "σ");
+        // The path, whose only sigma is final, then the line left to right.
+        assert_eq!(
+            found[0],
+            FindMatch {
+                file: 0,
+                line: None
+            }
+        );
+        let hits: Vec<&str> = found[1..].iter().map(|m| found_text(&doc, m)).collect();
+        assert_eq!(hits, ["σ", "σ", "ς", "Σ", "Σ", "σ", "ς"]);
+        // Offsets are the painted line's bytes: Ὀ is three, δ and υ two.
+        assert_eq!(found[1].line.clone().unwrap().1, 7..9);
+        assert_eq!(find_in_doc(&doc, "Σ"), found);
+        assert_eq!(find_in_doc(&doc, "ς"), found);
+        assert_eq!(find_in_doc(&doc, "ΣΟΦ").len(), 2);
+    }
+
+    #[test]
+    fn find_folds_only_what_the_old_find_bar_folded() {
+        let doc = added_doc("a.md", &["Straße · \u{17F} · \u{212A} · \u{130}"]);
+        // ß is not "ss", the long s is not s, the Kelvin sign is not k, and
+        // dotted İ is not i: each would take an ASCII letter for another.
+        assert!(find_in_doc(&doc, "ss").is_empty());
+        assert_eq!(find_in_doc(&doc, "s").len(), 1);
+        assert!(find_in_doc(&doc, "k").is_empty());
+        assert!(find_in_doc(&doc, "i").is_empty());
+        let hits: Vec<&str> = find_in_doc(&doc, "STRASSE")
+            .iter()
+            .map(|m| found_text(&doc, m))
+            .collect();
+        assert!(hits.is_empty(), "{hits:?}");
+        assert_eq!(find_in_doc(&doc, "straße").len(), 1);
+        assert!(find_in_doc(&doc, "").is_empty());
+    }
+
+    #[gpui::test]
+    fn an_animation_asks_for_frames_only_while_it_is_on_screen(cx: &mut gpui::TestAppContext) {
+        use base64::Engine as _;
+        use jiji_core::snapshot::{FileDiff, FileDiffContent, ImageContent};
+        let dir = crate::testing::scratch("animation-frames");
+        let _model = crate::testing::install(&dir, cx);
+        let (surface, cx) = cx.add_window_view(|_, cx| DiffSurface::new(false, cx));
+        let gif = include_bytes!("fixtures/anim.gif");
+        let lines: Vec<String> = (0..400).map(|n| format!("line {n}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut diff = diff_of(&[("notes.txt", None, &lines)]);
+        diff.files.insert(
+            0,
+            FileDiff {
+                path: "spinner.gif".into(),
+                status: FileStatus::Added,
+                renamed_from: None,
+                has_conflict: false,
+                content: FileDiffContent::Image {
+                    old: None,
+                    new: Some(ImageContent {
+                        mime: "image/gif".into(),
+                        size: gif.len() as u64,
+                        data: Some(base64::engine::general_purpose::STANDARD.encode(gif)),
+                    }),
+                },
+            },
+        );
+        let prepared = Prepared::new(Arc::new(diff));
+        surface.update(cx, |surface, cx| surface.set_doc(&prepared, false, cx));
+        cx.run_until_parked();
+        let animating = |surface: &Entity<DiffSurface>, cx: &mut gpui::VisualTestContext| {
+            surface.read_with(cx, |surface, _| surface.animating.is_some())
+        };
+        assert!(animating(&surface, cx), "the two-frame GIF is on screen");
+
+        // Scrolled out of view, it costs nothing until it is back.
+        surface.update(cx, |surface, cx| surface.scroll_to(f32::MAX, cx));
+        cx.run_until_parked();
+        assert!(!animating(&surface, cx));
+        surface.update(cx, |surface, cx| surface.scroll_to(0., cx));
+        cx.run_until_parked();
+        assert!(animating(&surface, cx));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -10,14 +10,17 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
-use gpui::SharedString;
+use futures::future::{FutureExt as _, Shared};
+use gpui::{BackgroundExecutor, SharedString, Task};
 use jiji_core::snapshot::{
     ChangeDiff, ConflictSection, DiffHunk, DiffLine, DiffLineKind, FileDiff, FileDiffContent,
     FileStatus,
 };
 
 use crate::diff::highlight::{lang_for_path, HighlightJob, Mark};
+use crate::diff::picture::{format_for, Picture, Undrawable};
 
 pub type LineId = u32;
 
@@ -66,9 +69,6 @@ pub struct Line {
     /// Intraline emphasis ranges. Empty unless the line mixes changed and
     /// unchanged segments: a wholly added/removed line stays a flat tint.
     pub changed: Vec<Range<u32>>,
-    /// Syntax marks, sorted and non-overlapping; filled in by the
-    /// background highlighter after first paint.
-    pub marks: Vec<Mark>,
     pub cols: u32,
 }
 
@@ -116,7 +116,6 @@ impl Line {
             text: text.into(),
             source,
             changed,
-            marks: Vec::new(),
             cols: col as u32,
         }
     }
@@ -349,35 +348,31 @@ pub struct FileModel {
 
 /// One side of an image comparison.
 pub struct ImageSide {
-    /// The picture, when the side is small enough to carry inline and in
-    /// a format that can be drawn.
-    pub image: Option<std::sync::Arc<gpui::Image>>,
+    /// The picture to decode, or why the side has none to show.
+    pub picture: Result<Picture, Undrawable>,
+    pub mime: SharedString,
     /// The side's full byte size, already phrased.
     pub size: String,
 }
 
 fn image_side(content: &jiji_core::snapshot::ImageContent) -> ImageSide {
     use base64::Engine as _;
-    let format = match content.mime.as_str() {
-        "image/png" => Some(gpui::ImageFormat::Png),
-        "image/jpeg" => Some(gpui::ImageFormat::Jpeg),
-        "image/webp" => Some(gpui::ImageFormat::Webp),
-        "image/gif" => Some(gpui::ImageFormat::Gif),
-        "image/svg+xml" => Some(gpui::ImageFormat::Svg),
-        "image/bmp" => Some(gpui::ImageFormat::Bmp),
-        "image/tiff" => Some(gpui::ImageFormat::Tiff),
-        _ => None,
+    let picture = match (format_for(&content.mime), &content.data) {
+        // The backend keeps a side's bytes back past its per-image cap, or
+        // once the change's images have used what one diff carries.
+        (_, None) if content.size > jiji_core::jj::MAX_IMAGE_INLINE_BYTES as u64 => {
+            Err(Undrawable::TooLarge)
+        }
+        (_, None) => Err(Undrawable::OverBudget),
+        (None, Some(_)) => Err(Undrawable::Unsupported),
+        (Some(format), Some(data)) => base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map(|bytes| Picture::new(format, bytes))
+            .map_err(|_| Undrawable::Corrupt),
     };
-    let image = format
-        .zip(content.data.as_ref())
-        .and_then(|(format, data)| {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .ok()?;
-            Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
-        });
     ImageSide {
-        image,
+        picture,
+        mime: content.mime.clone().into(),
         size: format_bytes(content.size),
     }
 }
@@ -391,8 +386,12 @@ pub struct DiffDoc {
     pub digits: u32,
     pub added: u32,
     pub removed: u32,
-    /// One per file with a known language; drained by the view at startup.
-    pub jobs: Vec<HighlightJob>,
+    /// One per file with a known language, run once (`Prepared`).
+    jobs: Vec<HighlightJob>,
+    /// Each line's syntax marks, sorted and non-overlapping, once its
+    /// file's job has run. Set from the highlighter's threads while the
+    /// document is on screen.
+    marks: Box<[OnceLock<Vec<Mark>>]>,
 }
 
 struct Numbered {
@@ -415,7 +414,16 @@ impl DiffDoc {
             added: 0,
             removed: 0,
             jobs: Vec::new(),
+            marks: Box::default(),
         }
+    }
+
+    /// A line's syntax marks: none until its file has been highlighted.
+    pub fn marks(&self, line: LineId) -> &[Mark] {
+        self.marks
+            .get(line as usize)
+            .and_then(OnceLock::get)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn build(diff: &ChangeDiff) -> Self {
@@ -428,6 +436,7 @@ impl DiffDoc {
             added: 0,
             removed: 0,
             jobs: Vec::new(),
+            marks: Box::default(),
         };
         let mut max_no = 1u32;
         for (index, file) in diff.files.iter().enumerate() {
@@ -527,6 +536,7 @@ impl DiffDoc {
             }
         }
         doc.digits = (max_no.max(1).ilog10() + 1).max(2);
+        doc.marks = (0..doc.lines.len()).map(|_| OnceLock::new()).collect();
         doc
     }
 
@@ -674,6 +684,61 @@ impl DiffDoc {
     }
 }
 
+/// A diff as read and laid out, ready for the surface. The cache keeps it
+/// and whatever shows it shares it, so a diff shown again is neither read
+/// nor built again, and keeps the colours its first showing gave it.
+#[derive(Clone)]
+pub struct Prepared(Arc<PreparedInner>);
+
+struct PreparedInner {
+    diff: Arc<ChangeDiff>,
+    doc: Arc<DiffDoc>,
+    /// One task per file with a grammar, started the first time the diff
+    /// is shown; each is done once its file's marks are in the document.
+    highlighting: OnceLock<Vec<Shared<Task<()>>>>,
+}
+
+impl Prepared {
+    /// Lay `diff` out. It costs what the diff is long: call it off the UI
+    /// thread.
+    pub fn new(diff: Arc<ChangeDiff>) -> Self {
+        let doc = Arc::new(DiffDoc::build(&diff));
+        Self(Arc::new(PreparedInner {
+            diff,
+            doc,
+            highlighting: OnceLock::new(),
+        }))
+    }
+
+    pub fn diff(&self) -> &Arc<ChangeDiff> {
+        &self.0.diff
+    }
+
+    pub fn doc(&self) -> &Arc<DiffDoc> {
+        &self.0.doc
+    }
+
+    /// Highlight the diff, once. The first call starts a task per file, in
+    /// file order so the top of the diff colours first; every call answers
+    /// the same tasks, finished or not.
+    pub fn highlighting(&self, executor: &BackgroundExecutor) -> &[Shared<Task<()>>] {
+        self.0.highlighting.get_or_init(|| {
+            (0..self.0.doc.jobs.len())
+                .map(|job| {
+                    let doc = self.0.doc.clone();
+                    executor
+                        .spawn(async move {
+                            for (line, marks) in doc.jobs[job].run() {
+                                let _ = doc.marks[line as usize].set(marks);
+                            }
+                        })
+                        .shared()
+                })
+                .collect()
+        })
+    }
+}
+
 fn file_model(file: &FileDiff, added: u32, removed: u32, max_cols: u32) -> FileModel {
     let (dir, name) = match file.path.rfind('/') {
         Some(slash) => file.path.split_at(slash + 1),
@@ -783,7 +848,7 @@ fn split_rows(lines: &[Numbered], out: &mut Layout) {
 }
 
 /// Human-readable byte size, decimal units: "847 B", "24.1 KB", "3.2 MB".
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     if bytes < 1000 {
         return format!("{bytes} B");
     }
@@ -950,6 +1015,33 @@ mod tests {
         assert_eq!(stored.cols, 16);
         assert_eq!(stored.source_slice(0..stored.text.len()), "\tif x {\t// y");
         assert_eq!(stored.source_slice(4..8), "if x");
+    }
+
+    #[test]
+    fn an_image_side_says_why_it_has_no_picture() {
+        let why = |mime: &str, size: u64, data: Option<&str>| {
+            image_side(&jiji_core::snapshot::ImageContent {
+                mime: mime.into(),
+                size,
+                data: data.map(str::to_owned),
+            })
+            .picture
+            .err()
+        };
+        let cap = jiji_core::jj::MAX_IMAGE_INLINE_BYTES as u64;
+        assert_eq!(why("image/png", cap + 1, None), Some(Undrawable::TooLarge));
+        // Within the cap and still without bytes: the change's budget ran out.
+        assert_eq!(why("image/png", cap, None), Some(Undrawable::OverBudget));
+        assert_eq!(
+            why("image/jxl", 3, Some("AAAA")),
+            Some(Undrawable::Unsupported)
+        );
+        assert_eq!(
+            why("image/png", 3, Some("not base64!")),
+            Some(Undrawable::Corrupt)
+        );
+        // Bytes to decode: whether they draw is for the decoder to say.
+        assert_eq!(why("image/heic", 3, Some("AAAA")), None);
     }
 
     #[test]

@@ -20,12 +20,12 @@ use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FontWeight, ScrollHandle, SharedString,
     Window,
 };
-use jiji_core::snapshot::{ChangeDiff, ChangeEvolog, EvologEntry, NodeKind};
+use jiji_core::snapshot::{ChangeEvolog, EvologEntry, NodeKind};
 
 use super::WorkbenchView;
 use crate::app::DiffLayout;
-use crate::diff::model::DiffDoc;
-use crate::diff::view::DiffSurface;
+use crate::diff::model::Prepared;
+use crate::diff::view::{DiffEvent, DiffSurface};
 use crate::host::CommandError;
 use crate::logic::evolution::{default_span, extend_to, grow, scrub, step_to, Span};
 use crate::logic::inspect::{find_node, summary_of};
@@ -41,9 +41,10 @@ use crate::ui::{
 /// demand when selected.
 const PREFETCH_CAP: usize = 32;
 
-/// A fetched step or span diff, with its weight for the timeline.
+/// A fetched step or span diff, laid out, with its weight for the
+/// timeline.
 struct Held {
-    diff: Arc<ChangeDiff>,
+    prepared: Prepared,
     added: u32,
     removed: u32,
 }
@@ -68,9 +69,9 @@ pub(super) struct EvolutionState {
     /// Step and span diffs keyed older → newer commit id.
     diffs: HashMap<(String, String), Entry>,
     prefetch_seq: u64,
-    /// The diff the surface holds.
+    /// The span whose diff the surface holds.
     shown: Option<(String, String)>,
-    surface: Entity<DiffSurface>,
+    pub(super) surface: Entity<DiffSurface>,
     restore_armed: bool,
     acting: bool,
     action_error: Option<String>,
@@ -231,14 +232,16 @@ impl WorkbenchView {
                 .compare_diff(Path::new(&repo), &from, &to)
                 .map_err(CommandError::from)
                 .map(|diff| {
-                    // The weight is the diff's own line counts.
-                    let doc = DiffDoc::build(&diff);
-                    let (added, removed) = doc
+                    // Laid out once, here: the weight is the diff's own
+                    // line counts, and the surface shows the same layout.
+                    let prepared = Prepared::new(Arc::new(diff));
+                    let (added, removed) = prepared
+                        .doc()
                         .files
                         .iter()
                         .fold((0, 0), |(a, r), file| (a + file.added, r + file.removed));
                     Held {
-                        diff: Arc::new(diff),
+                        prepared,
                         added,
                         removed,
                     }
@@ -340,22 +343,50 @@ impl WorkbenchView {
         let Some(Entry::Ready(held)) = self.evolution.diffs.get(&key) else {
             return;
         };
-        let diff = held.diff.clone();
-        self.evolution.shown = Some(key.clone());
-        let built = cx.background_spawn(async move { DiffDoc::build(&diff) });
-        cx.spawn(async move |this, cx| {
-            let doc = built.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.evolution.shown.as_ref() != Some(&key) {
-                    return;
-                }
-                this.evolution
-                    .surface
-                    .update(cx, |surface, cx| surface.set_doc(doc, false, cx));
-                cx.notify();
+        let prepared = held.prepared.clone();
+        self.evolution
+            .surface
+            .update(cx, |surface, cx| surface.set_doc(&prepared, false, cx));
+        self.evolution.shown = Some(key);
+        cx.notify();
+    }
+
+    /// Right-click on the version's diff: the diff's reading verbs for the
+    /// file under the pointer, as it was in that version — open it, copy
+    /// its paths, copy a hunk or the file as a patch. Nothing that changes
+    /// the repository: a discard or a move would act on the change as it
+    /// is now, with an old version's lines.
+    pub(super) fn on_evolution_event(&mut self, event: &DiffEvent, cx: &mut Context<Self>) {
+        let DiffEvent::Context { position, target } = event else {
+            return;
+        };
+        let selection = target.selection.clone().unwrap_or_default();
+        // A span's diff goes on the surface the moment it is read, so the
+        // span's read is what the surface shows; while it is still being
+        // read, the surface shows another span's, and names no file.
+        let held = self
+            .span_key()
+            .and_then(|key| match self.evolution.diffs.get(&key) {
+                Some(Entry::Ready(held)) => Some(held.prepared.diff().clone()),
+                _ => None,
             });
-        })
-        .detach();
+        let file = held.as_ref().and_then(|diff| {
+            let path = target.path.as_deref()?;
+            diff.files.iter().find(|file| file.path == path)
+        });
+        let change = self.evolution_change(cx);
+        self.app.update(cx, |model, cx| match (file, change) {
+            (Some(file), Some(change)) => model.open_diff_menu(
+                file,
+                &change,
+                true,
+                target.line(),
+                &selection,
+                *position,
+                cx,
+            ),
+            _ => model.open_surface_menu(*position, &selection, cx),
+        });
     }
 
     pub(super) fn set_evolution_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
@@ -490,7 +521,7 @@ impl WorkbenchView {
                 let step = self.key_between(index - 1, index).and_then(|key| {
                     match self.evolution.diffs.get(&key) {
                         Some(Entry::Ready(held)) => {
-                            Some((held.diff.files.len(), held.added, held.removed))
+                            Some((held.prepared.diff().files.len(), held.added, held.removed))
                         }
                         _ => None,
                     }
@@ -668,7 +699,7 @@ impl WorkbenchView {
             .span_key()
             .and_then(|key| self.evolution.diffs.get(&key))
         {
-            let files = held.diff.files.len();
+            let files = held.prepared.diff().files.len();
             if files > 0 {
                 caption = caption.child(
                     h_flex()
@@ -795,7 +826,7 @@ impl WorkbenchView {
         match held {
             None | Some(Entry::Loading) => skeleton(),
             Some(Entry::Failed(error)) => note(error.clone(), t.warn).into_any_element(),
-            Some(Entry::Ready(held)) if held.diff.files.is_empty() => {
+            Some(Entry::Ready(held)) if held.prepared.diff().files.is_empty() => {
                 let span = self.evolution.span;
                 let pair = span.and_then(|span| {
                     let versions = &self.evolution.versions;
@@ -870,7 +901,7 @@ impl WorkbenchView {
                         .min_h_0()
                         .child(self.evolution.surface.clone()),
                 );
-                if held.diff.truncated {
+                if held.prepared.diff().truncated {
                     body = body.child(
                         note(
                             "File list truncated — this rewrite touched more files than Jiji \

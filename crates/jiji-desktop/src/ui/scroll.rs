@@ -318,9 +318,178 @@ impl Element for Scrollbar {
     }
 }
 
+/// A sideways overlay scrollbar for an offset the caller keeps rather than
+/// a scroll handle: `offset` of `max`, over content panning inside the
+/// bar's own width. Lay it along the bottom of what pans; `on_pan` hears
+/// each offset a drag of the thumb asks for.
+pub fn pan_scrollbar(
+    id: impl Into<ElementId>,
+    offset: f32,
+    max: f32,
+    on_pan: impl Fn(f32, &mut Window, &mut App) + 'static,
+) -> PanScrollbar {
+    PanScrollbar {
+        id: id.into(),
+        offset,
+        max,
+        on_pan: Rc::new(on_pan),
+    }
+}
+
+/// What a sideways scrollbar tells its owner: the offset a drag asks for.
+type OnPan = Rc<dyn Fn(f32, &mut Window, &mut App)>;
+
+pub struct PanScrollbar {
+    id: ElementId,
+    offset: f32,
+    max: f32,
+    on_pan: OnPan,
+}
+
+/// Where a sideways thumb sits on its track, and how far the content pans
+/// per point of thumb travel. The track is the viewport: the thumb is to
+/// the track as the viewport is to the content.
+fn pan_geometry(bounds: Bounds<Pixels>, offset: f32, max: f32) -> Option<(Bounds<Pixels>, f32)> {
+    let track: f32 = bounds.size.width.into();
+    if max <= 0.5 || track <= 0. {
+        return None;
+    }
+    let width = (track * track / (track + max)).max(MIN_THUMB).min(track);
+    let travel = track - width;
+    let left = f32::from(bounds.left()) + travel * (offset / max).clamp(0., 1.);
+    let thumb = Bounds::new(
+        point(px(left), bounds.top() + px(THUMB_INSET)),
+        size(px(width), px(TRACK_W - THUMB_INSET * 2.)),
+    );
+    Some((thumb, if travel > 0. { max / travel } else { 0. }))
+}
+
+impl Element for PanScrollbar {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = px(TRACK_W).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        // Only the thumb takes the pointer; the track lets the lines under
+        // it be clicked.
+        pan_geometry(bounds, self.offset, self.max)
+            .map(|(thumb, _)| window.insert_hitbox(thumb, HitboxBehavior::Normal))
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (Some((thumb, ratio)), Some(hitbox)) =
+            (pan_geometry(bounds, self.offset, self.max), hitbox.clone())
+        else {
+            return;
+        };
+        let state: Rc<DragState> = window.with_element_state(
+            id.expect("scrollbars carry an id"),
+            |state: Option<Rc<DragState>>, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            },
+        );
+        let t = theme(cx);
+        let hot = state.grab.get().is_some() || hitbox.is_hovered(window);
+        window.paint_quad(
+            fill(thumb, if hot { t.scrollbar_hover } else { t.scrollbar }).corner_radii(px(4.)),
+        );
+
+        let (max, track) = (self.max, bounds.left());
+        window.on_mouse_event({
+            let state = state.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && event.button == MouseButton::Left
+                    && hitbox.is_hovered(window)
+                {
+                    state.grab.set(Some(event.position.x - thumb.left()));
+                    cx.stop_propagation();
+                    window.refresh();
+                }
+            }
+        });
+        window.on_mouse_event({
+            let state = state.clone();
+            let on_pan = self.on_pan.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+                let Some(grab) = state.grab.get() else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    state.grab.set(None);
+                    window.refresh();
+                    return;
+                }
+                let left: f32 = (event.position.x - grab - track).into();
+                on_pan((left * ratio).clamp(0., max), window, cx);
+            }
+        });
+        window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
+            if phase == DispatchPhase::Capture && state.grab.take().is_some() {
+                window.refresh();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pan_thumb_is_to_its_track_as_the_view_is_to_the_content() {
+        let track = Bounds::new(point(px(100.), px(0.)), size(px(200.), px(TRACK_W)));
+        // 200 points of view over 600 of content: a third of the track.
+        let (thumb, ratio) = pan_geometry(track, 0., 400.).unwrap();
+        assert_eq!(thumb.size.width, px(200. / 3.));
+        assert_eq!(thumb.left(), px(100.));
+        let (end, _) = pan_geometry(track, 400., 400.).unwrap();
+        assert_eq!(end.right(), px(300.));
+        // A thumb's full travel pans the whole way.
+        assert_eq!(ratio * (200. - 200. / 3.), 400.);
+        assert!(pan_geometry(track, 0., 0.).is_none());
+    }
 
     #[test]
     fn a_gesture_keeps_the_axis_it_sets_off_on() {

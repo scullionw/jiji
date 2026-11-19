@@ -19,7 +19,8 @@ use gpui::{
 use crate::theme::{theme, FONT_UI, RADIUS_S, TEXT_XS};
 
 /// GPUI's own delay between hovering an element and building its tooltip.
-const SHOW_DELAY: Duration = Duration::from_millis(500);
+/// Elements that raise their own tooltips wait as long.
+pub const SHOW_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct TooltipGuard {
