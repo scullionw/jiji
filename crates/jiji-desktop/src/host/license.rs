@@ -43,9 +43,27 @@ struct Activation {
 pub struct PolarError {
     pub status: u16,
     /// Polar's own words, for the log.
-    #[allow(dead_code)]
     pub message: String,
 }
+
+impl PolarError {
+    /// A failure that says nothing about the key: Polar unreachable, slow,
+    /// busy or broken. Asking again later may well work.
+    fn is_transient(&self) -> bool {
+        matches!(self.status, 0 | 408 | 429) || self.status >= 500
+    }
+}
+
+/// Polar's license-key endpoints, behind a seam so tests can answer for
+/// them.
+pub trait Polar {
+    fn validate(&self, key: &str, activation_id: Option<&str>) -> Result<Validation, PolarError>;
+    /// Register `device_id` against `key`; the new activation's id.
+    fn activate(&self, key: &str, device_id: &str) -> Result<String, PolarError>;
+}
+
+/// The real thing, over HTTPS.
+pub struct PolarApi;
 
 fn post<T: serde::de::DeserializeOwned>(
     endpoint: &str,
@@ -86,24 +104,27 @@ fn post<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn activate(key: &str, device_id: &str) -> Result<Activation, PolarError> {
-    post(
-        "activate",
-        json!({
-            "key": key,
-            "organization_id": POLAR_ORG_ID,
-            "label": format!("Jiji desktop ({})", &device_id[..device_id.len().min(8)]),
-            "meta": { "device_id": device_id },
-        }),
-    )
-}
-
-fn validate(key: &str, activation_id: Option<&str>) -> Result<Validation, PolarError> {
-    let mut body = json!({ "key": key, "organization_id": POLAR_ORG_ID });
-    if let Some(id) = activation_id.filter(|id| !id.is_empty()) {
-        body["activation_id"] = json!(id);
+impl Polar for PolarApi {
+    fn validate(&self, key: &str, activation_id: Option<&str>) -> Result<Validation, PolarError> {
+        let mut body = json!({ "key": key, "organization_id": POLAR_ORG_ID });
+        if let Some(id) = activation_id.filter(|id| !id.is_empty()) {
+            body["activation_id"] = json!(id);
+        }
+        post("validate", body)
     }
-    post("validate", body)
+
+    fn activate(&self, key: &str, device_id: &str) -> Result<String, PolarError> {
+        post::<Activation>(
+            "activate",
+            json!({
+                "key": key,
+                "organization_id": POLAR_ORG_ID,
+                "label": format!("Jiji desktop ({})", &device_id[..device_id.len().min(8)]),
+                "meta": { "device_id": device_id },
+            }),
+        )
+        .map(|activation| activation.id)
+    }
 }
 
 /// A granted, unexpired key entitles the user.
@@ -177,8 +198,8 @@ pub enum Refresh {
 }
 
 /// Re-validate a cached license.
-pub fn refresh(record: &LicenseRecord) -> Refresh {
-    match validate(&record.key, Some(&record.activation_id)) {
+pub fn refresh(polar: &impl Polar, record: &LicenseRecord) -> Refresh {
+    match polar.validate(&record.key, Some(&record.activation_id)) {
         Ok(validation) if is_entitled(&validation) => Refresh::Keep(record_from(
             &record.key,
             &record.activation_id,
@@ -195,6 +216,7 @@ pub fn refresh(record: &LicenseRecord) -> Refresh {
 /// Activate and validate a freshly entered key. The error is the message
 /// to show.
 pub fn activate_license(
+    polar: &impl Polar,
     raw_key: &str,
     device_id: &str,
     cached: Option<&LicenseRecord>,
@@ -204,12 +226,13 @@ pub fn activate_license(
         return Err("Enter your license key.".into());
     }
     let generic = || "Something went wrong activating your license. Try again.".to_owned();
+    let unreachable = || "Couldn’t reach Polar. Check your connection and try again.".to_owned();
 
     // Re-entering the same key on this device: reuse the existing
     // activation rather than burning another slot.
     if let Some(record) = cached.filter(|r| r.key == key && !r.activation_id.is_empty()) {
-        if let Ok(validation) = validate(key, Some(&record.activation_id)) {
-            if is_entitled(&validation) {
+        match polar.validate(key, Some(&record.activation_id)) {
+            Ok(validation) if is_entitled(&validation) => {
                 return Ok(record_from(
                     key,
                     &record.activation_id,
@@ -218,16 +241,45 @@ pub fn activate_license(
                     cached,
                 ));
             }
+            // Polar could not say: a new activation now could spend a
+            // device slot, or meet the device limit, for a key this device
+            // already holds. Nothing changes; asking again will tell.
+            Err(err) if err.is_transient() => {
+                log::warn!(
+                    "could not validate this device's activation ({}): {}",
+                    err.status,
+                    err.message
+                );
+                return Err(match err.status {
+                    0 => unreachable(),
+                    _ => "Polar couldn’t check your key just now. Nothing changed — try again \
+                          in a moment."
+                        .into(),
+                });
+            }
+            // Revoked or expired, or an activation Polar no longer knows: a
+            // new activation is the way back, and its answer the one to
+            // show.
+            Ok(_) | Err(_) => {}
         }
     }
 
-    let activation = activate(key, device_id).map_err(|err| match err.status {
-        404 => "We couldn’t find that license key. Check it and try again.".to_owned(),
-        403 => "This license is already active on its maximum number of devices.".to_owned(),
-        0 => "Couldn’t reach Polar. Check your connection and try again.".to_owned(),
-        _ => generic(),
+    let activation = polar.activate(key, device_id).map_err(|err| {
+        log::warn!(
+            "Polar refused the activation ({}): {}",
+            err.status,
+            err.message
+        );
+        match err.status {
+            404 => "We couldn’t find that license key. Check it and try again.".to_owned(),
+            403 => "This license is already active on its maximum number of devices.".to_owned(),
+            0 => unreachable(),
+            _ => generic(),
+        }
     })?;
-    let validation = validate(key, Some(&activation.id)).map_err(|_| generic())?;
+    let validation = polar
+        .validate(key, Some(&activation))
+        .map_err(|_| generic())?;
     if !is_entitled(&validation) {
         return Err(
             "That license isn’t active right now. Contact support if this is unexpected.".into(),
@@ -235,7 +287,7 @@ pub fn activate_license(
     }
     Ok(record_from(
         key,
-        &activation.id,
+        &activation,
         device_id,
         &validation,
         cached,
@@ -273,5 +325,87 @@ mod tests {
     #[test]
     fn keys_display_masked() {
         assert_eq!(mask_key("JIJI-ABCD-1234"), "••••1234");
+    }
+
+    /// Polar as a test needs it: validation answers `fails` in turn (a
+    /// status per call) and then grants the key; activations are counted.
+    struct StubPolar {
+        fails: std::cell::RefCell<Vec<u16>>,
+        activations: std::cell::Cell<u32>,
+    }
+
+    impl StubPolar {
+        fn failing(statuses: &[u16]) -> Self {
+            Self {
+                fails: std::cell::RefCell::new(statuses.to_vec()),
+                activations: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl Polar for StubPolar {
+        fn validate(&self, _: &str, _: Option<&str>) -> Result<Validation, PolarError> {
+            let mut fails = self.fails.borrow_mut();
+            if !fails.is_empty() {
+                return Err(PolarError {
+                    status: fails.remove(0),
+                    message: "stubbed".into(),
+                });
+            }
+            Ok(Validation {
+                status: "granted".into(),
+                limit_activations: Some(3),
+                expires_at: None,
+            })
+        }
+
+        fn activate(&self, _: &str, _: &str) -> Result<String, PolarError> {
+            self.activations.set(self.activations.get() + 1);
+            Ok("activation-new".into())
+        }
+    }
+
+    fn registered() -> LicenseRecord {
+        LicenseRecord {
+            key: "JIJI-ABCD-1234".into(),
+            activation_id: "activation-1".into(),
+            device_id: "device-1".into(),
+            status: "granted".into(),
+            plan: "personal".into(),
+            limit_activations: Some(3),
+            expires_at: None,
+            registered_at: 1,
+            last_validated_at: 1,
+        }
+    }
+
+    #[test]
+    fn re_entering_a_key_while_polar_hiccups_activates_nothing() {
+        let cached = registered();
+        for status in [0, 429, 503] {
+            let polar = StubPolar::failing(&[status]);
+            let refused = activate_license(&polar, "JIJI-ABCD-1234", "device-1", Some(&cached));
+            assert!(refused.is_err(), "{status}");
+            assert_eq!(polar.activations.get(), 0, "{status}");
+            // Asking again, once Polar answers, reuses this device's
+            // activation.
+            let retried =
+                activate_license(&polar, " JIJI-ABCD-1234 ", "device-1", Some(&cached)).unwrap();
+            assert_eq!(polar.activations.get(), 0);
+            assert_eq!(
+                (retried.activation_id.as_str(), retried.device_id.as_str()),
+                ("activation-1", "device-1")
+            );
+            assert_eq!(retried.registered_at, cached.registered_at);
+        }
+    }
+
+    #[test]
+    fn an_activation_polar_no_longer_knows_is_replaced() {
+        let polar = StubPolar::failing(&[404]);
+        let cached = registered();
+        let record = activate_license(&polar, "JIJI-ABCD-1234", "device-1", Some(&cached)).unwrap();
+        assert_eq!(polar.activations.get(), 1);
+        assert_eq!(record.activation_id, "activation-new");
     }
 }

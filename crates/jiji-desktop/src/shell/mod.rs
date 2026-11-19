@@ -371,9 +371,9 @@ impl Shell {
         }
     }
 
-    /// The workbench, while it is the section on screen.
+    /// The section view on screen, when it is a `V`.
     #[cfg(test)]
-    pub fn workbench(&self) -> Option<Entity<crate::views::workbench::WorkbenchView>> {
+    pub fn section<V: 'static>(&self) -> Option<Entity<V>> {
         let (_, view) = self.content.as_ref()?;
         view.clone().downcast().ok()
     }
@@ -670,8 +670,9 @@ impl Render for Shell {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    this.app
-                        .update(cx, |model, cx| model.open_surface_menu(event.position, cx));
+                    this.app.update(cx, |model, cx| {
+                        model.open_surface_menu(event.position, "", cx)
+                    });
                 }),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {

@@ -4,6 +4,7 @@
 //! launcher forwards to it); without, it is the app.
 
 mod app;
+mod diagnostics;
 mod diff;
 mod headless;
 mod host;
@@ -26,30 +27,6 @@ use crate::app::AppModel;
 use crate::shell::Shell;
 use crate::store::Store;
 
-struct Logger;
-
-impl log::Log for Logger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
-    }
-
-    fn log(&self, record: &log::Record) {
-        // GPUI and its dependencies are chatty at info; keep theirs to
-        // warnings.
-        let ours = record.target().starts_with("jiji");
-        if self.enabled(record.metadata()) && (ours || record.level() <= log::Level::Warn) {
-            eprintln!(
-                "[{}] {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            );
-        }
-    }
-
-    fn flush(&self) {}
-}
-
 /// SF Mono when it is installed (it ships with Xcode and Terminal, not
 /// with the system), else Menlo, which every Mac has.
 fn mono_font(cx: &App) -> SharedString {
@@ -66,7 +43,7 @@ fn main() {
     if std::env::args_os().nth(1).is_some() {
         std::process::exit(jiji_cli::run(std::env::args_os()));
     }
-    let _ = log::set_logger(&Logger).map(|()| log::set_max_level(log::LevelFilter::Info));
+    diagnostics::install();
 
     // Development switches ride the environment so argv stays the CLI's:
     //   JIJI_OPEN=<path>      open this repository at launch; several,
@@ -189,6 +166,13 @@ fn main() {
             if cx.windows().is_empty() {
                 cx.quit();
             }
+        })
+        .detach();
+        // A panic the session lived through is in the log; only one that
+        // ended it is news at the next launch.
+        cx.on_app_quit(|cx| {
+            diagnostics::take_crash_mark(app::app(cx).read(cx).store.dir());
+            async {}
         })
         .detach();
 

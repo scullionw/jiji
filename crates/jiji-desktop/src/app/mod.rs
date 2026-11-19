@@ -15,6 +15,7 @@ mod tabs;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt as _;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString,
@@ -267,6 +268,9 @@ pub struct AppModel {
     pub update: UpdateUi,
     /// The registration popover in the top bar.
     pub registration_open: bool,
+    /// The last session ended in a panic (its record is in the log): the
+    /// status line says so until dismissed.
+    pub crashed: bool,
     /// What a graph drag in progress would do, for the status line.
     pub drag_hint: Option<DragHint>,
     /// The context menu on screen.
@@ -305,7 +309,20 @@ impl AppModel {
     /// Build the model, restore the previous session's tabs and start the
     /// background rhythms.
     pub fn install(store: Store, mono_font: SharedString, cx: &mut App) -> Entity<Self> {
-        let (host, mut events) = Host::new(store.dir().to_path_buf());
+        let host = Host::new(store.dir().to_path_buf());
+        Self::install_over(host, store, mono_font, cx)
+    }
+
+    /// `install` over a host of the caller's making: tests serve the mock
+    /// backend through one.
+    pub(crate) fn install_over(
+        (host, mut events): (Arc<Host>, UnboundedReceiver<HostEvent>),
+        mut store: Store,
+        mono_font: SharedString,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let license = LicenseUi::load(&mut store);
+        let crashed = crate::diagnostics::take_crash_mark(store.dir());
         let model = cx.new(|cx| {
             let mut this = Self {
                 sidebar_collapsed: store.flag("rail.hidden"),
@@ -313,7 +330,7 @@ impl AppModel {
                 recent_repos: store.recent_repos(),
                 upstream: UpstreamUi::new(&store),
                 cli: CliUi::new(&store),
-                license: LicenseUi::load(&store),
+                license,
                 host,
                 store,
                 window: None,
@@ -332,6 +349,7 @@ impl AppModel {
                 terminals: Vec::new(),
                 update: UpdateUi::default(),
                 registration_open: false,
+                crashed,
                 drag_hint: None,
                 menu: None,
                 menu_seq: 0,
@@ -384,6 +402,7 @@ impl AppModel {
         self.sync_cli_status(cx);
         self.sync_integrations(cx);
         self.revalidate_license(cx);
+        self.reread_license(cx);
         self.start_upstream_checks(cx);
         self.start_update_checks(cx);
     }
@@ -707,4 +726,40 @@ impl AppModel {
 
 pub fn no_repo_open() -> CommandError {
     CommandError::new("no_repo_open", "No repository is currently open")
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use crate::diagnostics::{take_crash_mark, CRASH_MARK};
+    use crate::store::{PersistedRepo, PersistedTabs, Store};
+    use crate::testing::{install, jj_repo, scratch};
+
+    #[gpui::test]
+    fn a_session_that_ended_in_a_panic_is_news_at_the_next_launch(cx: &mut TestAppContext) {
+        let dir = scratch("crash-notice");
+        let alpha = jj_repo(&dir, "alpha");
+        // The last session had a tab open when its panic struck.
+        Store::at(dir.join("data")).set_tabs(&PersistedTabs {
+            repos: vec![PersistedRepo {
+                path: alpha.clone(),
+                name: "alpha".into(),
+            }],
+            active: 0,
+        });
+        std::fs::write(dir.join("data").join(CRASH_MARK), "then").unwrap();
+
+        let model = install(&dir, cx);
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert!(model.crashed);
+            assert_eq!(model.tab().path.as_deref(), Some(alpha.as_str()));
+        });
+        // Said once: the launch after this one has nothing to say.
+        assert!(!take_crash_mark(&dir.join("data")));
+        model.update(cx, |model, cx| model.dismiss_crash_notice(cx));
+        model.read_with(cx, |model, _| assert!(!model.crashed));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

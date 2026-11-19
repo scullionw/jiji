@@ -713,21 +713,29 @@ impl WorkbenchView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let loaded = self.diff.loaded.clone();
+        let selection = target.selection.unwrap_or_default();
+        // Only a diff read at the repository, operation and comparison on
+        // screen names a file to act on. While another selection loads, or
+        // after a refresh failed, the dimmed diff is an older one, and its
+        // paths, hunks and conflicts would be taken for the current
+        // change's: the menu is the bare surface's until they match.
+        let loaded = self.diff.loaded.clone().filter(|_| self.diff.fresh());
         let file = loaded.as_ref().and_then(|(_, diff)| {
             let path = target.path.as_deref()?;
             diff.files.iter().find(|file| file.path == path)
         });
         let (Some((key, _)), Some(file)) = (&loaded, file) else {
-            self.app
-                .update(cx, |model, cx| model.open_surface_menu(position, cx));
+            self.app.update(cx, |model, cx| {
+                model.open_surface_menu(position, &selection, cx)
+            });
             return;
         };
         let line = (!target.on_header && (target.old_no.is_some() || target.new_no.is_some()))
             .then_some((target.old_no, target.new_no));
-        let selection = target.selection.unwrap_or_default();
-        // A comparison's hunks are not the change's own: reading verbs
-        // only.
+        // A comparison's hunks are not the change's own, and a file's
+        // discard would undo the change's edits rather than the span on
+        // screen: reading verbs only. Acting happens on the change's own
+        // diff, one Esc away.
         let readonly = key.from.is_some();
         self.app.update(cx, |model, cx| {
             model.open_diff_menu(file, &key.id, readonly, line, &selection, position, cx)
@@ -882,5 +890,182 @@ impl Render for WorkbenchView {
                 .h_full()
                 .child(self.render_diff_pane(window, cx)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use gpui::{point, px, TestAppContext, WindowHandle};
+
+    use crate::app::AppModel;
+    use crate::diff::view::{DiffEvent, DiffTarget};
+    use crate::logic::inspect::CompareMode;
+    use crate::shell::Shell;
+
+    /// The working copy's two-hunk file in the mock repo, and its second
+    /// changed line: a target for every file, hunk and line action.
+    const VIEWPORT: &str = "src/lib/components/diff/DiffViewport.svelte";
+    /// A file the conflicted mock change `pmwzqkvt` leaves unresolved.
+    const CONFLICTED: &str = "src/lib/components/conflicts/ConflictList.svelte";
+
+    /// What may change the repository from a diff's menu.
+    const CHANGING: [&str; 5] = [
+        "diff.moveFile",
+        "diff.restoreFile",
+        "diff.restoreHunk",
+        "diff.restoreLine",
+        "diff.resolve",
+    ];
+
+    fn on_line(path: &str, old: u32) -> DiffTarget {
+        DiffTarget {
+            path: Some(path.into()),
+            old_no: Some(old),
+            selection: Some("rows.slice".into()),
+            ..DiffTarget::default()
+        }
+    }
+
+    fn on_header(path: &str) -> DiffTarget {
+        DiffTarget {
+            path: Some(path.into()),
+            on_header: true,
+            ..DiffTarget::default()
+        }
+    }
+
+    fn workbench(
+        window: WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+    ) -> gpui::Entity<super::WorkbenchView> {
+        window
+            .update(cx, |shell, _, _| shell.section::<super::WorkbenchView>())
+            .unwrap()
+            .expect("the workbench is on screen")
+    }
+
+    /// Right-click the diff surface over `target`, as its hit-testing
+    /// reports it, and read back what the menu offers.
+    fn menu_for(
+        model: &gpui::Entity<AppModel>,
+        window: WindowHandle<Shell>,
+        target: DiffTarget,
+        cx: &mut TestAppContext,
+    ) -> Vec<&'static str> {
+        model.update(cx, |model, cx| model.close_menu(cx));
+        let surface = workbench(window, cx).read_with(cx, |view, _| view.surface.clone());
+        surface.update(cx, |_, cx| {
+            cx.emit(DiffEvent::Context {
+                position: point(px(900.), px(300.)),
+                target,
+            })
+        });
+        model.read_with(cx, |model, _| {
+            model
+                .menu
+                .iter()
+                .flat_map(|menu| menu.sections.iter().flatten())
+                .map(|item| item.id)
+                .collect()
+        })
+    }
+
+    fn changing(ids: &[&'static str]) -> Vec<&'static str> {
+        ids.iter()
+            .copied()
+            .filter(|id| CHANGING.contains(id))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_diff_that_is_not_the_one_asked_for_offers_nothing_to_change(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("stale-diff-menu");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+
+        // The working copy's own diff, read at the operation on screen.
+        let fresh = menu_for(&model, window, on_line(VIEWPORT, 39), cx);
+        assert_eq!(
+            changing(&fresh),
+            [
+                "diff.moveFile",
+                "diff.restoreLine",
+                "diff.restoreHunk",
+                "diff.restoreFile"
+            ]
+        );
+
+        // Another change selected, its diff still being read: the working
+        // copy's stays on screen, dimmed, and offers nothing to change —
+        // the bare surface's menu, with the selection still copying.
+        model.update(cx, |model, cx| {
+            model.select_node(Some("pmwzqkvt".into()), cx)
+        });
+        let loading = menu_for(&model, window, on_line(VIEWPORT, 39), cx);
+        assert!(
+            loading.iter().all(|id| !id.starts_with("diff.")),
+            "{loading:?}"
+        );
+        assert!(loading.contains(&"copy.selection") && loading.contains(&"app.refresh"));
+        cx.run_until_parked();
+        let conflicted = menu_for(&model, window, on_header(CONFLICTED), cx);
+        assert_eq!(
+            changing(&conflicted),
+            ["diff.resolve", "diff.moveFile", "diff.restoreFile"]
+        );
+
+        // A new operation lands and reading the diff at it fails: the diff
+        // on screen was read at the previous operation, so it offers
+        // nothing to change until a read at this one succeeds.
+        let next = model.read_with(cx, |model, _| {
+            let backend = model.host.backend();
+            backend
+                .describe(Path::new(&repo), "lwnouzpy", "elsewhere")
+                .unwrap();
+            backend.open(Path::new(&repo)).unwrap()
+        });
+        let (jj, away) = (Path::new(&repo).join(".jj"), dir.join("jj-away"));
+        std::fs::rename(&jj, &away).unwrap();
+        model.update(cx, |model, cx| model.apply_snapshot(Arc::new(next), cx));
+        cx.run_until_parked();
+        let failed = workbench(window, cx).read_with(cx, |view, _| view.diff.error.clone());
+        assert!(failed.is_some());
+        let stale = menu_for(&model, window, on_header(CONFLICTED), cx);
+        assert!(stale.iter().all(|id| !id.starts_with("diff.")), "{stale:?}");
+
+        std::fs::rename(&away, &jj).unwrap();
+        workbench(window, cx).update(cx, |view, cx| view.retry_diff(cx));
+        cx.run_until_parked();
+        let retried = menu_for(&model, window, on_header(CONFLICTED), cx);
+        assert_eq!(
+            changing(&retried),
+            ["diff.resolve", "diff.moveFile", "diff.restoreFile"]
+        );
+
+        // A comparison asked for while the change's own diff is on screen:
+        // nothing to change while it loads, and only reading once it is
+        // there — a comparison's hunks are not the change's own.
+        workbench(window, cx).update(cx, |view, cx| view.set_compare(CompareMode::Trunk, cx));
+        let comparing = menu_for(&model, window, on_header(CONFLICTED), cx);
+        assert!(
+            comparing.iter().all(|id| !id.starts_with("diff.")),
+            "{comparing:?}"
+        );
+        cx.run_until_parked();
+        let compared = workbench(window, cx).read_with(cx, |view, _| {
+            let (key, diff) = view.diff.loaded.clone().expect("the comparison loaded");
+            assert!(key.from.is_some() && view.diff.fresh());
+            diff.files[0].path.clone()
+        });
+        let reading = menu_for(&model, window, on_header(&compared), cx);
+        assert!(reading.contains(&"diff.copyPath"), "{reading:?}");
+        assert!(changing(&reading).is_empty(), "{reading:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -75,11 +75,10 @@ pub(super) struct DiffState {
     want: Option<DiffKey>,
     /// What the surface holds.
     pub(super) loaded: Option<(DiffKey, Arc<ChangeDiff>)>,
-    error: Option<String>,
+    pub(super) error: Option<String>,
     /// The fetch outlasted the slow timer.
     slow: bool,
     seq: u64,
-    retry: u64,
     pub(super) layout: DiffLayout,
     pub(super) tree_on: bool,
     tree_width: f32,
@@ -115,7 +114,6 @@ impl DiffState {
             error: None,
             slow: false,
             seq: 0,
-            retry: 0,
             layout,
             tree_on,
             tree_width,
@@ -370,6 +368,14 @@ impl WorkbenchView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// The error band's Retry: read the comparison the selection asks for
+    /// again.
+    pub(super) fn retry_diff(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.diff.want.clone() {
+            self.request_diff(key, cx);
+        }
     }
 
     /// Warm the cache for the selections one arrow-key step away, so
@@ -1306,12 +1312,7 @@ impl WorkbenchView {
                             .text_color(t.text1)
                             .cursor_pointer()
                             .hover(|style| style.bg(t.bg_hover))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.diff.retry += 1;
-                                if let Some(key) = this.diff.want.clone() {
-                                    this.request_diff(key, cx);
-                                }
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_diff(cx)))
                             .child("Retry"),
                     ),
             );

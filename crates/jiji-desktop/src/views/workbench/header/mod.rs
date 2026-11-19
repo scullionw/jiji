@@ -924,7 +924,7 @@ mod tests {
     fn editor_text(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Option<String> {
         window
             .update(cx, |shell, _, cx| {
-                let workbench = shell.workbench()?;
+                let workbench = shell.section::<crate::views::workbench::WorkbenchView>()?;
                 let header = &workbench.read(cx).header;
                 (header.tray == super::Tray::Edit).then(|| header.editor.read(cx).text().to_owned())
             })

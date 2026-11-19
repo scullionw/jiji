@@ -877,7 +877,11 @@ impl Shell {
                         .text_color(t.accent_strong)
                         .cursor_pointer()
                         .hover(|style| style.text_color(t.text1))
-                        .tooltip(tooltip(format!("Key {display_key}")))
+                        // A licence file that cannot be read right now
+                        // keeps the registration but not the key.
+                        .when(!display_key.is_empty(), |el| {
+                            el.tooltip(tooltip(format!("Key {display_key}")))
+                        })
                         .child("Replace key…")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.settings_menu.close();

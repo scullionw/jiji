@@ -8,7 +8,9 @@ The binary is `jiji-desktop`. Run bare it is the app; with arguments it is
 the `jiji` CLI (`jiji-desktop publish …`), which is how the `jiji` command
 the app installs works. What the app remembers lives in
 `~/Library/Application Support/com.lauf.jiji`: recents, saved views,
-preferences, the licence and auto-land records.
+preferences, the licence and auto-land records. Its log, with any panic and
+its backtrace, is `~/Library/Logs/com.lauf.jiji/Jiji.log`, kept to about a
+megabyte with the part before it in `Jiji.old.log`.
 
 ## GPUI version
 
@@ -42,7 +44,7 @@ variables:
 | Variable | |
 |---|---|
 | `JIJI_OPEN=<path>` | open this repository at launch; several, separated like `PATH`, arrive together the way folders opened from Finder do |
-| `JIJI_DATA_DIR=<dir>` | keep preferences, recents and licence here instead of the real data directory — set it for any test run |
+| `JIJI_DATA_DIR=<dir>` | keep preferences, recents, licence and the log here instead of the real data and log directories — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock repository (needs a directory containing `.jj`) |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
 | `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
@@ -91,10 +93,11 @@ what survives a switch of section or tab, which tab an open lands in —
 since those go wrong between views rather than inside a function.
 
 These tests open real repositories, made for the test and without remotes,
-and under test the host finds no forge token, so they read no credentials
-and reach no network. Keep it that way: a test that needs a token-bearing
-path should fake the forge, not lift the guard in
-`host::forge::resolved_token`.
+or the mock backend's (`testing::install_mock`: conflicts, a merge tool,
+every kind of diff, and a backend a test can make fail by hiding `.jj`).
+Under test the host finds no forge token, so they read no credentials and
+reach no network. Keep it that way: a test that needs a token-bearing path
+should fake the forge, not lift the guard in `host::forge::resolved_token`.
 
 ## Layout
 
@@ -109,7 +112,7 @@ Under `src/`:
 | `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. |
 | `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings. |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
-| `theme.rs`, `store.rs` | The ten palettes; the persisted preferences. |
+| `theme.rs`, `store.rs`, `diagnostics.rs` | The ten palettes; the persisted preferences; the log and the record a panic leaves. |
 
 ## Design
 
@@ -234,3 +237,11 @@ Things this code works around, so the next change does not rediscover them:
   smooth-mouse case, not the trackpad one. Scroll down before scrolling
   sideways in a script; a sideways scroll fresh from launch only covers a
   gesture's first report.
+- **A panic cannot be contained to a view.** Frames and events arrive
+  through `extern "C"` AppKit callbacks, which abort on an unwind. Catching
+  one sooner leaves GPUI broken: the entity being updated is dropped from
+  the entity map while its handles live on (`LeaseInner::drop`), `App`'s
+  pending-update count is never wound back, so effects stop flushing, and
+  the window's draw stacks are left pushed. So a panic ends the session:
+  `diagnostics` records it with its backtrace, and the next launch says so
+  in the status line, with the tabs restored.

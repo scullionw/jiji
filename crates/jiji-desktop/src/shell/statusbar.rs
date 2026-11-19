@@ -138,6 +138,37 @@ impl Shell {
                 };
                 bar = bar.child(undo);
             }
+        } else if model.crashed {
+            // The panic that ended the last session is in the log; the tabs
+            // it had open are back.
+            let app = self.app.clone();
+            bar = bar
+                .child(dot(t.warn, 6.))
+                .child(msg("The last session ended unexpectedly.".into()))
+                .child(
+                    div()
+                        .id("crash-log")
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .h(px(18.))
+                        .px(px(6.))
+                        .rounded(px(RADIUS_S))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.accent_strong)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(t.accent_dim))
+                        .tooltip(tooltip("Open the log, where the error was recorded"))
+                        .on_click(|_, _, cx| cx.open_with_system(&crate::diagnostics::log_path()))
+                        .child("Show Log"),
+                )
+                .child(
+                    dismiss("crash-dismiss")
+                        .tooltip(tooltip("Dismiss"))
+                        .on_click(move |_, _, cx| {
+                            app.update(cx, |m, cx| m.dismiss_crash_notice(cx))
+                        }),
+                );
         } else if let Some(op) = snapshot.as_ref().and_then(|s| {
             // Every look at the repo snapshots the working copy, so the
             // newest operation is nearly always that; the line names the

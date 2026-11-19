@@ -10,9 +10,9 @@ use super::AppModel;
 use crate::host::cli::CliStatus;
 use crate::host::integrations::{self, AppInfo};
 use crate::host::license::{self, Refresh};
-use crate::host::update::{self, Staged};
+use crate::host::update::{self, InstallError, Staged};
 use crate::host::HostResult;
-use crate::store::{LicenseRecord, Store, ThemePref};
+use crate::store::{LicenseRecord, Store, ThemePref, Unreadable};
 use crate::theme::{self, Scheme, Theme, DEFAULT_LIGHT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +51,9 @@ pub struct LicenseUi {
     record: Option<LicenseRecord>,
     /// A simulated state (debug builds): never touches the store or Polar.
     simulated: bool,
+    /// The licence file could not be read: `registered` is what it last
+    /// said, until a read gets through.
+    unread: bool,
 }
 
 /// Debug builds are not stuck behind the license gate (which pins the app
@@ -69,14 +72,14 @@ fn dev_mode() -> Option<bool> {
 }
 
 impl LicenseUi {
-    pub fn load(store: &Store) -> Self {
+    pub fn load(store: &mut Store) -> Self {
         match dev_mode() {
             Some(true) => Self {
                 registered: true,
                 plan: "personal".into(),
                 display_key: "dev-mode".into(),
-                record: None,
                 simulated: true,
+                ..Self::default()
             },
             Some(false) => Self {
                 simulated: true,
@@ -88,12 +91,27 @@ impl LicenseUi {
                     plan: "unknown".into(),
                     ..Self::default()
                 };
-                if let Some(record) = store.license() {
-                    this.adopt(record);
-                }
+                this.read(store);
                 this
             }
         }
+    }
+
+    /// Take in what the licence file says; false while it cannot be read.
+    /// A file that cannot be read right now is not taken for an
+    /// unregistered copy — a registered user keeps the themes through it.
+    fn read(&mut self, store: &mut Store) -> bool {
+        match store.license() {
+            Ok(Some(record)) => self.adopt(record),
+            Ok(None) => self.drop_record(),
+            Err(Unreadable) => {
+                self.registered = store.was_registered();
+                self.unread = true;
+                return false;
+            }
+        }
+        self.unread = false;
+        true
     }
 
     fn adopt(&mut self, record: LicenseRecord) {
@@ -148,6 +166,9 @@ pub struct UpdateUi {
 
 /// Windows stay open for days; look again now and then.
 const UPDATE_RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How soon a licence file that could not be read is tried again.
+const LICENSE_RECHECK: Duration = Duration::from_secs(30);
 
 impl AppModel {
     // ── Theme ──
@@ -239,6 +260,33 @@ impl AppModel {
         cx.notify();
     }
 
+    /// While the licence file cannot be read, try it again now and then:
+    /// the registration is whole again as soon as it can be.
+    pub(super) fn reread_license(&mut self, cx: &mut Context<Self>) {
+        if !self.license.unread {
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(LICENSE_RECHECK).await;
+            let unread = this.update(cx, |this, cx| {
+                this.recheck_license(cx);
+                this.license.unread
+            });
+            if !unread.unwrap_or(false) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn recheck_license(&mut self, cx: &mut Context<Self>) {
+        if self.license.unread && self.license.read(&mut self.store) {
+            self.apply_theme(cx);
+            self.revalidate_license(cx);
+            cx.notify();
+        }
+    }
+
     /// Revalidate the cached license opportunistically (at most once a
     /// day). Offline keeps the cache; an explicit negative drops it.
     pub(super) fn revalidate_license(&mut self, cx: &mut Context<Self>) {
@@ -251,7 +299,8 @@ impl AppModel {
         if !license::needs_refresh(&record) {
             return;
         }
-        let refreshed = cx.background_spawn(async move { license::refresh(&record) });
+        let refreshed =
+            cx.background_spawn(async move { license::refresh(&license::PolarApi, &record) });
         cx.spawn(async move |this, cx| {
             let outcome = refreshed.await;
             let _ = this.update(cx, |this, cx| {
@@ -284,10 +333,17 @@ impl AppModel {
                 "This is a development build with a simulated license.".into()
             ));
         }
-        let device_id = self.store.device_id();
+        self.recheck_license(cx);
+        let Ok(device_id) = self.store.device_id() else {
+            return Task::ready(Err(
+                "Jiji couldn’t read its licence file, so nothing was changed. Try again in a \
+                 moment."
+                    .into(),
+            ));
+        };
         let cached = self.license.record.clone();
         let activated = cx.background_spawn(async move {
-            license::activate_license(&key, &device_id, cached.as_ref())
+            license::activate_license(&license::PolarApi, &key, &device_id, cached.as_ref())
         });
         cx.spawn(async move |this, cx| {
             let record = activated.await?;
@@ -511,6 +567,12 @@ impl AppModel {
                 Ok(()) => cx.quit(),
                 Err(err) => {
                     this.update.installing = false;
+                    if err == InstallError::Unverified {
+                        // Its archive is gone; fetch the release afresh.
+                        this.update.staged = None;
+                        this.update.version = None;
+                        this.check_update_quietly(cx).detach();
+                    }
                     log::warn!("app update install failed: {err}");
                     this.tell(
                         PromptLevel::Warning,
@@ -640,5 +702,95 @@ impl AppModel {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    use super::*;
+
+    fn record() -> LicenseRecord {
+        LicenseRecord {
+            key: "JIJI-ABCD-1234".into(),
+            activation_id: "activation-1".into(),
+            device_id: "device-1".into(),
+            status: "granted".into(),
+            plan: "personal".into(),
+            limit_activations: Some(3),
+            expires_at: None,
+            registered_at: 1,
+            last_validated_at: 1,
+        }
+    }
+
+    /// The licence state a launch on `dir` starts with.
+    fn launch(dir: &Path) -> (Store, LicenseUi) {
+        let mut store = Store::at(dir.to_path_buf());
+        let mut ui = LicenseUi::default();
+        ui.read(&mut store);
+        (store, ui)
+    }
+
+    #[test]
+    fn a_registration_holds_while_its_licence_file_cannot_be_read() {
+        let dir = crate::testing::scratch("licence-unread");
+        let file = dir.join("license.json");
+        let (mut store, _) = launch(&dir);
+        let device = store.device_id().unwrap();
+        store.set_license(&record());
+        let good = std::fs::read(&file).unwrap();
+
+        // Read refused, or the bytes not JSON at all.
+        for how in ["permission", "decode"] {
+            match how {
+                "permission" => {
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap()
+                }
+                _ => std::fs::write(&file, b"{\"state\": {\"key\"").unwrap(),
+            }
+            let (mut store, mut ui) = launch(&dir);
+            assert!(ui.registered && ui.unread, "{how}");
+            assert_eq!(ui.record, None, "{how}");
+            // No other device id, and nothing written over the file.
+            assert_eq!(store.device_id(), Err(Unreadable), "{how}");
+
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if how == "decode" {
+                assert_ne!(std::fs::read(&file).unwrap(), good);
+                std::fs::write(&file, &good).unwrap();
+            }
+            assert_eq!(std::fs::read(&file).unwrap(), good, "{how}");
+            // Back to normal at the next read.
+            assert!(ui.read(&mut store), "{how}");
+            assert!(ui.registered && !ui.unread, "{how}");
+            assert_eq!(ui.record, Some(record()), "{how}");
+            assert_eq!(ui.display_key, "••••1234", "{how}");
+            assert_eq!(store.device_id(), Ok(device.clone()), "{how}");
+        }
+
+        // A copy never registered stays unregistered through the same.
+        store.clear_license();
+        std::fs::write(&file, b"not json").unwrap();
+        let (_, ui) = launch(&dir);
+        assert!(!ui.registered && ui.unread);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_licence_written_before_the_flag_existed_sets_it_when_read() {
+        let dir = crate::testing::scratch("licence-upgrade");
+        // An install from before: the licence file alone.
+        let state = serde_json::json!({ "state": record(), "deviceId": "device-1" });
+        std::fs::write(dir.join("license.json"), state.to_string()).unwrap();
+        let (_, ui) = launch(&dir);
+        assert!(ui.registered);
+
+        std::fs::write(dir.join("license.json"), b"").unwrap();
+        let (_, ui) = launch(&dir);
+        assert!(ui.registered && ui.unread);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -709,6 +709,15 @@ impl PublishView {
             .into_any_element()
     }
 
+    /// Retry after a failed stack read: read the stacks again now, as well
+    /// as the rest. The snapshot and the PR state may never move again to
+    /// do it for us.
+    fn retry_stacks(&mut self, cx: &mut Context<Self>) {
+        self.stacks_for = None;
+        self.sync(cx);
+        self.refresh_selected(cx);
+    }
+
     fn refresh_selected(&mut self, cx: &mut Context<Self>) {
         self.app.update(cx, |model, cx| model.refresh_forge_prs(cx));
         let Some(stack) = self.selected_stack().cloned() else {
@@ -1134,14 +1143,27 @@ impl Render for PublishView {
             }))
             .child(self.render_page_bar(window, cx));
         let loading = matches!(phase, ForgePhase::Idle | ForgePhase::Loading);
+        let stacks_notice = |this: &Self, error: String, cx: &mut Context<Self>| {
+            this.notice(
+                "notice-stacks",
+                error,
+                true,
+                Some(("Retry", Box::new(|this, _, cx| this.retry_stacks(cx)))),
+                cx,
+            )
+        };
         let Some(snapshot) = self.snapshot.clone() else {
-            return root.child(
-                div().p(px(48.)).text_color(t.text2).child(
-                    self.stacks_error
-                        .clone()
-                        .unwrap_or_else(|| "Reading your stacks…".to_owned()),
+            // Nothing read yet: what is happening, or why it failed and the
+            // way to try again.
+            return match self.stacks_error.clone() {
+                Some(error) => root.child(stacks_notice(self, error, cx)),
+                None => root.child(
+                    div()
+                        .p(px(48.))
+                        .text_color(t.text2)
+                        .child("Reading your stacks…"),
                 ),
-            );
+            };
         };
         if !has_repo && !loading {
             return root.child(empty_state(
@@ -1171,13 +1193,7 @@ impl Render for PublishView {
             ));
         }
         if let Some(error) = self.stacks_error.clone() {
-            root = root.child(self.notice(
-                "notice-stacks",
-                error,
-                true,
-                Some(("Retry", Box::new(|this, _, cx| this.refresh_selected(cx)))),
-                cx,
-            ));
+            root = root.child(stacks_notice(self, error, cx));
         }
         if let Some(error) = prs_error {
             root = root.child(self.notice(
@@ -1208,5 +1224,60 @@ impl Render for PublishView {
             Page::Stacks => self.render_stacks_page(&snapshot, &jobs, window, cx),
             Page::Review => self.render_review_page(&snapshot, window, cx),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use gpui::TestAppContext;
+    use jiji_core::snapshot::SnapshotView;
+
+    use super::PublishView;
+    use crate::app::Section;
+    use crate::shell::Shell;
+
+    #[gpui::test]
+    fn retry_reads_the_stacks_again_when_nothing_else_moved(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("publish-retry");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let window = cx.add_window(Shell::new);
+        model.update(cx, |model, cx| {
+            model.open_paths(vec![PathBuf::from(&repo)], cx)
+        });
+        cx.run_until_parked();
+        // A lens the graph narrows: Publish reads the complete stacks from
+        // the repository itself, the read that fails below.
+        model.update(cx, |model, cx| {
+            model
+                .set_snapshot_view(SnapshotView::Mine, false, cx)
+                .detach()
+        });
+        cx.run_until_parked();
+
+        let (jj, away) = (Path::new(&repo).join(".jj"), dir.join("jj-away"));
+        std::fs::rename(&jj, &away).unwrap();
+        model.update(cx, |model, cx| model.go_to_section(Section::Publish, cx));
+        cx.run_until_parked();
+        let publish = window
+            .update(cx, |shell, _, _| shell.section::<PublishView>())
+            .unwrap()
+            .expect("Publish is on screen");
+        let (error, stacks) =
+            publish.read_with(cx, |view, _| (view.stacks_error.clone(), view.stacks.len()));
+        assert!(error.is_some() && stacks == 0);
+
+        // The local problem goes away; the snapshot and the (absent) PR
+        // state stay exactly as they were.
+        std::fs::rename(&away, &jj).unwrap();
+        publish.update(cx, |view, cx| view.retry_stacks(cx));
+        cx.run_until_parked();
+        let (error, stacks) =
+            publish.read_with(cx, |view, _| (view.stacks_error.clone(), view.stacks.len()));
+        assert_eq!(error, None);
+        assert!(stacks > 0);
+        model.read_with(cx, |model, _| assert_eq!(model.section(), Section::Publish));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -6,6 +6,10 @@
 //! first release, so an install from then keeps its recents, saved views,
 //! registration and interrupted auto-land jobs. `prefs.json` holds the
 //! rest (tabs, theme, pane widths, per-repo view lenses).
+//!
+//! A file that is there but cannot be read is never written over: what it
+//! holds is unknown, not gone. Lists decode entry by entry, so one bad
+//! entry costs only itself.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-const APP_ID: &str = "com.lauf.jiji";
+pub(crate) const APP_ID: &str = "com.lauf.jiji";
 const MAX_RECENT: usize = 8;
 
 /// Where the store lives. `JIJI_DATA_DIR` redirects it (tests, scripted
@@ -41,15 +45,43 @@ pub fn data_dir() -> PathBuf {
 struct JsonFile {
     path: PathBuf,
     map: Map<String, Value>,
+    /// The file is there but could not be read or decoded. It may hold
+    /// what a later read finds, so it is not written over until a read
+    /// succeeds; changes made meanwhile live in memory only.
+    unread: bool,
 }
 
 impl JsonFile {
     fn load(path: PathBuf) -> Self {
-        let map = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
-            .unwrap_or_default();
-        Self { path, map }
+        let mut file = Self {
+            path,
+            map: Map::new(),
+            unread: false,
+        };
+        file.reload();
+        file
+    }
+
+    /// Read the file again; false while it is there but still unreadable.
+    fn reload(&mut self) -> bool {
+        let read = match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+            Err(err) => Err(err.to_string()),
+        };
+        match read {
+            Ok(map) => {
+                self.map = map;
+                self.unread = false;
+            }
+            Err(err) => {
+                if !self.unread {
+                    log::warn!("could not read {}: {err}", self.path.display());
+                }
+                self.unread = true;
+            }
+        }
+        !self.unread
     }
 
     fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
@@ -58,24 +90,44 @@ impl JsonFile {
             .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 
+    /// The entries of a list that decode, in order.
+    fn get_each<T: DeserializeOwned>(&self, key: &str) -> Vec<T> {
+        match self.map.get(key) {
+            Some(Value::Array(entries)) => entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a change may go to disk: always, unless the file could not
+    /// be read and still cannot.
+    fn writable(&mut self) -> bool {
+        !self.unread || self.reload()
+    }
+
     fn set<T: Serialize>(&mut self, key: &str, value: &T) {
-        match serde_json::to_value(value) {
-            Ok(value) => {
-                if self.map.get(key) == Some(&value) {
-                    return;
-                }
-                self.map.insert(key.to_owned(), value);
-            }
+        let value = match serde_json::to_value(value) {
+            Ok(value) => value,
             Err(err) => {
                 log::warn!("could not encode {key}: {err}");
                 return;
             }
+        };
+        let writable = self.writable();
+        if self.map.get(key) == Some(&value) {
+            return;
         }
-        self.save();
+        self.map.insert(key.to_owned(), value);
+        if writable {
+            self.save();
+        }
     }
 
     fn remove(&mut self, key: &str) {
-        if self.map.remove(key).is_some() {
+        let writable = self.writable();
+        if self.map.remove(key).is_some() && writable {
             self.save();
         }
     }
@@ -104,19 +156,65 @@ pub struct RecentRepo {
     pub last_opened_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PersistedRepo {
     pub path: String,
-    #[serde(default)]
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PersistedTabs {
-    #[serde(default)]
     pub repos: Vec<PersistedRepo>,
-    #[serde(default)]
     pub active: usize,
+}
+
+impl PersistedTabs {
+    /// The saved tabs, entry by entry: an entry without a usable path
+    /// drops alone, as does a later copy of a path already restored, and
+    /// the active tab is found again among what is kept.
+    fn decode(value: Option<&Value>) -> Self {
+        let tabs = value.and_then(Value::as_object);
+        let field = |name| tabs.and_then(|tabs| tabs.get(name));
+        let active = field("active")
+            .and_then(Value::as_u64)
+            .map_or(0, |active| active as usize);
+        let entries = field("repos")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let mut repos: Vec<PersistedRepo> = Vec::new();
+        let mut active_at = None;
+        for (ix, entry) in entries.iter().enumerate() {
+            let path = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty());
+            let at = path.map(|path| {
+                repos
+                    .iter()
+                    .position(|repo| repo.path == path)
+                    .unwrap_or_else(|| {
+                        repos.push(PersistedRepo {
+                            path: path.to_owned(),
+                            // The repo names itself once it opens.
+                            name: entry
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        });
+                        repos.len() - 1
+                    })
+            });
+            if ix == active {
+                // A dropped active entry hands over to the next one kept.
+                active_at = Some(at.unwrap_or(repos.len()));
+            }
+        }
+        Self {
+            active: active_at.unwrap_or(active),
+            repos,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +267,15 @@ pub struct WindowGeometry {
     pub fullscreen: bool,
 }
 
+/// The licence file, or the record in it, could not be read: what it holds
+/// is unknown, not absent.
+#[derive(Debug, PartialEq)]
+pub struct Unreadable;
+
+/// Set beside the preferences while a licence record is stored: what a
+/// licence file that cannot be read falls back on.
+const REGISTERED: &str = "license.registered";
+
 pub struct Store {
     dir: PathBuf,
     prefs: JsonFile,
@@ -217,7 +324,7 @@ impl Store {
     // ── Tabs, theme, window ──
 
     pub fn tabs(&self) -> PersistedTabs {
-        self.pref("tabs").unwrap_or_default()
+        PersistedTabs::decode(self.prefs.map.get("tabs"))
     }
 
     pub fn set_tabs(&mut self, tabs: &PersistedTabs) {
@@ -293,8 +400,20 @@ impl Store {
 
     // ── Saved revset views, per repo ──
 
+    /// A repo's saved views, trimmed, without blanks or later copies of a
+    /// name.
     pub fn saved_views(&self, repo_path: &str) -> Vec<SavedView> {
-        self.saved_views.get(repo_path).unwrap_or_default()
+        let mut views: Vec<SavedView> = Vec::new();
+        for view in self.saved_views.get_each::<SavedView>(repo_path) {
+            let (name, revset) = (view.name.trim(), view.revset.trim());
+            if !name.is_empty() && !revset.is_empty() && !views.iter().any(|v| v.name == name) {
+                views.push(SavedView {
+                    name: name.to_owned(),
+                    revset: revset.to_owned(),
+                });
+            }
+        }
+        views
     }
 
     pub fn set_saved_views(&mut self, repo_path: &str, views: &[SavedView]) {
@@ -307,26 +426,47 @@ impl Store {
 
     // ── License ──
 
-    pub fn license(&self) -> Option<LicenseRecord> {
-        self.license.get("state")
+    /// The licence record, as the file says it now.
+    pub fn license(&mut self) -> Result<Option<LicenseRecord>, Unreadable> {
+        if !self.license.reload() {
+            return Err(Unreadable);
+        }
+        let record = match self.license.map.get("state") {
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| Unreadable)?),
+            None => None,
+        };
+        self.prefs.set(REGISTERED, &record.is_some());
+        Ok(record)
+    }
+
+    /// Whether a licence record was stored when the file was last read.
+    pub fn was_registered(&self) -> bool {
+        self.flag(REGISTERED)
     }
 
     pub fn set_license(&mut self, record: &LicenseRecord) {
         self.license.set("state", record);
+        self.prefs.set(REGISTERED, &true);
     }
 
     pub fn clear_license(&mut self) {
         self.license.remove("state");
+        self.prefs.set(REGISTERED, &false);
     }
 
-    /// A stable, random per-install id used as the activation device.
-    pub fn device_id(&mut self) -> String {
+    /// A stable, random per-install id used as the activation device. It
+    /// lives in the licence file: while that cannot be read there is none,
+    /// rather than a fresh one that would spend another device slot.
+    pub fn device_id(&mut self) -> Result<String, Unreadable> {
+        if !self.license.writable() {
+            return Err(Unreadable);
+        }
         if let Some(id) = self.license.get::<String>("deviceId") {
-            return id;
+            return Ok(id);
         }
         let id = random_uuid();
         self.license.set("deviceId", &id);
-        id
+        Ok(id)
     }
 }
 
@@ -408,10 +548,133 @@ mod tests {
     fn device_id_is_stable_and_uuid_shaped() {
         let dir = scratch("device");
         let mut store = Store::at(dir.clone());
-        let id = store.device_id();
+        let id = store.device_id().unwrap();
         assert_eq!(id.len(), 36);
         assert_eq!(id.as_bytes()[14], b'4');
-        assert_eq!(Store::at(dir.clone()).device_id(), id);
+        assert_eq!(Store::at(dir.clone()).device_id(), Ok(id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn view(name: &str, revset: &str) -> SavedView {
+        SavedView {
+            name: name.into(),
+            revset: revset.into(),
+        }
+    }
+
+    #[test]
+    fn a_bad_saved_view_costs_only_itself() {
+        let dir = scratch("views-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = serde_json::json!({
+            "/r": [
+                {"name": "WIP", "revset": "description(wip)"},
+                "not an object",
+                {"name": "no revset"},
+                {"name": 7, "revset": "all()"},
+                {"name": "  ", "revset": "all()"},
+                {"name": "blank revset", "revset": "  "},
+                {"name": " Mine ", "revset": " mine() "},
+                {"name": "WIP", "revset": "all()"},
+            ],
+            "/not-a-list": {"name": "x", "revset": "y"},
+        });
+        std::fs::write(dir.join("saved-views.json"), saved.to_string()).unwrap();
+        let store = Store::at(dir.clone());
+        assert_eq!(
+            store.saved_views("/r"),
+            [view("WIP", "description(wip)"), view("Mine", "mine()")]
+        );
+        assert_eq!(store.saved_views("/not-a-list"), []);
+        assert_eq!(store.saved_views("/missing"), []);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn tabs_from(tabs: serde_json::Value) -> PersistedTabs {
+        let dir = scratch("tabs-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefs = serde_json::json!({ "tabs": tabs });
+        std::fs::write(dir.join("prefs.json"), prefs.to_string()).unwrap();
+        let tabs = Store::at(dir.clone()).tabs();
+        let _ = std::fs::remove_dir_all(dir);
+        tabs
+    }
+
+    fn paths(tabs: &PersistedTabs) -> Vec<&str> {
+        tabs.repos.iter().map(|repo| repo.path.as_str()).collect()
+    }
+
+    #[test]
+    fn a_bad_tab_costs_only_itself_and_the_active_one_stays_active() {
+        let tabs = tabs_from(serde_json::json!({
+            "repos": [
+                {"path": "/a", "name": "a"},
+                {"name": "no path"},
+                {"path": "/b", "name": "b"},
+                {"path": "/a", "name": "a again"},
+                {"path": "  "},
+                {"path": "/c", "name": 5},
+            ],
+            "active": 2,
+        }));
+        assert_eq!(paths(&tabs), ["/a", "/b", "/c"]);
+        assert_eq!(tabs.active, 1);
+        // The name only labels the tab until the repo names itself.
+        assert_eq!(tabs.repos[2].name, "");
+
+        // A later copy of a path that was active: its first copy is.
+        let copied = tabs_from(serde_json::json!({
+            "repos": [{"path": "/a"}, {"path": "/b"}, {"path": "/a"}],
+            "active": 2,
+        }));
+        assert_eq!((paths(&copied), copied.active), (vec!["/a", "/b"], 0));
+        // An active entry that is dropped hands over to the next one kept.
+        let dropped = tabs_from(serde_json::json!({
+            "repos": [{"path": "/a"}, {"path": 7}, {"path": "/b"}],
+            "active": 1,
+        }));
+        assert_eq!((paths(&dropped), dropped.active), (vec!["/a", "/b"], 1));
+        // Nothing usable at all.
+        assert_eq!(
+            tabs_from(serde_json::json!("tabs")),
+            PersistedTabs::default()
+        );
+        assert_eq!(
+            tabs_from(serde_json::json!({"repos": {"path": "/a"}, "active": "1"})),
+            PersistedTabs::default()
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_never_written_over() {
+        let dir = scratch("unread");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("prefs.json");
+        std::fs::write(
+            &file,
+            r#"{"theme": {"mode": "dark", "dark": "a", "light": "b"}, "#,
+        )
+        .unwrap();
+        let mut store = Store::at(dir.clone());
+        assert_eq!(store.theme(), ThemePref::default());
+        // The session goes on in memory; the file keeps what it holds.
+        store.set_pref("diff.layout", &"split");
+        assert_eq!(
+            store.pref::<String>("diff.layout").as_deref(),
+            Some("split")
+        );
+        assert!(std::fs::read_to_string(&file).unwrap().ends_with(", "));
+
+        // Once it reads again, a change lands on what it holds.
+        std::fs::write(
+            &file,
+            r#"{"theme": {"mode": "dark", "dark": "a", "light": "b"}}"#,
+        )
+        .unwrap();
+        store.set_pref("graph.collapsed", &true);
+        let reread = Store::at(dir.clone());
+        assert_eq!(reread.theme().mode, "dark");
+        assert!(reread.flag("graph.collapsed"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

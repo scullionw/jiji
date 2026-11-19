@@ -304,9 +304,15 @@ impl AppModel {
         self.open_menu(position, "", MenuTarget::Breadcrumb, cx);
     }
 
-    /// Anything that is nothing in particular.
-    pub fn open_surface_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.open_menu(position, "", MenuTarget::Surface, cx);
+    /// Anything that is nothing in particular. Text selected there still
+    /// copies.
+    pub fn open_surface_menu(
+        &mut self,
+        position: Point<Pixels>,
+        selection: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu(position, selection, MenuTarget::Surface, cx);
     }
 
     /// Run one command. Shared by the context menu and the palette; the

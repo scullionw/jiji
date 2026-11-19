@@ -165,4 +165,9 @@ impl AppModel {
         self.tab_mut().ui.error = None;
         cx.notify();
     }
+
+    pub fn dismiss_crash_notice(&mut self, cx: &mut Context<Self>) {
+        self.crashed = false;
+        cx.notify();
+    }
 }
