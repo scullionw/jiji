@@ -8,7 +8,10 @@ The binary is `jiji-desktop`. Run bare it is the app; with arguments it is
 the `jiji` CLI (`jiji-desktop publish …`), which is how the `jiji` command
 the app installs works. What the app remembers lives in
 `~/Library/Application Support/com.lauf.jiji`: recents, saved views,
-preferences, the licence and auto-land records. Its log, with any panic and
+preferences, the window, the licence and auto-land records. The first
+launch after the Tauri app (0.4 and earlier) carries over the session,
+preferences and window state that app kept, reading its files once and
+never writing them (`src/upgrade.rs`). Its log, with any panic and
 its backtrace, is `~/Library/Logs/com.lauf.jiji/Jiji.log`, kept to about a
 megabyte with the part before it in `Jiji.old.log`.
 
@@ -44,7 +47,7 @@ variables:
 | Variable | |
 |---|---|
 | `JIJI_OPEN=<path>` | open this repository at launch; several, separated like `PATH`, arrive together the way folders opened from Finder do |
-| `JIJI_DATA_DIR=<dir>` | keep preferences, recents, licence and the log here instead of the real data and log directories — set it for any test run |
+| `JIJI_DATA_DIR=<dir>` | keep preferences, recents, licence and the log here instead of the real data and log directories, and never read the Tauri app's — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock repository (needs a directory containing `.jj`) |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
 | `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
@@ -110,9 +113,9 @@ Under `src/`:
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
 | `diff/` | The diff surface: a flat row model, tree-sitter highlighting, and one custom-painted element that windows, selects, finds and scrolls. |
 | `ui/` | Buttons, inputs (with IME), popovers and the layer that hangs them off a trigger, tooltips, scrollbars, icons, ref labels and tags, a page's bar and bands, and the text and list elements GPUI lacks: one line that ellipsizes, a paragraph that wraps, a group heading that pins. |
-| `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings. |
+| `shell/` | The window frame: tabs, top bar, section rail, status bar, menus, key bindings; where the window opens, and how it was left (its display, the frame it unzooms to, zoomed, full screen). |
 | `views/` | The sections — workbench (graph, change header and its plan panels, diff pane, annotate, evolution, drag-and-drop), conflicts, publish, bookmarks, operations — and the overlays (command palette, history search, context menu). |
-| `theme.rs`, `store.rs`, `diagnostics.rs` | The ten palettes; the persisted preferences; the log and the record a panic leaves. |
+| `theme.rs`, `store.rs`, `upgrade.rs`, `diagnostics.rs` | The ten palettes; the persisted preferences, and what the Tauri app left of them; the log and the record a panic leaves. |
 
 ## Design
 

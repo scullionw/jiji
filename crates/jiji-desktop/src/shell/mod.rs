@@ -3,6 +3,7 @@
 //! around one full-bleed working area on bg1. The open tab is cut from the
 //! working area's surface and runs down into it. Hairlines are the joinery.
 
+pub mod placement;
 mod statusbar;
 pub mod topbar;
 
@@ -17,7 +18,6 @@ use gpui::{
 };
 
 use crate::app::{app, AppEvent, AppModel, Section, UiIntent, SECTIONS};
-use crate::store::WindowGeometry;
 use crate::theme::{theme, FONT_UI, RADIUS_M, RAIL_W, TEXT_M};
 use crate::ui::{icon, popover, tooltip, v_flex, IconName, PopoverState};
 
@@ -228,6 +228,8 @@ pub struct Shell {
     search: Option<AnyView>,
     /// The context menu on screen, by the opening it was built for.
     menu: Option<(u64, Entity<crate::views::menu::ContextMenu>)>,
+    /// Waiting for the window to hold still before keeping where it is.
+    window_settle: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -264,18 +266,13 @@ impl Shell {
                     this.app.update(cx, |model, _| model.window_activated());
                 }
             }),
-            // Window geometry survives restarts.
+            // Where the window was left survives restarts, once it holds
+            // still: every change starts the wait again.
             cx.observe_window_bounds(window, |this, window, cx| {
-                let bounds = window.bounds();
-                let geometry = WindowGeometry {
-                    x: bounds.origin.x.into(),
-                    y: bounds.origin.y.into(),
-                    width: bounds.size.width.into(),
-                    height: bounds.size.height.into(),
-                    fullscreen: window.is_fullscreen(),
-                };
-                this.app
-                    .update(cx, |model, _| model.store.set_window(&geometry));
+                this.window_settle = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(placement::SETTLE).await;
+                    let _ = this.update_in(cx, |this, window, cx| this.keep_window(window, cx));
+                }));
             }),
             cx.subscribe_in(
                 &license_input,
@@ -304,11 +301,20 @@ impl Shell {
             palette: None,
             search: None,
             menu: None,
+            window_settle: None,
             _subscriptions: subscriptions,
         };
         this.sync(window, cx);
         window.focus(&this.focus, cx);
         this
+    }
+
+    fn keep_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let seen = placement::seen(window, cx);
+        self.app.update(cx, |model, _| {
+            let state = placement::settle(model.store.window().as_ref(), seen);
+            model.store.set_window(&state);
+        });
     }
 
     /// Keep what the shell derives from the model in step: the section

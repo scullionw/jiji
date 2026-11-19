@@ -19,6 +19,11 @@ TARGET="${CARGO_TARGET_DIR:-target}"
 RESOURCES="crates/jiji-desktop/resources"
 APP="$TARGET/release/bundle/Jiji.app"
 
+# Both slices are built for the oldest macOS the bundle says it runs on, so
+# the system turns away the same Macs the binary would fail on.
+MACOSX_DEPLOYMENT_TARGET=$(plutil -extract LSMinimumSystemVersion raw "$RESOURCES/Info.plist")
+export MACOSX_DEPLOYMENT_TARGET
+
 if [ "${JIJI_UNIVERSAL:-0}" = 1 ]; then
   cargo build --release -p jiji-desktop --target aarch64-apple-darwin
   cargo build --release -p jiji-desktop --target x86_64-apple-darwin

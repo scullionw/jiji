@@ -73,6 +73,19 @@ jobs:
       - name: build and sign Jiji.app
         run: JIJI_UNIVERSAL=1 scripts/bundle.sh
 
+      # The system checks the bundle's floor, the loader each slice's: a
+      # slice built for a newer macOS than the bundle declares would be
+      # let in and fail to start.
+      - name: check both slices against the bundle's macOS floor
+        run: |
+          FLOOR="$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")"
+          for ARCH in arm64 x86_64; do
+            MINOS="$(vtool -arch "$ARCH" -show-build "$APP/Contents/MacOS/jiji-desktop" |
+              awk '$1 == "minos" { print $2 }')"
+            echo "$ARCH: built for macOS $MINOS, bundle declares $FLOOR"
+            test "$MINOS" = "$FLOOR"
+          done
+
       - name: notarize the app, then the DMG that carries it
         env:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}

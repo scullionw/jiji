@@ -16,15 +16,13 @@ mod store;
 mod testing;
 mod theme;
 mod ui;
+mod upgrade;
 mod views;
 
-use gpui::{
-    point, prelude::*, px, size, App, Bounds, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions,
-};
+use gpui::{point, prelude::*, px, App, SharedString, TitlebarOptions, WindowOptions};
 
 use crate::app::AppModel;
-use crate::shell::Shell;
+use crate::shell::{placement, Shell};
 use crate::store::Store;
 
 /// SF Mono when it is installed (it ships with Xcode and Terminal, not
@@ -118,31 +116,23 @@ fn main() {
         shell::register_app_actions(cx);
         cx.set_menus(shell::menus());
 
-        let store = Store::open();
+        let mut store = Store::open();
+        // What the Tauri app left, before anything reads the store: an
+        // upstream interval of Off must hold from the first open.
+        upgrade::carry_over(&mut store, cx);
         // A headless run always starts at the default size: its
         // screenshots should not depend on where a window was last left.
-        let geometry = store.window().filter(|_| !headless);
+        let saved = store.window().filter(|_| !headless);
+        let placed = placement::restore(saved.as_ref(), &placement::screens(cx));
         let model = AppModel::install(store, mono_font(cx), cx);
         if !open_at_launch.is_empty() {
             model.update(cx, |model, cx| model.open_paths(open_at_launch, cx));
         }
 
-        let default_size = size(px(1280.), px(820.));
-        let bounds = match geometry {
-            Some(saved) if saved.width >= 400. && saved.height >= 300. => Bounds::new(
-                point(px(saved.x), px(saved.y)),
-                size(px(saved.width), px(saved.height)),
-            ),
-            _ => Bounds::centered(None, default_size, cx),
-        };
-        let fullscreen = geometry.is_some_and(|saved| saved.fullscreen);
         let options = WindowOptions {
-            window_bounds: Some(if fullscreen {
-                WindowBounds::Fullscreen(bounds)
-            } else {
-                WindowBounds::Windowed(bounds)
-            }),
-            window_min_size: Some(size(px(980.), px(640.))),
+            window_bounds: Some(placed.bounds),
+            display_id: placed.display,
+            window_min_size: Some(placement::MIN_SIZE),
             titlebar: Some(TitlebarOptions {
                 title: Some("Jiji".into()),
                 appears_transparent: true,

@@ -5,7 +5,9 @@
 //! `autoland.json` keep the names and shapes Jiji has written since its
 //! first release, so an install from then keeps its recents, saved views,
 //! registration and interrupted auto-land jobs. `prefs.json` holds the
-//! rest (tabs, theme, pane widths, per-repo view lenses).
+//! rest (tabs, theme, pane widths, per-repo view lenses, the window); the
+//! Tauri app kept those in its web view, and `upgrade.rs` carries them
+//! over once.
 //!
 //! A file that is there but cannot be read is never written over: what it
 //! holds is unknown, not gone. Lists decode entry by entry, so one bad
@@ -172,7 +174,7 @@ impl PersistedTabs {
     /// The saved tabs, entry by entry: an entry without a usable path
     /// drops alone, as does a later copy of a path already restored, and
     /// the active tab is found again among what is kept.
-    fn decode(value: Option<&Value>) -> Self {
+    pub(crate) fn decode(value: Option<&Value>) -> Self {
         let tabs = value.and_then(Value::as_object);
         let field = |name| tabs.and_then(|tabs| tabs.get(name));
         let active = field("active")
@@ -257,12 +259,22 @@ pub struct LicenseRecord {
     pub last_validated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct WindowGeometry {
+/// Where the main window was left. The frame is the window's own, from
+/// the top-left of the display it was on: where it sits when neither
+/// zoomed nor full screen, so a window that comes back zoomed unzooms to
+/// it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    /// The display, by its UUID. A state saved before this was kept has
+    /// none, and meant the primary display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    #[serde(default)]
+    pub zoomed: bool,
     #[serde(default)]
     pub fullscreen: bool,
 }
@@ -274,7 +286,10 @@ pub struct Unreadable;
 
 /// Set beside the preferences while a licence record is stored: what a
 /// licence file that cannot be read falls back on.
-const REGISTERED: &str = "license.registered";
+pub(crate) const REGISTERED: &str = "license.registered";
+
+/// The per-repo lenses: one map, a repo path to the lens it was left on.
+const VIEWS: &str = "views";
 
 pub struct Store {
     dir: PathBuf,
@@ -321,6 +336,37 @@ impl Store {
         self.pref::<bool>(key).unwrap_or(false)
     }
 
+    /// Take in what an earlier install left, in one write. A preference
+    /// set here already keeps its value, and so does a repo's lens.
+    pub fn adopt(&mut self, prefs: Map<String, Value>, lenses: Map<String, Value>) {
+        let file = &mut self.prefs;
+        let writable = file.writable();
+        let mut changed = false;
+        for (key, value) in prefs {
+            if !file.map.contains_key(&key) {
+                file.map.insert(key, value);
+                changed = true;
+            }
+        }
+        if !lenses.is_empty() {
+            let views = file
+                .map
+                .entry(VIEWS)
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(views) = views {
+                for (repo, lens) in lenses {
+                    if !views.contains_key(&repo) {
+                        views.insert(repo, lens);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed && writable {
+            file.save();
+        }
+    }
+
     // ── Tabs, theme, window ──
 
     pub fn tabs(&self) -> PersistedTabs {
@@ -339,31 +385,31 @@ impl Store {
         self.set_pref("theme", pref);
     }
 
-    pub fn window(&self) -> Option<WindowGeometry> {
+    pub fn window(&self) -> Option<WindowState> {
         self.pref("window")
     }
 
-    pub fn set_window(&mut self, geometry: &WindowGeometry) {
-        self.set_pref("window", geometry);
+    pub fn set_window(&mut self, state: &WindowState) {
+        self.set_pref("window", state);
     }
 
     /// The view lens a repo was last left on.
     pub fn repo_view(&self, repo_path: &str) -> SnapshotView {
-        self.pref::<HashMap<String, SnapshotView>>("views")
+        self.pref::<HashMap<String, SnapshotView>>(VIEWS)
             .and_then(|mut views| views.remove(repo_path))
             .unwrap_or_default()
     }
 
     pub fn set_repo_view(&mut self, repo_path: &str, view: &SnapshotView) {
         let mut views = self
-            .pref::<HashMap<String, SnapshotView>>("views")
+            .pref::<HashMap<String, SnapshotView>>(VIEWS)
             .unwrap_or_default();
         if *view == SnapshotView::Workstreams {
             views.remove(repo_path);
         } else {
             views.insert(repo_path.to_owned(), view.clone());
         }
-        self.set_pref("views", &views);
+        self.set_pref(VIEWS, &views);
     }
 
     // ── Recent repositories ──

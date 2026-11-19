@@ -51,6 +51,12 @@ tree-sitter-yaml = "0.7"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-svelte-ng = "1.0"
 
+# Where each display sits in the desktop and at what scale, which GPUI does
+# not say: the Tauri app's saved window is measured in those terms. GPUI's
+# macOS platform builds this crate already.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
 [dev-dependencies]
 # Tests that drive the model or a window run on GPUI's test context: the
 # app with a deterministic scheduler and windows that exist only in memory.
