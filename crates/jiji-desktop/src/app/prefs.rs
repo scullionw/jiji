@@ -2,6 +2,7 @@
 //! them: the theme, registration, the `jiji` launcher, editor and terminal
 //! choices, and app updates.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, PromptLevel, Task, WindowAppearance};
@@ -10,7 +11,7 @@ use super::AppModel;
 use crate::host::cli::CliStatus;
 use crate::host::integrations::{self, AppInfo};
 use crate::host::license::{self, Refresh};
-use crate::host::update::{self, InstallError, Staged};
+use crate::host::update::{self, InstallError, Staged, Updates};
 use crate::host::HostResult;
 use crate::store::{LicenseRecord, Store, ThemePref, Unreadable};
 use crate::theme::{self, Scheme, Theme, DEFAULT_LIGHT};
@@ -156,12 +157,24 @@ impl CliUi {
 }
 
 /// App updates: the downloaded one waiting for a restart, if any.
-#[derive(Default)]
 pub struct UpdateUi {
     pub version: Option<String>,
     pub installing: bool,
     staged: Option<Staged>,
     checking: bool,
+    feed: Arc<dyn Updates>,
+}
+
+impl Default for UpdateUi {
+    fn default() -> Self {
+        Self {
+            version: None,
+            installing: false,
+            staged: None,
+            checking: false,
+            feed: Arc::new(update::ReleaseFeed),
+        }
+    }
 }
 
 /// Windows stay open for days; look again now and then.
@@ -507,7 +520,7 @@ impl AppModel {
     /// Checks at startup and every few hours, in builds that update
     /// themselves (see `update::supported`).
     pub(super) fn start_update_checks(&mut self, cx: &mut Context<Self>) {
-        if !update::supported() {
+        if !self.update.feed.supported() {
             return;
         }
         cx.spawn(async move |this, cx| loop {
@@ -526,9 +539,10 @@ impl AppModel {
         }
         self.update.checking = true;
         let dir = self.store.dir().to_path_buf();
+        let feed = self.update.feed.clone();
         let staged = cx.background_spawn(async move {
-            match update::check() {
-                Ok(Some(found)) => update::download(&found, &dir).map(Some),
+            match feed.check() {
+                Ok(Some(found)) => feed.download(&found, &dir).map(Some),
                 Ok(None) => Ok(None),
                 Err(err) => Err(err),
             }
@@ -560,7 +574,8 @@ impl AppModel {
         }
         self.update.installing = true;
         cx.notify();
-        let installed = cx.background_spawn(async move { update::install_and_relaunch(&staged) });
+        let feed = self.update.feed.clone();
+        let installed = cx.background_spawn(async move { feed.install_and_relaunch(&staged) });
         cx.spawn(async move |this, cx| {
             let result = installed.await;
             let _ = this.update(cx, |this, cx| match result {
@@ -602,7 +617,7 @@ impl AppModel {
         let Some(window) = self.window else {
             return;
         };
-        if !update::supported() {
+        if !self.update.feed.supported() {
             self.tell(
                 PromptLevel::Info,
                 "Check for Updates",
@@ -635,7 +650,11 @@ impl AppModel {
             return;
         }
         let dir = self.store.dir().to_path_buf();
-        let checked = cx.background_spawn(async move { update::check() });
+        let feed = self.update.feed.clone();
+        let checked = cx.background_spawn({
+            let feed = feed.clone();
+            async move { feed.check() }
+        });
         cx.spawn(async move |this, cx| {
             let found = match checked.await {
                 Ok(Some(found)) => found,
@@ -682,7 +701,7 @@ impl AppModel {
             // Either way it downloads: "Later" keeps it for the status
             // bar's restart offer.
             let staged = cx
-                .background_spawn(async move { update::download(&found, &dir) })
+                .background_spawn(async move { feed.download(&found, &dir) })
                 .await;
             let _ = this.update(cx, |this, cx| match staged {
                 Ok(staged) => {
@@ -832,6 +851,95 @@ mod tests {
         std::fs::write(dir.join("license.json"), b"").unwrap();
         let (_, ui) = launch(&dir);
         assert!(ui.registered && ui.unread);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── Ported from the Tauri app's update.test.ts ──
+
+    use std::sync::Mutex;
+
+    use crate::host::update::Available;
+
+    /// A release feed offering `offer`, and what it was asked to do.
+    struct Feed {
+        offer: Option<&'static str>,
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    impl Updates for Feed {
+        fn supported(&self) -> bool {
+            true
+        }
+
+        fn check(&self) -> Result<Option<Available>, String> {
+            self.asked.lock().unwrap().push("check");
+            Ok(self.offer.map(|version| Available {
+                version: version.into(),
+                url: String::new(),
+                signature: String::new(),
+            }))
+        }
+
+        fn download(&self, update: &Available, dir: &Path) -> Result<Staged, String> {
+            self.asked.lock().unwrap().push("download");
+            Ok(Staged {
+                version: update.version.clone(),
+                archive: dir.join("update.tar.gz"),
+                signature: String::new(),
+            })
+        }
+
+        fn install_and_relaunch(&self, _: &Staged) -> Result<(), InstallError> {
+            self.asked.lock().unwrap().push("install and relaunch");
+            Ok(())
+        }
+    }
+
+    fn checking(
+        name: &str,
+        offer: Option<&'static str>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<AppModel>, Arc<Feed>, std::path::PathBuf) {
+        let dir = crate::testing::scratch(name);
+        let model = crate::testing::install(&dir, cx);
+        let feed = Arc::new(Feed {
+            offer,
+            asked: Mutex::new(Vec::new()),
+        });
+        model.update(cx, |model, cx| {
+            model.update.feed = feed.clone();
+            model.start_update_checks(cx);
+        });
+        cx.run_until_parked();
+        (model, feed, dir)
+    }
+
+    #[gpui::test]
+    fn a_found_update_downloads_then_waits_for_the_user_to_restart(cx: &mut gpui::TestAppContext) {
+        let (model, feed, dir) = checking("update-found", Some("9.9.9"), cx);
+        model.read_with(cx, |model, _| {
+            assert_eq!(model.update.version.as_deref(), Some("9.9.9"))
+        });
+        assert_eq!(*feed.asked.lock().unwrap(), ["check", "download"]);
+        // Only a restart installs it.
+        model.update(cx, |model, cx| model.restart_to_update(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            *feed.asked.lock().unwrap(),
+            ["check", "download", "install and relaunch"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn nothing_new_is_nothing_to_say(cx: &mut gpui::TestAppContext) {
+        let (model, feed, dir) = checking("update-none", None, cx);
+        model.read_with(cx, |model, _| assert_eq!(model.update.version, None));
+        assert_eq!(*feed.asked.lock().unwrap(), ["check"]);
+        // With nothing waiting, a restart has nothing to install.
+        model.update(cx, |model, cx| model.restart_to_update(cx));
+        cx.run_until_parked();
+        assert_eq!(*feed.asked.lock().unwrap(), ["check"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

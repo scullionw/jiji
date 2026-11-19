@@ -374,4 +374,328 @@ mod tests {
         conflicted.has_conflict = true;
         assert!(!can_select_hunks(&conflicted));
     }
+
+    // ── Ported from the Tauri app's split.test.ts ──
+
+    /// Context, a replaced line, context; then context and an added tail.
+    fn two_hunks() -> Vec<DiffHunk> {
+        use DiffLineKind::*;
+        vec![
+            DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                context: None,
+                lines: vec![
+                    line(Context, "x"),
+                    line(Removed, "old"),
+                    line(Added, "new"),
+                    line(Context, "x"),
+                ],
+            },
+            DiffHunk {
+                old_start: 10,
+                new_start: 10,
+                context: None,
+                lines: vec![line(Context, "x"), line(Added, "tail")],
+            },
+        ]
+    }
+
+    fn text(path: &str, hunks: Vec<DiffHunk>) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            has_conflict: false,
+            content: FileDiffContent::Text {
+                hunks,
+                truncated: false,
+            },
+        }
+    }
+
+    fn a_and_b() -> [FileDiff; 2] {
+        [
+            text("a.ts", two_hunks()),
+            text("b.ts", vec![two_hunks()[0].clone()]),
+        ]
+    }
+
+    fn hunks(picks: &[(usize, HunkPick)]) -> SplitPick {
+        SplitPick::Hunks(picks.iter().cloned().collect())
+    }
+
+    fn lines(picked: &[u32]) -> HunkPick {
+        HunkPick::Lines(picked.iter().copied().collect())
+    }
+
+    fn coords(old_start: u32, old_lines: u32, new_lines: u32, picked: Option<&[u32]>) -> SplitHunk {
+        SplitHunk {
+            old_start,
+            new_start: old_start,
+            old_lines,
+            new_lines,
+            lines: picked.map(<[u32]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn hunks_are_offered_only_on_a_whole_clean_text_diff_with_several() {
+        assert!(can_select_hunks(&text("a.ts", two_hunks())));
+        // One hunk is the whole file.
+        assert!(!can_select_hunks(&text(
+            "a.ts",
+            vec![two_hunks()[0].clone()]
+        )));
+        // Conflict markers are not the file's content.
+        let conflicted = FileDiff {
+            has_conflict: true,
+            ..text("a.ts", two_hunks())
+        };
+        assert!(!can_select_hunks(&conflicted));
+        // A trimmed hunk list is not the diff the backend will see.
+        let trimmed = FileDiff {
+            content: FileDiffContent::Text {
+                hunks: two_hunks(),
+                truncated: true,
+            },
+            ..text("a.ts", vec![])
+        };
+        assert!(!can_select_hunks(&trimmed));
+        let binary = FileDiff {
+            content: FileDiffContent::Binary {
+                old_size: None,
+                new_size: Some(16),
+            },
+            ..text("a.bin", vec![])
+        };
+        assert!(!can_select_hunks(&binary));
+    }
+
+    #[test]
+    fn a_hunk_counts_context_on_both_sides_and_titles_itself() {
+        let [first, second] = <[DiffHunk; 2]>::try_from(two_hunks()).unwrap();
+        assert_eq!(hunk_coords(&first), coords(1, 3, 3, None));
+        assert_eq!(hunk_coords(&second), coords(10, 1, 2, None));
+        assert_eq!(hunk_label(&second), "@@ -10,1 +10,2");
+        assert_eq!(hunk_preview(&first), "- old");
+        assert_eq!(hunk_preview(&second), "+ tail");
+    }
+
+    #[test]
+    fn file_and_hunk_picks_settle_into_the_simplest_form() {
+        let mut selection = Selection::new();
+        toggle_file(&mut selection, "a.ts");
+        assert_eq!(selection["a.ts"], SplitPick::All);
+        toggle_file(&mut selection, "a.ts");
+        assert!(selection.is_empty());
+        // A partly picked file ticks to whole.
+        selection.insert("a.ts".into(), hunks(&[(0, HunkPick::All)]));
+        toggle_file(&mut selection, "a.ts");
+        assert_eq!(selection["a.ts"], SplitPick::All);
+
+        let mut selection = Selection::new();
+        toggle_hunk(&mut selection, "a.ts", 0, 2);
+        assert_eq!(selection["a.ts"], hunks(&[(0, HunkPick::All)]));
+        // Every hunk picked is the whole file…
+        toggle_hunk(&mut selection, "a.ts", 1, 2);
+        assert_eq!(selection["a.ts"], SplitPick::All);
+        // …and one unticked from the whole leaves the rest.
+        let mut whole = Selection::from([("a.ts".to_owned(), SplitPick::All)]);
+        toggle_hunk(&mut whole, "a.ts", 0, 3);
+        assert_eq!(
+            whole["a.ts"],
+            hunks(&[(1, HunkPick::All), (2, HunkPick::All)])
+        );
+        // The last hunk unticked unticks the file.
+        let mut last = Selection::from([("a.ts".to_owned(), hunks(&[(1, HunkPick::All)]))]);
+        toggle_hunk(&mut last, "a.ts", 1, 2);
+        assert!(last.is_empty());
+        // A hunk with some lines picked ticks to whole, as a file does.
+        let mut some = Selection::from([("a.ts".to_owned(), hunks(&[(0, lines(&[1]))]))]);
+        toggle_hunk(&mut some, "a.ts", 0, 2);
+        assert_eq!(some["a.ts"], hunks(&[(0, HunkPick::All)]));
+    }
+
+    #[test]
+    fn line_picks_settle_through_the_hunk_and_the_file() {
+        let file = text("a.ts", two_hunks());
+        assert_eq!(changed_line_indices(&two_hunks()[0]), [1, 2]);
+        let mut selection = Selection::new();
+        toggle_line(&mut selection, &file, 0, 1);
+        assert_eq!(selection["a.ts"], hunks(&[(0, lines(&[1]))]));
+        // Every changed line of the hunk is the hunk.
+        toggle_line(&mut selection, &file, 0, 2);
+        assert_eq!(selection["a.ts"], hunks(&[(0, HunkPick::All)]));
+        // Every hunk whole is the file.
+        let mut nearly = Selection::from([(
+            "a.ts".to_owned(),
+            hunks(&[(0, lines(&[1])), (1, HunkPick::All)]),
+        )]);
+        toggle_line(&mut nearly, &file, 0, 2);
+        assert_eq!(nearly["a.ts"], SplitPick::All);
+        // A line unticked from the whole file leaves the rest of it.
+        let mut whole = Selection::from([("a.ts".to_owned(), SplitPick::All)]);
+        toggle_line(&mut whole, &file, 0, 2);
+        assert_eq!(
+            whole["a.ts"],
+            hunks(&[(0, lines(&[1])), (1, HunkPick::All)])
+        );
+        // The hunk's last line unticked drops the hunk; the file's, the file.
+        let mut one = Selection::from([("a.ts".to_owned(), hunks(&[(0, lines(&[1]))]))]);
+        toggle_line(&mut one, &file, 0, 1);
+        assert!(one.is_empty());
+        let mut two = Selection::from([(
+            "a.ts".to_owned(),
+            hunks(&[(0, lines(&[1])), (1, HunkPick::All)]),
+        )]);
+        toggle_line(&mut two, &file, 0, 1);
+        assert_eq!(two["a.ts"], hunks(&[(1, HunkPick::All)]));
+    }
+
+    #[test]
+    fn lines_are_offered_where_a_hunk_changes_more_than_one() {
+        assert!(can_select_lines(&two_hunks()[0]));
+        // One changed line is the hunk.
+        assert!(!can_select_lines(&two_hunks()[1]));
+    }
+
+    #[test]
+    fn the_summary_needs_something_checked_and_something_left() {
+        let files = a_and_b();
+        let summary = |selection: Selection| split_summary(Some(&files), &selection);
+        assert!(!summary(Selection::new()).valid);
+        let all_a = Selection::from([("a.ts".to_owned(), SplitPick::All)]);
+        assert!(!split_summary(None, &all_a).valid);
+        let partial = summary(Selection::from([(
+            "a.ts".to_owned(),
+            hunks(&[(1, HunkPick::All)]),
+        )]));
+        assert_eq!(
+            (
+                partial.whole,
+                partial.partial,
+                partial.hunks,
+                partial.lines,
+                partial.valid
+            ),
+            (0, 1, 1, 0, true)
+        );
+        // Picked lines count apart from whole hunks.
+        let picked = summary(Selection::from([(
+            "a.ts".to_owned(),
+            hunks(&[(0, lines(&[1, 2])), (1, HunkPick::All)]),
+        )]));
+        assert_eq!(
+            (
+                picked.whole,
+                picked.partial,
+                picked.hunks,
+                picked.lines,
+                picked.valid
+            ),
+            (0, 1, 1, 2, true)
+        );
+        // Every file whole leaves nothing behind…
+        let covered = summary(Selection::from([
+            ("a.ts".to_owned(), SplitPick::All),
+            ("b.ts".to_owned(), SplitPick::All),
+        ]));
+        assert_eq!(
+            (covered.whole, covered.all_covered, covered.valid),
+            (2, true, false)
+        );
+        // …but a partly picked file leaves its other hunks behind.
+        let mixed = summary(Selection::from([
+            ("a.ts".to_owned(), hunks(&[(0, HunkPick::All)])),
+            ("b.ts".to_owned(), SplitPick::All),
+        ]));
+        assert_eq!(
+            (mixed.whole, mixed.partial, mixed.all_covered, mixed.valid),
+            (1, 1, false, true)
+        );
+    }
+
+    #[test]
+    fn the_payload_sends_whole_files_whole_and_hunks_by_coordinates_in_diff_order() {
+        let files = a_and_b();
+        let payload = split_payload(
+            &files,
+            &Selection::from([
+                ("b.ts".to_owned(), SplitPick::All),
+                (
+                    "a.ts".to_owned(),
+                    hunks(&[(1, HunkPick::All), (0, HunkPick::All)]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            payload,
+            [
+                SplitSelection {
+                    path: "a.ts".into(),
+                    hunks: Some(vec![coords(1, 3, 3, None), coords(10, 1, 2, None)]),
+                },
+                SplitSelection::whole("b.ts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_picked_hunk_sends_its_sorted_lines_beside_whole_ones() {
+        let files = a_and_b();
+        let payload = split_payload(
+            &files,
+            &Selection::from([
+                (
+                    "a.ts".to_owned(),
+                    hunks(&[(1, HunkPick::All), (0, lines(&[2, 1]))]),
+                ),
+                ("b.ts".to_owned(), SplitPick::All),
+            ]),
+        );
+        assert_eq!(
+            payload[0].hunks,
+            Some(vec![coords(1, 3, 3, Some(&[1, 2])), coords(10, 1, 2, None)])
+        );
+        assert_eq!(payload[1], SplitSelection::whole("b.ts"));
+    }
+
+    #[test]
+    fn a_change_splits_with_several_files_or_one_with_hunks_to_tell_apart() {
+        assert!(splittable(&[
+            text("a.ts", two_hunks()),
+            text("b.ts", vec![])
+        ]));
+        assert!(splittable(&[text("a.ts", two_hunks())]));
+        assert!(!splittable(&[text("a.ts", vec![two_hunks()[0].clone()])]));
+        assert!(!splittable(&[]));
+    }
+
+    #[test]
+    fn a_new_change_needs_a_remainder_and_a_move_needs_a_destination() {
+        let files = a_and_b();
+        let some = split_summary(
+            Some(&files),
+            &Selection::from([("a.ts".to_owned(), SplitPick::All)]),
+        );
+        assert!(selection_ready(&some, None));
+        assert!(!selection_ready(&some, Some(None)));
+        assert!(selection_ready(&some, Some(Some("dest"))));
+        // Everything may move into another change, but nothing may not.
+        let all = split_summary(
+            Some(&files),
+            &Selection::from([
+                ("a.ts".to_owned(), SplitPick::All),
+                ("b.ts".to_owned(), SplitPick::All),
+            ]),
+        );
+        assert!(all.all_covered);
+        assert!(!selection_ready(&all, None));
+        assert!(selection_ready(&all, Some(Some("dest"))));
+        let none = split_summary(Some(&files), &Selection::new());
+        assert!(!selection_ready(&none, Some(Some("dest"))));
+        let unread = split_summary(None, &Selection::new());
+        assert!(!selection_ready(&unread, Some(Some("dest"))));
+    }
 }

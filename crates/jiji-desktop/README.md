@@ -49,6 +49,7 @@ variables:
 | `JIJI_OPEN=<path>` | open this repository at launch; several, separated like `PATH`, arrive together the way folders opened from Finder do |
 | `JIJI_DATA_DIR=<dir>` | keep preferences, recents, licence and the log here instead of the real data and log directories, and never read the Tauri app's — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock repository (needs a directory containing `.jj`) |
+| `JIJI_OFFLINE=1` | reach nothing on its own: no GitHub token is looked up (the Keychain, `GITHUB_TOKEN`, `gh`) and GitHub is never asked, so Publish reads as not connected, and upstream checks are off for the run (a Fetch now still fetches) — set it for any scripted run |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
 | `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
 | `JIJI_HEADLESS=1` | never show the window; a scripted run nobody sees (needs a `headless` build) |
@@ -68,7 +69,7 @@ the steps run out. Runs do not see each other, so several can go at once.
 
 ```sh
 cargo build -p jiji-desktop --features headless
-JIJI_DATA_DIR=/tmp/jiji-test JIJI_HEADLESS=1 JIJI_OPEN=~/Dev/some-repo \
+JIJI_DATA_DIR=/tmp/jiji-test JIJI_OFFLINE=1 JIJI_HEADLESS=1 JIJI_OPEN=~/Dev/some-repo \
 JIJI_SCRIPT="wait=1500;rclick=200,150;key=down;shot=/tmp/menu.png" \
   target/debug/jiji-desktop
 ```
@@ -116,9 +117,18 @@ and a headless run's `a11y` step shows the whole tree.
 These tests open real repositories, made for the test and without remotes,
 or the mock backend's (`testing::install_mock`: conflicts, a merge tool,
 every kind of diff, and a backend a test can make fail by hiding `.jj`).
-Under test the host finds no forge token, so they read no credentials and
-reach no network. Keep it that way: a test that needs a token-bearing path
-should fake the forge, not lift the guard in `host::forge::resolved_token`.
+The host takes its forge (`host::forge::Forge`) as it takes its backend:
+GitHub in the app, `Offline` in an offline run, and in tests either nothing
+or GitHub as a test captured it (`testing::forge::Fixture` through
+`testing::install_mock_over`: pull requests, what each merge button says,
+the repository's merge rules), so Publish, review, land, ship and auto-land
+run their real planning and execution and the test reads what GitHub was
+asked. The real forge finds no token under test either, so nothing reads
+credentials or reaches the network. Keep it that way: a test that needs a
+token-bearing path uses the fixture, never lifts the guard in
+`host::forge::GitHub::token`. An auto-land job works on a thread of its
+own; a test waiting on it lets GPUI's executor see that thread
+(`allow_parking`).
 
 ## Layout
 
@@ -126,7 +136,7 @@ Under `src/`:
 
 | | |
 |---|---|
-| `host/` | The backend the views call: repo sessions and their watchers, the forge workflows (publish, land, ship, auto-land), the CLI launcher, editor and terminal hand-offs, licensing, updates. Blocking; views run it on the background executor. |
+| `host/` | The backend the views call: repo sessions and their watchers, the forge workflows (publish, land, ship, auto-land) over one `Forge`, the CLI launcher, editor and terminal hand-offs, licensing, updates (through `Updates`, so a test can stand in for the release feed). Blocking; views run it on the background executor. |
 | `app/` | The app model — one entity holding tabs, each tab's selection and breadcrumb, the forge connection, upstream checks, auto-land jobs, preferences, and the context menu. Views read it and call its methods. |
 | `logic/` | What to draw and what each affordance means, with no UI types: graph layout, stack and conflict grouping, the split checklist, menu and palette contents, drag-and-drop policy, timelines. Unit-tested. |
 | `diff/` | The diff surface: a flat row model laid out once per diff and shared by the cache and the screen, tree-sitter highlighting, the pictures of image diffs (GPUI's decoders, and the system's ImageIO for AVIF and HEIC), and one custom-painted element that windows, selects, finds and scrolls. |

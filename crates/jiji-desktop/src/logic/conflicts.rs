@@ -170,4 +170,184 @@ mod tests {
         assert_eq!(merge_tool_label("custom-tool"), "custom-tool");
         assert!(!can_take_side(&snapshot, None));
     }
+
+    // ── Ported from the Tauri app's conflicts.test.ts ──
+
+    use jiji_core::snapshot::{GraphNode, WorkspaceSummary};
+
+    fn base() -> RepoSnapshot {
+        let dir = std::env::temp_dir().join(format!("jiji-conflicts-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join(".jj"));
+        MockBackend::default().open(&dir).unwrap()
+    }
+
+    fn node(id: &str, kind: NodeKind) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c-{id}"),
+            description: format!("change {id}"),
+            author: "test".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            kind,
+            parents: vec![],
+            elided_parents: vec![],
+            bookmarks: vec![],
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn item(id: &str, kind: ConflictKind, node_id: Option<&str>) -> ConflictItem {
+        ConflictItem {
+            id: id.into(),
+            kind,
+            summary: format!("conflict {id}"),
+            node_id: node_id.map(str::to_owned),
+            paths: vec![],
+            more_paths: 0,
+            targets: vec![],
+            workspace: None,
+        }
+    }
+
+    fn inbox(conflicts: Vec<ConflictItem>, nodes: Vec<GraphNode>) -> RepoSnapshot {
+        RepoSnapshot {
+            conflicts,
+            nodes,
+            working_copy: "wc".into(),
+            resolve_tool: Some("smerge".into()),
+            ..base()
+        }
+    }
+
+    fn grouped(snapshot: &RepoSnapshot) -> Vec<(GroupKey, Vec<&str>)> {
+        group_conflicts(snapshot)
+            .into_iter()
+            .map(|group| {
+                (
+                    group.key,
+                    group.items.iter().map(|i| i.id.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_working_copy_s_files_group_apart_from_commits() {
+        let snapshot = inbox(
+            vec![
+                item("file-a", ConflictKind::File, Some("a")),
+                item("file-wc", ConflictKind::File, Some("wc")),
+            ],
+            vec![
+                node("wc", NodeKind::WorkingCopy),
+                node("a", NodeKind::Mutable),
+            ],
+        );
+        assert_eq!(
+            grouped(&snapshot),
+            [
+                (GroupKey::WorkingCopy, vec!["file-wc"]),
+                (GroupKey::Commits, vec!["file-a"])
+            ]
+        );
+    }
+
+    #[test]
+    fn groups_keep_their_order_and_empty_ones_are_left_out() {
+        let snapshot = inbox(
+            vec![
+                item("workspace-review", ConflictKind::StaleWorkspace, None),
+                item("bookmark-x", ConflictKind::Bookmark, None),
+            ],
+            vec![],
+        );
+        let keys: Vec<GroupKey> = grouped(&snapshot).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, [GroupKey::Bookmarks, GroupKey::Workspaces]);
+        assert!(group_conflicts(&inbox(vec![], vec![])).is_empty());
+    }
+
+    #[test]
+    fn commit_conflicts_read_in_graph_order_with_undrawn_changes_last() {
+        let snapshot = inbox(
+            vec![
+                item("file-hidden", ConflictKind::File, Some("gone")),
+                item("file-low", ConflictKind::File, Some("low")),
+                item("file-high", ConflictKind::File, Some("high")),
+            ],
+            vec![
+                node("high", NodeKind::Mutable),
+                node("low", NodeKind::Mutable),
+            ],
+        );
+        assert_eq!(
+            grouped(&snapshot),
+            [(
+                GroupKey::Commits,
+                vec!["file-high", "file-low", "file-hidden"]
+            )]
+        );
+    }
+
+    #[test]
+    fn known_merge_tools_go_by_their_names() {
+        assert_eq!(merge_tool_label("smerge"), "Sublime Merge");
+        assert_eq!(merge_tool_label("vscode"), "VS Code");
+        assert_eq!(merge_tool_label("meld"), "Meld");
+        assert_eq!(merge_tool_label("my-house-tool"), "my-house-tool");
+    }
+
+    #[test]
+    fn only_the_open_workspace_s_staleness_can_be_recovered_here() {
+        let workspace = |name: &str, current: bool| WorkspaceSummary {
+            name: name.into(),
+            is_default: current,
+            is_current: current,
+            is_stale: true,
+            working_copy_node: None,
+        };
+        let stale = |name: Option<&str>| ConflictItem {
+            workspace: name.map(str::to_owned),
+            ..item("workspace", ConflictKind::StaleWorkspace, None)
+        };
+        let mut snapshot = inbox(vec![], vec![]);
+        snapshot.workspaces = vec![workspace("default", true), workspace("review", false)];
+        assert!(can_recover_workspace(&snapshot, &stale(Some("default"))));
+        assert!(!can_recover_workspace(&snapshot, &stale(Some("review"))));
+        assert!(!can_recover_workspace(
+            &snapshot,
+            &item("file-a", ConflictKind::File, None)
+        ));
+        assert!(!can_recover_workspace(&snapshot, &stale(None)));
+        snapshot.workspaces.clear();
+        assert!(!can_recover_workspace(&snapshot, &stale(Some("default"))));
+    }
+
+    #[test]
+    fn resolving_needs_a_tool_and_taking_a_side_a_drawn_mutable_change() {
+        let nodes = vec![
+            node("wc", NodeKind::WorkingCopy),
+            node("mut", NodeKind::Mutable),
+            node("trunk", NodeKind::Immutable),
+        ];
+        let tooled = inbox(vec![], nodes.clone());
+        let untooled = RepoSnapshot {
+            resolve_tool: None,
+            ..inbox(vec![], nodes)
+        };
+        for (id, ok) in [
+            (Some("wc"), true),
+            (Some("mut"), true),
+            (Some("trunk"), false),
+            (Some("gone"), false),
+            (None, false),
+        ] {
+            assert_eq!(can_resolve(&tooled, id), ok, "{id:?}");
+            assert_eq!(can_take_side(&untooled, id), ok, "{id:?}");
+        }
+        assert!(!can_resolve(&untooled, Some("mut")));
+    }
 }

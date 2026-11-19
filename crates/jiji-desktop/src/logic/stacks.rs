@@ -254,4 +254,230 @@ mod tests {
             .unwrap();
         assert_eq!(found.head_bookmark(), Some(existing.as_str()));
     }
+
+    // ── Ported from the Tauri app's submit.test.ts and ship.test.ts ──
+
+    use jiji_core::snapshot::{BookmarkState, SyncState, WorkstreamSummary};
+
+    fn change(id: &str, kind: NodeKind, description: &str, bookmarks: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c{id}"),
+            description: description.into(),
+            author: "test".into(),
+            timestamp: "2026-07-01T12:00:00Z".into(),
+            kind,
+            parents: vec![],
+            elided_parents: vec![],
+            bookmarks: bookmarks.iter().map(|b| (*b).to_owned()).collect(),
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn mutable(id: &str, bookmarks: &[&str]) -> GraphNode {
+        change(id, NodeKind::Mutable, &format!("change {id}"), bookmarks)
+    }
+
+    fn local(name: &str, is_trunk: bool) -> BookmarkState {
+        BookmarkState {
+            name: name.into(),
+            target: String::new(),
+            remote: None,
+            sync: SyncState::LocalOnly,
+            is_trunk,
+            is_local: true,
+            tracked: false,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        }
+    }
+
+    fn stream(id: &str, nodes: &[&str], active: bool) -> WorkstreamSummary {
+        WorkstreamSummary {
+            id: id.into(),
+            title: format!("Stream {id}"),
+            node_ids: nodes.iter().map(|n| (*n).to_owned()).collect(),
+            bookmark: None,
+            is_active: active,
+            behind_trunk: 0,
+        }
+    }
+
+    fn repo(
+        nodes: Vec<GraphNode>,
+        bookmarks: Vec<BookmarkState>,
+        streams: Vec<WorkstreamSummary>,
+    ) -> RepoSnapshot {
+        RepoSnapshot {
+            nodes,
+            bookmarks,
+            workstreams: streams,
+            ..snapshot()
+        }
+    }
+
+    #[test]
+    fn a_stack_publishes_from_its_topmost_bookmark_and_counts_from_there() {
+        let snapshot = repo(
+            vec![
+                mutable("wc", &[]),
+                mutable("b", &["feat"]),
+                mutable("c", &[]),
+                mutable("d", &[]),
+            ],
+            vec![local("feat", false), local("main", true)],
+            vec![stream("s1", &["wc", "b", "c", "d"], true)],
+        );
+        assert_eq!(
+            publishable_stacks(&snapshot, &HashSet::new()),
+            [PublishableStack {
+                workstream_id: "s1".into(),
+                title: "Stream s1".into(),
+                is_active: true,
+                change_count: 3,
+                head: StackHead::Bookmark("feat".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_stack_with_no_bookmark_publishes_from_its_head_change_active_first() {
+        let snapshot = repo(
+            vec![
+                mutable("a", &["one"]),
+                mutable("b", &[]),
+                mutable("c", &["two"]),
+            ],
+            vec![local("one", false), local("two", false)],
+            vec![
+                stream("anon", &["b"], false),
+                stream("other", &["a"], false),
+                stream("active", &["c"], true),
+            ],
+        );
+        let stacks = publishable_stacks(&snapshot, &HashSet::new());
+        let order: Vec<&str> = stacks.iter().map(|s| s.workstream_id.as_str()).collect();
+        assert_eq!(order, ["active", "anon", "other"]);
+        assert_eq!(
+            stacks[1],
+            PublishableStack {
+                workstream_id: "anon".into(),
+                title: "Stream anon".into(),
+                is_active: false,
+                change_count: 1,
+                head: StackHead::Change {
+                    id: "b".into(),
+                    title: "change b".into()
+                },
+            }
+        );
+        assert_eq!(stacks[2].head_bookmark(), Some("one"));
+    }
+
+    #[test]
+    fn an_undescribed_draft_on_top_is_not_published_and_alone_offers_nothing() {
+        let draft = change("wc", NodeKind::WorkingCopy, "", &[]);
+        let snapshot = repo(
+            vec![draft, mutable("b", &[]), mutable("c", &[])],
+            vec![local("main", true)],
+            vec![
+                stream("s1", &["wc", "b", "c"], true),
+                stream("only-draft", &["wc"], false),
+            ],
+        );
+        assert_eq!(
+            publishable_stacks(&snapshot, &HashSet::new()),
+            [PublishableStack {
+                workstream_id: "s1".into(),
+                title: "Stream s1".into(),
+                is_active: true,
+                change_count: 2,
+                head: StackHead::Change {
+                    id: "b".into(),
+                    title: "change b".into()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn trunk_is_never_a_head_and_a_name_github_knows_wins_a_shared_change() {
+        let snapshot = repo(
+            vec![mutable("a", &["main", "zeta", "beta"])],
+            vec![
+                local("main", true),
+                local("zeta", false),
+                local("beta", false),
+            ],
+            vec![stream("s1", &["a"], true)],
+        );
+        // By name without PR knowledge…
+        let named = publishable_stacks(&snapshot, &HashSet::new());
+        assert_eq!(named[0].head_bookmark(), Some("beta"));
+        // …but a branch with a pull request wins.
+        let known = publishable_stacks(&snapshot, &HashSet::from(["zeta"]));
+        assert_eq!(known[0].head_bookmark(), Some("zeta"));
+    }
+
+    #[test]
+    fn every_stream_ships_bookmark_or_not_the_active_one_first() {
+        let snapshot = repo(
+            vec![
+                mutable("a1", &[]),
+                change("b1", NodeKind::WorkingCopy, "change b1", &[]),
+                mutable("b2", &[]),
+            ],
+            vec![],
+            vec![
+                stream("a", &["a1"], false),
+                stream("b", &["b1", "b2"], true),
+            ],
+        );
+        let stacks = shippable_stacks(&snapshot);
+        let order: Vec<&str> = stacks.iter().map(|s| s.workstream_id.as_str()).collect();
+        assert_eq!(order, ["b", "a"]);
+        assert_eq!(
+            (stacks[0].head_change.as_str(), stacks[0].change_count),
+            ("b1", 2)
+        );
+    }
+
+    #[test]
+    fn an_undescribed_working_copy_never_ships_but_a_described_one_does() {
+        // Edits or not, undescribed is a draft, not what ships.
+        let snapshot = repo(
+            vec![
+                change("wc", NodeKind::WorkingCopy, "", &[]),
+                change("b1", NodeKind::Mutable, "feat: real work", &[]),
+            ],
+            vec![],
+            vec![stream("b", &["wc", "b1"], true)],
+        );
+        let stacks = shippable_stacks(&snapshot);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(
+            (
+                stacks[0].head_change.as_str(),
+                stacks[0].head_title.as_str(),
+                stacks[0].change_count
+            ),
+            ("b1", "feat: real work", 1)
+        );
+        let mut lone = change("lone", NodeKind::WorkingCopy, "", &[]);
+        lone.is_empty = true;
+        let draft_only = repo(vec![lone], vec![], vec![stream("l", &["lone"], true)]);
+        assert!(shippable_stacks(&draft_only).is_empty());
+        let described = repo(
+            vec![change("wc", NodeKind::WorkingCopy, "fix: on top", &[])],
+            vec![],
+            vec![stream("w", &["wc"], true)],
+        );
+        assert_eq!(shippable_stacks(&described)[0].head_change, "wc");
+    }
 }

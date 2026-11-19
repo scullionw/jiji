@@ -366,8 +366,23 @@ impl PublishView {
                 this.stacks_loading = false;
                 match result {
                     Ok((snapshot, stacks)) => {
+                        // A stack published from its head change comes
+                        // back under its new bookmark's key: follow it, so
+                        // what was just done stays on screen.
+                        let head = this
+                            .selected_stack()
+                            .and_then(|stack| stack.head_change.clone());
                         this.snapshot = Some(snapshot);
                         this.stacks = stacks;
+                        if this.selected_stack().is_none() {
+                            if let Some(stack) = this
+                                .stacks
+                                .iter()
+                                .find(|stack| head.is_some() && stack.head_change == head)
+                            {
+                                this.selected = Some(stack.key.clone());
+                            }
+                        }
                     }
                     Err(error) => this.stacks_error = Some(error.message),
                 }
@@ -1281,13 +1296,577 @@ impl Render for PublishView {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
-    use gpui::TestAppContext;
+    use gpui::{Entity, TestAppContext, WindowHandle};
     use jiji_core::snapshot::SnapshotView;
+    use jiji_forge::{
+        AutoLandPhase, AutoLandRecord, AutoLandState, ChecksRollup, LandAction, MergeMethod,
+        ReviewDecision, SubmitAction,
+    };
 
-    use super::PublishView;
-    use crate::app::Section;
+    use super::{Mode, Page, PublishView};
+    use crate::app::{AppModel, Section};
     use crate::shell::Shell;
+    use crate::testing::forge::Fixture;
+
+    /// Publish on screen over the mock repository, with `fixture` as its
+    /// GitHub, settled: connected, the stacks read, the current stack's
+    /// plan in. `pushed` publishes the mock's stack first, so its branches
+    /// are what GitHub holds.
+    struct Bench {
+        dir: PathBuf,
+        model: Entity<AppModel>,
+        publish: Entity<PublishView>,
+        _window: WindowHandle<Shell>,
+    }
+
+    fn bench(name: &str, fixture: &Fixture, pushed: bool, cx: &mut TestAppContext) -> Bench {
+        let dir = crate::testing::scratch(name);
+        bench_in(dir, fixture, pushed, cx)
+    }
+
+    fn bench_in(dir: PathBuf, fixture: &Fixture, pushed: bool, cx: &mut TestAppContext) -> Bench {
+        let (model, repo) = crate::testing::install_mock_over(&dir, fixture.boxed(), cx);
+        if pushed {
+            model.read_with(cx, |model, _| {
+                let names = ["diff-model".to_owned(), "diff-virtualization".to_owned()];
+                model
+                    .host
+                    .backend()
+                    .push_bookmarks(Path::new(&repo), &names, Some("origin"))
+                    .unwrap();
+            });
+        }
+        let window = cx.add_window(Shell::new);
+        model.update(cx, |model, cx| {
+            model.open_paths(vec![PathBuf::from(&repo)], cx)
+        });
+        cx.run_until_parked();
+        model.update(cx, |model, cx| model.go_to_section(Section::Publish, cx));
+        cx.run_until_parked();
+        let publish = window
+            .update(cx, |shell, _, _| shell.section::<PublishView>())
+            .unwrap()
+            .expect("Publish is on screen");
+        Bench {
+            dir,
+            model,
+            publish,
+            _window: window,
+        }
+    }
+
+    impl Bench {
+        fn land(&self, cx: &TestAppContext) -> jiji_forge::LandPlan {
+            self.publish.read_with(cx, |view, _| {
+                assert_eq!(view.land_error, None);
+                view.land.clone().expect("a land plan is on the card")
+            })
+        }
+
+        fn select(&self, key: &str, cx: &mut TestAppContext) {
+            self.publish
+                .update(cx, |view, cx| view.select_stack(key, cx));
+            cx.run_until_parked();
+        }
+    }
+
+    fn merges(plan: &jiji_forge::LandPlan) -> Vec<(u64, MergeMethod)> {
+        plan.actions
+            .iter()
+            .filter_map(|action| match action {
+                LandAction::MergePr { number, method, .. } => Some((*number, *method)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn blocking(plan: &jiji_forge::LandPlan) -> Vec<String> {
+        plan.blockers
+            .iter()
+            .map(|blocker| blocker.message.clone())
+            .collect()
+    }
+
+    /// Run the app until `done` holds. An auto-land job works on a thread
+    /// of its own, so what it publishes arrives from outside the test's
+    /// executor: the test lets it, as GPUI does for real threads.
+    fn until(
+        cx: &mut TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        cx.executor().allow_parking();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[gpui::test]
+    fn the_current_stack_opens_on_its_land_plan_and_local_work_on_its_publish_plan(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-open", &fixture, true, cx);
+        // The working copy's stack is chosen, its two pull requests in
+        // landing order, and the plan lands the bottom one first.
+        bench.publish.read_with(cx, |view, cx| {
+            assert!(view.connected(cx));
+            assert_eq!(view.selected.as_deref(), Some("diff-virtualization"));
+            assert!(view.mode == Mode::Land && view.page == Page::Stacks);
+            let stack = view.selected_stack().unwrap();
+            assert!(stack.is_active);
+            let prs: Vec<u64> = stack
+                .segments
+                .iter()
+                .filter_map(|segment| segment.pr.as_ref().map(|pr| pr.number))
+                .collect();
+            assert_eq!(prs, [41, 42]);
+            assert_eq!(view.land_for.as_deref(), Some("diff-virtualization"));
+        });
+        let plan = bench.land(cx);
+        assert_eq!(merges(&plan), [(41, MergeMethod::Squash)]);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        // Planning only reads.
+        assert_eq!(fixture.take_asked(), Vec::<String>::new());
+
+        // Local work answers with its publish plan: a branch to push and a
+        // pull request to open.
+        bench.select("toznkvpq", cx);
+        bench.publish.read_with(cx, |view, _| {
+            assert!(view.mode == Mode::Publish && view.land.is_none());
+            let plan = view.plan.as_ref().expect("a publish plan is on the card");
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            assert!(plan
+                .actions
+                .iter()
+                .any(|action| matches!(action, SubmitAction::CreatePr { .. })));
+        });
+        assert_eq!(fixture.take_asked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn the_pull_requests_page_leaves_the_stack_and_its_plan_where_they_were(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-pages", &fixture, true, cx);
+        let before = bench
+            .publish
+            .read_with(cx, |view, _| (view.selected.clone(), view.land_seq));
+        bench.publish.update(cx, |view, cx| {
+            view.page = Page::Review;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Every open pull request is a row there.
+        bench.model.read_with(cx, |model, _| {
+            let rows =
+                crate::logic::publish::review_rows(model.forge.prs.as_deref(), Some("jiji-mock"));
+            assert_eq!(rows.len(), 2);
+        });
+        bench.publish.update(cx, |view, cx| {
+            view.page = Page::Stacks;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Back on the stacks: the same one chosen, its plan not asked again.
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!((view.selected.clone(), view.land_seq), before);
+            assert!(view.land.is_some());
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn a_stack_that_differs_from_github_waits_to_be_published(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-unpushed", &fixture, false, cx);
+        let plan = bench.land(cx);
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            blocking(&plan),
+            [
+                "\u{201c}diff-model\u{201d} and its GitHub branch differ — publish the stack \
+              first, so what merges is what you see here"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn the_merge_method_bypass_and_drafts_shape_the_land_plan(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-options", &fixture, true, cx);
+        let replan = |method: Option<MergeMethod>, bypass: bool, cx: &mut TestAppContext| {
+            bench.publish.update(cx, |view, cx| {
+                view.land_method = method;
+                view.land_bypass = bypass;
+                view.replan_land(cx);
+            });
+            cx.run_until_parked();
+            bench.land(cx)
+        };
+
+        // The method asked for is the one the merge uses, and one the
+        // repository refuses is a blocker, not a quiet substitute.
+        let plan = replan(Some(MergeMethod::Rebase), false, cx);
+        assert_eq!(merges(&plan), [(41, MergeMethod::Rebase)]);
+        assert_eq!(plan.options.method, Some(MergeMethod::Rebase));
+        fixture.github().rebase = false;
+        let plan = replan(Some(MergeMethod::Rebase), false, cx);
+        assert!(merges(&plan).is_empty());
+        assert_eq!(
+            blocking(&plan),
+            ["jiji-mock/workbench does not allow rebase merges — pick another method"]
+        );
+        let plan = replan(None, false, cx);
+        assert_eq!(merges(&plan), [(41, MergeMethod::Squash)]);
+
+        // Failing required checks block; bypass merges past them, and says
+        // so.
+        fixture.pull(41, |pull| pull.summary.checks = ChecksRollup::Failing);
+        let plan = replan(None, false, cx);
+        assert_eq!(blocking(&plan), ["#41's checks are failing"]);
+        let plan = replan(None, true, cx);
+        assert_eq!(merges(&plan), [(41, MergeMethod::Squash)]);
+        assert!(plan.options.bypass);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.starts_with("Bypassing failing checks on #41")),
+            "{:?}",
+            plan.warnings
+        );
+
+        // A draft is marked ready as its own step, just before it merges.
+        fixture.pull(41, |pull| {
+            pull.summary.checks = ChecksRollup::Passing;
+            pull.summary.is_draft = true;
+        });
+        let plan = replan(None, false, cx);
+        assert!(matches!(
+            plan.actions[..2],
+            [
+                LandAction::MarkReadyPr { number: 41, .. },
+                LandAction::MergePr { number: 41, .. }
+            ]
+        ));
+        assert_eq!(fixture.take_asked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn a_plan_that_answers_late_never_lands_on_the_stack_chosen_since(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-late", &fixture, true, cx);
+        // The current stack's plan is asked for again, and before GitHub
+        // answers, another stack is chosen.
+        bench.publish.update(cx, |view, cx| {
+            view.load_land_plan("diff-virtualization".into(), cx);
+            assert!(view.land_loading);
+            view.select_stack("toznkvpq", cx);
+        });
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.selected.as_deref(), Some("toznkvpq"));
+            assert!(view.mode == Mode::Publish);
+            assert!(view.land.is_none() && !view.land_loading);
+            assert!(view.plan.is_some());
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn failed_ci_is_sent_back_to_work_and_the_badges_follow(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        fixture.pull(42, |pull| {
+            pull.summary.checks = ChecksRollup::Failing;
+            pull.failed_runs = vec!["ci / test".into()];
+        });
+        let bench = bench("publish-rerun", &fixture, true, cx);
+        bench.publish.update(cx, |view, cx| {
+            view.page = Page::Review;
+            view.rerun_ci(42, cx);
+        });
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.rerun_busy, None);
+            assert_eq!(
+                view.rerun_note.as_deref(),
+                Some("#42: Re-running failed jobs in ci / test.")
+            );
+        });
+        assert_eq!(fixture.take_asked(), ["rerun c5e208d4"]);
+        // The refresh that follows reads the checks running again.
+        bench.model.read_with(cx, |model, _| {
+            let prs = model.forge.prs.as_ref().unwrap();
+            assert_eq!(
+                prs.by_branch["diff-virtualization"].checks,
+                ChecksRollup::Pending
+            );
+        });
+
+        // Nothing failed this time: the note says so plainly.
+        bench.publish.update(cx, |view, cx| view.rerun_ci(42, cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            let note = view.rerun_note.clone().unwrap();
+            assert!(note.starts_with("#42: "), "{note}");
+            assert_ne!(note, "#42: Re-running failed jobs in ci / test.");
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn a_pull_request_is_fetched_for_review_by_its_row_or_its_number(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-review", &fixture, false, cx);
+        let window = bench._window;
+        // By number: GitHub is asked for that one pull request, and the
+        // panel opens on it with a bookmark name to take.
+        window
+            .update(cx, |_, window, cx| {
+                bench.publish.update(cx, |view, cx| {
+                    view.page = Page::Review;
+                    view.lookup.update(cx, |input, cx| input.set_text("41", cx));
+                    view.lookup_pr(window, cx);
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, cx| {
+            assert_eq!(view.review_for.as_ref().map(|pr| pr.number), Some(41));
+            assert_eq!(view.review_name.read(cx).text(), "pr/41");
+        });
+        bench
+            .publish
+            .update(cx, |view, cx| view.fetch_for_review(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.review_error, None);
+            assert!(view.review_for.is_none());
+            let (bookmark, change) = view.review_done.clone().expect("the fetch landed");
+            assert_eq!(bookmark, "pr/41");
+            assert!(change.is_some());
+        });
+        // The bookmark is the repository's now: the same name is refused.
+        let snapshot = bench
+            .model
+            .read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        assert!(snapshot.bookmarks.iter().any(|b| b.name == "pr/41"));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn publishing_opens_the_pull_requests_the_plan_named_and_keeps_the_result(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let bench = bench("publish-submit", &fixture, false, cx);
+        // A stack with no bookmark: the plan names one, pushes it and opens
+        // its pull request.
+        bench.select("toznkvpq", cx);
+        bench.publish.update(cx, |view, cx| view.publish(cx));
+        cx.run_until_parked();
+        let branch = "feat-palette-matcher-scores-revset-atoms";
+        assert_eq!(
+            fixture.take_asked(),
+            [format!("create #41 {branch} → main")]
+        );
+        // The badges follow what GitHub now holds, and the stack, known by
+        // its new bookmark now, stays chosen with what was done on it.
+        bench.model.read_with(cx, |model, _| {
+            let prs = model.forge.prs.as_ref().unwrap();
+            assert_eq!(prs.by_branch[branch].number, 41);
+        });
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.plan_error, None);
+            assert_eq!(view.selected.as_deref(), Some(branch));
+            let outcome = view.outcome.as_ref().expect("the publish's steps stay");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn landing_merges_on_github_then_tidies_the_stack_here(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-land", &fixture, true, cx);
+        bench.publish.update(cx, |view, cx| view.land_stack(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.land_error, None);
+            let outcome = view.land_outcome.as_ref().expect("the land ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+        });
+        // #41 merged, and #42, rebased onto trunk here, targets it now.
+        // It is ready already, so it is left for the next Land to merge
+        // rather than handed to auto-merge.
+        assert_eq!(
+            fixture.take_asked(),
+            ["merge #41 by squash", "retarget #42 → main"]
+        );
+        // The landed segment is gone from here and from the remote.
+        let snapshot = bench
+            .model
+            .read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        assert!(!snapshot.bookmarks.iter().any(|b| b.name == "diff-model"));
+        assert!(!snapshot.nodes.iter().any(|node| node.id == "nzpwlxvr"));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn shipping_moves_trunk_to_the_stack_and_pushes_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let bench = bench("publish-ship", &fixture, false, cx);
+        bench.select("toznkvpq", cx);
+        let head = bench
+            .publish
+            .read_with(cx, |view, _| {
+                view.selected_stack().unwrap().head_change.clone()
+            })
+            .unwrap();
+        bench
+            .publish
+            .update(cx, |view, cx| view.load_ship_plan(head.clone(), cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert!(view.mode == Mode::Ship);
+            assert_eq!(view.ship_error, None);
+            let plan = view.ship.as_ref().expect("a ship plan is on the card");
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            assert!(!plan.actions.is_empty());
+        });
+        bench.publish.update(cx, |view, cx| view.ship_stack(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.ship_error, None);
+            let outcome = view.ship_outcome.as_ref().expect("the ship ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+        });
+        let snapshot = bench
+            .model
+            .read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        let trunk = snapshot.bookmarks.iter().find(|b| b.is_trunk).unwrap();
+        assert_eq!(trunk.target, head);
+        assert_eq!(trunk.sync, jiji_core::snapshot::SyncState::Synced);
+        // Shipping is git's alone: GitHub was asked nothing.
+        assert_eq!(fixture.take_asked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn auto_land_starts_stops_resumes_and_is_dismissed(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        // Checks still running: the job hands #41 to GitHub's auto-merge
+        // and watches.
+        fixture.pull(41, |pull| pull.summary.checks = ChecksRollup::Pending);
+        let bench = bench("publish-autoland", &fixture, true, cx);
+        let records = bench.dir.join("data").join("autoland.json");
+        let jobs = |bench: &Bench, cx: &mut TestAppContext| {
+            bench
+                .model
+                .read_with(cx, |model, _| model.autoland.jobs.clone())
+        };
+        bench.publish.update(cx, |view, cx| view.queue_autoland(cx));
+        // Queued, the record already reads as watching: wait for the round
+        // that handed #41 over.
+        until(cx, "the job's first round", |cx| {
+            jobs(&bench, cx).iter().any(|job| {
+                job.live
+                    && job.record.state.rounds == 1
+                    && matches!(job.record.state.phase, AutoLandPhase::Waiting { .. })
+            })
+        });
+        assert_eq!(fixture.take_asked(), ["auto-merge #41 by squash"]);
+        bench.publish.read_with(cx, |view, cx| {
+            assert!(view.job_active(cx));
+            assert_eq!(view.queue_error, None);
+        });
+
+        bench.model.update(cx, |model, cx| model.stop_autoland(cx));
+        until(cx, "the job to stop", |cx| {
+            jobs(&bench, cx)
+                .iter()
+                .any(|job| !job.live && job.record.state.phase == AutoLandPhase::Stopped)
+        });
+        let stopped = jobs(&bench, cx);
+        bench
+            .model
+            .update(cx, |model, cx| model.dismiss_autoland(&stopped[0], cx));
+        cx.run_until_parked();
+        assert!(jobs(&bench, cx).is_empty());
+        assert!(jiji_forge::load_autoland_records(&records).is_empty());
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn an_interrupted_job_resumes_with_its_saved_rules(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        fixture.pull(41, |pull| {
+            pull.summary.review = ReviewDecision::ReviewRequired
+        });
+        // The last session was watching this stack, with bypass on, when
+        // it ended.
+        let dir = crate::testing::scratch("publish-resume");
+        let repo = dir.join("repo").to_string_lossy().into_owned();
+        let mut state = AutoLandState::queued("diff-virtualization");
+        state.phase = AutoLandPhase::Waiting {
+            attention: false,
+            reasons: vec!["#41 still needs an approving review".into()],
+        };
+        state.options.bypass = true;
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let records = dir.join("data").join("autoland.json");
+        jiji_forge::save_autoland_records(
+            &records,
+            &[AutoLandRecord {
+                repo_path: repo,
+                state,
+                saved_at_ms: 0,
+            }],
+        )
+        .unwrap();
+        let bench = bench_in(dir, &fixture, true, cx);
+        let jobs = |bench: &Bench, cx: &mut TestAppContext| {
+            bench
+                .model
+                .read_with(cx, |model, _| model.autoland.jobs.clone())
+        };
+        let interrupted = jobs(&bench, cx);
+        assert_eq!(interrupted.len(), 1);
+        assert!(crate::logic::autoland::is_interrupted(&interrupted[0]));
+
+        // Resume sends the rules the card shows; bypass merges at once.
+        let options = interrupted[0].record.state.options;
+        bench.publish.update(cx, |view, cx| {
+            view.resume_autoland("diff-virtualization".into(), options, cx)
+        });
+        until(cx, "the resumed job to merge", |_| {
+            fixture
+                .github()
+                .asked
+                .iter()
+                .any(|asked| asked == "merge #41 by squash")
+        });
+        bench.model.update(cx, |model, cx| model.stop_autoland(cx));
+        until(cx, "the job to come to rest", |cx| {
+            jobs(&bench, cx).iter().all(|job| !job.live)
+        });
+        bench
+            .publish
+            .read_with(cx, |view, _| assert_eq!(view.resume_error, None));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
 
     #[gpui::test]
     fn retry_reads_the_stacks_again_when_nothing_else_moved(cx: &mut TestAppContext) {

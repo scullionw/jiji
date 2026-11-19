@@ -170,4 +170,69 @@ mod tests {
             ["local:done", "origin:gone"]
         );
     }
+
+    // ── Ported from the Tauri app's bookmarks.test.ts ──
+
+    fn fixture() -> Vec<BookmarkState> {
+        let at = |name: &str, stamp: &str| BookmarkState {
+            target_description: String::new(),
+            target_author: String::new(),
+            sync: SyncState::LocalOnly,
+            ..mark(name, None, true, stamp)
+        };
+        vec![
+            at("feature-x", "2026-06-10T10:00:00Z"),
+            BookmarkState {
+                remote: Some("origin".into()),
+                sync: SyncState::Synced,
+                tracked: true,
+                ..at("main", "2026-06-01T10:00:00Z")
+            },
+            BookmarkState {
+                is_merged: true,
+                ..at("landed", "2026-05-01T10:00:00Z")
+            },
+            BookmarkState {
+                is_local: false,
+                remote: Some("origin".into()),
+                sync: SyncState::RemoteOnly,
+                target_author: "alice".into(),
+                ..at("alice/api", "2026-06-09T10:00:00Z")
+            },
+            BookmarkState {
+                is_local: false,
+                remote: Some("upstream".into()),
+                sync: SyncState::RemoteOnly,
+                is_merged: true,
+                ..at("old-spike", "2026-04-01T10:00:00Z")
+            },
+        ]
+    }
+
+    fn named(list: &[&BookmarkState]) -> Vec<String> {
+        list.iter().map(|b| b.name.clone()).collect()
+    }
+
+    #[test]
+    fn locals_and_each_remote_group_apart_trunk_pinned_newest_first() {
+        let marks = fixture();
+        let groups = group_bookmarks(&marks, "");
+        assert_eq!(named(&groups.local), ["main", "feature-x", "landed"]);
+        let remotes: Vec<&str> = groups.remotes.iter().map(|(remote, _)| *remote).collect();
+        assert_eq!(remotes, ["origin", "upstream"]);
+        assert_eq!(named(&groups.remotes[0].1), ["alice/api"]);
+    }
+
+    #[test]
+    fn the_filter_reads_names_authors_and_remotes() {
+        let marks = fixture();
+        let alice = group_bookmarks(&marks, "alice");
+        assert_eq!(named(&alice.remotes[0].1), ["alice/api"]);
+        assert!(alice.local.is_empty());
+        assert_eq!(group_bookmarks(&marks, "upstream").remotes.len(), 1);
+        assert_eq!(
+            named(&group_bookmarks(&marks, "feature").local),
+            ["feature-x"]
+        );
+    }
 }

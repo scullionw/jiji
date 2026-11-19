@@ -3,9 +3,12 @@
 //! These run the real model and the real views on GPUI's test context:
 //! nothing reaches the screen, and tasks run when a test lets them. Repos
 //! are real ones made for the test, with no remotes, or the mock backend's
-//! fabricated one, and the host finds no forge token under test
-//! (`host::forge::resolved_token`), so nothing here reads the user's
-//! credentials or reaches the network.
+//! fabricated one. The forge is GitHub as a test captured it (`forge`), or
+//! none at all; the real one finds no token under test
+//! (`host::forge::GitHub`), so nothing here reads the user's credentials
+//! or reaches the network.
+
+pub mod forge;
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +48,7 @@ pub fn scratch(name: &str) -> PathBuf {
 
 /// Key bindings and actions, as `main` registers them. Motion holds
 /// still, as in a scripted run: a test about motion lets it run itself.
-fn bind(cx: &mut App) {
+pub fn bind(cx: &mut App) {
     crate::ui::motion::hold(cx);
     crate::ui::tooltip::init(cx);
     crate::ui::input::bind_keys(cx);
@@ -71,9 +74,18 @@ pub fn install(dir: &Path, cx: &mut TestAppContext) -> Entity<AppModel> {
 
 /// The app over the mock backend (`JIJI_MOCK_BACKEND=1`), whose fabricated
 /// repo — conflicts, a merge tool, diffs of every kind — sits at
-/// `dir/repo`. Upstream checks are off: the mock's fetch would record an
-/// operation of its own. Returns the repo's path.
+/// `dir/repo`, with no forge to reach. Returns the repo's path.
 pub fn install_mock(dir: &Path, cx: &mut TestAppContext) -> (Entity<AppModel>, String) {
+    install_mock_over(dir, Box::new(crate::host::forge::Offline), cx)
+}
+
+/// `install_mock` with `forge` behind the repo's GitHub remote. Upstream
+/// checks are off: the mock's fetch would record an operation of its own.
+pub fn install_mock_over(
+    dir: &Path,
+    forge: Box<dyn crate::host::forge::Forge>,
+    cx: &mut TestAppContext,
+) -> (Entity<AppModel>, String) {
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join(".jj")).unwrap();
     let data = dir.join("data");
@@ -81,7 +93,7 @@ pub fn install_mock(dir: &Path, cx: &mut TestAppContext) -> (Entity<AppModel>, S
     store.set_pref("upstream.interval", &0u32);
     let model = cx.update(|cx| {
         bind(cx);
-        let host = Host::with_backend(Box::new(jiji_core::MockBackend::default()), data);
+        let host = Host::with_backend(Box::new(jiji_core::MockBackend::default()), forge, data);
         AppModel::install_over(host, store, "Menlo".into(), cx)
     });
     (model, repo.to_string_lossy().into_owned())

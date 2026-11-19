@@ -91,4 +91,27 @@ mod tests {
             "0 matching changes · searched 40 changes · stopped early, older history unsearched"
         );
     }
+
+    #[test]
+    fn one_match_and_one_change_read_in_the_singular() {
+        let result = HistorySearch {
+            query: "needle".into(),
+            hits: vec![jiji_core::snapshot::SearchHit {
+                id: "x".into(),
+                change_id: "x".into(),
+                commit_id: "x".into(),
+                description: String::new(),
+                author: String::new(),
+                timestamp: String::new(),
+                files: vec![],
+                more_files: 0,
+            }],
+            scanned: 1,
+            truncated: false,
+        };
+        assert_eq!(
+            search_status(&result),
+            "1 matching change · searched 1 change"
+        );
+    }
 }

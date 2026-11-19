@@ -10,10 +10,9 @@
 //! over once.
 //!
 //! A file that is there but cannot be read is never written over: what it
-//! holds is unknown, not gone. Lists decode entry by entry, so one bad
-//! entry costs only itself.
+//! holds is unknown, not gone. Lists and per-repo maps decode entry by
+//! entry, so one bad entry costs only itself.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use jiji_core::snapshot::SnapshotView;
@@ -393,21 +392,26 @@ impl Store {
         self.set_pref("window", state);
     }
 
-    /// The view lens a repo was last left on.
+    /// The view lens a repo was last left on. Each repo's lens reads on
+    /// its own, so one that no longer makes sense costs only itself, and a
+    /// custom revset left blank is no lens to restore.
     pub fn repo_view(&self, repo_path: &str) -> SnapshotView {
-        self.pref::<HashMap<String, SnapshotView>>(VIEWS)
+        self.pref::<Map<String, Value>>(VIEWS)
             .and_then(|mut views| views.remove(repo_path))
+            .and_then(|view| serde_json::from_value(view).ok())
+            .filter(
+                |view| !matches!(view, SnapshotView::Custom { revset } if revset.trim().is_empty()),
+            )
             .unwrap_or_default()
     }
 
     pub fn set_repo_view(&mut self, repo_path: &str, view: &SnapshotView) {
-        let mut views = self
-            .pref::<HashMap<String, SnapshotView>>(VIEWS)
-            .unwrap_or_default();
+        let mut views = self.pref::<Map<String, Value>>(VIEWS).unwrap_or_default();
         if *view == SnapshotView::Workstreams {
             views.remove(repo_path);
         } else {
-            views.insert(repo_path.to_owned(), view.clone());
+            let value = serde_json::to_value(view).expect("a lens is plain data");
+            views.insert(repo_path.to_owned(), value);
         }
         self.set_pref(VIEWS, &views);
     }
@@ -583,10 +587,39 @@ mod tests {
         assert_eq!(store.repo_view("/r"), SnapshotView::Trunk);
         store.set_repo_view("/r", &SnapshotView::Workstreams);
         assert_eq!(store.repo_view("/r"), SnapshotView::Workstreams);
+        assert_eq!(store.pref::<Map<String, Value>>("views"), Some(Map::new()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lens_that_makes_no_sense_costs_only_its_own_repo() {
+        let dir = scratch("views-garbage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefs = serde_json::json!({"views": {
+            "/a": {"kind": "trunk"},
+            "/b": {"kind": "nope"},
+            "/c": {"kind": "custom"},
+            "/d": {"kind": "custom", "revset": "  "},
+            "/e": {"kind": "custom", "revset": "mine()"},
+            "/f": "team",
+        }});
+        std::fs::write(dir.join("prefs.json"), prefs.to_string()).unwrap();
+        let mut store = Store::at(dir.clone());
+        assert_eq!(store.repo_view("/a"), SnapshotView::Trunk);
+        for repo in ["/b", "/c", "/d", "/f"] {
+            assert_eq!(store.repo_view(repo), SnapshotView::Workstreams, "{repo}");
+        }
         assert_eq!(
-            store.pref::<HashMap<String, SnapshotView>>("views"),
-            Some(HashMap::new())
+            store.repo_view("/e"),
+            SnapshotView::Custom {
+                revset: "mine()".into()
+            }
         );
+        // Choosing a lens elsewhere leaves the others as they were.
+        store.set_repo_view("/g", &SnapshotView::All);
+        let store = Store::at(dir.clone());
+        assert_eq!(store.repo_view("/a"), SnapshotView::Trunk);
+        assert_eq!(store.repo_view("/g"), SnapshotView::All);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -436,4 +436,272 @@ mod tests {
         );
         assert!(rerun_summary(&report(&[], &[])).starts_with("No failed GitHub Actions runs"));
     }
+
+    // ── Ported from the Tauri app's review.test.ts and stacks.test.ts ──
+
+    fn watcher(edit: impl FnOnce(&mut PrSummary)) -> PrSummary {
+        let mut pr = PrSummary {
+            number: 213,
+            title: "Add the watcher".into(),
+            url: "https://github.com/o/r/pull/213".into(),
+            state: PrState::Open,
+            is_draft: false,
+            head_branch: "watcher-fix".into(),
+            head_commit: "a".repeat(40),
+            head_owner: Some("o".into()),
+            base_branch: "main".into(),
+            body: None,
+            review: jiji_forge::ReviewDecision::None,
+            checks: ChecksRollup::None,
+        };
+        edit(&mut pr);
+        pr
+    }
+
+    fn state(prs: Vec<PrSummary>) -> RepoPrState {
+        RepoPrState {
+            report: jiji_forge::PrStateReport {
+                prs,
+                truncated: false,
+            },
+            by_branch: Default::default(),
+        }
+    }
+
+    fn row_of(pr: PrSummary) -> (String, bool) {
+        let prs = state(vec![pr]);
+        let rows = review_rows(Some(&prs), Some("o"));
+        (rows[0].head_label.clone(), rows[0].can_rerun)
+    }
+
+    #[test]
+    fn a_same_repo_pr_reads_as_its_branch_whatever_the_owner_s_case() {
+        assert_eq!(row_of(watcher(|_| {})).0, "watcher-fix");
+        assert_eq!(
+            row_of(watcher(|pr| pr.head_owner = Some("O".into()))).0,
+            "watcher-fix"
+        );
+    }
+
+    #[test]
+    fn a_fork_s_pr_reads_as_owner_and_branch() {
+        assert_eq!(
+            row_of(watcher(|pr| pr.head_owner = Some("contributor".into()))).0,
+            "contributor:watcher-fix"
+        );
+        // A fork since deleted keeps the plain branch.
+        assert_eq!(row_of(watcher(|pr| pr.head_owner = None)).0, "watcher-fix");
+    }
+
+    #[test]
+    fn re_running_ci_is_offered_on_an_open_pr_whose_checks_fail() {
+        let rerun = |edit: fn(&mut PrSummary)| row_of(watcher(edit)).1;
+        assert!(rerun(|pr| pr.checks = ChecksRollup::Failing));
+        assert!(!rerun(|pr| pr.checks = ChecksRollup::Passing));
+        assert!(!rerun(|pr| pr.checks = ChecksRollup::Pending));
+        assert!(!rerun(|pr| {
+            pr.state = PrState::Merged;
+            pr.checks = ChecksRollup::Failing;
+        }));
+    }
+
+    #[test]
+    fn every_reported_pr_is_a_row_once_the_state_and_the_repo_are_known() {
+        let prs = state(vec![
+            watcher(|_| {}),
+            watcher(|pr| {
+                pr.number = 7;
+                pr.head_owner = Some("fork-owner".into());
+            }),
+        ]);
+        let rows = review_rows(Some(&prs), Some("o"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].head_label, "fork-owner:watcher-fix");
+        assert!(review_rows(None, Some("o")).is_empty());
+        assert!(review_rows(Some(&prs), None).is_empty());
+    }
+
+    #[test]
+    fn a_stack_s_status_comes_from_the_engine_and_reads_as_a_word() {
+        assert_eq!(stack_summary(StackStatus::Draft), ("Draft", Tone::Muted));
+        assert_eq!(stack_summary(StackStatus::Published).0, "Published");
+        assert_eq!(stack_summary(StackStatus::Local).0, "Local");
+    }
+
+    // ── Ported from the Tauri app's land.test.ts, ship.test.ts and
+    // submit.test.ts: how each planned step reads ──
+
+    fn land(action: LandAction) -> String {
+        land_action_text(&action, "origin")
+    }
+
+    #[test]
+    fn a_merge_reads_with_its_method() {
+        let merge = |number, bookmark: &str, method| LandAction::MergePr {
+            number,
+            bookmark: bookmark.into(),
+            method,
+            expected_head: "feedface".into(),
+            commit_title: None,
+            commit_message: None,
+        };
+        assert_eq!(
+            land(merge(1, "auth", MergeMethod::Squash)),
+            "Squash-merge #1 (auth)"
+        );
+        assert_eq!(land(merge(2, "b", MergeMethod::Merge)), "Merge #2 (b)");
+        assert_eq!(
+            land(LandAction::MarkReadyPr {
+                number: 1,
+                bookmark: "auth".into()
+            }),
+            "Mark #1 (auth) ready for review"
+        );
+    }
+
+    #[test]
+    fn a_hand_off_to_github_says_whose_method_it_is() {
+        let auto = land(LandAction::EnableAutoMerge {
+            number: 1,
+            bookmark: "auth".into(),
+            method: MergeMethod::Squash,
+            expected_head: Some("feedface".into()),
+            commit_title: None,
+            commit_message: None,
+        });
+        assert!(auto.contains("Enable auto-merge (squash) on #1"), "{auto}");
+        assert_eq!(
+            land(LandAction::EnqueuePr {
+                number: 1,
+                bookmark: "auth".into(),
+                method: MergeMethod::Rebase,
+                expected_head: "feedface".into(),
+            }),
+            "Add #1 (auth) to the merge queue — GitHub uses its configured rebase method"
+        );
+    }
+
+    #[test]
+    fn the_reconcile_after_a_merge_reads_step_by_step() {
+        assert!(land(LandAction::FetchRemote {
+            remote: "origin".into()
+        })
+        .contains("Fetch from origin"));
+        assert_eq!(
+            land(LandAction::RetargetPr {
+                number: 7,
+                bookmark: "profile".into(),
+                to_base: "main".into()
+            }),
+            "Retarget #7 (profile) onto main"
+        );
+        assert_eq!(
+            land(LandAction::CleanupBookmark {
+                bookmark: "auth".into()
+            }),
+            "Remove the landed bookmark auth here and on origin"
+        );
+        let swept = |ids: &[&str]| {
+            land(LandAction::AbandonLanded {
+                bookmark: "auth".into(),
+                change_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            })
+        };
+        assert!(swept(&["a1"]).contains("landed change a1"));
+        assert!(swept(&["a2", "a1"]).contains("2 landed changes"));
+    }
+
+    #[test]
+    fn each_ship_step_reads_as_what_it_does() {
+        let rebase = ship_action_text(&ShipAction::RebaseOntoTrunk {
+            root_change: "abcd".into(),
+            moves: 2,
+        });
+        assert!(rebase.contains("its 1 descendant"), "{rebase}");
+        assert!(ship_action_text(&ShipAction::MoveTrunk {
+            bookmark: "main".into(),
+            to: "abcd".into()
+        })
+        .contains("Point main at abcd"));
+        assert!(ship_action_text(&ShipAction::PushTrunk {
+            bookmark: "main".into(),
+            remote: "origin".into()
+        })
+        .contains("Push main to origin"));
+        assert!(
+            ship_action_text(&ShipAction::NewWorkingCopy { on: "abcd".into() })
+                .contains("fresh working copy")
+        );
+    }
+
+    fn submit(action: SubmitAction) -> String {
+        submit_action_text(&action, "origin")
+    }
+
+    #[test]
+    fn each_publish_step_reads_as_what_it_does() {
+        assert_eq!(
+            submit(SubmitAction::CreateBookmark {
+                bookmark: "add-parser".into(),
+                change: "c2".into()
+            }),
+            "Create bookmark add-parser at c2 — named from its description"
+        );
+        let open = |draft| {
+            submit(SubmitAction::CreatePr {
+                bookmark: "feat".into(),
+                base: "main".into(),
+                title: "feat: thing".into(),
+                body: String::new(),
+                draft,
+            })
+        };
+        assert!(open(false).contains("feat → main"));
+        assert!(open(true).contains("Open a draft pull request"));
+        assert_eq!(
+            submit(SubmitAction::RetargetPr {
+                number: 7,
+                bookmark: "feat".into(),
+                from_base: "main".into(),
+                to_base: "auth".into()
+            }),
+            "Retarget #7: base main → auth"
+        );
+    }
+
+    #[test]
+    fn a_text_update_says_what_it_changes() {
+        let update = |title: Option<&str>, seed| {
+            submit(SubmitAction::UpdatePrText {
+                number: 7,
+                bookmark: "feat".into(),
+                title: title.map(str::to_owned),
+                body: "wrapped".into(),
+                seed,
+            })
+        };
+        assert_eq!(
+            update(None, false),
+            "Update #7\u{2019}s description from feat\u{2019}s commit text"
+        );
+        assert!(update(Some("feat: renamed"), false).contains("title and description"));
+        assert!(update(None, true).contains("Adopt #7\u{2019}s description"));
+    }
+
+    #[test]
+    fn a_stack_comment_is_posted_or_updated_on_the_pr_it_belongs_to() {
+        let comment = |number, create| {
+            submit(SubmitAction::SyncStackComment {
+                bookmark: "feat".into(),
+                number,
+                create,
+            })
+        };
+        assert_eq!(comment(Some(7), false), "Update the stack comment on #7");
+        assert_eq!(
+            comment(None, true),
+            "Post the stack comment on feat\u{2019}s new pull request"
+        );
+        assert_eq!(comment(Some(7), true), "Post the stack comment on #7");
+    }
 }

@@ -1,7 +1,9 @@
 //! Forge-facing host calls: the GitHub connection behind the Publish
 //! section. Thin over `jiji-forge`, like the repo calls stay thin over
-//! `jiji-core`. The forge client is synchronous; every method blocks on
-//! the network, the keychain, or a `gh` subprocess.
+//! `jiji-core`. Every call goes through one [`Forge`], which blocks on the
+//! network, the keychain, or a `gh` subprocess in the app; an offline run
+//! has one that reaches nothing, and tests put GitHub as they captured it
+//! there (`testing::forge`).
 
 use std::sync::{Arc, Mutex};
 
@@ -9,25 +11,179 @@ use jiji_core::snapshot::RepoSnapshot;
 use jiji_core::BackendError;
 use jiji_forge::{
     detect_github_repo, execute_land, execute_ship, execute_submit, no_github_remote, plan_land,
-    plan_ship, plan_submit, pr_template_candidates, resolve_token, CiRerunReport, ForgeAuth,
-    ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandOptions, LandOutcome,
-    LandPlan, LandRepoForge, LandVcs, PrSummary, PrTemplate, PublishStack, RepoForge, RepoPrState,
-    ShipOutcome, ShipPlan, ShipVcs, SubmitHead, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource,
-    TokenStore as _,
+    plan_ship, plan_submit, pr_template_candidates, resolve_token, AutoLandPrs, CiRerunReport,
+    ForgeAuth, ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandForge,
+    LandOptions, LandOutcome, LandPlan, LandRepoForge, LandVcs, PrSummary, PrTemplate,
+    PublishStack, RepoForge, RepoPrState, ResolvedToken, ShipOutcome, ShipPlan, ShipVcs,
+    SubmitForge, SubmitHead, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
 };
 
 use super::{CommandError, Host, HostResult};
 
-/// Session memory for the forge connection: the login the active token
-/// last verified as, so status answers without a network round trip. Keyed
-/// by token source — switching sources re-verifies.
+/// Where the host's forge calls go, and the token they go with.
+pub trait Forge: Send + Sync {
+    /// The token to act with on `repo`'s host, and where it came from;
+    /// `None` when there is none anywhere.
+    fn token(&self, repo: Option<&ForgeRepo>) -> Result<Option<ResolvedToken>, ForgeError>;
+    /// Keep a token the forge just accepted as Jiji's own.
+    fn store_token(&self, repo: Option<&ForgeRepo>, token: &str) -> Result<(), ForgeError>;
+    /// Forget Jiji's own token; one from elsewhere stays where it is.
+    fn delete_token(&self, repo: Option<&ForgeRepo>) -> Result<(), ForgeError>;
+    /// A client acting with `token` on `repo`'s host, github.com's without
+    /// one.
+    fn client(
+        &self,
+        repo: Option<&ForgeRepo>,
+        token: &str,
+    ) -> Result<Box<dyn ForgeClient>, ForgeError>;
+    /// Nothing may be reached from this run, so nothing fetches on its own
+    /// either: `jj git fetch` would use the user's Git credentials.
+    fn offline(&self) -> bool {
+        false
+    }
+}
+
+/// What the host asks of the forge with a token in hand, and the engines'
+/// own seams over the same connection.
+pub trait ForgeClient: Send + Sync {
+    /// The login the token authenticates as.
+    fn viewer(&self) -> Result<String, ForgeError>;
+    /// The repo's open pull requests, the one batched query badges and
+    /// every plan hang on.
+    fn open_prs(&self, repo: &ForgeRepo) -> Result<RepoPrState, ForgeError>;
+    /// One pull request by number, open or not.
+    fn pr(&self, repo: &ForgeRepo, number: u64) -> Result<PrSummary, ForgeError>;
+    /// Re-run the failed CI on a pull request's head commit.
+    fn rerun_failed_ci(&self, repo: &ForgeRepo, head: &str) -> Result<CiRerunReport, ForgeError>;
+    fn submit<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn SubmitForge + 'a>;
+    fn land<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn LandForge + 'a>;
+}
+
+/// GitHub, with the user's own token: the keychain's, the environment's,
+/// or the `gh` CLI's. Every read of the user's credentials comes through
+/// here.
+pub struct GitHub;
+
+/// Token storage keys off the forge host, so a GitHub Enterprise remote
+/// keeps its token separate from github.com's.
+fn token_store(repo: Option<&ForgeRepo>) -> KeychainTokenStore {
+    let host = repo.map_or("github.com", |r| r.host.as_str());
+    KeychainTokenStore::new(host)
+}
+
+impl Forge for GitHub {
+    /// Under test there is never one. Tests must not read real
+    /// credentials, and without a token nothing downstream talks to the
+    /// forge, so a test that puts a repo on screen stays off the network.
+    fn token(&self, repo: Option<&ForgeRepo>) -> Result<Option<ResolvedToken>, ForgeError> {
+        if cfg!(test) {
+            return Ok(None);
+        }
+        resolve_token(&token_store(repo))
+    }
+
+    fn store_token(&self, repo: Option<&ForgeRepo>, token: &str) -> Result<(), ForgeError> {
+        token_store(repo).set(token)
+    }
+
+    fn delete_token(&self, repo: Option<&ForgeRepo>) -> Result<(), ForgeError> {
+        token_store(repo).delete()
+    }
+
+    fn client(
+        &self,
+        repo: Option<&ForgeRepo>,
+        token: &str,
+    ) -> Result<Box<dyn ForgeClient>, ForgeError> {
+        Ok(Box::new(match repo {
+            Some(repo) => GitHubClient::for_repo(repo, token)?,
+            None => GitHubClient::for_github_com(token)?,
+        }))
+    }
+}
+
+impl ForgeClient for GitHubClient {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        GitHubClient::viewer(self)
+    }
+
+    fn open_prs(&self, repo: &ForgeRepo) -> Result<RepoPrState, ForgeError> {
+        let report = GitHubClient::open_prs(self, &repo.owner, &repo.name)?;
+        Ok(RepoPrState::new(report, &repo.owner))
+    }
+
+    fn pr(&self, repo: &ForgeRepo, number: u64) -> Result<PrSummary, ForgeError> {
+        self.pr_by_number(&repo.owner, &repo.name, number)
+    }
+
+    fn rerun_failed_ci(&self, repo: &ForgeRepo, head: &str) -> Result<CiRerunReport, ForgeError> {
+        jiji_forge::rerun_failed_ci(self, repo, head)
+    }
+
+    fn submit<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn SubmitForge + 'a> {
+        Box::new(RepoForge { client: self, repo })
+    }
+
+    fn land<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn LandForge + 'a> {
+        Box::new(LandRepoForge { client: self, repo })
+    }
+}
+
+/// A run with `JIJI_OFFLINE=1`: no token is looked up anywhere, and
+/// nothing is asked of GitHub, so Publish reads as not connected.
+pub struct Offline;
+
+impl Forge for Offline {
+    fn token(&self, _: Option<&ForgeRepo>) -> Result<Option<ResolvedToken>, ForgeError> {
+        Ok(None)
+    }
+
+    fn store_token(&self, _: Option<&ForgeRepo>, _: &str) -> Result<(), ForgeError> {
+        Err(offline())
+    }
+
+    fn delete_token(&self, _: Option<&ForgeRepo>) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
+    fn client(&self, _: Option<&ForgeRepo>, _: &str) -> Result<Box<dyn ForgeClient>, ForgeError> {
+        Err(offline())
+    }
+
+    fn offline(&self) -> bool {
+        true
+    }
+}
+
+fn offline() -> ForgeError {
+    ForgeError::Network("this run is offline (JIJI_OFFLINE=1)".into())
+}
+
+/// The open-PR half of a client, as the auto-land loop reads it every
+/// round.
+pub(crate) struct OpenPrs<'a> {
+    pub(crate) client: &'a dyn ForgeClient,
+    pub(crate) repo: &'a ForgeRepo,
+}
+
+impl AutoLandPrs for OpenPrs<'_> {
+    fn open_prs(&self) -> Result<RepoPrState, ForgeError> {
+        self.client.open_prs(self.repo)
+    }
+}
+
+/// The forge this session talks to, and the login the active token last
+/// verified as, so status answers without a network round trip. Keyed by
+/// token source — switching sources re-verifies.
 pub struct ForgeState {
+    pub(crate) api: Box<dyn Forge>,
     verified: Mutex<Option<(TokenSource, String)>>,
 }
 
 impl ForgeState {
-    pub fn new() -> Self {
+    pub fn new(api: Box<dyn Forge>) -> Self {
         Self {
+            api,
             verified: Mutex::new(None),
         }
     }
@@ -50,35 +206,6 @@ impl ForgeState {
     }
 }
 
-/// Token storage keys off the forge host, so a GitHub Enterprise remote
-/// keeps its token separate from github.com's.
-pub(crate) fn token_store(repo: Option<&ForgeRepo>) -> KeychainTokenStore {
-    let host = repo.map_or("github.com", |r| r.host.as_str());
-    KeychainTokenStore::new(host)
-}
-
-/// The token to act with: the keychain's, the environment's, or the `gh`
-/// CLI's — every read of the user's credentials comes through here.
-///
-/// Under test there is never one. Tests must not read real credentials,
-/// and without a token nothing downstream talks to the forge, so a test
-/// that puts a repo on screen stays off the network.
-pub(crate) fn resolved_token(
-    repo: Option<&ForgeRepo>,
-) -> Result<Option<jiji_forge::ResolvedToken>, ForgeError> {
-    if cfg!(test) {
-        return Ok(None);
-    }
-    resolve_token(&token_store(repo))
-}
-
-fn client_for(repo: Option<&ForgeRepo>, token: &str) -> Result<GitHubClient, ForgeError> {
-    match repo {
-        Some(repo) => GitHubClient::for_repo(repo, token),
-        None => GitHubClient::for_github_com(token),
-    }
-}
-
 fn plan_stale(what: &str, verb: &str) -> CommandError {
     CommandError::new(
         "plan_stale",
@@ -97,7 +224,7 @@ impl Host {
 
     fn assemble_status(&self, repo_path: &str) -> HostResult<ForgeStatus> {
         let repo = self.detected_repo(repo_path);
-        let source = resolved_token(repo.as_ref())?.map(|t| t.source);
+        let source = self.forge.api.token(repo.as_ref())?.map(|t| t.source);
         let login = source.and_then(|s| self.forge.login_for(s));
         Ok(ForgeStatus {
             repo,
@@ -117,11 +244,16 @@ impl Host {
     /// unauthenticated status so the UI can render the connect state.
     pub fn forge_verify(&self, repo_path: &str) -> HostResult<ForgeStatus> {
         let repo = self.detected_repo(repo_path);
-        let Some(resolved) = resolved_token(repo.as_ref())? else {
+        let Some(resolved) = self.forge.api.token(repo.as_ref())? else {
             self.forge.forget();
             return self.assemble_status(repo_path);
         };
-        match client_for(repo.as_ref(), &resolved.token)?.viewer() {
+        let verified = self
+            .forge
+            .api
+            .client(repo.as_ref(), &resolved.token)
+            .and_then(|client| client.viewer());
+        match verified {
             Ok(login) => self.forge.remember(resolved.source, login),
             Err(err) => {
                 self.forge.forget();
@@ -140,8 +272,8 @@ impl Host {
             return Err(ForgeError::AuthFailed("no token was entered".into()).into());
         }
         let repo = self.detected_repo(repo_path);
-        let login = client_for(repo.as_ref(), token)?.viewer()?;
-        token_store(repo.as_ref()).set(token)?;
+        let login = self.forge.api.client(repo.as_ref(), token)?.viewer()?;
+        self.forge.api.store_token(repo.as_ref(), token)?;
         self.forge.remember(TokenSource::Keychain, login);
         self.assemble_status(repo_path)
     }
@@ -151,16 +283,23 @@ impl Host {
     /// still be authenticated.
     pub fn forge_logout(&self, repo_path: &str) -> HostResult<ForgeStatus> {
         let repo = self.detected_repo(repo_path);
-        token_store(repo.as_ref()).delete()?;
+        self.forge.api.delete_token(repo.as_ref())?;
         self.forge.forget();
         self.assemble_status(repo_path)
     }
 
-    /// The connected repo and its client.
-    fn forge_client(&self, repo_path: &str) -> HostResult<(ForgeRepo, GitHubClient, TokenSource)> {
+    /// The connected repo and a client acting with the resolved token.
+    pub(crate) fn forge_client(
+        &self,
+        repo_path: &str,
+    ) -> HostResult<(ForgeRepo, Box<dyn ForgeClient>, TokenSource)> {
         let repo = self.detected_repo(repo_path).ok_or_else(no_github_remote)?;
-        let resolved = resolved_token(Some(&repo))?.ok_or(ForgeError::NoToken)?;
-        let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+        let resolved = self
+            .forge
+            .api
+            .token(Some(&repo))?
+            .ok_or(ForgeError::NoToken)?;
+        let client = self.forge.api.client(Some(&repo), &resolved.token)?;
         Ok((repo, client, resolved.source))
     }
 
@@ -169,7 +308,7 @@ impl Host {
     /// bookmark-attachment map already built.
     pub fn forge_prs(&self, repo_path: &str) -> HostResult<RepoPrState> {
         let (repo, client, source) = self.forge_client(repo_path)?;
-        let report = client.open_prs(&repo.owner, &repo.name)?;
+        let prs = client.open_prs(&repo)?;
         // A successful authenticated call is as good as a verification;
         // keep the session login fresh for status renders.
         if self.forge.login_for(source).is_none() {
@@ -177,7 +316,7 @@ impl Host {
                 self.forge.remember(source, login);
             }
         }
-        Ok(RepoPrState::new(report, &repo.owner))
+        Ok(prs)
     }
 
     /// The connected repo, its client, and fresh open-PR state — what the
@@ -185,9 +324,9 @@ impl Host {
     fn submit_context(
         &self,
         repo_path: &str,
-    ) -> HostResult<(ForgeRepo, GitHubClient, RepoPrState)> {
+    ) -> HostResult<(ForgeRepo, Box<dyn ForgeClient>, RepoPrState)> {
         let (repo, client, _) = self.forge_client(repo_path)?;
-        let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
+        let prs = client.open_prs(&repo)?;
         Ok((repo, client, prs))
     }
 
@@ -203,13 +342,9 @@ impl Host {
     pub fn submit_plan(&self, repo_path: &str, head: &SubmitHead) -> HostResult<SubmitPlan> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
-        let forge_side = RepoForge {
-            client: &client,
-            repo: &repo,
-        };
         let template = self.pr_template(repo_path);
-        plan_submit(&snapshot, &prs, &repo, head, &forge_side, template.as_ref())
-            .map_err(Into::into)
+        let forge = client.submit(&repo);
+        plan_submit(&snapshot, &prs, &repo, head, &*forge, template.as_ref()).map_err(Into::into)
     }
 
     /// Execute a confirmed submit plan. The plan is re-derived first and
@@ -222,12 +357,9 @@ impl Host {
     ) -> HostResult<SubmitOutcome> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
-        let forge_side = RepoForge {
-            client: &client,
-            repo: &repo,
-        };
         let template = self.pr_template(repo_path);
-        let fresh = plan_submit(&snapshot, &prs, &repo, head, &forge_side, template.as_ref())?;
+        let forge = client.submit(&repo);
+        let fresh = plan_submit(&snapshot, &prs, &repo, head, &*forge, template.as_ref())?;
         if fresh.actions != plan.actions {
             return Err(plan_stale("The stack or its pull requests", "publish"));
         }
@@ -235,16 +367,14 @@ impl Host {
             host: self,
             repo_path: repo_path.to_owned(),
         };
-        execute_submit(&fresh, &vcs, &forge_side).map_err(Into::into)
+        execute_submit(&fresh, &vcs, &*forge).map_err(Into::into)
     }
 
     /// One PR by number — the review flow's lookup for PRs the batched
     /// open-PR state cannot see (past the 100 cap, or closed).
     pub fn forge_pr(&self, repo_path: &str, number: u64) -> HostResult<PrSummary> {
         let (repo, client, _) = self.forge_client(repo_path)?;
-        client
-            .pr_by_number(&repo.owner, &repo.name, number)
-            .map_err(Into::into)
+        client.pr(&repo, number).map_err(Into::into)
     }
 
     /// Re-run the failed GitHub Actions runs on a PR's head. The PR is
@@ -252,8 +382,10 @@ impl Host {
     /// has.
     pub fn rerun_failed_ci(&self, repo_path: &str, number: u64) -> HostResult<CiRerunReport> {
         let (repo, client, _) = self.forge_client(repo_path)?;
-        let pr = client.pr_by_number(&repo.owner, &repo.name, number)?;
-        jiji_forge::rerun_failed_ci(&client, &repo, &pr.head_commit).map_err(Into::into)
+        let pr = client.pr(&repo, number)?;
+        client
+            .rerun_failed_ci(&repo, &pr.head_commit)
+            .map_err(Into::into)
     }
 
     /// Complete local stacks for Publish, without changing the graph view.
@@ -276,16 +408,13 @@ impl Host {
     ) -> HostResult<LandPlan> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
-        let forge_side = LandRepoForge {
-            client: &client,
-            repo: &repo,
-        };
+        let forge = client.land(&repo);
         plan_land(
             &snapshot,
             &prs,
             &repo,
             head_bookmark,
-            &forge_side,
+            &*forge,
             &options.unwrap_or_default(),
         )
         .map_err(Into::into)
@@ -302,16 +431,13 @@ impl Host {
     ) -> HostResult<LandOutcome> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
-        let forge_side = LandRepoForge {
-            client: &client,
-            repo: &repo,
-        };
+        let forge = client.land(&repo);
         let fresh = plan_land(
             &snapshot,
             &prs,
             &repo,
             head_bookmark,
-            &forge_side,
+            &*forge,
             &plan.options,
         )?;
         if fresh.actions != plan.actions {
@@ -321,7 +447,7 @@ impl Host {
             host: self,
             repo_path: repo_path.to_owned(),
         };
-        execute_land(&fresh, &vcs, &forge_side).map_err(Into::into)
+        execute_land(&fresh, &vcs, &*forge).map_err(Into::into)
     }
 
     /// Plan shipping the stack under a change directly to trunk.
@@ -335,7 +461,12 @@ impl Host {
             backend.git_fetch(path, Some(&remotes))
         })?;
         let snapshot = self.workflow_snapshot(repo_path)?;
-        let prs = ship_pr_facts(&repo);
+        // PR facts feed the marks-it-merged warning only: shipping needs no
+        // GitHub API, so no token (or a failed read) plans without it.
+        let prs = self
+            .forge_client(repo_path)
+            .ok()
+            .and_then(|(repo, client, _)| client.open_prs(&repo).ok());
         plan_ship(&snapshot, prs.as_ref(), &repo.remote, head_change).map_err(Into::into)
     }
 
@@ -361,16 +492,6 @@ impl Host {
         };
         execute_ship(&fresh, &vcs).map_err(Into::into)
     }
-}
-
-/// Open-PR facts for a ship plan's marks-it-merged warning, when a token
-/// resolves. Shipping itself needs no GitHub API, so no token (or a failed
-/// fetch of PR state) degrades to a plan without the warning.
-fn ship_pr_facts(repo: &ForgeRepo) -> Option<RepoPrState> {
-    let resolved = resolved_token(Some(repo)).ok().flatten()?;
-    let client = GitHubClient::for_repo(repo, &resolved.token).ok()?;
-    let report = client.open_prs(&repo.owner, &repo.name).ok()?;
-    Some(RepoPrState::new(report, &repo.owner))
 }
 
 /// The executors' jj half: every mutation runs through `Host::mutate`, so

@@ -93,7 +93,7 @@ impl PublishView {
         .detach();
     }
 
-    fn publish(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn publish(&mut self, cx: &mut Context<Self>) {
         let (Some(plan), Some(head), Some(repo)) = (
             self.plan.clone(),
             self.plan_head.clone(),
@@ -164,7 +164,7 @@ impl PublishView {
         .detach();
     }
 
-    fn replan_land(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn replan_land(&mut self, cx: &mut Context<Self>) {
         if let (Some(head), false) = (self.land_for.clone(), self.landing) {
             self.load_land_plan(head, cx);
         }
@@ -182,7 +182,7 @@ impl PublishView {
         });
     }
 
-    fn land_stack(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn land_stack(&mut self, cx: &mut Context<Self>) {
         let (Some(plan), Some(head), Some(repo)) =
             (self.land.clone(), self.land_for.clone(), self.repo_path(cx))
         else {
@@ -250,7 +250,7 @@ impl PublishView {
         .detach();
     }
 
-    fn ship_stack(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn ship_stack(&mut self, cx: &mut Context<Self>) {
         let (Some(plan), Some(head), Some(repo)) =
             (self.ship.clone(), self.ship_for.clone(), self.repo_path(cx))
         else {

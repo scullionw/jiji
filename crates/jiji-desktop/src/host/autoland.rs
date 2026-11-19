@@ -27,10 +27,10 @@ use std::thread::JoinHandle;
 use jiji_forge::{
     load_autoland_records, remove_autoland_record, run_autoland, save_autoland_records,
     unix_now_ms, upsert_autoland_record, AutoLandConfig, AutoLandRecord, AutoLandState,
-    AutoLandStatus, ForgeError, GitHubClient, LandOptions, LandRepoForge, StopSignal,
+    AutoLandStatus, LandOptions, StopSignal,
 };
 
-use super::forge::{resolved_token, HostVcs};
+use super::forge::{HostVcs, OpenPrs};
 use super::{CommandError, Host, HostEvent, HostResult};
 
 /// The active job's handles.
@@ -163,11 +163,7 @@ impl Host {
         // Build the forge context up front so connection problems refuse
         // the queueing instead of parking a just-started job.
         self.require_open(repo_path)?;
-        let repo = self
-            .detected_repo(repo_path)
-            .ok_or_else(jiji_forge::no_github_remote)?;
-        let resolved = resolved_token(Some(&repo))?.ok_or(ForgeError::NoToken)?;
-        let client = GitHubClient::for_repo(&repo, &resolved.token)?;
+        let (repo, client, _) = self.forge_client(repo_path)?;
 
         let prior = auto
             .records
@@ -218,8 +214,9 @@ impl Host {
                     host: &host,
                     repo_path: repo_path.clone(),
                 };
-                let forge_side = LandRepoForge {
-                    client: &client,
+                let forge = client.land(&repo);
+                let prs = OpenPrs {
+                    client: &*client,
                     repo: &repo,
                 };
                 let mut publish = |published: &AutoLandState| {
@@ -258,8 +255,8 @@ impl Host {
                     &repo,
                     initial,
                     &vcs,
-                    &forge_side,
-                    &forge_side,
+                    &*forge,
+                    &prs,
                     &AutoLandConfig::default(),
                     &stop,
                     &mut publish,

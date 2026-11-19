@@ -8,7 +8,7 @@ use jiji_core::snapshot::RepoSnapshot;
 use jiji_forge::PrSummary;
 
 use super::PublishView;
-use crate::logic::menu::review_bookmark;
+use crate::logic::menu::{bookmark_taken, review_bookmark};
 use crate::logic::publish::{rerun_summary, review_rows};
 use crate::theme::{theme, RADIUS_L, TEXT_M, TEXT_S, TEXT_XS, TOOLBAR_H};
 use crate::ui::ScrollY as _;
@@ -47,11 +47,7 @@ impl PublishView {
     }
 
     fn review_name_taken(&self, snapshot: &RepoSnapshot, cx: &gpui::App) -> bool {
-        let name = self.review_name.read(cx).text().trim().to_owned();
-        snapshot
-            .bookmarks
-            .iter()
-            .any(|bookmark| bookmark.is_local && bookmark.name == name)
+        bookmark_taken(self.review_name.read(cx).text(), &snapshot.bookmarks)
     }
 
     pub(super) fn fetch_for_review(&mut self, cx: &mut Context<Self>) {
@@ -131,7 +127,7 @@ impl PublishView {
 
     /// Re-run failed CI, per row; the note under the bar tells what
     /// happened, and the badge refresh follows GitHub's answer.
-    fn rerun_ci(&mut self, number: u64, cx: &mut Context<Self>) {
+    pub(super) fn rerun_ci(&mut self, number: u64, cx: &mut Context<Self>) {
         let Some(repo) = self.repo_path(cx) else {
             return;
         };

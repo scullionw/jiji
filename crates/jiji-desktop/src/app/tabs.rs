@@ -620,4 +620,184 @@ mod tests {
         assert_eq!(deeper[0].1.hint.as_deref(), Some("x/src"));
         assert_eq!(deeper[1].1.hint.as_deref(), Some("y/src"));
     }
+
+    // ── Ported from the Tauri app's actions.test.ts and tabs.test.ts ──
+
+    use jiji_core::snapshot::SnapshotView;
+
+    #[test]
+    fn a_repo_right_under_the_root_and_repos_named_alike_tell_apart() {
+        let root = tab_titles(&[
+            (1, Some("api"), Some("/api")),
+            (2, Some("api"), Some("/srv/api")),
+        ]);
+        assert_eq!(root[0].1.hint.as_deref(), Some("/"));
+        assert_eq!(root[1].1.hint.as_deref(), Some("srv"));
+        // The repo's own name is what is compared, not its folder's.
+        let named = tab_titles(&[
+            (1, Some("shared"), Some("/x/one")),
+            (2, Some("shared"), Some("/y/two")),
+        ]);
+        assert_eq!(named[0].1.hint.as_deref(), Some("x"));
+        assert_eq!(named[1].1.hint.as_deref(), Some("y"));
+    }
+
+    #[gpui::test]
+    fn a_kept_lens_goes_to_the_repo_it_was_kept_for_not_the_one_on_screen(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-lens-elsewhere");
+        let model = install(&dir, cx);
+        let (other, fresh) = (jj_repo(&dir, "other"), jj_repo(&dir, "fresh"));
+        open(&model, &[&other], cx);
+        cx.run_until_parked();
+        model.update(cx, |model, _| {
+            model.store.set_repo_view(&fresh, &SnapshotView::All)
+        });
+        open(&model, &[&fresh], cx);
+        // Back to the other repo before the open lands.
+        let first = model.read_with(cx, |model, _| model.tabs[0].id);
+        model.update(cx, |model, cx| model.activate_tab(first, cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            let view = |path: &String| model.host.snapshot_for(path).unwrap().view.clone();
+            assert_eq!(view(&fresh), SnapshotView::All);
+            assert_eq!(view(&other), SnapshotView::Workstreams);
+            assert_eq!(model.repo_path().as_deref(), Some(other.as_str()));
+            let tab = model
+                .tabs
+                .iter()
+                .find(|tab| tab.path.as_ref() == Some(&fresh))
+                .unwrap();
+            assert_eq!(tab.snapshot.as_ref().unwrap().view, SnapshotView::All);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_tab_closed_while_its_repo_opens_leaves_no_session_behind(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-closed-mid-open");
+        let model = install(&dir, cx);
+        let (other, fresh) = (jj_repo(&dir, "other"), jj_repo(&dir, "fresh"));
+        open(&model, &[&other], cx);
+        cx.run_until_parked();
+        open(&model, &[&fresh], cx);
+        model.update(cx, |model, cx| model.close_active_tab(cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(shown(model), [Some(other.clone())]);
+            assert!(model.host.snapshot_for(&fresh).is_none());
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_lens_outlives_its_tab_closing_before_it_could_be_put_back(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-lens-closed");
+        let model = install(&dir, cx);
+        let fresh = jj_repo(&dir, "fresh");
+        model.update(cx, |model, _| {
+            model.store.set_repo_view(&fresh, &SnapshotView::Mine)
+        });
+        // The open lands; before the lens goes back on, the tab closes and
+        // its session with it.
+        let opened = model.read_with(cx, |model, _| model.host.open_repo(&fresh));
+        model.update(cx, |model, cx| {
+            let tab = model.active_id;
+            model.finish_open(tab, opened, cx);
+            model.close_tab(tab, cx);
+            model.host.close_repo(&fresh);
+        });
+        cx.run_until_parked();
+        // The refusal was the session's, not the lens's.
+        model.read_with(cx, |model, _| {
+            assert_eq!(model.store.repo_view(&fresh), SnapshotView::Mine)
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn closed_tabs_come_back_newest_first_and_skip_what_was_reopened(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-reopen");
+        let model = install(&dir, cx);
+        let (a, b) = (jj_repo(&dir, "a"), jj_repo(&dir, "b"));
+        open(&model, &[&a, &b], cx);
+        cx.run_until_parked();
+        let ids = model.read_with(cx, |model, _| (model.tabs[0].id, model.tabs[1].id));
+        model.update(cx, |model, cx| {
+            model.close_tab(ids.1, cx);
+            model.close_tab(ids.0, cx);
+        });
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| assert_eq!(shown(model), [None]));
+        // The empty tab the last close left takes the repo back.
+        model.update(cx, |model, cx| model.reopen_closed_tab(cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| assert_eq!(shown(model), [Some(a.clone())]));
+        model.update(cx, |model, cx| model.reopen_closed_tab(cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(shown(model), [Some(a.clone()), Some(b.clone())]);
+            assert_eq!(model.repo_path().as_deref(), Some(b.as_str()));
+            assert!(model.reopenable_tab().is_none());
+        });
+
+        // Closed, then one opened again another way: ⌘⇧T passes it by.
+        let ids = model.read_with(cx, |model, _| (model.tabs[0].id, model.tabs[1].id));
+        model.update(cx, |model, cx| {
+            model.close_tab(ids.0, cx);
+            model.close_tab(ids.1, cx);
+        });
+        open(&model, &[&b], cx);
+        cx.run_until_parked();
+        model.update(cx, |model, cx| model.reopen_closed_tab(cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            let mut paths = shown(model);
+            paths.sort();
+            assert_eq!(paths, [Some(a.clone()), Some(b.clone())]);
+            assert!(model.closed.is_empty());
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_forgotten_recent_leaves_the_list_and_the_store_at_once(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-forget");
+        let model = install(&dir, cx);
+        let (a, gone) = (jj_repo(&dir, "a"), jj_repo(&dir, "gone"));
+        open(&model, &[&gone, &a], cx);
+        cx.run_until_parked();
+        model.update(cx, |model, cx| model.forget_recent_repo(&gone, cx));
+        model.read_with(cx, |model, _| {
+            let listed: Vec<&str> = model.recent_repos.iter().map(|r| r.path.as_str()).collect();
+            assert_eq!(listed, [a.as_str()]);
+            assert_eq!(model.store.recent_repos(), model.recent_repos);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_refresh_that_works_clears_what_a_failed_one_left(cx: &mut TestAppContext) {
+        let dir = scratch("tabs-refresh-error");
+        let model = install(&dir, cx);
+        let repo = jj_repo(&dir, "repo");
+        open(&model, &[&repo], cx);
+        cx.run_until_parked();
+        let shown = model.read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        // The repository goes missing for a moment: the refresh fails.
+        let (jj, away) = (std::path::Path::new(&repo).join(".jj"), dir.join("jj-away"));
+        std::fs::rename(&jj, &away).unwrap();
+        model.update(cx, |model, cx| model.refresh_snapshot(cx));
+        cx.run_until_parked();
+        assert!(model.read_with(cx, |model, _| model.ui().error.is_some()));
+        // It is back, and the next refresh finds nothing new: the failure
+        // is answered, and the snapshot on screen is the same one.
+        std::fs::rename(&away, &jj).unwrap();
+        model.update(cx, |model, cx| model.refresh_snapshot(cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            assert_eq!(model.ui().error, None);
+            assert!(std::sync::Arc::ptr_eq(model.snapshot().unwrap(), &shown));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -552,9 +552,16 @@ pub fn mutation_outcome(
             // all-synced no-op. The mock has no remote to move underneath
             // it, so lease refusals never replay.
             let mut to_push = Vec::new();
+            let mut to_delete = Vec::new();
             for name in names {
                 let bookmark = find_bookmark(snapshot, name)?;
                 if !bookmark.is_local {
+                    // What a deleted bookmark left tracked on the remote:
+                    // the push carries the deletion out.
+                    if bookmark.tracked && bookmark.remote.as_deref() == Some(remote.as_str()) {
+                        to_delete.push(name.clone());
+                        continue;
+                    }
                     return Err(BackendError::BookmarkMissing(name.clone()));
                 }
                 if snapshot
@@ -584,16 +591,24 @@ pub fn mutation_outcome(
                     to_push.push(name.clone());
                 }
             }
-            if to_push.is_empty() {
+            if to_push.is_empty() && to_delete.is_empty() {
                 return Ok(MutationOutcome {
                     operation_id: None,
                     summary: format!("Everything is already pushed to {remote}"),
                     target_change: None,
                 });
             }
-            let summary = match &to_push[..] {
-                [name] => format!("Pushed {name} to {remote}"),
-                names => format!("Pushed {} bookmarks to {remote}", names.len()),
+            let summary = match (&to_push[..], &to_delete[..]) {
+                ([name], []) => format!("Pushed {name} to {remote}"),
+                (names, []) => format!("Pushed {} bookmarks to {remote}", names.len()),
+                ([], [name]) => format!("Deleted {name} on {remote}"),
+                ([], names) => format!("Deleted {} bookmarks on {remote}", names.len()),
+                (names, gone) => format!(
+                    "Pushed {} bookmark{} and deleted {} on {remote}",
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" },
+                    gone.len()
+                ),
             };
             Ok(MutationOutcome {
                 operation_id: Some(mock_operation_id(index)),
@@ -1291,7 +1306,19 @@ pub fn apply_mutation(
             );
         }
         MockMutation::DeleteBookmark { name } => {
-            snapshot.bookmarks.retain(|b| b.name != *name);
+            // Like jj, a tracked bookmark leaves its remote counterpart
+            // behind, remote-only, for a push to carry the deletion out.
+            snapshot.bookmarks.retain_mut(|b| {
+                if b.name != *name {
+                    return true;
+                }
+                let tracked = b.is_local && b.tracked && b.remote.is_some();
+                if tracked {
+                    b.is_local = false;
+                    b.sync = SyncState::RemoteOnly;
+                }
+                tracked
+            });
             for node in &mut snapshot.nodes {
                 node.bookmarks.retain(|b| b != name);
             }
@@ -1411,10 +1438,19 @@ pub fn apply_mutation(
             let mut pushed = Vec::new();
             let mut effects = Vec::new();
             for name in names {
-                let Some(bookmark) = snapshot.bookmarks.iter_mut().find(|b| b.name == *name)
-                else {
+                let Some(ix) = snapshot.bookmarks.iter().position(|b| b.name == *name) else {
                     continue;
                 };
+                if !snapshot.bookmarks[ix].is_local {
+                    snapshot.bookmarks.remove(ix);
+                    pushed.push(name.clone());
+                    effects.push(OpEffect {
+                        kind: OpEffectKind::RemoteBookmark,
+                        label: format!("{name}@{remote} deleted"),
+                    });
+                    continue;
+                }
+                let bookmark = &mut snapshot.bookmarks[ix];
                 if bookmark.sync == SyncState::Synced && bookmark.remote.is_some() {
                     continue;
                 }

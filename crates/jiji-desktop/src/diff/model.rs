@@ -1059,4 +1059,559 @@ mod tests {
         assert_eq!(layout.file_of(1), 0);
         assert_eq!(layout.file_of(layout.file_rows[1]), 1);
     }
+
+    // ── Ported from the Tauri app's diff.test.ts ──
+
+    fn hunk(old_start: u32, new_start: u32, lines: Vec<DiffLine>) -> DiffHunk {
+        DiffHunk {
+            old_start,
+            new_start,
+            context: None,
+            lines,
+        }
+    }
+
+    fn mixed(kind: DiffLineKind, same: &str, changed: &str, pair: Option<u32>) -> DiffLine {
+        DiffLine {
+            kind,
+            segments: vec![
+                DiffSegment {
+                    text: same.to_owned(),
+                    changed: false,
+                },
+                DiffSegment {
+                    text: changed.to_owned(),
+                    changed: true,
+                },
+            ],
+            pair,
+        }
+    }
+
+    fn file_doc(files: Vec<FileDiff>) -> DiffDoc {
+        DiffDoc::build(&ChangeDiff {
+            id: "x".into(),
+            from: None,
+            files,
+            truncated: false,
+        })
+    }
+
+    /// The split layout's line rows as (left, right) texts.
+    fn split_texts(doc: &DiffDoc) -> Vec<(Option<String>, Option<String>)> {
+        let text = |cell: Option<Cell>| cell.map(|c| doc.lines[c.line as usize].text.to_string());
+        doc.split
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Split { left, right } => Some((text(*left), text(*right))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The split layout's line rows as (left, right) numbers.
+    fn split_numbers(doc: &DiffDoc) -> Vec<(Option<u32>, Option<u32>)> {
+        doc.split
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Split { left, right } => Some((left.map(|c| c.no), right.map(|c| c.no))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn some(text: &str) -> Option<String> {
+        Some(text.to_owned())
+    }
+
+    #[test]
+    fn only_a_line_mixing_kept_and_changed_text_gets_intraline_emphasis() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                mixed(Removed, "let x = ", "1", Some(1)),
+                line(Added, "let x = 2", None),
+                line(Context, "}", None),
+            ],
+        )]);
+        let emphasized: Vec<bool> = doc.lines.iter().map(|l| !l.changed.is_empty()).collect();
+        assert_eq!(emphasized, [true, false, false]);
+        assert_eq!(doc.lines[0].changed, [8..9]);
+    }
+
+    #[test]
+    fn counts_add_up_per_file_and_skip_what_is_not_text() {
+        use DiffLineKind::*;
+        let text = text_file(
+            "src/a.ts",
+            vec![
+                hunk(
+                    1,
+                    1,
+                    vec![
+                        line(Removed, "x", None),
+                        line(Added, "x", None),
+                        line(Added, "x", None),
+                    ],
+                ),
+                hunk(
+                    9,
+                    10,
+                    vec![line(Context, "x", None), line(Added, "x", None)],
+                ),
+            ],
+        );
+        let doc = file_doc(vec![text]);
+        assert_eq!((doc.files[0].added, doc.files[0].removed), (3, 1));
+
+        let binary = FileDiff {
+            path: "logo.png".into(),
+            status: FileStatus::Added,
+            renamed_from: None,
+            has_conflict: false,
+            content: FileDiffContent::Binary {
+                old_size: None,
+                new_size: Some(2048),
+            },
+        };
+        let one = text_file("src/a.ts", vec![hunk(1, 1, vec![line(Added, "x", None)])]);
+        let doc = file_doc(vec![binary, one.clone(), one]);
+        assert_eq!((doc.files[0].added, doc.files[0].removed), (0, 0));
+        assert_eq!((doc.added, doc.removed), (2, 0));
+    }
+
+    #[test]
+    fn context_fills_both_sides_with_its_own_numbers() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            10,
+            12,
+            vec![line(Context, "a", None), line(Context, "b", None)],
+        )]);
+        assert_eq!(
+            split_numbers(&doc),
+            [(Some(10), Some(12)), (Some(11), Some(13))]
+        );
+        assert!(doc.split.rows.iter().all(|row| match row {
+            Row::Split { left, right } =>
+                left.is_some_and(|c| c.kind == Kind::Context)
+                    && right.is_some_and(|c| c.kind == Kind::Context),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn an_unpaired_removed_run_sits_beside_the_added_run_after_it() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            5,
+            5,
+            vec![
+                line(Context, "c", None),
+                line(Removed, "old1", None),
+                line(Removed, "old2", None),
+                line(Added, "new1", None),
+                line(Context, "c", None),
+            ],
+        )]);
+        assert_eq!(
+            split_numbers(&doc),
+            [
+                (Some(5), Some(5)),
+                (Some(6), Some(6)),
+                (Some(7), None),
+                (Some(8), Some(7))
+            ]
+        );
+        assert_eq!(split_texts(&doc)[1], (some("old1"), some("new1")));
+        assert_eq!(split_texts(&doc)[2], (some("old2"), None));
+    }
+
+    #[test]
+    fn a_pure_insertion_leaves_the_old_side_empty() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            3,
+            3,
+            vec![
+                line(Context, "c", None),
+                line(Added, "a", None),
+                line(Added, "b", None),
+            ],
+        )]);
+        assert_eq!(
+            split_numbers(&doc),
+            [(Some(3), Some(3)), (None, Some(4)), (None, Some(5))]
+        );
+    }
+
+    #[test]
+    fn runs_never_pair_across_a_context_line() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                line(Removed, "r", None),
+                line(Context, "c", None),
+                line(Added, "a", None),
+            ],
+        )]);
+        let kinds: Vec<_> = doc
+            .split
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Split { left, right } => Some((left.map(|c| c.kind), right.map(|c| c.kind))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (Some(Kind::Removed), None),
+                (Some(Kind::Context), Some(Kind::Context)),
+                (None, Some(Kind::Added)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paired_row_keeps_each_side_s_own_emphasis() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                mixed(Removed, "let x = ", "1", Some(1)),
+                line(Added, "let x = 2", Some(0)),
+            ],
+        )]);
+        let rows: Vec<_> = doc
+            .split
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Split { left, right } => Some((left.unwrap(), right.unwrap())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let (left, right) = rows[0];
+        assert!(!doc.lines[left.line as usize].changed.is_empty());
+        assert!(doc.lines[right.line as usize].changed.is_empty());
+    }
+
+    #[test]
+    fn a_pair_shares_a_row_with_the_unpaired_lines_packed_above_and_below() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                line(Removed, "// gone comment", None),
+                line(Removed, "// more comment", None),
+                line(Removed, "unsafe impl Old {}", Some(4)),
+                line(Removed, "struct Zzz;", None),
+                line(Added, "unsafe impl New {}", Some(2)),
+            ],
+        )]);
+        assert_eq!(
+            split_texts(&doc),
+            [
+                (some("// gone comment"), None),
+                (some("// more comment"), None),
+                (some("unsafe impl Old {}"), some("unsafe impl New {}")),
+                (some("struct Zzz;"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn unpaired_added_lines_pack_before_their_block_s_pair() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                line(Removed, "old call", Some(3)),
+                line(Added, "// why", None),
+                line(Added, "// because", None),
+                line(Added, "new call", Some(0)),
+            ],
+        )]);
+        assert_eq!(
+            split_texts(&doc),
+            [
+                (None, some("// why")),
+                (None, some("// because")),
+                (some("old call"), some("new call")),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_pairs_align_and_the_stretches_between_them_pack() {
+        use DiffLineKind::*;
+        let doc = doc(vec![hunk(
+            1,
+            1,
+            vec![
+                line(Removed, "a", Some(3)),
+                line(Removed, "b", None),
+                line(Removed, "c", Some(5)),
+                line(Added, "a2", Some(0)),
+                line(Added, "mid", None),
+                line(Added, "c2", Some(2)),
+                line(Added, "tail", None),
+            ],
+        )]);
+        assert_eq!(
+            split_texts(&doc),
+            [
+                (some("a"), some("a2")),
+                (some("b"), some("mid")),
+                (some("c"), some("c2")),
+                (None, some("tail")),
+            ]
+        );
+    }
+
+    /// Two hunks: the first covers new lines 5 to 6, the second starts at
+    /// 20, so thirteen unchanged lines lie between them and four above.
+    fn two_hunks() -> Vec<DiffHunk> {
+        use DiffLineKind::*;
+        vec![
+            hunk(
+                5,
+                5,
+                vec![
+                    line(Context, "c", None),
+                    line(Removed, "r", None),
+                    line(Added, "a", None),
+                ],
+            ),
+            hunk(20, 20, vec![line(Context, "c", None)]),
+        ]
+    }
+
+    #[test]
+    fn the_gap_rows_count_what_is_skipped_above_and_between_hunks() {
+        use DiffLineKind::*;
+        let hunks = two_hunks();
+        assert_eq!(gap_before(&hunks, 0), Some(4));
+        assert_eq!(gap_before(&hunks, 1), Some(13));
+        assert_eq!(
+            gap_before(&[hunk(1, 1, vec![line(Added, "a", None)])], 0),
+            None
+        );
+        let contiguous = [hunks[0].clone(), hunk(7, 7, vec![line(Context, "c", None)])];
+        assert_eq!(gap_before(&contiguous, 1), None);
+    }
+
+    /// A layout's rows past the file's header and padding, as the old
+    /// tests named them.
+    fn shape(layout: &Layout) -> Vec<String> {
+        layout
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Gap { skipped, .. } => Some(format!("gap:{skipped}")),
+                Row::Line { kind, .. } => Some(format!("{kind:?}").to_lowercase()),
+                Row::Split { left, right } => Some(format!(
+                    "{}/{}",
+                    left.map_or("-".into(), |c| c.no.to_string()),
+                    right.map_or("-".into(), |c| c.no.to_string()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_layouts_interleave_gap_rows_with_their_lines() {
+        let doc = doc(two_hunks());
+        assert_eq!(
+            shape(&doc.unified),
+            ["gap:4", "context", "removed", "added", "gap:13", "context"]
+        );
+        assert_eq!(
+            shape(&doc.split),
+            ["gap:4", "5/5", "6/6", "gap:13", "20/20"]
+        );
+        // Nothing skipped from line one: no gap row at all.
+        let from_the_top = self::doc(vec![hunk(1, 1, vec![line(DiffLineKind::Added, "a", None)])]);
+        assert_eq!(shape(&from_the_top.unified), ["added"]);
+    }
+
+    #[test]
+    fn the_gutter_fits_the_widest_line_number_on_either_side() {
+        use DiffLineKind::*;
+        assert_eq!(
+            doc(vec![hunk(1, 1, vec![line(Added, "a", None)])]).digits,
+            2
+        );
+        let tall = hunk(
+            996,
+            8,
+            vec![
+                line(Context, "c", None),
+                line(Removed, "r", None),
+                line(Context, "c", None),
+                line(Context, "c", None),
+            ],
+        );
+        assert_eq!(doc(vec![tall]).digits, 3);
+    }
+
+    #[test]
+    fn a_file_is_as_wide_as_its_widest_line_with_tabs_at_four() {
+        use DiffLineKind::*;
+        let widest = doc(vec![
+            hunk(
+                1,
+                1,
+                vec![
+                    line(Context, "short", None),
+                    line(Added, &"a".repeat(40), None),
+                ],
+            ),
+            hunk(9, 9, vec![line(Removed, "\tindented", None)]),
+        ]);
+        assert_eq!(widest.files[0].max_cols, 40);
+        let tabs = doc(vec![hunk(1, 1, vec![line(Added, "\t\tab", None)])]);
+        assert_eq!(tabs.files[0].max_cols, 10);
+        // A line's segments add up.
+        let segmented = doc(vec![hunk(1, 1, vec![mixed(Added, "one", "twotwo", None)])]);
+        assert_eq!(segmented.files[0].max_cols, 9);
+    }
+
+    #[test]
+    fn sizes_read_in_the_unit_that_suits_them() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(847), "847 B");
+        assert_eq!(format_bytes(1000), "1 KB");
+        assert_eq!(format_bytes(24_140), "24.1 KB");
+        assert_eq!(format_bytes(153_600), "154 KB");
+        assert_eq!(format_bytes(3_212_000), "3.2 MB");
+        assert_eq!(format_bytes(7_400_000_000), "7.4 GB");
+    }
+
+    #[test]
+    fn a_binary_file_tells_what_its_sizes_say() {
+        assert_eq!(binary_note(None, Some(2048)), "Binary file — 2 KB");
+        assert_eq!(binary_note(Some(2048), None), "Binary file — was 2 KB");
+        assert_eq!(
+            binary_note(Some(47_000), Some(47_900)),
+            "Binary file — 47 KB → 47.9 KB (+900 B)"
+        );
+        assert_eq!(
+            binary_note(Some(5000), Some(1200)),
+            "Binary file — 5 KB → 1.2 KB (−3.8 KB)"
+        );
+        assert_eq!(binary_note(Some(512), Some(512)), "Binary file — 512 B");
+        assert_eq!(binary_note(None, None), "Binary file — no text diff");
+    }
+
+    fn conflicted() -> FileDiff {
+        use DiffLineKind::*;
+        let side = |label: Option<&str>, theirs: &str| jiji_core::snapshot::ConflictSideDiff {
+            label: label.map(str::to_owned),
+            lines: vec![line(Removed, "base", None), line(Added, theirs, None)],
+        };
+        FileDiff {
+            path: "src/a.ts".into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            has_conflict: true,
+            content: FileDiffContent::Conflict {
+                sections: vec![
+                    ConflictSection::Elided { lines: 4 },
+                    ConflictSection::Resolved {
+                        lines: vec![line(Context, "shared", None)],
+                    },
+                    ConflictSection::Region {
+                        sides: vec![
+                            side(None, "ours"),
+                            side(Some("feat: theirs"), "a much longer theirs line"),
+                        ],
+                    },
+                    ConflictSection::Resolved {
+                        lines: vec![line(Context, "tail", None)],
+                    },
+                ],
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_conflict_reads_in_order_resolved_runs_around_each_side() {
+        let doc = file_doc(vec![conflicted()]);
+        let read: Vec<String> = doc
+            .unified
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Gap { skipped, .. } => Some(format!("gap:{skipped}")),
+                Row::Line { line, .. } => Some(doc.lines[*line as usize].text.to_string()),
+                Row::Region { text, side, .. } => Some(match side {
+                    Some(side) => format!("{text} ({side})"),
+                    None => text.to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "gap:4",
+                "shared",
+                "Conflict 1 of 1",
+                "Side #1 · ours (vs base)",
+                "base",
+                "ours",
+                "Side #2 · theirs (vs base · feat: theirs)",
+                "base",
+                "a much longer theirs line",
+                "tail",
+            ]
+        );
+        assert_eq!(doc.files[0].regions, 1);
+        // The code column is as wide as the widest line of any side.
+        assert_eq!(
+            doc.files[0].max_cols,
+            "a much longer theirs line".len() as u32
+        );
+    }
+
+    #[gpui::test]
+    fn highlighting_a_file_colours_only_its_own_lines(cx: &mut gpui::TestAppContext) {
+        use DiffLineKind::*;
+        let prepared = Prepared::new(Arc::new(ChangeDiff {
+            id: "x".into(),
+            from: None,
+            files: vec![
+                text_file(
+                    "src/a.ts",
+                    vec![hunk(1, 1, vec![line(Added, "let x = 1;", None)])],
+                ),
+                text_file(
+                    "notes.unknown",
+                    vec![hunk(1, 1, vec![line(Added, "let y = 2;", None)])],
+                ),
+            ],
+            truncated: false,
+        }));
+        let _ = prepared.highlighting(&cx.executor());
+        cx.run_until_parked();
+        let doc = prepared.doc();
+        let (known, foreign) = (doc.files[0].lines.start, doc.files[1].lines.start);
+        assert!(!doc.marks(known).is_empty());
+        assert!(doc.marks(foreign).is_empty());
+    }
 }

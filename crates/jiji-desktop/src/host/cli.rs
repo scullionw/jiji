@@ -150,9 +150,16 @@ pub fn uninstall_cli() -> HostResult<CliStatus> {
 }
 
 fn write_executable(target: &Path, script: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
     std::fs::write(target, script)?;
-    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+    // Only macOS installs a launcher, but the refusal elsewhere is a
+    // runtime check, so this still has to build where there are no Unix
+    // permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// Neither install dir was writable: stage the script somewhere we can

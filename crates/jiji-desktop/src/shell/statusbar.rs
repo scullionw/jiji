@@ -23,6 +23,7 @@ impl Shell {
         let dismiss = |id: &'static str, name: &'static str| {
             div()
                 .id(id)
+                .debug_selector(move || id.into())
                 .role(Role::Button)
                 .aria_label(name)
                 .tabbable_in(t.accent)
@@ -71,6 +72,7 @@ impl Shell {
                 .child(
                     div()
                         .id("status-error")
+                        .debug_selector(|| "status-error".into())
                         .alert(error.clone())
                         .min_w_0()
                         .truncate()
@@ -354,5 +356,44 @@ impl Shell {
             );
         }
         bar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    use crate::shell::Shell;
+
+    #[gpui::test]
+    fn an_error_shows_its_first_line_reads_whole_on_hover_and_is_dismissed(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = crate::testing::scratch("status-error");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        let message = "Error: Revision `zzz` doesn't exist\nHint: Did you mean `zzzz`?";
+        model.update(cx, |model, cx| model.set_error(message, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let line = cx
+            .debug_bounds("status-error")
+            .expect("the error holds the line");
+        cx.simulate_mouse_move(line.center(), None, Modifiers::none());
+        cx.executor()
+            .advance_clock(crate::ui::tooltip::SHOW_DELAY * 2);
+        cx.run_until_parked();
+        let shown = cx.update(|_, cx| crate::ui::tooltip::showing(cx));
+        assert_eq!(shown.as_deref(), Some(message));
+        let dismiss = cx
+            .debug_bounds("error-dismiss")
+            .expect("it can be dismissed");
+        cx.simulate_click(dismiss.center(), Modifiers::none());
+        cx.run_until_parked();
+        model.read_with(&cx, |model, _| assert_eq!(model.ui().error, None));
+        assert!(cx.debug_bounds("status-error").is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

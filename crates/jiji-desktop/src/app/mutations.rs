@@ -102,7 +102,7 @@ impl AppModel {
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             if let Err(error) = task.await {
                 let _ = this.update(cx, |this, cx| match &path {
-                    Some(path) => this.set_error_for(path, error.message, cx),
+                    Some(path) => this.set_error_for(path, Some(error.message), cx),
                     None => this.set_error(error.message, cx),
                 });
             }

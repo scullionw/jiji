@@ -277,4 +277,25 @@ mod tests {
         assert_eq!(ops_since(&ops, "zz"), None);
         assert!(is_root_op(&ops[2]) && !is_root_op(&ops[0]));
     }
+
+    #[test]
+    fn a_run_of_snapshots_never_collapses_across_midnight() {
+        let ops = vec![
+            op("a", "2026-06-10T01:00:00+00:00", true, false),
+            op("b", "2026-06-10T00:30:00+00:00", true, false),
+            op("c", "2026-06-09T23:59:00+00:00", true, false),
+            op("d", "2026-06-09T23:00:00+00:00", true, false),
+        ];
+        let groups = group_operations(&ops, at("2026-06-10T13:00:00+00:00"));
+        let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();
+        assert_eq!(labels, ["Today", "Yesterday"]);
+        assert_eq!(
+            groups[0].rows,
+            [TimelineRow::Op(&ops[0]), TimelineRow::Op(&ops[1])]
+        );
+        assert_eq!(
+            groups[1].rows,
+            [TimelineRow::Op(&ops[2]), TimelineRow::Op(&ops[3])]
+        );
+    }
 }

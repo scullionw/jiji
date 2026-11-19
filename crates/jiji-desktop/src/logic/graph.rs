@@ -756,6 +756,54 @@ mod tests {
         assert_eq!(rows_in_view(&tops, 2520., 280.), 89..100);
     }
 
+    /// Each row's top and, last, the content's height.
+    fn tops_of(heights: &[f32]) -> Vec<f32> {
+        let mut tops = vec![0.];
+        for height in heights {
+            tops.push(tops.last().unwrap() + height);
+        }
+        tops
+    }
+
+    #[test]
+    fn nothing_to_show_builds_nothing_and_beyond_the_rows_builds_their_edge() {
+        assert_eq!(rows_in_view(&[0.], 0., 800.), 0..0);
+        let tops = tops_of(&[30., 30.]);
+        // Scrolled far above or below, only the row by that edge is built.
+        assert_eq!(rows_in_view(&tops, -800., 600.), 0..1);
+        assert_eq!(rows_in_view(&tops, 600., 600.), 1..2);
+    }
+
+    #[test]
+    fn a_viewport_builds_every_row_it_crosses_and_at_most_one_either_side() {
+        let heights: Vec<f32> = (0..500)
+            .map(|i| if i % 7 == 0 { 18. } else { 64. * 20.8 + 10.4 })
+            .collect();
+        let tops = tops_of(&heights);
+        let mut top = -1200.;
+        while top < tops[500] + 1200. {
+            let built = rows_in_view(&tops, top, 820.);
+            let crossed: Vec<usize> = (0..500)
+                .filter(|&i| tops[i + 1] > top && tops[i] < top + 820.)
+                .collect();
+            for row in &crossed {
+                assert!(built.contains(row), "row {row} at {top}");
+            }
+            let extra = built.len() - crossed.len();
+            assert!(extra <= 2, "{extra} extra rows at {top}");
+            top += 1379.;
+        }
+    }
+
+    #[test]
+    fn a_thousand_change_graph_builds_a_screenful_wherever_it_is_read() {
+        let tops = tops_of(&[NODE_ROW_HEIGHT; 1000]);
+        for top in [0., 8500., 17000., 27000.] {
+            let built = rows_in_view(&tops, top, 820.);
+            assert!(!built.is_empty() && built.len() < 50, "{built:?} at {top}");
+        }
+    }
+
     fn snapshot() -> RepoSnapshot {
         let dir = std::env::temp_dir().join(format!("jiji-graph-{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join(".jj"));
@@ -967,5 +1015,753 @@ mod tests {
             row_gutter_width(crossed.last_column(), 6),
             gutter_width(3, 6)
         );
+    }
+
+    // ── Ported from the Tauri app's graph.test.ts ──
+
+    const NOON: &str = "2026-06-10T12:00:00Z";
+
+    fn at(id: &str, kind: NodeKind, parents: &[&str], time: &str) -> GraphNode {
+        GraphNode {
+            timestamp: time.into(),
+            ..node(id, parents, kind, 0)
+        }
+    }
+
+    fn elided(mut node: GraphNode, links: &[&str]) -> GraphNode {
+        node.elided_parents = links.iter().map(|id| (*id).to_owned()).collect();
+        node
+    }
+
+    fn behind(mut stream: WorkstreamSummary, commits: u32) -> WorkstreamSummary {
+        stream.behind_trunk = commits;
+        stream
+    }
+
+    fn trunk_at(snapshot: &mut RepoSnapshot, target: &str) {
+        let main = jiji_core::snapshot::BookmarkState {
+            name: "main".into(),
+            target: target.into(),
+            remote: Some("origin".into()),
+            sync: SyncState::Synced,
+            is_trunk: true,
+            is_local: true,
+            tracked: true,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        };
+        snapshot.trunk_bookmark = "main".into();
+        snapshot.bookmarks.push(main);
+    }
+
+    /// Every row's id, a `~` row named for the node it hangs under, as
+    /// the old tests spelled them.
+    fn rows_of(model: &GraphModel, snapshot: &RepoSnapshot) -> Vec<String> {
+        let mut last = String::new();
+        model
+            .rows
+            .iter()
+            .map(|row| match row {
+                GraphRow::Node(row) => {
+                    last = snapshot.nodes[row.node].id.clone();
+                    last.clone()
+                }
+                GraphRow::Elision(_) => format!("~{last}"),
+            })
+            .collect()
+    }
+
+    fn row<'a>(model: &'a GraphModel, snapshot: &RepoSnapshot, id: &str) -> &'a NodeRow {
+        model.row_of(snapshot, id).expect("the node draws").1
+    }
+
+    fn elisions(model: &GraphModel) -> Vec<&ElisionRow> {
+        model
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                GraphRow::Elision(gap) => Some(gap),
+                GraphRow::Node(_) => None,
+            })
+            .collect()
+    }
+
+    /// A solid rail on `col` in lane `lane` (a stream's slot, `None` for
+    /// immutable history).
+    fn r(col: usize, lane: Option<usize>) -> Rail {
+        Rail {
+            col,
+            lane,
+            elided: false,
+        }
+    }
+
+    fn dashed(col: usize, lane: Option<usize>) -> Rail {
+        Rail {
+            col,
+            lane,
+            elided: true,
+        }
+    }
+
+    const A: Option<usize> = Some(0);
+    const B: Option<usize> = Some(1);
+    const BASE: Option<usize> = None;
+
+    #[test]
+    fn two_stacks_merge_onto_a_shared_trunk_base() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["a1"], NOON),
+                at("a1", NodeKind::Mutable, &["trunk"], NOON),
+                at("b2", NodeKind::Mutable, &["b1"], NOON),
+                at("b1", NodeKind::Mutable, &["trunk"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc", "a1"], true),
+                behind(stream("ws-b", &["b2", "b1"], false), 2),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        // The working stack first, the sibling next, trunk last with the
+        // end of drawn history below it.
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["wc", "a1", "b2", "b1", "trunk", "~trunk"]
+        );
+        let wc = row(&model, &snapshot, "wc");
+        assert!(wc.column == 0 && wc.is_working_copy && wc.is_stack_head);
+        assert_eq!(row(&model, &snapshot, "a1").column, 0);
+        let b2 = row(&model, &snapshot, "b2");
+        assert!(b2.column == 1 && b2.is_stack_head);
+        assert_eq!(b2.behind_trunk, 2);
+        // The working stack's rail passes the sibling's rows, and the
+        // sibling joins it right at its bottom row (jj's ├─╯) wearing its
+        // own stream: trunk takes one rail for both.
+        assert_eq!(b2.pass_through, [r(0, A)]);
+        let b1 = row(&model, &snapshot, "b1");
+        assert_eq!(b1.pass_through, [r(0, A)]);
+        assert_eq!(b1.edges_out, [r(0, B)]);
+        let trunk = row(&model, &snapshot, "trunk");
+        assert!(trunk.column == 0 && trunk.stream.is_none());
+        assert_eq!(trunk.edges_in, [r(0, A)]);
+        assert!(trunk.edges_out.is_empty());
+        assert_eq!(row_bookmarks(&snapshot, trunk)[0].name, "main");
+        let end = elisions(&model)[0];
+        assert_eq!(end.marks, [r(0, BASE)]);
+        assert!(!end.continues && end.pass_through.is_empty());
+        assert_eq!(model.column_count, 2);
+    }
+
+    #[test]
+    fn a_sibling_forking_off_the_middle_of_the_working_stack_interleaves() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["x"], NOON),
+                at("x", NodeKind::Mutable, &["low"], NOON),
+                at("low", NodeKind::Mutable, &["trunk"], NOON),
+                at("s1", NodeKind::Mutable, &["x"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc", "x", "low"], true),
+                stream("ws-b", &["s1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        // s1 is x's child, so it draws above x for all the working stack's
+        // priority, and bends into the rail already waiting for x.
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["wc", "s1", "x", "low", "trunk", "~trunk"]
+        );
+        let s1 = row(&model, &snapshot, "s1");
+        assert_eq!(s1.column, 1);
+        assert_eq!(s1.edges_out, [r(0, B)]);
+        let x = row(&model, &snapshot, "x");
+        assert_eq!(x.column, 0);
+        assert_eq!(x.edges_in, [r(0, A)]);
+    }
+
+    #[test]
+    fn a_merge_s_second_parent_routes_into_the_column_waiting_for_it() {
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("t1", NodeKind::Mutable, &["p2"], NOON),
+                at("m", NodeKind::Mutable, &["p1", "p2"], NOON),
+                at("p1", NodeKind::Mutable, &[], NOON),
+                at("p2", NodeKind::Mutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-1", &["t1"], true),
+                stream("ws-2", &["m", "p1"], false),
+            ],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(rows_of(&model, &snapshot), ["t1", "m", "p1", "p2"]);
+        // The first parent keeps m's column; the second merges into
+        // ws-1's, which already waits for p2. Both rails leave m, so both
+        // wear its stream, and ws-1's own rail passes underneath.
+        let m = row(&model, &snapshot, "m");
+        assert_eq!(m.column, 1);
+        assert_eq!(m.edges_out, [r(1, B), r(0, B)]);
+        assert_eq!(m.pass_through, [r(0, A)]);
+        let p2 = row(&model, &snapshot, "p2");
+        assert_eq!(p2.column, 0);
+        assert_eq!(p2.edges_in, [r(0, A)]);
+        // p2 is mutable and parentless: the rail ends with no `~`.
+        assert!(elisions(&model).is_empty());
+    }
+
+    #[test]
+    fn a_merge_parent_nothing_waits_for_opens_a_column() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["a1", "b1"], NOON),
+                at("a1", NodeKind::Mutable, &["trunk"], NOON),
+                at("b1", NodeKind::Mutable, &["trunk"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc", "a1"], true),
+                stream("ws-b", &["b1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        assert_eq!(row(&model, &snapshot, "wc").edges_out, [r(0, A), r(1, A)]);
+        // b1 lands on the column the merge opened for it.
+        let b1 = row(&model, &snapshot, "b1");
+        assert_eq!(b1.column, 1);
+        assert_eq!(b1.edges_in, [r(1, A)]);
+    }
+
+    #[test]
+    fn each_stack_stays_with_the_base_it_grew_from() {
+        // The working stack sits on an old base nothing links to trunk; a
+        // sibling sits on trunk. Each base lands right under the work that
+        // grew from it, the walk following a branch to its end first.
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at(
+                    "wc",
+                    NodeKind::WorkingCopy,
+                    &["old"],
+                    "2026-06-11T10:00:00Z",
+                ),
+                at("b1", NodeKind::Mutable, &["trunk"], "2026-06-10T11:00:00Z"),
+                at("trunk", NodeKind::Immutable, &[], "2026-06-10T08:00:00Z"),
+                at("old", NodeKind::Immutable, &[], "2026-06-01T12:00:00Z"),
+            ],
+            vec![
+                behind(stream("ws-a", &["wc"], true), 5),
+                stream("ws-b", &["b1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["wc", "old", "~old", "b1", "trunk", "~trunk"]
+        );
+        // One line at a time: nothing passes the closed-off base, and the
+        // freed column serves the sibling.
+        assert!(elisions(&model)[0].pass_through.is_empty());
+        assert_eq!(row(&model, &snapshot, "wc").behind_trunk, 5);
+        assert_eq!(row(&model, &snapshot, "b1").column, 0);
+        assert_eq!(model.column_count, 1);
+    }
+
+    #[test]
+    fn a_branch_is_followed_to_its_base_before_the_next_head() {
+        // A lens drawing unclaimed history: h1's parent is older than the
+        // other head, yet stays with h1, git's topo-order.
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("h1", NodeKind::Immutable, &["p1"], "2026-06-10T10:00:00Z"),
+                at("h2", NodeKind::Immutable, &["base"], "2026-06-08T10:00:00Z"),
+                at("p1", NodeKind::Immutable, &["base"], "2026-06-05T10:00:00Z"),
+                at("base", NodeKind::Immutable, &[], "2026-06-01T10:00:00Z"),
+            ],
+            vec![],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["h1", "p1", "h2", "base", "~base"]
+        );
+    }
+
+    #[test]
+    fn every_stack_joins_the_rail_already_waiting_for_its_base() {
+        let heads = ["b", "c", "d", "e", "f"];
+        let mut nodes = vec![
+            at("wc", NodeKind::WorkingCopy, &["a1"], NOON),
+            at("a1", NodeKind::Mutable, &["trunk"], NOON),
+        ];
+        let mut streams = vec![stream("ws-a", &["wc", "a1"], true)];
+        for head in heads {
+            let (top, bottom) = (format!("{head}2"), format!("{head}1"));
+            nodes.push(at(&top, NodeKind::Mutable, &[&bottom], NOON));
+            nodes.push(at(&bottom, NodeKind::Mutable, &["trunk"], NOON));
+            streams.push(stream(&format!("ws-{head}"), &[&top, &bottom], false));
+        }
+        nodes.push(at("trunk", NodeKind::Immutable, &[], NOON));
+        let mut snapshot = with(snapshot(), nodes, streams);
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        // Two columns, not six; each bottom row bends into the working
+        // stack's rail, which keeps passing the row the bend lands in.
+        assert_eq!(model.column_count, 2);
+        for (ix, head) in heads.iter().enumerate() {
+            let bottom = row(&model, &snapshot, &format!("{head}1"));
+            assert_eq!(bottom.column, 1);
+            assert_eq!(bottom.edges_out, [r(0, Some(lane_slot(ix + 1)))]);
+            assert_eq!(bottom.pass_through, [r(0, A)]);
+        }
+        assert_eq!(row(&model, &snapshot, "trunk").edges_in, [r(0, A)]);
+    }
+
+    #[test]
+    fn teammates_immutable_branches_join_one_base_the_same_way() {
+        // The Team lens: remote branches are immutable but not trunk's
+        // spine, so they converge as stacks do.
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at(
+                    "wc",
+                    NodeKind::WorkingCopy,
+                    &["trunk"],
+                    "2026-06-11T10:00:00Z",
+                ),
+                at(
+                    "r1",
+                    NodeKind::Immutable,
+                    &["trunk"],
+                    "2026-06-10T10:00:00Z",
+                ),
+                at(
+                    "s1",
+                    NodeKind::Immutable,
+                    &["trunk"],
+                    "2026-06-09T10:00:00Z",
+                ),
+                at("trunk", NodeKind::Immutable, &[], "2026-06-01T10:00:00Z"),
+            ],
+            vec![stream("ws-a", &["wc"], true)],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        assert_eq!(model.column_count, 2);
+        assert_eq!(row(&model, &snapshot, "r1").edges_out, [r(0, BASE)]);
+        let s1 = row(&model, &snapshot, "s1");
+        assert_eq!(s1.column, 1);
+        assert_eq!(s1.edges_out, [r(0, BASE)]);
+        assert_eq!(row(&model, &snapshot, "trunk").edges_in, [r(0, A)]);
+    }
+
+    #[test]
+    fn rails_join_only_leftward_so_the_leftmost_keeps_its_column() {
+        // m merges p and q; the walk reaches q first, which waits for base
+        // on column 1. p, on column 0, does not bend right into that
+        // younger rail: the two meet at base. r bends left into p's.
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("m", NodeKind::Mutable, &["p", "q"], "2026-06-11T10:00:00Z"),
+                at("r", NodeKind::Immutable, &["p"], "2026-06-08T10:00:00Z"),
+                at("q", NodeKind::Immutable, &["base"], "2026-06-10T10:00:00Z"),
+                at("p", NodeKind::Immutable, &["base"], "2026-06-09T10:00:00Z"),
+                at("base", NodeKind::Immutable, &[], "2026-06-01T10:00:00Z"),
+            ],
+            vec![stream("ws-m", &["m"], true)],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["m", "q", "r", "p", "base", "~base"]
+        );
+        assert_eq!(row(&model, &snapshot, "q").column, 1);
+        let r_row = row(&model, &snapshot, "r");
+        assert_eq!(r_row.column, 2);
+        assert_eq!(r_row.edges_out, [r(0, BASE)]);
+        let p = row(&model, &snapshot, "p");
+        assert_eq!(p.column, 0);
+        assert_eq!(p.edges_out, [r(0, BASE)]);
+        assert_eq!(
+            row(&model, &snapshot, "base").edges_in,
+            [r(0, BASE), r(1, BASE)]
+        );
+        assert_eq!(model.column_count, 3);
+    }
+
+    #[test]
+    fn trunk_s_spine_never_bends_into_a_waiting_rail() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at(
+                    "wc",
+                    NodeKind::WorkingCopy,
+                    &["old"],
+                    "2026-06-11T10:00:00Z",
+                ),
+                elided(
+                    at("trunk", NodeKind::Immutable, &[], "2026-06-10T08:00:00Z"),
+                    &["old"],
+                ),
+                at("old", NodeKind::Immutable, &[], "2026-06-01T12:00:00Z"),
+            ],
+            vec![stream("ws-a", &["wc"], true)],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["wc", "trunk", "~trunk", "old", "~old"]
+        );
+        let trunk = row(&model, &snapshot, "trunk");
+        assert_eq!(trunk.column, 1);
+        assert_eq!(trunk.edges_out, [dashed(1, BASE)]);
+        let gap = elisions(&model)[0];
+        assert_eq!(gap.marks, [r(1, BASE)]);
+        assert_eq!(gap.pass_through, [r(0, A)]);
+        assert_eq!(
+            row(&model, &snapshot, "old").edges_in,
+            [r(0, A), r(1, BASE)]
+        );
+    }
+
+    #[test]
+    fn sibling_stacks_order_by_their_head_s_recency_not_their_listing() {
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("o1", NodeKind::Mutable, &["base"], "2026-06-01T10:00:00Z"),
+                at("n1", NodeKind::Mutable, &["base"], "2026-06-10T10:00:00Z"),
+                at("base", NodeKind::Immutable, &[], "2026-05-01T10:00:00Z"),
+            ],
+            vec![
+                stream("ws-old", &["o1"], false),
+                stream("ws-new", &["n1"], false),
+            ],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(rows_of(&model, &snapshot), ["n1", "o1", "base", "~base"]);
+    }
+
+    #[test]
+    fn bases_linked_through_elided_history_form_one_continuing_spine() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at(
+                    "wc",
+                    NodeKind::WorkingCopy,
+                    &["trunk"],
+                    "2026-06-11T10:00:00Z",
+                ),
+                at("b1", NodeKind::Mutable, &["old"], "2026-06-09T10:00:00Z"),
+                elided(
+                    at("trunk", NodeKind::Immutable, &[], "2026-06-10T08:00:00Z"),
+                    &["old"],
+                ),
+                at("old", NodeKind::Immutable, &[], "2026-06-01T12:00:00Z"),
+            ],
+            vec![
+                stream("ws-a", &["wc"], true),
+                stream("ws-b", &["b1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["wc", "trunk", "~trunk", "b1", "old", "~old"]
+        );
+        // The elided link draws dashed and keeps trunk's column alive.
+        assert_eq!(row(&model, &snapshot, "trunk").edges_out, [dashed(0, BASE)]);
+        let gaps = elisions(&model);
+        assert_eq!(gaps[0].marks, [r(0, BASE)]);
+        assert!(gaps[0].continues);
+        // The sibling bends into the spine, already waiting for old
+        // beneath the gap; old takes the spine alone, and history ends.
+        let b1 = row(&model, &snapshot, "b1");
+        assert_eq!(b1.column, 1);
+        assert_eq!(b1.edges_out, [r(0, B)]);
+        assert_eq!(b1.pass_through, [r(0, BASE)]);
+        let old = row(&model, &snapshot, "old");
+        assert_eq!(old.column, 0);
+        assert_eq!(old.edges_in, [r(0, BASE)]);
+        assert!(!gaps[1].continues);
+    }
+
+    #[test]
+    fn directly_linked_bases_draw_without_a_gap_row() {
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["t2"], "2026-06-11T10:00:00Z"),
+                at("b1", NodeKind::Mutable, &["t1"], "2026-06-09T10:00:00Z"),
+                at("t2", NodeKind::Immutable, &["t1"], "2026-06-10T08:00:00Z"),
+                at("t1", NodeKind::Immutable, &[], "2026-06-01T12:00:00Z"),
+            ],
+            vec![
+                stream("ws-a", &["wc"], true),
+                stream("ws-b", &["b1"], false),
+            ],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(rows_of(&model, &snapshot), ["wc", "t2", "b1", "t1", "~t1"]);
+        assert_eq!(row(&model, &snapshot, "t2").edges_out, [r(0, BASE)]);
+    }
+
+    #[test]
+    fn a_column_freed_by_a_merge_serves_the_next_head() {
+        let snapshot = with(
+            snapshot(),
+            vec![
+                at("a2", NodeKind::Mutable, &["a1"], NOON),
+                at("a1", NodeKind::Mutable, &["base"], NOON),
+                at("b1", NodeKind::Mutable, &["a1"], NOON),
+                at("c1", NodeKind::Mutable, &["base"], NOON),
+                at("base", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["a2", "a1"], true),
+                stream("ws-b", &["b1"], false),
+                stream("ws-c", &["c1"], false),
+            ],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(
+            rows_of(&model, &snapshot),
+            ["a2", "b1", "a1", "c1", "base", "~base"]
+        );
+        assert_eq!(row(&model, &snapshot, "c1").column, 1);
+        assert_eq!(model.column_count, 2);
+    }
+
+    #[test]
+    fn a_stream_s_ids_missing_from_the_snapshot_are_passed_over() {
+        let snapshot = with(
+            snapshot(),
+            vec![at("wc", NodeKind::WorkingCopy, &[], NOON)],
+            vec![stream("ws", &["gone", "wc"], true)],
+        );
+        let model = build_graph_model(&snapshot);
+        assert_eq!(rows_of(&model, &snapshot), ["wc"]);
+        // The first node present stands in as the stack's visible top.
+        let wc = row(&model, &snapshot, "wc");
+        assert!(wc.is_stack_head);
+        assert_eq!(wc.stream.as_deref(), Some("ws"));
+    }
+
+    fn two_stacks_on_trunk() -> RepoSnapshot {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["a1"], NOON),
+                at("a1", NodeKind::Mutable, &["trunk"], NOON),
+                at("b2", NodeKind::Mutable, &["b1"], NOON),
+                at("b1", NodeKind::Mutable, &["trunk"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc", "a1"], true),
+                behind(stream("ws-b", &["b2", "b1"], false), 2),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        snapshot
+    }
+
+    #[test]
+    fn the_focus_view_draws_one_stream_on_its_base_in_one_column() {
+        let snapshot = two_stacks_on_trunk();
+        let focus = build_focus_model(&snapshot, &snapshot.workstreams[1]);
+        // The sibling stays out, so the lane is one straight rail.
+        assert_eq!(
+            rows_of(&focus.graph, &snapshot),
+            ["b2", "b1", "trunk", "~trunk"]
+        );
+        assert_eq!(focus.graph.column_count, 1);
+        assert!(focus.graph.node_rows().all(|(_, row)| row.column == 0));
+        // Trunk is the base drawn, so the stale-base count stays quiet.
+        assert!(focus.trunk_on_base);
+        assert_eq!(focus.behind_trunk, 0);
+    }
+
+    #[test]
+    fn the_focus_view_keeps_the_stale_base_count_behind_trunk() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["old"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+                at("old", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![behind(stream("ws-a", &["wc"], true), 5)],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let focus = build_focus_model(&snapshot, &snapshot.workstreams[0]);
+        assert_eq!(rows_of(&focus.graph, &snapshot), ["wc", "old", "~old"]);
+        assert!(!focus.trunk_on_base);
+        assert_eq!(focus.behind_trunk, 5);
+    }
+
+    #[test]
+    fn the_focus_view_ends_the_lane_at_its_base_past_elided_links() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["trunk"], NOON),
+                elided(
+                    at("trunk", NodeKind::Immutable, &[], "2026-06-10T08:00:00Z"),
+                    &["old"],
+                ),
+                at("old", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![stream("ws-a", &["wc"], true)],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let focus = build_focus_model(&snapshot, &snapshot.workstreams[0]);
+        assert_eq!(rows_of(&focus.graph, &snapshot), ["wc", "trunk", "~trunk"]);
+        assert!(!elisions(&focus.graph)[0].continues);
+    }
+
+    #[test]
+    fn the_focus_view_drops_a_parent_another_stack_claims() {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["x"], NOON),
+                at("x", NodeKind::Mutable, &["trunk"], NOON),
+                at("s1", NodeKind::Mutable, &["x"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc", "x"], true),
+                stream("ws-b", &["s1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        let focus = build_focus_model(&snapshot, &snapshot.workstreams[1]);
+        // s1's parent is mutable and ws-a's: no base, the rail just ends.
+        assert_eq!(rows_of(&focus.graph, &snapshot), ["s1"]);
+        assert!(elisions(&focus.graph).is_empty());
+    }
+
+    fn one_stack_and_a_sibling() -> RepoSnapshot {
+        let mut snapshot = with(
+            snapshot(),
+            vec![
+                at("wc", NodeKind::WorkingCopy, &["trunk"], NOON),
+                at("b1", NodeKind::Mutable, &["trunk"], NOON),
+                at("trunk", NodeKind::Immutable, &[], NOON),
+            ],
+            vec![
+                stream("ws-a", &["wc"], true),
+                stream("ws-b", &["b1"], false),
+            ],
+        );
+        trunk_at(&mut snapshot, "trunk");
+        snapshot
+    }
+
+    #[test]
+    fn only_nodes_are_selectable_and_each_knows_its_stream() {
+        let snapshot = one_stack_and_a_sibling();
+        let model = build_graph_model(&snapshot);
+        assert_eq!(ids(&model, &snapshot), ["wc", "b1", "trunk"]);
+        assert_eq!(row(&model, &snapshot, "b1").stream.as_deref(), Some("ws-b"));
+        assert_eq!(row(&model, &snapshot, "trunk").stream, None);
+        assert!(model.row_of(&snapshot, "nope").is_none());
+    }
+
+    #[test]
+    fn the_hot_stream_is_the_selection_s_then_the_focused_one() {
+        let snapshot = one_stack_and_a_sibling();
+        assert_eq!(
+            emphasized_stream(&snapshot, Some("b1"), None).as_deref(),
+            Some("ws-b")
+        );
+        // A base selection keeps the focused (or active) stream hot.
+        assert_eq!(
+            emphasized_stream(&snapshot, Some("trunk"), Some("ws-b")).as_deref(),
+            Some("ws-b")
+        );
+        assert_eq!(
+            emphasized_stream(&snapshot, None, None).as_deref(),
+            Some("ws-a")
+        );
+    }
+
+    #[test]
+    fn the_focused_stream_falls_back_to_the_active_then_the_first() {
+        let snapshot = one_stack_and_a_sibling();
+        let focused = |id| resolve_focused_workstream(&snapshot, id).map(|w| w.id.as_str());
+        assert_eq!(focused(Some("ws-b")), Some("ws-b"));
+        assert_eq!(focused(Some("missing")), Some("ws-a"));
+        assert_eq!(focused(None), Some("ws-a"));
+    }
+
+    #[test]
+    fn full_lanes_draw_at_full_spacing_then_a_narrow_band() {
+        assert_eq!(rail_x(0, 6), 12.);
+        assert_eq!(rail_x(5, 6), 77.);
+        // The first narrow lane steps in closer than a full one would.
+        assert_eq!(rail_x(6, 6), 86.);
+        assert_eq!(rail_x(7, 6), 91.);
+    }
+
+    #[test]
+    fn past_the_narrow_band_lanes_saturate_so_the_gutter_is_bounded() {
+        let last = rail_x(6 + NARROW_LANES - 1, 6);
+        assert_eq!(rail_x(6 + NARROW_LANES, 6), last);
+        assert_eq!(rail_x(500, 6), last);
+        assert_eq!(gutter_width(500, 6), last + 12.);
+    }
+
+    #[test]
+    fn a_graph_inside_the_budget_keeps_the_classic_gutter() {
+        assert_eq!(gutter_width(1, MAX_FULL_LANES), 24.);
+        assert_eq!(gutter_width(2, MAX_FULL_LANES), 37.);
+        assert_eq!(gutter_width(0, MAX_FULL_LANES), 24.);
+    }
+
+    #[test]
+    fn each_column_s_tier_follows_the_budget() {
+        assert_eq!(lane_tier(0, 6), LaneTier::Full);
+        assert_eq!(lane_tier(5, 6), LaneTier::Full);
+        assert_eq!(lane_tier(6, 6), LaneTier::Narrow);
+        assert_eq!(lane_tier(6 + NARROW_LANES - 1, 6), LaneTier::Narrow);
+        assert_eq!(lane_tier(6 + NARROW_LANES, 6), LaneTier::Overflow);
+    }
+
+    #[test]
+    fn the_pane_s_spare_width_goes_to_full_lanes_never_the_text_s() {
+        assert_eq!(full_lanes_for(460., 3), MIN_FULL_LANES);
+        assert_eq!(full_lanes_for(460., 10), 10);
+        // Twenty lanes in the default pane: as many full lanes as leave the
+        // text its reserve once the rest pack into the narrow band.
+        let full = full_lanes_for(460., 20);
+        assert_eq!(full, 9);
+        assert!(gutter_width(20, full) <= 460. - TEXT_RESERVE);
+        assert!(gutter_width(20, full + 1) > 460. - TEXT_RESERVE);
+        assert_eq!(full_lanes_for(340., 20), MIN_FULL_LANES);
+        assert_eq!(full_lanes_for(1200., 40), MAX_FULL_LANES);
     }
 }

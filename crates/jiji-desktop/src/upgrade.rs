@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(store.pref::<bool>("diff.tree"), Some(false));
         assert_eq!(store.pref::<f32>("pane.graph"), Some(512.));
         assert_eq!(store.pref::<f32>("pane.filetree"), Some(300.));
-        assert_eq!(UpstreamUi::new(&store).interval_minutes, 0);
+        assert_eq!(UpstreamUi::new(&store, false).interval_minutes, 0);
         assert_eq!(
             store.repo_view(&alpha),
             SnapshotView::Custom {

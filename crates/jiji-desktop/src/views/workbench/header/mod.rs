@@ -1344,4 +1344,171 @@ mod tests {
         assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // ── Ported from the Tauri app's ChangeHeader.test.ts ──
+
+    /// `editing` over the mock backend, so a save describes the change for
+    /// real. The working copy, `ktpqsmxw`, starts undescribed.
+    fn editing_mock(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<AppModel>,
+        gpui::WindowHandle<Shell>,
+        std::path::PathBuf,
+    ) {
+        let dir = crate::testing::scratch(name);
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        open_editor(&model, cx);
+        cx.simulate_keystrokes(window.into(), "cmd-a");
+        cx.simulate_input(window.into(), DRAFT);
+        (model, window, dir)
+    }
+
+    fn header_of<T>(
+        window: gpui::WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        read: impl FnOnce(&super::HeaderState) -> T,
+    ) -> T {
+        window
+            .update(cx, |shell, _, cx| {
+                let workbench = shell
+                    .section::<crate::views::workbench::WorkbenchView>()
+                    .unwrap();
+                read(&workbench.read(cx).header)
+            })
+            .unwrap()
+    }
+
+    fn workbench_do(
+        window: gpui::WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+        act: impl FnOnce(
+            &mut crate::views::workbench::WorkbenchView,
+            &mut gpui::Window,
+            &mut gpui::Context<crate::views::workbench::WorkbenchView>,
+        ),
+    ) {
+        window
+            .update(cx, |shell, window, cx| {
+                let workbench = shell
+                    .section::<crate::views::workbench::WorkbenchView>()
+                    .unwrap();
+                workbench.update(cx, |view, cx| act(view, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// The draft the header's pencil would offer for a change now.
+    fn kept(model: &gpui::Entity<AppModel>, id: &str, cx: &mut TestAppContext) -> Option<String> {
+        model.read_with(cx, |model, _| {
+            let snapshot = model.snapshot().unwrap();
+            let node = snapshot.nodes.iter().find(|node| node.id == id).unwrap();
+            model
+                .draft_for(&snapshot.repo_path, id, &node.description)
+                .map(str::to_owned)
+        })
+    }
+
+    const WC: &str = "ktpqsmxw";
+
+    #[gpui::test]
+    fn esc_keeps_an_unsaved_draft_and_reopening_restores_it(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-esc", cx);
+        cx.simulate_keystrokes(window.into(), "escape");
+        assert_eq!(editor_text(window, cx), None);
+        assert_eq!(kept(&model, WC, cx).as_deref(), Some(DRAFT));
+        open_editor(&model, cx);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        assert!(header_of(window, cx, |header| header.draft_restored));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_draft_stays_with_its_change_while_another_is_selected(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-selection", cx);
+        model.update(cx, |model, cx| {
+            model.select_node(Some("mvkortsq".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(editor_text(window, cx), None);
+        assert_eq!(kept(&model, "mvkortsq", cx), None);
+        model.update(cx, |model, cx| model.select_node(Some(WC.into()), cx));
+        cx.run_until_parked();
+        open_editor(&model, cx);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_saved_description_leaves_no_draft(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-saved", cx);
+        workbench_do(window, cx, |view, window, cx| {
+            view.save_description(window, cx)
+        });
+        assert_eq!(editor_text(window, cx), None);
+        assert_eq!(kept(&model, WC, cx), None);
+        // Reopened, it holds the description as saved, not a draft.
+        open_editor(&model, cx);
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        assert!(!header_of(window, cx, |header| header.draft_restored));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_draft_is_never_offered_over_a_description_changed_elsewhere(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-elsewhere", cx);
+        cx.simulate_keystrokes(window.into(), "escape");
+        // `jj describe` in a terminal, and the watcher's refresh.
+        let next = model.read_with(cx, |model, _| {
+            let path = std::path::Path::new(&model.snapshot().unwrap().repo_path).to_owned();
+            let backend = model.host.backend();
+            backend
+                .describe(&path, WC, "Described from the CLI")
+                .unwrap();
+            backend.open(&path).unwrap()
+        });
+        model.update(cx, |model, cx| {
+            model.apply_snapshot(std::sync::Arc::new(next), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(kept(&model, WC, cx), None);
+        open_editor(&model, cx);
+        assert_eq!(
+            editor_text(window, cx).as_deref(),
+            Some("Described from the CLI")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn discarding_a_restored_draft_goes_back_to_the_description(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-discard", cx);
+        cx.simulate_keystrokes(window.into(), "escape");
+        open_editor(&model, cx);
+        workbench_do(window, cx, |view, window, cx| {
+            view.discard_editor_draft(window, cx)
+        });
+        assert_eq!(editor_text(window, cx).as_deref(), Some(""));
+        cx.simulate_keystrokes(window.into(), "escape");
+        assert_eq!(kept(&model, WC, cx), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn the_editor_stays_open_with_its_text_through_a_refresh(cx: &mut TestAppContext) {
+        let (model, window, dir) = editing_mock("draft-refresh", cx);
+        // A watcher tick republishes the same change as a new snapshot.
+        let again = model.read_with(cx, |model, _| (*model.snapshot().unwrap().clone()).clone());
+        model.update(cx, |model, cx| {
+            model.apply_snapshot(std::sync::Arc::new(again), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(editor_text(window, cx).as_deref(), Some(DRAFT));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

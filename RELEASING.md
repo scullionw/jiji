@@ -18,7 +18,8 @@ The app binary is `jiji-desktop`, and it embeds the `jiji` command line from `cr
 
 ```bash
 cargo test --workspace
-scripts/bundle.sh && open target/release/bundle/Jiji.app
+scripts/release-preflight app-v0.5.0
+open target/release/bundle/Jiji.app
 
 git commit -am "release 0.5.0"
 git tag app-v0.5.0
@@ -26,6 +27,20 @@ git push origin HEAD app-v0.5.0
 ```
 
 The workflow refuses a tag that does not match the workspace version.
+
+## Preflight
+
+`scripts/release-preflight [tag]` checks a release before its tag is pushed, so a mistake the workflow would only find after the push (or not at all) shows up here first. With no tag it checks `app-v<workspace version>`. It reports each check as ok, a warning or a blocker, and exits non-zero on any blocker:
+
+- the tag matches the workspace version, and does not already tag another commit (a version that has shipped);
+- `CHANGELOG.md` has a section for the version, with notes in it;
+- the update feed in `crates/jiji-desktop/src/host/update.rs` is the latest release of the repository `origin` points at;
+- both Rust targets are installed (`rustup target add x86_64-apple-darwin` on an Apple Silicon Mac);
+- the bundle builds, universal as the workflow builds it (this Mac's slice alone, with a blocker, when a target is missing), into `target/release/bundle/Jiji.app`;
+- its `Info.plist` passes `plutil -lint` and names the version, each slice is built for the macOS floor the bundle declares, and `codesign --verify --deep --strict` passes;
+- with `gh` signed in: every secret the workflow names is set (names only; an unset `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is a warning, since an updater key may have no password), and the repository is public, which downloads and update checks need. Without `gh`, or signed out of it, these are skipped with a note.
+
+It publishes, tags and changes nothing; the build is the only thing it writes, and `CARGO_TARGET_DIR` moves it.
 
 ## Secrets
 

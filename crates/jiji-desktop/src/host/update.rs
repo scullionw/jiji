@@ -43,17 +43,19 @@ struct PlatformEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Available {
     pub version: String,
-    url: String,
-    signature: String,
+    pub(crate) url: String,
+    pub(crate) signature: String,
 }
 
 /// A downloaded, signature-verified update waiting for a restart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Staged {
     pub version: String,
-    archive: PathBuf,
+    pub(crate) archive: PathBuf,
     /// What the archive verified against, to verify it again at install.
-    signature: String,
+    /// Installing checks it again, so a staged update made any other way
+    /// installs nothing.
+    pub(crate) signature: String,
 }
 
 /// Why a staged update did not install.
@@ -278,6 +280,37 @@ pub fn download(update: &Available, cache_dir: &Path) -> Result<Staged, String> 
         archive,
         signature: update.signature.clone(),
     })
+}
+
+/// Where updates come from and how one goes in: the release feed and the
+/// running bundle in the app, a stand-in under test.
+pub trait Updates: Send + Sync {
+    /// Whether this build replaces itself at all (see [`supported`]).
+    fn supported(&self) -> bool;
+    fn check(&self) -> Result<Option<Available>, String>;
+    fn download(&self, update: &Available, cache_dir: &Path) -> Result<Staged, String>;
+    fn install_and_relaunch(&self, staged: &Staged) -> Result<(), InstallError>;
+}
+
+/// The release feed, installing over the bundle this build runs from.
+pub struct ReleaseFeed;
+
+impl Updates for ReleaseFeed {
+    fn supported(&self) -> bool {
+        supported()
+    }
+
+    fn check(&self) -> Result<Option<Available>, String> {
+        check()
+    }
+
+    fn download(&self, update: &Available, cache_dir: &Path) -> Result<Staged, String> {
+        download(update, cache_dir)
+    }
+
+    fn install_and_relaunch(&self, staged: &Staged) -> Result<(), InstallError> {
+        install_and_relaunch(staged)
+    }
 }
 
 /// Swap the running bundle for the staged one and relaunch into it. On

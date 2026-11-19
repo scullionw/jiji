@@ -1172,4 +1172,501 @@ mod tests {
         assert_eq!(ids(&palette_results(&registered, "moss")), ["theme.moss"]);
         assert!(!ids(&palette_results(&registered, "")).contains(&"theme.moss"));
     }
+
+    // ── Ported from the Tauri app's palette.test.ts ──
+
+    use jiji_core::snapshot::{BookmarkState, GitRemote, SyncState, WorkstreamSummary};
+    use jiji_forge::{AutoLandPhase, AutoLandRecord, AutoLandState};
+
+    fn change(id: &str, kind: NodeKind, parents: &[&str], bookmarks: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c{id}"),
+            description: format!("change {id}"),
+            author: "test".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            kind,
+            parents: parents.iter().map(|p| (*p).to_owned()).collect(),
+            elided_parents: vec![],
+            bookmarks: bookmarks.iter().map(|b| (*b).to_owned()).collect(),
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn local(name: &str, target: &str, trunk: bool) -> BookmarkState {
+        BookmarkState {
+            name: name.into(),
+            target: target.into(),
+            remote: None,
+            sync: SyncState::LocalOnly,
+            is_trunk: trunk,
+            is_local: true,
+            tracked: false,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        }
+    }
+
+    /// A stack on trunk: wxyz → mnop (feature) → qrst → base (main).
+    fn stack() -> RepoSnapshot {
+        RepoSnapshot {
+            repo_path: "/tmp/repo".into(),
+            working_copy: String::new(),
+            trunk_bookmark: "main".into(),
+            git_remotes: vec![],
+            nodes: vec![
+                change("wxyz", NodeKind::WorkingCopy, &["mnop"], &[]),
+                change("mnop", NodeKind::Mutable, &["qrst"], &["feature"]),
+                change("qrst", NodeKind::Mutable, &["base"], &[]),
+                change("base", NodeKind::Immutable, &[], &["main"]),
+            ],
+            workstreams: vec![WorkstreamSummary {
+                id: "ws".into(),
+                title: "ws".into(),
+                node_ids: vec!["wxyz".into(), "mnop".into(), "qrst".into()],
+                bookmark: None,
+                is_active: false,
+                behind_trunk: 0,
+            }],
+            bookmarks: vec![local("main", "base", true), local("feature", "mnop", false)],
+            ..snapshot()
+        }
+    }
+
+    fn listed(ctx: &PaletteContext, query: &str) -> Vec<String> {
+        palette_results(ctx, query)
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    fn has(list: &[String], id: &str) -> bool {
+        list.iter().any(|listed| listed == id)
+    }
+
+    #[test]
+    fn a_mutable_change_on_a_mutable_parent_gets_every_command() {
+        let snapshot = stack();
+        let ctx = context(Some(&snapshot), Some(&snapshot.nodes[1]));
+        let items = listed(&ctx, "");
+        for id in [
+            "change.describe",
+            "change.new",
+            "change.edit",
+            "change.bookmark",
+            "change.rebase",
+            "change.split",
+            "change.squash",
+            "change.revert",
+            "change.evolog",
+            "change.abandon",
+            "compare.parent",
+            "compare.trunk",
+            "compare.base",
+            "compare.pick",
+            "view.graph",
+            "view.focus",
+            "layout.unified",
+            "layout.split",
+            "section.Operations",
+            "repo.open",
+            "repo.refresh",
+        ] {
+            assert!(has(&items, id), "{id} missing");
+        }
+    }
+
+    #[test]
+    fn an_immutable_change_gets_what_rewrites_nothing_revert_and_history_too() {
+        let snapshot = stack();
+        let items = listed(&context(Some(&snapshot), Some(&snapshot.nodes[3])), "");
+        for id in [
+            "change.new",
+            "change.bookmark",
+            "change.revert",
+            "change.evolog",
+        ] {
+            assert!(has(&items, id), "{id} missing");
+        }
+        for id in [
+            "change.describe",
+            "change.edit",
+            "change.rebase",
+            "change.split",
+            "change.squash",
+            "change.abandon",
+        ] {
+            assert!(!has(&items, id), "{id} offered");
+        }
+    }
+
+    #[test]
+    fn revert_squash_and_edit_are_withheld_where_they_mean_nothing() {
+        let snapshot = stack();
+        let mut empty = snapshot.nodes[1].clone();
+        empty.is_empty = true;
+        assert!(!has(
+            &listed(&context(Some(&snapshot), Some(&empty)), ""),
+            "change.revert"
+        ));
+        // qrst sits right on the immutable base.
+        assert!(!has(
+            &listed(&context(Some(&snapshot), Some(&snapshot.nodes[2])), ""),
+            "change.squash"
+        ));
+        // The working copy is edited already.
+        let items = listed(&context(Some(&snapshot), Some(&snapshot.nodes[0])), "");
+        assert!(!has(&items, "change.edit") && has(&items, "change.squash"));
+    }
+
+    #[test]
+    fn a_comparison_that_cannot_resolve_is_not_offered() {
+        // No trunk bookmark, no stream claiming the change.
+        let bare = RepoSnapshot {
+            workstreams: vec![],
+            bookmarks: vec![],
+            trunk_bookmark: String::new(),
+            ..stack()
+        };
+        let items = listed(&context(Some(&bare), Some(&bare.nodes[1])), "");
+        assert!(!has(&items, "compare.trunk") && !has(&items, "compare.base"));
+        assert!(has(&items, "compare.parent") && has(&items, "compare.pick"));
+    }
+
+    #[test]
+    fn undo_is_offered_while_its_operation_is_around() {
+        let snapshot = stack();
+        let ctx = context(Some(&snapshot), Some(&snapshot.nodes[1]));
+        assert!(!has(&listed(&ctx, ""), "repo.undo"));
+        let undoable = PaletteContext {
+            can_undo: true,
+            ..ctx
+        };
+        assert!(has(&listed(&undoable, ""), "repo.undo"));
+    }
+
+    #[test]
+    fn the_other_tabs_are_rows_and_tab_commands_answer_a_query() {
+        let tabs = [
+            OpenTab {
+                id: 1,
+                label: "alpha".into(),
+                active: true,
+            },
+            OpenTab {
+                id: 2,
+                label: "beta".into(),
+                active: false,
+            },
+        ];
+        let ctx = PaletteContext {
+            open_tabs: &tabs,
+            ..context(None, None)
+        };
+        let items = listed(&ctx, "");
+        assert!(has(&items, "tab.switch.2") && !has(&items, "tab.switch.1"));
+        let queried = listed(&ctx, "tab");
+        assert!(has(&queried, "tab.new") && has(&queried, "tab.close"));
+    }
+
+    #[test]
+    fn reopening_a_closed_tab_answers_a_query_and_names_it() {
+        assert!(!has(&listed(&context(None, None), "reopen"), "tab.reopen"));
+        let ctx = PaletteContext {
+            reopenable_tab: Some("beta"),
+            ..context(None, None)
+        };
+        let results = palette_results(&ctx, "reopen");
+        let row = results.iter().find(|item| item.id == "tab.reopen").unwrap();
+        assert_eq!(row.hint.as_deref(), Some("beta"));
+        assert_eq!(row.action, PaletteAction::ReopenTab);
+        assert!(!has(&listed(&ctx, ""), "tab.reopen"));
+    }
+
+    #[test]
+    fn fetching_upstream_needs_a_git_remote() {
+        let snapshot = stack();
+        assert!(!has(
+            &listed(&context(Some(&snapshot), None), ""),
+            "repo.fetch"
+        ));
+        let remoted = RepoSnapshot {
+            git_remotes: vec![GitRemote {
+                name: "origin".into(),
+                url: "https://example.com/r.git".into(),
+            }],
+            ..stack()
+        };
+        assert!(has(
+            &listed(&context(Some(&remoted), None), ""),
+            "repo.fetch"
+        ));
+    }
+
+    #[test]
+    fn each_landable_and_shippable_stack_is_a_row_opening_its_plan() {
+        let snapshot = stack();
+        let landable = [("feature".to_owned(), "ws".to_owned())];
+        let shippable = [("mnop".to_owned(), "feat: work".to_owned(), 2)];
+        let ctx = PaletteContext {
+            landable: &landable,
+            shippable: &shippable,
+            ..context(Some(&snapshot), Some(&snapshot.nodes[1]))
+        };
+        let results = palette_results(&ctx, "");
+        let land = results
+            .iter()
+            .find(|item| item.id == "publish.land.feature")
+            .unwrap();
+        assert_eq!(
+            land.action,
+            PaletteAction::Intent(UiIntent::Land {
+                bookmark: "feature".into()
+            })
+        );
+        let results = palette_results(&ctx, "ship");
+        let ship = results
+            .iter()
+            .find(|item| item.id == "publish.ship.mnop")
+            .unwrap();
+        assert_eq!(
+            ship.action,
+            PaletteAction::Intent(UiIntent::Ship {
+                head: "mnop".into()
+            })
+        );
+        assert!(ship.title.contains("feat: work"));
+        // With nothing passed in (no connection, no GitHub remote), none.
+        let bare = listed(&context(Some(&snapshot), Some(&snapshot.nodes[1])), "ship");
+        assert!(!has(&bare, "publish.land.feature") && !has(&bare, "publish.ship.mnop"));
+    }
+
+    fn job(head: &str, phase: AutoLandPhase, live: bool, bypass: bool) -> AutoLandStatus {
+        let mut state = AutoLandState::queued(head);
+        state.phase = phase;
+        state.options.bypass = bypass;
+        AutoLandStatus {
+            live,
+            record: AutoLandRecord {
+                repo_path: "/tmp/repo".into(),
+                state,
+                saved_at_ms: 0,
+            },
+        }
+    }
+
+    fn watching() -> AutoLandPhase {
+        AutoLandPhase::Waiting {
+            attention: false,
+            reasons: vec!["waiting on checks".into()],
+        }
+    }
+
+    fn with_jobs(jobs: &[AutoLandStatus]) -> Vec<String> {
+        let snapshot = stack();
+        let jobs: Vec<&AutoLandStatus> = jobs.iter().collect();
+        let ctx = PaletteContext {
+            autoland_jobs: &jobs,
+            ..context(Some(&snapshot), Some(&snapshot.nodes[1]))
+        };
+        listed(&ctx, "")
+    }
+
+    #[test]
+    fn a_live_job_offers_stop_and_an_interrupted_one_resume() {
+        let live = with_jobs(&[job("feature", watching(), true, false)]);
+        assert!(has(&live, "autoland.stop") && !has(&live, "autoland.resume.feature"));
+        assert!(!has(&with_jobs(&[]), "autoland.stop"));
+        let interrupted = with_jobs(&[job("feature", watching(), false, false)]);
+        assert!(has(&interrupted, "autoland.resume.feature"));
+        assert!(!has(&interrupted, "autoland.stop"));
+        // Each record has its own row.
+        let both = with_jobs(&[
+            job("feature", watching(), true, false),
+            job("main", watching(), false, false),
+        ]);
+        assert!(has(&both, "autoland.stop") && has(&both, "autoland.resume.main"));
+    }
+
+    #[test]
+    fn resume_is_withheld_for_a_bypass_a_vanished_stack_or_a_job_that_ended() {
+        // Publish's card shows a saved bypass before it resumes; a palette
+        // row would hide it.
+        assert!(!has(
+            &with_jobs(&[job("feature", watching(), false, true)]),
+            "autoland.resume.feature"
+        ));
+        assert!(!has(
+            &with_jobs(&[job("vanished", watching(), false, false)]),
+            "autoland.resume.vanished"
+        ));
+        let done = with_jobs(&[job("feature", AutoLandPhase::Done, false, false)]);
+        assert!(!has(&done, "autoland.resume.feature") && !has(&done, "autoland.stop"));
+    }
+
+    #[test]
+    fn secondary_rows_wait_for_a_query_that_finds_them() {
+        let snapshot = stack();
+        let recents = [RecentRepo {
+            path: "/tmp/other".into(),
+            name: "other".into(),
+            last_opened_at: 1,
+        }];
+        let ctx = PaletteContext {
+            recent_repos: &recents,
+            ..context(Some(&snapshot), Some(&snapshot.nodes[1]))
+        };
+        assert!(!has(&listed(&ctx, ""), "repo.recent./tmp/other"));
+        assert!(has(&listed(&ctx, "other"), "repo.recent./tmp/other"));
+        // The row-density pair too.
+        let items = listed(&ctx, "");
+        assert!(!has(&items, "density.compact") && !has(&items, "density.classic"));
+        let rows = listed(&ctx, "rows");
+        assert!(has(&rows, "density.compact") && has(&rows, "density.classic"));
+    }
+
+    #[test]
+    fn a_title_hit_outranks_a_keyword_hit() {
+        let snapshot = stack();
+        let items = listed(&context(Some(&snapshot), Some(&snapshot.nodes[1])), "diff");
+        assert_eq!(items[0], "layout.unified");
+        let at = |id: &str| items.iter().position(|item| item == id).unwrap();
+        assert!(at("compare.parent") > at("layout.split"));
+    }
+
+    #[test]
+    fn a_query_nothing_answers_leaves_only_the_history_search() {
+        let snapshot = stack();
+        let ctx = context(Some(&snapshot), Some(&snapshot.nodes[1]));
+        assert_eq!(listed(&ctx, "zzzz-no-such"), ["search.query"]);
+        assert!(has(&listed(&ctx, ""), "search.history"));
+        assert!(!has(&listed(&context(None, None), ""), "search.history"));
+        let results = palette_results(&ctx, "  needle text ");
+        let last = results.last().unwrap();
+        assert_eq!(last.id, "search.query");
+        assert_eq!(last.title, "Search history for \u{201c}needle text\u{201d}");
+        assert_eq!(
+            last.action,
+            PaletteAction::SearchHistory(Some("needle text".into()))
+        );
+        assert!(!has(
+            &listed(&context(None, None), "needle"),
+            "search.query"
+        ));
+    }
+
+    fn cli(installed: bool, upgrade: bool, conflict: bool) -> Option<CliState<'static>> {
+        Some(CliState {
+            installed,
+            upgrade_available: upgrade,
+            path: installed.then_some("/usr/local/bin/jiji"),
+            conflict,
+        })
+    }
+
+    #[test]
+    fn the_command_line_tools_install_from_the_welcome_screen_or_by_name() {
+        let welcome = PaletteContext {
+            cli: cli(false, false, false),
+            ..context(None, None)
+        };
+        assert!(has(&listed(&welcome, ""), "cli.install"));
+        let snapshot = stack();
+        let open = PaletteContext {
+            cli: cli(false, false, false),
+            ..context(Some(&snapshot), None)
+        };
+        assert!(!has(&listed(&open, ""), "cli.install"));
+        assert!(has(&listed(&open, "cli"), "cli.install"));
+    }
+
+    #[test]
+    fn installed_tools_offer_removal_or_an_update_of_the_old_launcher() {
+        let installed = PaletteContext {
+            cli: cli(true, false, false),
+            ..context(None, None)
+        };
+        assert!(!has(&listed(&installed, ""), "cli.install"));
+        assert!(!has(&listed(&installed, "install"), "cli.install"));
+        assert!(has(&listed(&installed, "remove"), "cli.uninstall"));
+        let old = PaletteContext {
+            cli: cli(true, true, false),
+            ..context(None, None)
+        };
+        let results = palette_results(&old, "update jiji");
+        let row = results
+            .iter()
+            .find(|item| item.id == "cli.install")
+            .unwrap();
+        assert_eq!(row.title, "Update jiji command-line tools");
+    }
+
+    #[test]
+    fn a_foreign_jiji_or_an_unknown_state_offers_neither() {
+        let foreign = PaletteContext {
+            cli: cli(false, false, true),
+            ..context(None, None)
+        };
+        assert!(listed(&foreign, "cli").is_empty());
+        assert!(listed(&context(None, None), "cli").is_empty());
+    }
+
+    #[test]
+    fn a_change_is_found_by_id_bookmark_or_title_but_never_the_selection() {
+        let snapshot = stack();
+        let selected = context(Some(&snapshot), Some(&snapshot.nodes[1]));
+        assert!(has(&listed(&selected, "qrst"), "goto.qrst"));
+        // "feature" names the selection itself.
+        assert!(!has(&listed(&selected, "feature"), "goto.mnop"));
+        let elsewhere = context(Some(&snapshot), Some(&snapshot.nodes[0]));
+        assert!(has(&listed(&elsewhere, "feature"), "goto.mnop"));
+        assert!(has(&listed(&elsewhere, "change qrst"), "goto.qrst"));
+    }
+
+    #[test]
+    fn going_back_to_the_working_copy_is_offered_while_the_lens_draws_it() {
+        let drawn = RepoSnapshot {
+            working_copy: "wxyz".into(),
+            ..stack()
+        };
+        let results = palette_results(&context(Some(&drawn), Some(&drawn.nodes[1])), "");
+        let row = results
+            .iter()
+            .find(|item| item.id == "navigate.workingCopy")
+            .unwrap();
+        assert_eq!(row.action, PaletteAction::Goto("wxyz".into()));
+        assert_eq!(row.shortcut.as_deref(), Some("@"));
+        let hidden = RepoSnapshot {
+            working_copy: "hidden".into(),
+            ..stack()
+        };
+        assert!(!has(
+            &listed(&context(Some(&hidden), Some(&hidden.nodes[1])), ""),
+            "navigate.workingCopy"
+        ));
+    }
+
+    #[test]
+    fn jump_rows_are_capped_and_keep_the_snapshot_s_order() {
+        let many = RepoSnapshot {
+            nodes: (0..12)
+                .map(|i| change(&format!("node{i:02}"), NodeKind::Mutable, &[], &[]))
+                .collect(),
+            workstreams: vec![],
+            bookmarks: vec![],
+            ..stack()
+        };
+        let jumps: Vec<String> = listed(&context(Some(&many), None), "node")
+            .into_iter()
+            .filter(|id| id.starts_with("goto."))
+            .collect();
+        assert_eq!(jumps.len(), 8);
+        assert_eq!(jumps[0], "goto.node00");
+    }
 }

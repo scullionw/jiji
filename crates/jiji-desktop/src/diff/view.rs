@@ -3079,4 +3079,210 @@ mod tests {
             (Pos { row: 1, col: 9 }, Pos { row: 4, col: 2 })
         );
     }
+
+    // ── Ported from the Tauri app's find.test.ts ──
+
+    use jiji_core::snapshot::{
+        ChangeDiff, DiffHunk, DiffLine, DiffLineKind, DiffSegment, FileDiff, FileDiffContent,
+    };
+
+    fn kinded(kind: DiffLineKind, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            segments: vec![DiffSegment {
+                text: text.into(),
+                changed: kind != DiffLineKind::Context,
+            }],
+            pair: None,
+        }
+    }
+
+    fn text(path: &str, hunks: Vec<DiffHunk>) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            has_conflict: false,
+            content: FileDiffContent::Text {
+                hunks,
+                truncated: false,
+            },
+        }
+    }
+
+    fn at(start: u32, lines: Vec<DiffLine>) -> DiffHunk {
+        DiffHunk {
+            old_start: start,
+            new_start: start,
+            context: None,
+            lines,
+        }
+    }
+
+    fn doc_of(files: Vec<FileDiff>) -> DiffDoc {
+        DiffDoc::build(&ChangeDiff {
+            id: "x".into(),
+            from: None,
+            files,
+            truncated: false,
+        })
+    }
+
+    /// `src/alpha.ts` with two needles on its removed line, and
+    /// `docs/needle.md`, whose name is the only needle.
+    fn needles() -> DiffDoc {
+        use DiffLineKind::*;
+        doc_of(vec![
+            text(
+                "src/alpha.ts",
+                vec![at(
+                    1,
+                    vec![
+                        kinded(Context, "const alpha = 1;"),
+                        kinded(Removed, "needle here, needle there"),
+                        kinded(Added, "nothing"),
+                    ],
+                )],
+            ),
+            text(
+                "docs/needle.md",
+                vec![at(1, vec![kinded(Added, "plain text")])],
+            ),
+        ])
+    }
+
+    #[test]
+    fn find_reads_lines_and_paths_in_order_whatever_their_case() {
+        let doc = needles();
+        let found = find_in_doc(&doc, "NEEDLE");
+        let line = doc.files[0].lines.start + 1;
+        assert_eq!(
+            found,
+            [
+                FindMatch {
+                    file: 0,
+                    line: Some((line, 0..6))
+                },
+                FindMatch {
+                    file: 0,
+                    line: Some((line, 13..19))
+                },
+                FindMatch {
+                    file: 1,
+                    line: None
+                },
+            ]
+        );
+        assert!(find_in_doc(&doc, "").is_empty());
+    }
+
+    #[test]
+    fn find_takes_its_query_literally() {
+        let doc = doc_of(vec![text(
+            "a.ts",
+            vec![at(
+                1,
+                vec![kinded(DiffLineKind::Added, "value = a+b (sum)")],
+            )],
+        )]);
+        assert_eq!(find_in_doc(&doc, "a+b (sum").len(), 1);
+        assert!(find_in_doc(&doc, ".*").is_empty());
+    }
+
+    #[test]
+    fn find_knows_a_rename_by_its_old_path_and_a_binary_by_its_name() {
+        let renamed = FileDiff {
+            status: FileStatus::Renamed,
+            renamed_from: Some("src/old-needle.ts".into()),
+            ..text("src/new-name.ts", vec![])
+        };
+        assert_eq!(
+            find_in_doc(&doc_of(vec![renamed]), "needle"),
+            [FindMatch {
+                file: 0,
+                line: None
+            }]
+        );
+        let binary = FileDiff {
+            content: FileDiffContent::Binary {
+                old_size: Some(1),
+                new_size: Some(2),
+            },
+            ..text("assets/logo.png", vec![])
+        };
+        let doc = doc_of(vec![binary]);
+        assert_eq!(find_in_doc(&doc, "logo").len(), 1);
+        assert!(find_in_doc(&doc, "zzz").is_empty());
+    }
+
+    #[gpui::test]
+    fn one_match_is_current_and_stepping_wraps_round(cx: &mut gpui::TestAppContext) {
+        let dir = crate::testing::scratch("find-current");
+        let _model = crate::testing::install(&dir, cx);
+        let (surface, cx) = cx.add_window_view(|_, cx| DiffSurface::new(false, cx));
+        let prepared = Prepared::new(Arc::new(ChangeDiff {
+            id: "x".into(),
+            from: None,
+            files: vec![
+                text(
+                    "src/alpha.ts",
+                    vec![at(
+                        1,
+                        vec![
+                            kinded(DiffLineKind::Context, "const alpha = 1;"),
+                            kinded(DiffLineKind::Removed, "needle here, needle there"),
+                        ],
+                    )],
+                ),
+                text("docs/needle.md", vec![]),
+            ],
+            truncated: false,
+        }));
+        surface.update(cx, |surface, cx| {
+            surface.set_doc(&prepared, false, cx);
+            assert_eq!(surface.set_find("needle", cx), 3);
+            assert_eq!(surface.find_position(), (0, 3));
+            surface.find_step(1, cx);
+            assert_eq!(surface.find_position(), (1, 3));
+            surface.find_step(1, cx);
+            surface.find_step(1, cx);
+            assert_eq!(surface.find_position(), (0, 3));
+            surface.find_step(-1, cx);
+            assert_eq!(surface.find_position(), (2, 3));
+            // A new query starts over at its first match.
+            surface.set_find("there", cx);
+            assert_eq!(surface.find_position(), (0, 1));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_line_is_found_on_its_row_in_either_layout_and_gaps_are_taller() {
+        use crate::diff::model::{GAP_H, LINE_H};
+        use DiffLineKind::*;
+        let doc = doc_of(vec![text(
+            "a.rs",
+            vec![
+                at(1, vec![kinded(Context, "a"), kinded(Added, "b")]),
+                at(10, vec![kinded(Context, "c"), kinded(Removed, "target")]),
+            ],
+        )]);
+        let target = doc.files[0].lines.start + 3;
+        let unified = doc.unified.row_of_line(0, target).unwrap();
+        assert!(matches!(doc.unified.rows[unified], Row::Line { line, .. } if line == target));
+        let split = doc.split.row_of_line(0, target).unwrap();
+        assert!(matches!(
+            doc.split.rows[split],
+            Row::Split { left: Some(cell), .. } if cell.line == target
+        ));
+        // The seam between the hunks is a gap and a half of a line tall.
+        let gap = doc
+            .unified
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Gap { .. }))
+            .unwrap();
+        let height = doc.unified.tops[gap + 1] - doc.unified.tops[gap];
+        assert_eq!((height, GAP_H), (1.5 * LINE_H, 1.5 * LINE_H));
+    }
 }

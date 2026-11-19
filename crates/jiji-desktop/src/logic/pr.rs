@@ -179,4 +179,120 @@ mod tests {
         assert_eq!(merged.tone, PrTone::Merged);
         assert!(merged.review.is_none() && merged.checks.is_none());
     }
+
+    // ── Ported from the Tauri app's pr.test.ts ──
+
+    fn watcher(edit: impl FnOnce(&mut PrSummary)) -> PrSummary {
+        let mut pr = PrSummary {
+            number: 213,
+            title: "Add the watcher".into(),
+            url: "https://github.com/o/r/pull/213".into(),
+            state: PrState::Open,
+            is_draft: false,
+            head_branch: "watcher-fix".into(),
+            head_commit: "a".repeat(40),
+            head_owner: Some("o".into()),
+            base_branch: "main".into(),
+            body: None,
+            review: ReviewDecision::None,
+            checks: ChecksRollup::None,
+        };
+        edit(&mut pr);
+        pr
+    }
+
+    fn local(name: &str, is_local: bool, is_trunk: bool) -> BookmarkState {
+        BookmarkState {
+            name: name.into(),
+            target: "x".into(),
+            remote: None,
+            sync: jiji_core::snapshot::SyncState::LocalOnly,
+            is_trunk,
+            is_local,
+            tracked: false,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_local_bookmark_wears_the_pull_request_its_name_heads() {
+        let prs = RepoPrState::new(
+            jiji_forge::PrStateReport {
+                prs: vec![watcher(|_| {})],
+                truncated: false,
+            },
+            "o",
+        );
+        let found =
+            |bookmark: &BookmarkState| pr_for_bookmark(bookmark, Some(&prs)).map(|pr| pr.number);
+        assert_eq!(found(&local("watcher-fix", true, false)), Some(213));
+        // Not trunk, not a remote-only entry, not another name.
+        assert_eq!(found(&local("watcher-fix", true, true)), None);
+        assert_eq!(found(&local("watcher-fix", false, false)), None);
+        assert_eq!(found(&local("other", true, false)), None);
+        // Nothing before the PR state arrives.
+        assert!(pr_for_bookmark(&local("watcher-fix", true, false), None).is_none());
+    }
+
+    #[test]
+    fn a_plain_open_pr_has_no_cues_to_show() {
+        let badge = pr_badge(&watcher(|_| {}));
+        assert_eq!(badge.label, "#213");
+        assert_eq!(badge.tone, PrTone::Open);
+        assert!(badge.review.is_none() && badge.checks.is_none());
+        assert_eq!(
+            badge.title,
+            "#213 \u{201c}Add the watcher\u{201d} — open · into main"
+        );
+    }
+
+    #[test]
+    fn an_open_pr_carries_its_review_and_checks() {
+        let ok = pr_badge(&watcher(|pr| {
+            pr.review = ReviewDecision::Approved;
+            pr.checks = ChecksRollup::Passing;
+        }));
+        assert_eq!(
+            (ok.review.unwrap().glyph, ok.review.unwrap().tone),
+            ("✓", Tone::Ok)
+        );
+        assert_eq!(
+            (ok.checks.unwrap().glyph, ok.checks.unwrap().tone),
+            ("✓", Tone::Ok)
+        );
+        assert!(ok.title.contains("approved · checks passing"));
+        let blocked = pr_badge(&watcher(|pr| {
+            pr.review = ReviewDecision::ChangesRequested;
+            pr.checks = ChecksRollup::Failing;
+        }));
+        assert_eq!(blocked.review.unwrap().glyph, "±");
+        assert_eq!(blocked.checks.unwrap().glyph, "×");
+        assert_eq!(blocked.review.unwrap().tone, Tone::Danger);
+        let waiting = pr_badge(&watcher(|pr| {
+            pr.review = ReviewDecision::ReviewRequired;
+            pr.checks = ChecksRollup::Pending;
+        }));
+        assert_eq!(waiting.review.unwrap().tone, Tone::Warn);
+        assert_eq!(waiting.checks.unwrap().tone, Tone::Warn);
+    }
+
+    #[test]
+    fn a_draft_is_its_own_tone_and_keeps_its_live_cues() {
+        let draft = pr_badge(&watcher(|pr| {
+            pr.is_draft = true;
+            pr.checks = ChecksRollup::Pending;
+        }));
+        assert_eq!(draft.tone, PrTone::Draft);
+        assert!(draft.checks.is_some());
+        assert!(draft.title.contains("draft · checks running"));
+        // Closed, a draft reads closed.
+        let closed = pr_badge(&watcher(|pr| {
+            pr.state = PrState::Closed;
+            pr.is_draft = true;
+        }));
+        assert_eq!(closed.tone, PrTone::Closed);
+    }
 }

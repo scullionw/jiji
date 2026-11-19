@@ -168,8 +168,8 @@ impl WorkbenchView {
                 }
                 match result {
                     Ok(evolog) => {
-                        // The backend answers newest first.
-                        this.evolution.versions = evolog.entries.iter().rev().cloned().collect();
+                        this.evolution.versions =
+                            crate::logic::evolution::timeline_versions(&evolog);
                         this.evolution.evolog = Some(Arc::new(evolog));
                         this.evolution.error = None;
                         this.settle_span(cx);

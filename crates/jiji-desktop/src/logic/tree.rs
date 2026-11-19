@@ -334,4 +334,147 @@ mod tests {
         // not inside it.
         assert_eq!(active_row_key(&rows, &collapsed, "ab.rs"), "ab.rs");
     }
+
+    // ── Ported from the Tauri app's tree.test.ts ──
+
+    fn shape_of(rows: &[TreeRow]) -> Vec<String> {
+        labels(&rows.iter().collect::<Vec<_>>())
+    }
+
+    fn tree(paths: &[&str]) -> Vec<TreeRow> {
+        let files: Vec<TreeFile> = paths.iter().map(|path| file(path, 0)).collect();
+        build_tree_rows(&files)
+    }
+
+    #[test]
+    fn files_nest_under_their_folders_folders_first_both_sorted() {
+        assert_eq!(
+            shape_of(&tree(&[
+                "zebra.md",
+                "src/main.rs",
+                "src/lib.rs",
+                "alpha.md"
+            ])),
+            ["src/", "  lib.rs", "  main.rs", "alpha.md", "zebra.md"]
+        );
+    }
+
+    #[test]
+    fn each_file_keeps_its_place_in_the_diff_s_order() {
+        let rows = tree(&["b.ts", "a.ts"]);
+        let order: Vec<(&str, usize)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                TreeRow::File(file) => Some((file.name.as_str(), file.index)),
+                TreeRow::Dir(_) => None,
+            })
+            .collect();
+        assert_eq!(order, [("a.ts", 1), ("b.ts", 0)]);
+    }
+
+    #[test]
+    fn a_chain_of_lone_folders_is_one_row() {
+        let rows = tree(&[
+            "src/lib/components/Button.svelte",
+            "src/lib/components/Icon.svelte",
+        ]);
+        assert_eq!(
+            shape_of(&rows),
+            ["src/lib/components/", "  Button.svelte", "  Icon.svelte"]
+        );
+        let TreeRow::Dir(top) = &rows[0] else {
+            panic!("a folder row");
+        };
+        assert_eq!((top.path.as_str(), top.depth), ("src/lib/components", 0));
+    }
+
+    #[test]
+    fn compaction_stops_where_the_tree_branches_or_holds_a_file() {
+        assert_eq!(
+            shape_of(&tree(&[
+                "src/app/one.ts",
+                "src/util/two.ts",
+                "pkg/mod.rs",
+                "pkg/deep/three.rs",
+            ])),
+            [
+                "pkg/",
+                "  deep/",
+                "    three.rs",
+                "  mod.rs",
+                "src/",
+                "  app/",
+                "    one.ts",
+                "  util/",
+                "    two.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_row_sums_what_is_under_it() {
+        let rows = build_tree_rows(&[
+            TreeFile {
+                removed: 1,
+                ..file("src/a.ts", 3)
+            },
+            TreeFile {
+                has_conflict: true,
+                ..file("src/deep/b.ts", 2)
+            },
+            file("root.md", 1),
+        ]);
+        let src = rows
+            .iter()
+            .find_map(|row| match row {
+                TreeRow::Dir(dir) if dir.path == "src" => Some(dir),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (src.file_count, src.added, src.removed, src.has_conflict),
+            (2, 5, 1, true)
+        );
+    }
+
+    /// `a/` holding `b/two.ts` and `one.ts`, `c/three.ts`, and `root.md`.
+    fn nested() -> Vec<TreeRow> {
+        tree(&["a/one.ts", "a/b/two.ts", "c/three.ts", "root.md"])
+    }
+
+    fn visible(rows: &[TreeRow], collapsed: &[&str]) -> Vec<String> {
+        let collapsed: HashSet<String> = collapsed.iter().map(|path| (*path).to_owned()).collect();
+        labels(&visible_tree_rows(rows, &collapsed))
+    }
+
+    #[test]
+    fn folding_a_folder_hides_what_is_under_it_and_nothing_else() {
+        let rows = nested();
+        assert_eq!(visible(&rows, &[]), shape_of(&rows));
+        assert_eq!(
+            visible(&rows, &["a"]),
+            ["a/", "c/", "  three.ts", "root.md"]
+        );
+        // A folded folder inside a folded one stays hidden with it.
+        assert_eq!(
+            visible(&rows, &["a", "a/b"]),
+            ["a/", "c/", "  three.ts", "root.md"]
+        );
+        // Folding a nested folder keeps its siblings.
+        assert_eq!(
+            visible(&rows, &["a/b"]),
+            ["a/", "  b/", "  one.ts", "c/", "  three.ts", "root.md"]
+        );
+    }
+
+    #[test]
+    fn the_row_standing_for_the_file_read_is_it_or_its_folded_folder() {
+        let rows = tree(&["a/b/two.ts", "root.md"]);
+        let none = HashSet::new();
+        let folded = HashSet::from(["a/b".to_owned()]);
+        assert_eq!(active_row_key(&rows, &none, "a/b/two.ts"), "a/b/two.ts");
+        // "a/b" is one compacted row, known by its whole path.
+        assert_eq!(active_row_key(&rows, &folded, "a/b/two.ts"), "a/b");
+        assert_eq!(active_row_key(&rows, &folded, "root.md"), "root.md");
+    }
 }

@@ -108,11 +108,17 @@ pub struct UpstreamUi {
 }
 
 impl UpstreamUi {
-    pub fn new(store: &Store) -> Self {
-        let interval = store
-            .pref::<u32>("upstream.interval")
-            .filter(|minutes| UPSTREAM_INTERVALS.iter().any(|(m, _)| m == minutes))
-            .unwrap_or(DEFAULT_INTERVAL_MINUTES);
+    /// An offline run's checks are off for the run, the saved choice
+    /// untouched: `jj git fetch` would use the user's Git credentials.
+    pub fn new(store: &Store, offline: bool) -> Self {
+        let interval = if offline {
+            0
+        } else {
+            store
+                .pref::<u32>("upstream.interval")
+                .filter(|minutes| UPSTREAM_INTERVALS.iter().any(|(m, _)| m == minutes))
+                .unwrap_or(DEFAULT_INTERVAL_MINUTES)
+        };
         Self {
             checking: false,
             last_checked: None,
@@ -558,5 +564,57 @@ impl AppModel {
     /// a watching auto-land job to poll now.
     pub fn window_activated(&mut self) {
         self.host.autoland.poke_active();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+    use crate::host::forge::Offline;
+    use crate::host::Host;
+
+    #[gpui::test]
+    fn an_offline_run_asks_github_nothing_and_fetches_nothing_on_its_own(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("offline-run");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join(".jj")).unwrap();
+        // The saved choice is a check every five minutes.
+        let mut store = Store::at(dir.join("data"));
+        store.set_pref("upstream.interval", &5u32);
+        let model = cx.update(|cx| {
+            crate::testing::bind(cx);
+            let host = Host::with_backend(
+                Box::new(jiji_core::MockBackend::default()),
+                Box::new(Offline),
+                dir.join("data"),
+            );
+            AppModel::install_over(host, store, "Menlo".into(), cx)
+        });
+        model.update(cx, |model, cx| model.open_paths(vec![repo.clone()], cx));
+        cx.run_until_parked();
+        model.read_with(cx, |model, _| {
+            // The remote is still known for what it is; no token was
+            // looked for, and nothing was fetched.
+            let status = model.forge.status.clone().expect("the connection settled");
+            assert!(status.repo.is_some());
+            assert_eq!(status.auth.source, None);
+            assert_eq!(model.forge.phase, ForgePhase::Ready);
+            assert_eq!(model.upstream.interval_minutes, 0);
+            assert_eq!(model.upstream.last_checked, None);
+        });
+        // A pasted token goes nowhere either.
+        let connect = model.update(cx, |model, cx| model.connect_forge("ghp_pasted".into(), cx));
+        cx.run_until_parked();
+        let refused = cx.foreground_executor().block_test(connect).unwrap_err();
+        assert_eq!(
+            refused.message,
+            "Could not reach GitHub: this run is offline (JIJI_OFFLINE=1)"
+        );
+        // The run's checks are off; the saved choice is not touched.
+        let saved = Store::at(dir.join("data")).pref::<u32>("upstream.interval");
+        assert_eq!(saved, Some(5));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

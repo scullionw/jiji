@@ -410,4 +410,482 @@ mod tests {
         assert_eq!(combined_description("a\n", ""), "a");
         assert_eq!(combined_description("a", "b"), "a\n\nb");
     }
+
+    // ── Ported from the Tauri app's inspect.test.ts and selection.test.ts ──
+
+    fn node(id: &str, kind: NodeKind, parents: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c-{id}"),
+            description: format!("change {id}"),
+            author: "test".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            kind,
+            parents: parents.iter().map(|p| (*p).to_owned()).collect(),
+            elided_parents: vec![],
+            bookmarks: vec![],
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn stream(id: &str, nodes: &[&str]) -> WorkstreamSummary {
+        WorkstreamSummary {
+            id: id.into(),
+            title: id.into(),
+            node_ids: nodes.iter().map(|n| (*n).to_owned()).collect(),
+            bookmark: None,
+            is_active: false,
+            behind_trunk: 0,
+        }
+    }
+
+    fn bookmark(name: &str, target: &str, trunk: bool) -> BookmarkState {
+        BookmarkState {
+            name: name.into(),
+            target: target.into(),
+            remote: trunk.then(|| "origin".into()),
+            sync: if trunk {
+                SyncState::Synced
+            } else {
+                SyncState::LocalOnly
+            },
+            is_trunk: trunk,
+            is_local: true,
+            tracked: trunk,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        }
+    }
+
+    fn graph(
+        nodes: Vec<GraphNode>,
+        streams: Vec<WorkstreamSummary>,
+        bookmarks: Vec<BookmarkState>,
+    ) -> RepoSnapshot {
+        RepoSnapshot {
+            nodes,
+            workstreams: streams,
+            bookmarks,
+            ..snapshot()
+        }
+    }
+
+    fn ids(nodes: Vec<&GraphNode>) -> Vec<&str> {
+        nodes.into_iter().map(|node| node.id.as_str()).collect()
+    }
+
+    fn owned(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn children_are_every_node_naming_the_change_as_a_parent() {
+        let snapshot = graph(
+            vec![
+                node("a", NodeKind::WorkingCopy, &["b"]),
+                node("merge", NodeKind::Mutable, &["b", "side"]),
+                node("b", NodeKind::Mutable, &["base"]),
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(ids(children_of(&snapshot, "b")), ["a", "merge"]);
+        assert!(children_of(&snapshot, "a").is_empty());
+    }
+
+    #[test]
+    fn descendants_walk_nearest_first_across_forks_and_count_once() {
+        let snapshot = graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["mid"]),
+                node("merge", NodeKind::Mutable, &["mid", "side"]),
+                node("mid", NodeKind::Mutable, &["base"]),
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            ids(descendants_of(&snapshot, "base")),
+            ["mid", "side", "top", "merge"]
+        );
+        // Reachable two ways, reported once.
+        assert_eq!(ids(descendants_of(&snapshot, "mid")), ["top", "merge"]);
+        assert!(descendants_of(&snapshot, "top").is_empty());
+    }
+
+    #[test]
+    fn a_squash_s_description_is_either_side_or_both_destination_first() {
+        assert_eq!(combined_description("", "child text"), "child text");
+        assert_eq!(combined_description("parent text", ""), "parent text");
+        assert_eq!(
+            combined_description("parent text\n", "child text"),
+            "parent text\n\nchild text"
+        );
+    }
+
+    #[test]
+    fn a_change_s_place_is_its_stream_and_index_or_nothing() {
+        let snapshot = graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["low"]),
+                node("low", NodeKind::Mutable, &[]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![stream("ws-a", &["top", "low"]), stream("ws-b", &["other"])],
+            vec![],
+        );
+        let place = stack_position(&snapshot, "low").unwrap();
+        assert_eq!((place.workstream.id.as_str(), place.index), ("ws-a", 1));
+        assert!(stack_position(&snapshot, "base").is_none());
+    }
+
+    #[test]
+    fn a_change_s_bookmarks_list_trunk_first() {
+        let snapshot = graph(
+            vec![node("n1", NodeKind::Immutable, &[])],
+            vec![],
+            vec![
+                bookmark("feature", "n1", false),
+                bookmark("main", "n1", true),
+                bookmark("other", "n2", false),
+            ],
+        );
+        let names: Vec<&str> = bookmarks_at(&snapshot, "n1")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(names, ["main", "feature"]);
+    }
+
+    fn stack_with_elided_history() -> RepoSnapshot {
+        let mut mid = node("mid", NodeKind::Mutable, &[]);
+        mid.elided_parents = vec!["base".into()];
+        graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["mid"]),
+                mid,
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn ancestry_follows_parents_and_elided_links() {
+        let snapshot = stack_with_elided_history();
+        assert!(is_ancestor(&snapshot, "base", "top"));
+        assert!(is_ancestor(&snapshot, "mid", "top"));
+        assert!(!is_ancestor(&snapshot, "top", "base"));
+        assert!(!is_ancestor(&snapshot, "side", "top"));
+    }
+
+    #[test]
+    fn a_bookmark_move_is_named_as_the_backend_names_it() {
+        let snapshot = stack_with_elided_history();
+        let way = |from, to| move_direction(&snapshot, from, to);
+        assert_eq!(way("base", "top"), Some(MoveDirection::Forward));
+        assert_eq!(way("top", "base"), Some(MoveDirection::Backwards));
+        assert_eq!(way("side", "top"), Some(MoveDirection::Sideways));
+        // An end outside the snapshot has no direction to state.
+        assert_eq!(way("gone", "top"), None);
+    }
+
+    fn stack_and_sibling() -> RepoSnapshot {
+        graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["mid"]),
+                node("mid", NodeKind::Mutable, &["base"]),
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn rebase_destinations_leave_out_the_change_its_stack_and_its_parent() {
+        let snapshot = stack_and_sibling();
+        let to = |id, descendants| ids(rebase_destinations(&snapshot, id, descendants));
+        // Taking its descendants along: not itself, not them, not the
+        // parent it already sits on.
+        assert_eq!(to("mid", true), ["side"]);
+        // Alone: its descendants stay destinations (how neighbours swap),
+        // and the parent too, since there is a descendant to extract.
+        assert_eq!(to("mid", false), ["top", "side", "base"]);
+        // With nothing to extract the sole parent is no move at all.
+        assert_eq!(to("top", false), ["side", "base"]);
+        assert_eq!(to("top", true), ["side", "base"]);
+        assert!(to("gone", true).is_empty());
+    }
+
+    #[test]
+    fn squash_destinations_are_every_other_mutable_change() {
+        let snapshot = stack_and_sibling();
+        assert_eq!(ids(squash_destinations(&snapshot, "top")), ["mid", "side"]);
+        // Unlike a rebase the parent stays: moving files there is how work
+        // amends down the stack.
+        assert_eq!(ids(squash_destinations(&snapshot, "mid")), ["top", "side"]);
+    }
+
+    fn stacks_on_trunk_and_on_old_history() -> RepoSnapshot {
+        let mut side = node("side", NodeKind::Mutable, &[]);
+        side.elided_parents = vec!["old".into()];
+        graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["mid"]),
+                node("mid", NodeKind::Mutable, &["trunk"]),
+                side,
+                node("trunk", NodeKind::Immutable, &[]),
+                node("old", NodeKind::Immutable, &[]),
+            ],
+            vec![stream("ws-a", &["top", "mid"]), stream("ws-b", &["side"])],
+            vec![bookmark("main", "trunk", true)],
+        )
+    }
+
+    #[test]
+    fn a_stack_s_base_is_the_parent_under_its_bottom_change() {
+        let snapshot = stacks_on_trunk_and_on_old_history();
+        assert_eq!(stack_base_of(&snapshot, "top").as_deref(), Some("trunk"));
+        assert_eq!(stack_base_of(&snapshot, "mid").as_deref(), Some("trunk"));
+        assert_eq!(stack_base_of(&snapshot, "side").as_deref(), Some("old"));
+        // Immutable bases belong to no stack.
+        assert_eq!(stack_base_of(&snapshot, "trunk"), None);
+    }
+
+    #[test]
+    fn each_comparison_resolves_for_a_selection_or_not_at_all() {
+        let snapshot = stacks_on_trunk_and_on_old_history();
+        let from = |id, mode: CompareMode| resolve_compare_from(&snapshot, id, &mode);
+        assert_eq!(from("top", CompareMode::Parent), None);
+        assert_eq!(from("top", CompareMode::Trunk).as_deref(), Some("trunk"));
+        assert_eq!(from("top", CompareMode::Base).as_deref(), Some("trunk"));
+        assert_eq!(from("side", CompareMode::Base).as_deref(), Some("old"));
+        assert_eq!(
+            from("top", CompareMode::Change("side".into())).as_deref(),
+            Some("side")
+        );
+        // Trunk against itself, a node with no stack, a picked change that
+        // left the snapshot or is the selection.
+        assert_eq!(from("trunk", CompareMode::Trunk), None);
+        assert_eq!(from("trunk", CompareMode::Base), None);
+        assert_eq!(from("top", CompareMode::Change("gone".into())), None);
+        assert_eq!(from("top", CompareMode::Change("top".into())), None);
+        let trunkless = graph(
+            vec![node("top", NodeKind::WorkingCopy, &[])],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            resolve_compare_from(&trunkless, "top", &CompareMode::Trunk),
+            None
+        );
+    }
+
+    #[test]
+    fn a_divergent_change_s_siblings_are_its_other_copies() {
+        let copy = |id: &str| GraphNode {
+            change_id: "rzvqnkom".into(),
+            is_divergent: true,
+            ..node(id, NodeKind::Mutable, &["trunk"])
+        };
+        let snapshot = graph(
+            vec![
+                copy("b41c77d0"),
+                copy("e93d5a12"),
+                node("side", NodeKind::Mutable, &["trunk"]),
+                node("trunk", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        );
+        let of = |ix: usize| ids(divergent_siblings(&snapshot, &snapshot.nodes[ix]));
+        assert_eq!(of(0), ["e93d5a12"]);
+        assert_eq!(of(1), ["b41c77d0"]);
+        assert!(of(2).is_empty());
+    }
+
+    fn mixed_stack() -> RepoSnapshot {
+        graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["mid"]),
+                node("mid", NodeKind::Mutable, &["bottom"]),
+                node("bottom", NodeKind::Mutable, &["base"]),
+                node("merge", NodeKind::Mutable, &["mid", "bottom"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            vec![],
+            vec![],
+        )
+    }
+
+    fn actions_at(snapshot: &RepoSnapshot, id: &str) -> ChangeActions {
+        action_availability(snapshot, find_node(snapshot, id).unwrap())
+    }
+
+    #[test]
+    fn a_mutable_change_on_a_mutable_parent_offers_every_action() {
+        let snapshot = mixed_stack();
+        assert_eq!(
+            actions_at(&snapshot, "mid"),
+            ChangeActions {
+                describe: true,
+                new_child: true,
+                edit: true,
+                bookmark: true,
+                rebase: true,
+                split: true,
+                squash: true,
+                abandon: true,
+            }
+        );
+        assert_eq!(
+            actions_at(&snapshot, "base"),
+            ChangeActions {
+                describe: false,
+                new_child: true,
+                edit: false,
+                bookmark: true,
+                rebase: false,
+                split: false,
+                squash: false,
+                abandon: false,
+            }
+        );
+    }
+
+    #[test]
+    fn split_squash_and_edit_are_withheld_where_they_mean_nothing() {
+        let mut empty = node("wc", NodeKind::WorkingCopy, &["base"]);
+        empty.is_empty = true;
+        let snapshot = graph(
+            vec![empty, node("base", NodeKind::Immutable, &[])],
+            vec![],
+            vec![],
+        );
+        assert!(!actions_at(&snapshot, "wc").split);
+        let snapshot = mixed_stack();
+        // An immutable parent, or two parents: nothing single to squash into.
+        assert!(!actions_at(&snapshot, "bottom").squash);
+        assert!(!actions_at(&snapshot, "merge").squash);
+        // The working copy is edited already, and still described.
+        let wc = actions_at(&snapshot, "wc");
+        assert!(!wc.edit && wc.describe);
+    }
+
+    /// wc → b → a on trunk, and a one-change sibling on trunk.
+    fn three_and_one() -> RepoSnapshot {
+        let mut active = stream("ws-a", &["wc", "b", "a"]);
+        active.is_active = true;
+        graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["b"]),
+                node("b", NodeKind::Mutable, &["a"]),
+                node("a", NodeKind::Mutable, &["trunk"]),
+                node("s1", NodeKind::Mutable, &["trunk"]),
+                node("trunk", NodeKind::Immutable, &[]),
+            ],
+            vec![active, stream("ws-s", &["s1"])],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn a_range_runs_head_first_whichever_end_was_picked_first() {
+        let snapshot = three_and_one();
+        let range = |anchor, target| extend_range(&snapshot, anchor, target);
+        assert_eq!(range("wc", "a"), Some(owned(&["wc", "b", "a"])));
+        assert_eq!(range("a", "wc"), Some(owned(&["wc", "b", "a"])));
+        // Middle to end leaves the rest of the lane alone; one end is one id.
+        assert_eq!(range("b", "a"), Some(owned(&["b", "a"])));
+        assert_eq!(range("b", "b"), Some(owned(&["b"])));
+    }
+
+    #[test]
+    fn a_range_stays_in_one_stream_and_needs_a_base_to_diff_from() {
+        let snapshot = three_and_one();
+        assert_eq!(extend_range(&snapshot, "wc", "s1"), None);
+        assert_eq!(extend_range(&snapshot, "wc", "trunk"), None);
+        assert_eq!(extend_range(&snapshot, "trunk", "wc"), None);
+        let rootless = graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["a"]),
+                node("a", NodeKind::Mutable, &[]),
+            ],
+            vec![stream("ws", &["wc", "a"])],
+            vec![],
+        );
+        assert_eq!(extend_range(&rootless, "wc", "a"), None);
+    }
+
+    #[test]
+    fn a_range_diffs_from_its_root_s_first_parent() {
+        let snapshot = three_and_one();
+        let from = |run: &[&str]| range_compare_from(&snapshot, &owned(run));
+        assert_eq!(from(&["wc", "b", "a"]).as_deref(), Some("trunk"));
+        assert_eq!(from(&["wc", "b"]).as_deref(), Some("a"));
+        assert_eq!(from(&["ghost", "a"]), None);
+        assert_eq!(from(&["wc", "ghost"]), None);
+        assert_eq!(from(&[]), None);
+        let merge = graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["m"]),
+                node("m", NodeKind::Mutable, &["a", "other"]),
+                node("a", NodeKind::Immutable, &[]),
+                node("other", NodeKind::Immutable, &[]),
+            ],
+            vec![stream("ws", &["wc", "m"])],
+            vec![],
+        );
+        assert_eq!(
+            range_compare_from(&merge, &owned(&["wc", "m"])).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn a_kept_range_holds_only_while_its_run_is_unchanged() {
+        let snapshot = three_and_one();
+        let holds = |run: &[&str]| valid_range(&snapshot, &owned(run));
+        assert!(holds(&["wc", "b", "a"]) && holds(&["b", "a"]));
+        assert!(!holds(&["wc"]) && !holds(&[]));
+        // The head left every stream.
+        assert!(!holds(&["trunk", "a"]));
+        // A member was abandoned mid-run.
+        let abandoned = graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["a"]),
+                node("a", NodeKind::Mutable, &["trunk"]),
+                node("trunk", NodeKind::Immutable, &[]),
+            ],
+            vec![stream("ws-a", &["wc", "a"])],
+            vec![],
+        );
+        assert!(!valid_range(&abandoned, &owned(&["wc", "b", "a"])));
+        // The lane was reordered underneath it.
+        let reordered = graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["a"]),
+                node("a", NodeKind::Mutable, &["b"]),
+                node("b", NodeKind::Mutable, &["trunk"]),
+                node("trunk", NodeKind::Immutable, &[]),
+            ],
+            vec![stream("ws-a", &["wc", "a", "b"])],
+            vec![],
+        );
+        assert!(!valid_range(&reordered, &owned(&["wc", "b", "a"])));
+    }
 }

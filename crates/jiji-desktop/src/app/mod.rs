@@ -323,12 +323,13 @@ impl AppModel {
     ) -> Entity<Self> {
         let license = LicenseUi::load(&mut store);
         let crashed = crate::diagnostics::take_crash_mark(store.dir());
+        let offline = host.forge.api.offline();
         let model = cx.new(|cx| {
             let mut this = Self {
                 sidebar_collapsed: store.flag("rail.hidden"),
                 graph_collapsed: store.flag("graph.collapsed"),
                 recent_repos: store.recent_repos(),
-                upstream: UpstreamUi::new(&store),
+                upstream: UpstreamUi::new(&store, offline),
                 cli: CliUi::new(&store),
                 license,
                 host,
@@ -663,16 +664,21 @@ impl AppModel {
             move |host| host.refresh_snapshot(&path)
         });
         cx.spawn(async move |this, cx| {
-            if let Err(error) = refreshed.await {
-                let _ = this.update(cx, |this, cx| this.set_error_for(&path, error.message, cx));
-            }
+            let result = refreshed.await;
+            let _ = this.update(cx, |this, cx| match result {
+                // A refresh that worked answers the error a failed one
+                // left, even when nothing changed: no new snapshot arrives
+                // to clear it.
+                Ok(_) => this.set_error_for(&path, None, cx),
+                Err(error) => this.set_error_for(&path, Some(error.message), cx),
+            });
         })
         .detach();
     }
 
-    fn set_error_for(&mut self, path: &str, message: String, cx: &mut Context<Self>) {
+    fn set_error_for(&mut self, path: &str, message: Option<String>, cx: &mut Context<Self>) {
         if let Some(tab) = self.tab_for_path(path) {
-            tab.ui.error = Some(message);
+            tab.ui.error = message;
             cx.notify();
         }
     }

@@ -127,6 +127,15 @@ pub fn rename_saved_view(
     )
 }
 
+/// Deletes a view by name; the rest keep their order.
+pub fn delete_saved_view(views: &[SavedView], name: &str) -> Vec<SavedView> {
+    views
+        .iter()
+        .filter(|view| view.name != name)
+        .cloned()
+        .collect()
+}
+
 /// Panes this wide or narrower leave authors out of the rows.
 const AUTHOR_MIN_PANE: f32 = 560.;
 /// A full-spacing rail's stroke: lines on a transit map, not hairlines.
@@ -961,13 +970,8 @@ impl WorkbenchView {
                                     if this.view_menu.renaming.as_deref() == Some(&delete_name) {
                                         this.view_menu.renaming = None;
                                     }
-                                    let next: Vec<SavedView> = this
-                                        .view_menu
-                                        .saved
-                                        .iter()
-                                        .filter(|view| view.name != delete_name)
-                                        .cloned()
-                                        .collect();
+                                    let next =
+                                        delete_saved_view(&this.view_menu.saved, &delete_name);
                                     this.persist_views(next, cx);
                                 })),
                         ),
@@ -2163,10 +2167,20 @@ mod tests {
     #[test]
     fn lenses_label_themselves() {
         assert_eq!(view_label(&SnapshotView::Trunk), "Trunk history");
+        for (preset, label, _) in VIEW_PRESETS.iter() {
+            assert_eq!(view_label(preset), *label);
+        }
         assert_eq!(
             view_label(&SnapshotView::Custom { revset: "x".into() }),
             "Custom revset"
         );
+    }
+
+    #[test]
+    fn deleting_a_view_leaves_the_rest_in_order() {
+        let views = vec![view("WIP", "description(wip)"), view("Mine", "mine()")];
+        assert_eq!(delete_saved_view(&views, "WIP"), [view("Mine", "mine()")]);
+        assert_eq!(delete_saved_view(&views, "gone"), views);
     }
 
     #[test]

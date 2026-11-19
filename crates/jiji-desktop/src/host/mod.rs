@@ -30,7 +30,7 @@ use jiji_core::{BackendError, JjBackend, MockBackend, RepoBackend, RepoSnapshot,
 use jiji_forge::AutoLandStatus;
 
 use self::autoland::AutoLandHost;
-use self::forge::ForgeState;
+use self::forge::{Forge, ForgeState};
 
 /// A refusal the interface can render: a stable code plus the message.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,11 +115,18 @@ impl Host {
             } else {
                 Box::new(JjBackend::default())
             };
-        Self::with_backend(backend, data_dir)
+        let forge: Box<dyn Forge> = if std::env::var("JIJI_OFFLINE").as_deref() == Ok("1") {
+            log::info!("JIJI_OFFLINE=1 set; no forge token is looked up or used");
+            Box::new(forge::Offline)
+        } else {
+            Box::new(forge::GitHub)
+        };
+        Self::with_backend(backend, forge, data_dir)
     }
 
     pub fn with_backend(
         backend: Box<dyn RepoBackend>,
+        forge: Box<dyn Forge>,
         data_dir: PathBuf,
     ) -> (Arc<Self>, UnboundedReceiver<HostEvent>) {
         let (events, receiver) = unbounded();
@@ -127,7 +134,7 @@ impl Host {
             backend,
             sessions: Mutex::new(HashMap::new()),
             events,
-            forge: ForgeState::new(),
+            forge: ForgeState::new(forge),
             autoland: AutoLandHost::new(),
             data_dir,
             this: this.clone(),
@@ -493,7 +500,11 @@ mod tests {
     fn publishing_reads_full_stacks_without_changing_the_graph_lens() {
         let dir = scratch("workflow");
         std::fs::create_dir(dir.join(".jj")).unwrap();
-        let (host, _events) = Host::with_backend(Box::new(MockBackend::default()), dir.clone());
+        let (host, _events) = Host::with_backend(
+            Box::new(MockBackend::default()),
+            Box::new(forge::Offline),
+            dir.clone(),
+        );
         let full = host.open_repo(&display(&dir)).unwrap();
         let path = full.repo_path.clone();
         let filtered = host.set_snapshot_view(&path, SnapshotView::Trunk).unwrap();
@@ -511,7 +522,11 @@ mod tests {
     fn an_unchanged_republish_keeps_the_same_allocation() {
         let dir = scratch("settle");
         std::fs::create_dir(dir.join(".jj")).unwrap();
-        let (host, _events) = Host::with_backend(Box::new(MockBackend::default()), dir.clone());
+        let (host, _events) = Host::with_backend(
+            Box::new(MockBackend::default()),
+            Box::new(forge::Offline),
+            dir.clone(),
+        );
         let first = host.open_repo(&display(&dir)).unwrap();
         let again = host.refresh_snapshot(&first.repo_path).unwrap();
         assert!(Arc::ptr_eq(&first, &again));

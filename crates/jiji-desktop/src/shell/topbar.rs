@@ -1178,6 +1178,52 @@ mod tests {
     }
 
     #[test]
+    fn the_chip_reads_each_state_as_the_old_one_did() {
+        const MIN: u64 = 60_000;
+        // Never checked: a first fetch, naming the remote.
+        let (label, tone, title) = upstream_chip(false, None, None, &["origin"], 0).unwrap();
+        assert_eq!((label.as_str(), tone), ("Fetch", UpstreamTone::Quiet));
+        assert!(title.contains("origin"));
+        // Checked: its age, and the way to fetch again.
+        let (label, tone, title) =
+            upstream_chip(false, Some(0), None, &["origin"], 5 * MIN).unwrap();
+        assert_eq!(
+            (label.as_str(), tone),
+            ("Checked 5m ago", UpstreamTone::Quiet)
+        );
+        assert!(title.contains("fetch from origin now"));
+        // Checking: busy, whatever the last check said.
+        let (label, tone, _) =
+            upstream_chip(true, Some(0), Some("old failure"), &["origin"], MIN).unwrap();
+        assert_eq!((label.as_str(), tone), ("Checking…", UpstreamTone::Busy));
+        // Failed: quiet about it, with the story and the retry in the tip.
+        let (label, tone, title) = upstream_chip(
+            false,
+            Some(0),
+            Some("could not reach origin"),
+            &["origin"],
+            MIN,
+        )
+        .unwrap();
+        assert_eq!(
+            (label.as_str(), tone),
+            ("Fetch failed", UpstreamTone::Error)
+        );
+        assert!(title.contains("could not reach origin") && title.contains("retry"));
+    }
+
+    #[test]
+    fn ages_read_in_minutes_then_hours() {
+        const MIN: u64 = 60_000;
+        assert_eq!(checked_age_label(0, 3 * MIN), "3m ago");
+        assert_eq!(checked_age_label(0, 59 * MIN), "59m ago");
+        assert_eq!(checked_age_label(0, 60 * MIN), "1h ago");
+        assert_eq!(checked_age_label(0, 26 * 60 * MIN), "26h ago");
+        // A check finished "after" the heartbeat's clock is just now.
+        assert_eq!(checked_age_label(90_000, 30_000), "just now");
+    }
+
+    #[test]
     fn ages_are_minute_granular_and_never_negative() {
         assert_eq!(checked_age_label(1000, 500), "just now");
         assert_eq!(checked_age_label(0, 59_999), "just now");

@@ -456,3 +456,41 @@ fn hit_name(hit: &SearchHit) -> String {
 pub fn build(window: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|cx| Search::new(window, cx)).into()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use gpui::TestAppContext;
+
+    use super::{build, Search};
+    use crate::shell::Shell;
+
+    #[gpui::test]
+    fn the_search_reopens_on_its_last_query_and_a_seed_comes_first(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("search-last");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        model.update(cx, |model, cx| model.open_search("", cx));
+        cx.run_until_parked();
+        cx.simulate_input(window.into(), "parseRevset");
+        model.update(cx, |model, cx| model.close_search(cx));
+        cx.run_until_parked();
+        let field = |cx: &mut TestAppContext| {
+            let view = window
+                .update(cx, |_, window, cx| build(window, cx))
+                .unwrap()
+                .downcast::<Search>()
+                .unwrap();
+            view.read_with(cx, |search, cx| search.input.read(cx).text().to_owned())
+        };
+        // Opened again with nothing to search for, it holds the last query.
+        assert_eq!(field(cx), "parseRevset");
+        // What the palette hands over comes first.
+        model.update(cx, |model, cx| model.open_search("from the palette", cx));
+        assert_eq!(field(cx), "from the palette");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

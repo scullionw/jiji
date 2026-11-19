@@ -3,6 +3,14 @@
 //! (oldest first); the surface shows the diff `versions[from] →
 //! versions[to]`.
 
+use jiji_core::snapshot::{ChangeEvolog, EvologEntry};
+
+/// A change's versions in reading order, oldest first: the backend
+/// answers newest first.
+pub fn timeline_versions(evolog: &ChangeEvolog) -> Vec<EvologEntry> {
+    evolog.entries.iter().rev().cloned().collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub from: usize,
@@ -120,8 +128,33 @@ mod tests {
         // Inside the span: the far anchor stays.
         assert_eq!(extend_to(span(0, 5), 4, 6), span(0, 4));
         assert_eq!(extend_to(span(0, 5), 1, 6), span(1, 5));
-        // Never collapses to nothing.
+        // Never collapses to nothing, from either end.
         assert_eq!(extend_to(span(2, 3), 2, 6), span(2, 3));
+        assert_eq!(extend_to(span(2, 3), 3, 6), span(2, 3));
+    }
+
+    #[test]
+    fn the_timeline_reads_oldest_first_and_leaves_the_evolog_be() {
+        let entry = |commit_id: &str| EvologEntry {
+            commit_id: commit_id.into(),
+            description: String::new(),
+            author: "a".into(),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            op_id: None,
+            op_description: None,
+            op_timestamp: None,
+        };
+        let evolog = ChangeEvolog {
+            id: "zzzzzzzz".into(),
+            entries: vec![entry("c3"), entry("c2"), entry("c1")],
+            truncated: false,
+        };
+        let order: Vec<String> = timeline_versions(&evolog)
+            .into_iter()
+            .map(|version| version.commit_id)
+            .collect();
+        assert_eq!(order, ["c1", "c2", "c3"]);
+        assert_eq!(evolog.entries[0].commit_id, "c3");
     }
 
     #[test]

@@ -1585,6 +1585,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[gpui::test]
+    fn a_diff_that_lands_after_the_selection_moved_on_is_never_shown(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("late-diff");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        let select = |id: &str, cx: &mut TestAppContext| {
+            model.update(cx, |model, cx| model.select_node(Some(id.into()), cx));
+        };
+        // B has been read before. A has not: asking for it starts the read
+        // its selection will wait on.
+        select("mvkortsq", cx);
+        cx.run_until_parked();
+        let unread = model.update(cx, |model, cx| {
+            let op = model.snapshot().unwrap().operations[0].id.clone();
+            let key = crate::app::DiffKey {
+                repo: repo.clone(),
+                op,
+                from: None,
+                id: "pmwzqkvt".into(),
+            };
+            matches!(model.fetch_diff(key, cx), crate::app::DiffRead::Pending(_))
+        });
+        assert!(unread);
+        // A is chosen, then B before A's read comes back: B is on screen at
+        // once, and A, landing after, stays off it.
+        select("pmwzqkvt", cx);
+        select("mvkortsq", cx);
+        cx.run_until_parked();
+        workbench(window, cx).read_with(cx, |view, _| {
+            let (key, diff) = view.diff.loaded.clone().expect("a diff is on screen");
+            assert_eq!(
+                (key.id.as_str(), diff.id.as_str()),
+                ("mvkortsq", "mvkortsq")
+            );
+            assert!(view.diff.fresh());
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_change_far_down_a_long_history_scrolls_just_into_view_at_either_density(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::logic::graph::{RowDensity, NODE_ROW_HEIGHT, NODE_ROW_HEIGHT_CLASSIC};
+        use jiji_core::snapshot::{GraphNode, NodeKind};
+
+        let dir = crate::testing::scratch("graph-long");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        // A thousand changes in one line of history, newest first.
+        let mut snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        let template = snapshot.nodes[1].clone();
+        snapshot.nodes = (0..1000)
+            .map(|i| GraphNode {
+                id: format!("change{i}"),
+                change_id: format!("change{i}"),
+                commit_id: format!("commit{i}"),
+                description: format!("Change {i}"),
+                kind: NodeKind::Mutable,
+                parents: (i < 999)
+                    .then(|| format!("change{}", i + 1))
+                    .into_iter()
+                    .collect(),
+                elided_parents: vec![],
+                bookmarks: vec![],
+                ..template.clone()
+            })
+            .collect();
+        snapshot.workstreams.clear();
+        snapshot.bookmarks.clear();
+        snapshot.working_copy = "change0".into();
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+
+        let scrolled = |cx: &mut TestAppContext| {
+            workbench(window, cx).read_with(cx, |view, _| {
+                let top: f32 = (-view.scroll.offset().y).into();
+                let viewport: f32 = view.scroll.bounds().size.height.into();
+                (top, viewport)
+            })
+        };
+        assert_eq!(scrolled(cx).0, 0.);
+        // The 901st row comes up from below: just far enough to show it
+        // whole at the bottom.
+        model.update(cx, |model, cx| {
+            model.select_node(Some("change900".into()), cx)
+        });
+        cx.run_until_parked();
+        let (top, viewport) = scrolled(cx);
+        assert!(viewport > 0.);
+        assert_eq!(top, 901. * NODE_ROW_HEIGHT - viewport);
+
+        // Taller rows: the same change sits further down, and is shown
+        // again where it now is.
+        workbench(window, cx).update(cx, |view, cx| view.set_density(RowDensity::Classic, cx));
+        cx.run_until_parked();
+        let (top, viewport) = scrolled(cx);
+        assert_eq!(top, 901. * NODE_ROW_HEIGHT_CLASSIC - viewport);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Whether `handle` has the keys in `window`.
     fn has_keys(
         window: WindowHandle<Shell>,
@@ -1823,6 +1927,32 @@ mod tests {
         let kept = |key: &str| crate::store::Store::at(dir.join("data")).pref::<f32>(key);
         assert_eq!(kept("pane.graph"), Some(max - 16.));
         assert_eq!(kept("pane.filetree"), Some(super::diffpane::TREE_MAX - 16.));
+        drop(model);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[gpui::test]
+    fn a_narrow_window_takes_room_from_the_graph_but_never_its_kept_width(cx: &mut TestAppContext) {
+        let dir = crate::testing::scratch("narrow-graph");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        model.update(cx, |model, _| model.store.set_pref("pane.graph", &700f32));
+        let snapshot = jiji_core::mock::mock_snapshot(Path::new(&repo));
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let shown = |vcx: &mut gpui::VisualTestContext, width: f32| {
+            vcx.simulate_resize(gpui::size(px(width), px(800.)));
+            vcx.run_until_parked();
+            let view = workbench(window, vcx);
+            view.read_with(vcx, |view, _| (view.shown_width(), view.graph_limits().1))
+        };
+        // Too narrow for 700 beside the diff's minimum: the graph gives way.
+        let (narrow, limit) = shown(&mut vcx, 900.);
+        assert!(narrow < 700. && narrow == limit, "{narrow} {limit}");
+        let kept = || crate::store::Store::at(dir.join("data")).pref::<f32>("pane.graph");
+        assert_eq!(kept(), Some(700.));
+        // Room again: the kept width comes back.
+        assert_eq!(shown(&mut vcx, 1600.).0, 700.);
         drop(model);
         let _ = std::fs::remove_dir_all(dir);
     }

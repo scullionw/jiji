@@ -281,4 +281,188 @@ mod tests {
             descendants + 1
         );
     }
+
+    // ── Ported from the Tauri app's dnd.test.ts ──
+
+    fn node(id: &str, kind: NodeKind, parents: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c-{id}"),
+            description: format!("change {id}"),
+            author: "test".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            kind,
+            parents: parents.iter().map(|p| (*p).to_owned()).collect(),
+            elided_parents: vec![],
+            bookmarks: vec![],
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn graph(nodes: Vec<GraphNode>, working_copy: &str) -> RepoSnapshot {
+        RepoSnapshot {
+            nodes,
+            working_copy: working_copy.into(),
+            workstreams: vec![],
+            bookmarks: vec![],
+            ..snapshot()
+        }
+    }
+
+    /// top → mid → low → base, beside a sibling on the same base.
+    fn stacked() -> RepoSnapshot {
+        graph(
+            vec![
+                node("top", NodeKind::WorkingCopy, &["mid"]),
+                node("mid", NodeKind::Mutable, &["low"]),
+                node("low", NodeKind::Mutable, &["base"]),
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            "top",
+        )
+    }
+
+    /// The plan's (op, forced alone, summary, consequences); panics on a
+    /// refusal.
+    fn allowed(plan: DropPlan) -> (DropOp, bool, String, Vec<String>) {
+        match plan {
+            DropPlan::Allowed {
+                op,
+                forced_alone,
+                summary,
+                consequences,
+            } => (op, forced_alone, summary, consequences),
+            DropPlan::Refused(reason) => panic!("refused: {reason}"),
+        }
+    }
+
+    fn refused(reason: &str) -> DropPlan {
+        DropPlan::Refused(reason.into())
+    }
+
+    #[test]
+    fn mutable_and_working_copy_rows_drag_and_immutable_ones_do_not() {
+        assert!(can_drag(&node("a", NodeKind::Mutable, &[])));
+        assert!(can_drag(&node("a", NodeKind::WorkingCopy, &[])));
+        assert!(!can_drag(&node("a", NodeKind::Immutable, &[])));
+    }
+
+    #[test]
+    fn a_drop_rebases_with_descendants_onto_any_change_trunk_included() {
+        let snapshot = stacked();
+        let (op, forced, summary, _) = allowed(plan_drop(&snapshot, "low", "side", false));
+        assert_eq!((op, forced), (DropOp::Rebase, false));
+        assert_eq!(summary, "Rebase onto side — with 2 descendants");
+        // Onto trunk is the everyday gesture; immutable is fine.
+        let (op, ..) = allowed(plan_drop(&snapshot, "mid", "base", false));
+        assert_eq!(op, DropOp::Rebase);
+    }
+
+    #[test]
+    fn with_option_held_the_change_moves_alone() {
+        let snapshot = stacked();
+        let (op, forced, summary, consequences) =
+            allowed(plan_drop(&snapshot, "low", "side", true));
+        assert_eq!((op, forced), (DropOp::Move, false));
+        assert_eq!(summary, "Move onto side — only this change");
+        assert!(consequences.contains(&"2 descendants stay behind, reparented onto base.".into()));
+        assert!(consequences.contains(&"The working copy stays behind.".into()));
+    }
+
+    #[test]
+    fn option_means_nothing_without_descendants() {
+        let (op, _, summary, _) = allowed(plan_drop(&stacked(), "top", "side", true));
+        assert_eq!(op, DropOp::Rebase);
+        assert_eq!(summary, "Rebase onto side");
+    }
+
+    #[test]
+    fn a_target_inside_the_dragged_stack_makes_it_a_lone_move() {
+        let snapshot = stacked();
+        let (op, forced, summary, consequences) =
+            allowed(plan_drop(&snapshot, "low", "mid", false));
+        assert_eq!((op, forced), (DropOp::Move, true));
+        assert_eq!(summary, "Move onto mid — swapping their order");
+        assert_eq!(
+            consequences[0],
+            "mid is inside the dragged stack, so this change moves alone."
+        );
+        // Further up the stack it reorders rather than swaps.
+        let (_, forced, summary, _) = allowed(plan_drop(&snapshot, "low", "top", true));
+        assert!(!forced);
+        assert_eq!(summary, "Move onto top — reordering the stack");
+    }
+
+    #[test]
+    fn a_change_never_drops_onto_itself_or_the_parent_it_has() {
+        let snapshot = stacked();
+        assert_eq!(
+            plan_drop(&snapshot, "mid", "mid", false),
+            refused("A change cannot become its own parent")
+        );
+        assert_eq!(
+            plan_drop(&snapshot, "top", "mid", false),
+            refused("Already the parent of top — nothing would move")
+        );
+    }
+
+    #[test]
+    fn option_onto_the_parent_extracts_the_change() {
+        let (op, _, summary, consequences) = allowed(plan_drop(&stacked(), "low", "base", true));
+        assert_eq!(op, DropOp::Move);
+        assert_eq!(summary, "Extract low — its descendants skip past it");
+        assert!(
+            consequences.contains(&"It stays on base; 2 descendants reparent onto base.".into())
+        );
+    }
+
+    #[test]
+    fn the_card_names_a_dissolved_merge_and_where_the_working_copy_goes() {
+        let merged = graph(
+            vec![
+                node("wc", NodeKind::WorkingCopy, &["mid", "side"]),
+                node("mid", NodeKind::Mutable, &["base"]),
+                node("side", NodeKind::Mutable, &["base"]),
+                node("base", NodeKind::Immutable, &[]),
+            ],
+            "wc",
+        );
+        let (op, _, _, consequences) = allowed(plan_drop(&merged, "wc", "base", false));
+        assert_eq!(op, DropOp::Rebase);
+        assert!(consequences.contains(
+            &"Its 2 parents are replaced by the destination — the merge is dissolved.".into()
+        ));
+        assert!(consequences.contains(&"The working copy moves with it.".into()));
+        let (.., consequences) = allowed(plan_drop(&stacked(), "low", "side", false));
+        assert!(consequences.contains(&"The working copy follows the rebase.".into()));
+    }
+
+    #[test]
+    fn immutable_sources_and_vanished_targets_are_refused() {
+        let snapshot = stacked();
+        assert_eq!(
+            plan_drop(&snapshot, "base", "side", false),
+            refused("Immutable changes cannot be rebased")
+        );
+        assert_eq!(
+            plan_drop(&snapshot, "low", "gone", false),
+            refused("That change left the snapshot")
+        );
+    }
+
+    #[test]
+    fn a_drag_washes_the_changes_it_would_rewrite() {
+        let snapshot = stacked();
+        assert_eq!(
+            drag_affected_ids(&snapshot, "low", false),
+            ["low", "mid", "top"]
+        );
+        assert_eq!(drag_affected_ids(&snapshot, "low", true), ["low"]);
+        assert_eq!(drag_affected_ids(&snapshot, "top", false), ["top"]);
+    }
 }

@@ -240,6 +240,15 @@ pub fn review_bookmark(number: u64) -> String {
     format!("pr/{number}")
 }
 
+/// Whether a local bookmark already has this name. A remote-only entry
+/// does not: a local bookmark may share its name.
+pub fn bookmark_taken(name: &str, bookmarks: &[BookmarkState]) -> bool {
+    let name = name.trim();
+    bookmarks
+        .iter()
+        .any(|bookmark| bookmark.is_local && bookmark.name == name)
+}
+
 pub fn can_rerun(pr: &PrSummary) -> bool {
     pr.state == PrState::Open && pr.checks == ChecksRollup::Failing
 }
@@ -1393,5 +1402,901 @@ mod tests {
                 "app.openRepoEditor"
             ]
         );
+    }
+
+    // ── Ported from the Tauri app's menu.test.ts, and diff.test.ts's
+    // hunk lookup and patch text, which live here now ──
+
+    use jiji_forge::ReviewDecision;
+
+    fn change(id: &str, kind: NodeKind, parents: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            change_id: id.into(),
+            commit_id: format!("c{id}"),
+            description: format!("change {id}"),
+            author: "test".into(),
+            timestamp: "2026-06-10T12:00:00Z".into(),
+            kind,
+            parents: parents.iter().map(|p| (*p).to_owned()).collect(),
+            elided_parents: vec![],
+            bookmarks: vec![],
+            tags: vec![],
+            is_empty: false,
+            has_conflict: false,
+            is_divergent: false,
+        }
+    }
+
+    fn repo(nodes: Vec<GraphNode>) -> RepoSnapshot {
+        RepoSnapshot {
+            repo_path: "/tmp/repo".into(),
+            trunk_bookmark: "main".into(),
+            nodes,
+            ..snapshot()
+        }
+    }
+
+    fn menu(snapshot: Option<&RepoSnapshot>, target: MenuTarget) -> Vec<MenuSection> {
+        build_menu(&MenuContext {
+            snapshot,
+            selection: "",
+            target,
+            editors: &[],
+            can_undo: false,
+        })
+    }
+
+    fn sections(menu: &[MenuSection]) -> Vec<Vec<&'static str>> {
+        menu.iter()
+            .map(|section| section.iter().map(|item| item.id).collect())
+            .collect()
+    }
+
+    fn find<'a>(menu: &'a [MenuSection], id: &str) -> Option<&'a MenuItem> {
+        menu.iter().flatten().find_map(|item| {
+            if item.id == id {
+                Some(item)
+            } else {
+                find(&item.children, id)
+            }
+        })
+    }
+
+    fn change_target(node: &GraphNode) -> MenuTarget<'_> {
+        MenuTarget::Change {
+            node,
+            compare_trunk: false,
+            compare_base: false,
+            land_bookmark: None,
+            shippable: false,
+        }
+    }
+
+    /// One hunk at line 1: a context line, then an added one.
+    fn lib_rs() -> FileDiff {
+        use DiffLineKind::*;
+        FileDiff {
+            path: "src/lib.rs".into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            has_conflict: false,
+            content: FileDiffContent::Text {
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    new_start: 1,
+                    context: None,
+                    lines: vec![line(Context, "a"), line(Added, "b")],
+                }],
+                truncated: false,
+            },
+        }
+    }
+
+    fn diff_target<'a>(
+        file: &'a FileDiff,
+        mutable: bool,
+        line: Option<(Option<u32>, Option<u32>)>,
+    ) -> MenuTarget<'a> {
+        MenuTarget::Diff {
+            file,
+            change_id: "aaaa",
+            mutable,
+            line,
+            resolve_tool: None,
+        }
+    }
+
+    fn field(has_selection: bool, read_only: bool) -> MenuTarget<'static> {
+        MenuTarget::Editable {
+            has_selection,
+            read_only,
+            guesses: None,
+        }
+    }
+
+    #[test]
+    fn a_text_field_offers_editing_and_nothing_else() {
+        let menu = menu(None, field(true, false));
+        assert_eq!(
+            sections(&menu),
+            [
+                vec!["edit.cut", "edit.copy", "edit.paste"],
+                vec!["edit.selectAll"]
+            ]
+        );
+        assert!(menu.iter().flatten().all(|item| !item.disabled));
+    }
+
+    #[test]
+    fn cut_and_copy_need_a_selection_and_text_to_read_offers_reading() {
+        let none = menu(None, field(false, false));
+        assert!(find(&none, "edit.cut").unwrap().disabled);
+        assert!(find(&none, "edit.copy").unwrap().disabled);
+        assert!(!find(&none, "edit.paste").unwrap().disabled);
+        // Better than the old menu's greyed Cut and Paste: text that
+        // cannot change offers only what reading does.
+        let read_only = menu(None, field(true, true));
+        assert_eq!(
+            sections(&read_only),
+            [vec!["edit.copy"], vec!["edit.selectAll"]]
+        );
+    }
+
+    #[test]
+    fn a_mutable_change_offers_its_whole_command_set_and_its_ids() {
+        let target = change("aaaa", NodeKind::Mutable, &["bbbb"]);
+        let snapshot = repo(vec![target.clone(), change("bbbb", NodeKind::Mutable, &[])]);
+        let menu = menu(Some(&snapshot), change_target(&target));
+        assert_eq!(
+            sections(&menu),
+            [
+                vec![
+                    "change.describe",
+                    "change.new",
+                    "change.edit",
+                    "change.duplicate",
+                    "change.revert",
+                    "change.bookmark",
+                    "change.rebase",
+                    "change.split",
+                    "change.squash",
+                    "change.absorb",
+                    "change.abandon",
+                ],
+                vec!["change.compare"],
+                vec![
+                    "change.copyChangeId",
+                    "change.copyCommitId",
+                    "change.copyDescription"
+                ],
+            ]
+        );
+        assert!(find(&menu, "change.abandon").unwrap().danger);
+        assert_eq!(
+            find(&menu, "change.copyChangeId").unwrap().action,
+            Some(MenuAction::CopyText("aaaa".into()))
+        );
+    }
+
+    #[test]
+    fn an_immutable_change_offers_only_what_rewrites_nothing() {
+        let target = change("base", NodeKind::Immutable, &[]);
+        let snapshot = repo(vec![target.clone()]);
+        let menu = menu(Some(&snapshot), change_target(&target));
+        assert_eq!(
+            sections(&menu)[0],
+            [
+                "change.new",
+                "change.duplicate",
+                "change.revert",
+                "change.bookmark"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_compare_submenu_offers_what_resolves_and_names_trunk() {
+        let target = change("aaaa", NodeKind::Mutable, &[]);
+        let snapshot = repo(vec![target.clone()]);
+        let menu = menu(
+            Some(&snapshot),
+            MenuTarget::Change {
+                node: &target,
+                compare_trunk: true,
+                compare_base: false,
+                land_bookmark: None,
+                shippable: false,
+            },
+        );
+        let compare = find(&menu, "change.compare").unwrap();
+        assert_eq!(
+            sections(&compare.children),
+            [vec![
+                "change.compare.parent",
+                "change.compare.trunk",
+                "change.compare.pick"
+            ]]
+        );
+        assert_eq!(
+            find(&menu, "change.compare.trunk").unwrap().label,
+            "Against main"
+        );
+    }
+
+    #[test]
+    fn a_stack_head_offers_land_and_ship() {
+        let target = change("aaaa", NodeKind::Mutable, &[]);
+        let snapshot = repo(vec![target.clone()]);
+        let menu = menu(
+            Some(&snapshot),
+            MenuTarget::Change {
+                node: &target,
+                compare_trunk: false,
+                compare_base: false,
+                land_bookmark: Some("feature".into()),
+                shippable: true,
+            },
+        );
+        assert_eq!(find(&menu, "change.land").unwrap().label, "Land feature…");
+        assert_eq!(
+            find(&menu, "change.ship").unwrap().action,
+            Some(MenuAction::Intent(UiIntent::Ship {
+                head: "aaaa".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn an_empty_change_offers_no_absorb_or_revert() {
+        let mut target = change("aaaa", NodeKind::Mutable, &[]);
+        target.is_empty = true;
+        let snapshot = repo(vec![target.clone()]);
+        let menu = menu(Some(&snapshot), change_target(&target));
+        assert!(find(&menu, "change.absorb").is_none());
+        assert!(find(&menu, "change.revert").is_none());
+    }
+
+    const EDITORS: [AppInfo; 2] = [
+        AppInfo {
+            id: "zed",
+            label: "Zed",
+        },
+        AppInfo {
+            id: "vscode",
+            label: "VS Code",
+        },
+    ];
+
+    fn with_editors(snapshot: &RepoSnapshot, target: MenuTarget) -> Vec<MenuSection> {
+        build_menu(&MenuContext {
+            snapshot: Some(snapshot),
+            selection: "",
+            target,
+            editors: &EDITORS,
+            can_undo: false,
+        })
+    }
+
+    #[test]
+    fn a_diff_line_opens_its_file_there_in_each_editor() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::WorkingCopy, &[])]);
+        let file = lib_rs();
+        let menu = with_editors(
+            &snapshot,
+            diff_target(&file, true, Some((Some(1), Some(1)))),
+        );
+        assert_eq!(
+            find(&menu, "diff.openEditor").unwrap().action,
+            Some(MenuAction::OpenInEditor {
+                editor: "zed".into(),
+                path: "/tmp/repo/src/lib.rs".into(),
+                line: Some(1),
+            })
+        );
+        let with: Vec<&str> = find(&menu, "diff.openWith").unwrap().children[0]
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(with, ["Zed", "VS Code"]);
+        // Beyond the old menu: Finder sits with the editors.
+        assert!(find(&menu, "diff.reveal").is_some());
+    }
+
+    #[test]
+    fn a_removed_line_opens_at_its_old_number_and_a_removed_file_not_at_all() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::Mutable, &[])]);
+        let file = lib_rs();
+        let deleted = with_editors(&snapshot, diff_target(&file, true, Some((Some(5), None))));
+        assert!(matches!(
+            find(&deleted, "diff.openEditor").unwrap().action,
+            Some(MenuAction::OpenInEditor { line: Some(5), .. })
+        ));
+        let mut removed = lib_rs();
+        removed.status = FileStatus::Removed;
+        let gone = with_editors(
+            &snapshot,
+            diff_target(&removed, true, Some((Some(1), Some(1)))),
+        );
+        assert!(find(&gone, "diff.openEditor").is_none());
+        assert!(find(&gone, "diff.copyPath").is_some());
+    }
+
+    #[test]
+    fn a_mutable_change_s_diff_offers_patches_a_move_and_a_discard() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::Mutable, &[])]);
+        let file = lib_rs();
+        let menu = menu(
+            Some(&snapshot),
+            diff_target(&file, true, Some((Some(1), Some(1)))),
+        );
+        let FileDiffContent::Text { hunks, .. } = &file.content else {
+            unreachable!()
+        };
+        assert_eq!(
+            find(&menu, "diff.copyHunk").unwrap().action,
+            Some(MenuAction::CopyText(unified_patch(&file, Some(&hunks[0]))))
+        );
+        assert!(find(&menu, "diff.copyFilePatch").is_some());
+        assert_eq!(
+            find(&menu, "diff.moveFile").unwrap().action,
+            Some(MenuAction::Intent(UiIntent::Split {
+                into: true,
+                path: Some("src/lib.rs".into())
+            }))
+        );
+        let discard = find(&menu, "diff.restoreFile").unwrap();
+        assert!(discard.danger);
+        assert_eq!(
+            discard.action,
+            Some(MenuAction::RestoreFile {
+                change_id: "aaaa".into(),
+                path: "src/lib.rs".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_hunk_or_line_discard_is_offered_only_where_its_coordinates_hold() {
+        use DiffLineKind::*;
+        let snapshot = repo(vec![change("aaaa", NodeKind::Mutable, &[])]);
+        let hunks = vec![
+            DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                context: None,
+                lines: vec![line(Context, "a"), line(Added, "b")],
+            },
+            DiffHunk {
+                old_start: 10,
+                new_start: 11,
+                context: None,
+                lines: vec![line(Context, "c"), line(Removed, "d"), line(Added, "e")],
+            },
+        ];
+        let two = FileDiff {
+            content: FileDiffContent::Text {
+                hunks: hunks.clone(),
+                truncated: false,
+            },
+            ..lib_rs()
+        };
+        // The second hunk's added row: that hunk's coordinates, which the
+        // backend checks again before discarding, and the row itself.
+        let menu = menu(
+            Some(&snapshot),
+            diff_target(&two, true, Some((None, Some(12)))),
+        );
+        let coords = SplitHunk {
+            old_start: 10,
+            new_start: 11,
+            old_lines: 2,
+            new_lines: 2,
+            lines: None,
+        };
+        let discard = find(&menu, "diff.restoreHunk").unwrap();
+        assert!(discard.danger);
+        assert_eq!(
+            discard.action,
+            Some(MenuAction::RestoreHunk {
+                change_id: "aaaa".into(),
+                path: "src/lib.rs".into(),
+                hunk: coords.clone(),
+            })
+        );
+        let one_line = find(&menu, "diff.restoreLine").unwrap();
+        assert!(one_line.danger);
+        assert_eq!(
+            one_line.action,
+            Some(MenuAction::RestoreHunk {
+                change_id: "aaaa".into(),
+                path: "src/lib.rs".into(),
+                hunk: SplitHunk {
+                    lines: Some(vec![2]),
+                    ..coords
+                },
+            })
+        );
+        // A hunk of one changed line has no line to pick apart from it; a
+        // context row picks none, though its hunk is still offered.
+        let first = self::menu(
+            Some(&snapshot),
+            diff_target(&two, true, Some((None, Some(2)))),
+        );
+        assert!(find(&first, "diff.restoreHunk").is_some());
+        assert!(find(&first, "diff.restoreLine").is_none());
+        let context = self::menu(
+            Some(&snapshot),
+            diff_target(&two, true, Some((Some(10), Some(11)))),
+        );
+        assert!(find(&context, "diff.restoreHunk").is_some());
+        assert!(find(&context, "diff.restoreLine").is_none());
+        // Nothing on a one-hunk file (that is the file), a truncated diff
+        // (its coordinates cannot be trusted), or off the rows.
+        let single = lib_rs();
+        let whole = self::menu(
+            Some(&snapshot),
+            diff_target(&single, true, Some((Some(1), Some(1)))),
+        );
+        assert!(find(&whole, "diff.restoreHunk").is_none());
+        let truncated = FileDiff {
+            content: FileDiffContent::Text {
+                hunks,
+                truncated: true,
+            },
+            ..lib_rs()
+        };
+        let cut = self::menu(
+            Some(&snapshot),
+            diff_target(&truncated, true, Some((None, Some(12)))),
+        );
+        assert!(find(&cut, "diff.restoreHunk").is_none());
+        let off_row = self::menu(Some(&snapshot), diff_target(&two, true, None));
+        assert!(find(&off_row, "diff.restoreHunk").is_none());
+    }
+
+    #[test]
+    fn an_immutable_change_s_diff_is_read_only_and_off_row_copies_no_hunk() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::Immutable, &[])]);
+        let file = lib_rs();
+        let menu = menu(Some(&snapshot), diff_target(&file, false, None));
+        assert!(find(&menu, "diff.restoreFile").is_none());
+        assert!(find(&menu, "diff.moveFile").is_none());
+        assert!(find(&menu, "diff.copyHunk").is_none());
+        assert!(find(&menu, "diff.copyFilePatch").is_some());
+    }
+
+    #[test]
+    fn a_conflicted_file_offers_its_merge_tool() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::Mutable, &[])]);
+        let file = FileDiff {
+            has_conflict: true,
+            ..lib_rs()
+        };
+        let menu = menu(
+            Some(&snapshot),
+            MenuTarget::Diff {
+                file: &file,
+                change_id: "aaaa",
+                mutable: true,
+                line: Some((Some(1), Some(1))),
+                resolve_tool: Some("meld"),
+            },
+        );
+        assert_eq!(
+            find(&menu, "diff.resolve").unwrap().action,
+            Some(MenuAction::ResolveConflict {
+                change_id: "aaaa".into(),
+                path: "src/lib.rs".into()
+            })
+        );
+    }
+
+    #[test]
+    fn annotate_is_offered_on_line_shaped_files_the_change_still_has() {
+        let snapshot = repo(vec![change("aaaa", NodeKind::Mutable, &[])]);
+        let file = lib_rs();
+        let on = |file: &FileDiff, mutable| {
+            find(
+                &menu(Some(&snapshot), diff_target(file, mutable, None)),
+                "diff.annotate",
+            )
+            .map(|item| item.action.clone())
+        };
+        assert_eq!(
+            on(&file, true),
+            Some(Some(MenuAction::AnnotateFile {
+                change_id: "aaaa".into(),
+                path: "src/lib.rs".into()
+            }))
+        );
+        // A reading verb: immutable changes have it too.
+        assert!(on(&file, false).is_some());
+        // Text whose diff ran past what renders still annotates.
+        let omitted = FileDiff {
+            content: FileDiffContent::Omitted,
+            ..lib_rs()
+        };
+        assert!(on(&omitted, true).is_some());
+        // Gone from the change's tree, or not made of lines.
+        let removed = FileDiff {
+            status: FileStatus::Removed,
+            ..lib_rs()
+        };
+        assert!(on(&removed, true).is_none());
+        let binary = FileDiff {
+            content: FileDiffContent::Binary {
+                old_size: Some(1),
+                new_size: Some(2),
+            },
+            ..lib_rs()
+        };
+        assert!(on(&binary, true).is_none());
+    }
+
+    fn bookmark(edit: impl FnOnce(&mut BookmarkState)) -> BookmarkState {
+        let mut bookmark = BookmarkState {
+            name: "feature".into(),
+            target: "aaaa".into(),
+            remote: None,
+            sync: jiji_core::snapshot::SyncState::LocalOnly,
+            is_trunk: false,
+            is_local: true,
+            tracked: false,
+            is_merged: false,
+            target_description: String::new(),
+            target_author: String::new(),
+            target_timestamp: String::new(),
+        };
+        edit(&mut bookmark);
+        bookmark
+    }
+
+    fn pull(checks: ChecksRollup) -> PrSummary {
+        PrSummary {
+            number: 7,
+            title: "a change".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            state: PrState::Open,
+            is_draft: false,
+            head_branch: "feature".into(),
+            head_commit: "abc".into(),
+            head_owner: Some("o".into()),
+            base_branch: "main".into(),
+            body: None,
+            review: ReviewDecision::None,
+            checks,
+        }
+    }
+
+    fn bookmark_menu_of(
+        bookmark: &BookmarkState,
+        pr: Option<&PrSummary>,
+        remotes: bool,
+    ) -> Vec<MenuSection> {
+        menu(
+            None,
+            MenuTarget::Bookmark {
+                bookmark,
+                pr,
+                has_remotes: remotes,
+            },
+        )
+    }
+
+    #[test]
+    fn a_local_bookmark_pushes_is_managed_copied_and_deleted() {
+        let local = bookmark(|_| {});
+        assert_eq!(
+            sections(&bookmark_menu_of(&local, None, true)),
+            [
+                vec!["bookmark.push", "bookmark.manage"],
+                vec!["bookmark.copyName"],
+                vec!["bookmark.delete"]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_remote_bookmark_tracks_instead_and_trunk_never_deletes() {
+        let remote = bookmark(|b| {
+            b.is_local = false;
+            b.remote = Some("origin".into());
+        });
+        let menu = bookmark_menu_of(&remote, None, true);
+        assert!(find(&menu, "bookmark.track").is_some());
+        assert!(find(&menu, "bookmark.push").is_none());
+        assert!(find(&menu, "bookmark.delete").is_none());
+        let trunk = bookmark(|b| b.is_trunk = true);
+        let menu = bookmark_menu_of(&trunk, None, false);
+        assert!(find(&menu, "bookmark.delete").is_none());
+        assert!(find(&menu, "bookmark.push").is_none());
+    }
+
+    #[test]
+    fn a_bookmark_with_a_pull_request_leads_with_it() {
+        let pr = pull(ChecksRollup::Passing);
+        let local = bookmark(|_| {});
+        assert_eq!(
+            sections(&bookmark_menu_of(&local, Some(&pr), true))[0],
+            ["bookmark.openPr", "bookmark.copyPrUrl"]
+        );
+    }
+
+    #[test]
+    fn a_pr_badge_opens_and_copies_and_reruns_or_fetches_where_that_applies() {
+        let failing = pull(ChecksRollup::Failing);
+        let menu = menu(
+            None,
+            MenuTarget::Pr {
+                pr: &failing,
+                remote: Some("origin"),
+                review_bookmark_taken: false,
+            },
+        );
+        assert_eq!(
+            sections(&menu),
+            [
+                vec!["pr.open", "pr.copyUrl", "pr.copyNumber"],
+                vec!["pr.rerunCi", "pr.fetch"]
+            ]
+        );
+        assert_eq!(
+            find(&menu, "pr.fetch").unwrap().action,
+            Some(MenuAction::FetchPr {
+                remote: "origin".into(),
+                number: 7,
+                bookmark: "pr/7".into()
+            })
+        );
+        let passing = pull(ChecksRollup::Passing);
+        let quiet = self::menu(
+            None,
+            MenuTarget::Pr {
+                pr: &passing,
+                remote: None,
+                review_bookmark_taken: false,
+            },
+        );
+        assert!(find(&quiet, "pr.rerunCi").is_none());
+        assert!(find(&quiet, "pr.fetch").is_none());
+    }
+
+    #[test]
+    fn a_past_operation_restores_or_backs_out_and_the_current_one_undoes() {
+        let past = menu(
+            None,
+            MenuTarget::Operation {
+                op_id: "op1",
+                is_current: false,
+            },
+        );
+        assert_eq!(
+            sections(&past),
+            [vec!["op.restore", "op.revert"], vec!["op.copyId"]]
+        );
+        let current = menu(
+            None,
+            MenuTarget::Operation {
+                op_id: "op2",
+                is_current: true,
+            },
+        );
+        assert!(find(&current, "op.restore").is_none());
+        assert_eq!(
+            find(&current, "op.revert").unwrap().label,
+            "Undo This Operation"
+        );
+    }
+
+    #[test]
+    fn a_conflict_row_resolves_and_opens_only_the_working_copy_s_file() {
+        let snapshot = repo(vec![]);
+        let conflict = |change_id, wc, tool| {
+            build_menu(&MenuContext {
+                snapshot: Some(&snapshot),
+                selection: "",
+                target: MenuTarget::Conflict {
+                    change_id: Some(change_id),
+                    path: "src/x.rs",
+                    is_working_copy: wc,
+                    resolve_tool: tool,
+                },
+                editors: &EDITORS[..1],
+                can_undo: false,
+            })
+        };
+        let here = conflict("aaaa", true, Some("meld"));
+        assert!(find(&here, "conflict.resolve").is_some());
+        assert!(matches!(
+            &find(&here, "conflict.openEditor").unwrap().action,
+            Some(MenuAction::OpenInEditor { path, .. }) if path == "/tmp/repo/src/x.rs"
+        ));
+        let elsewhere = conflict("bbbb", false, None);
+        assert!(find(&elsewhere, "conflict.openEditor").is_none());
+        assert!(find(&elsewhere, "conflict.resolve").is_none());
+        assert!(find(&elsewhere, "conflict.copyPath").is_some());
+    }
+
+    #[test]
+    fn the_breadcrumb_undoes_and_leads_to_the_timeline() {
+        let menu = build_menu(&MenuContext {
+            snapshot: None,
+            selection: "",
+            target: MenuTarget::Breadcrumb,
+            editors: &[],
+            can_undo: true,
+        });
+        assert_eq!(sections(&menu), [vec!["breadcrumb.undo", "breadcrumb.ops"]]);
+    }
+
+    #[test]
+    fn before_a_repo_is_open_the_surface_offers_opening_one() {
+        let menu = menu(None, MenuTarget::Surface);
+        assert_eq!(sections(&menu), [vec!["app.palette", "app.openRepo"]]);
+    }
+
+    #[test]
+    fn selected_text_leads_any_menu_but_a_field_s_with_copy() {
+        let snapshot = repo(vec![]);
+        let menu = build_menu(&MenuContext {
+            snapshot: Some(&snapshot),
+            selection: "some diff text",
+            target: MenuTarget::Surface,
+            editors: &[],
+            can_undo: false,
+        });
+        assert_eq!(sections(&menu)[0], ["copy.selection"]);
+        assert_eq!(
+            find(&menu, "copy.selection").unwrap().action,
+            Some(MenuAction::CopyText("some diff text".into()))
+        );
+    }
+
+    fn hunks_at_1_and_10() -> Vec<DiffHunk> {
+        use DiffLineKind::*;
+        vec![
+            DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                context: None,
+                lines: vec![line(Context, "x"), line(Added, "x")],
+            },
+            DiffHunk {
+                old_start: 10,
+                new_start: 11,
+                context: None,
+                lines: vec![line(Removed, "x"), line(Context, "x")],
+            },
+        ]
+    }
+
+    #[test]
+    fn a_line_finds_the_hunk_covering_it_on_either_side_or_none() {
+        let hunks = hunks_at_1_and_10();
+        assert_eq!(hunk_at(&hunks, (None, Some(2))), Some(&hunks[0]));
+        assert_eq!(hunk_at(&hunks, (Some(10), None)), Some(&hunks[1]));
+        assert_eq!(hunk_at(&hunks, (Some(5), Some(5))), None);
+    }
+
+    #[test]
+    fn a_changed_row_resolves_to_its_index_and_a_context_row_to_none() {
+        use DiffLineKind::*;
+        // Old 10, new 12: context, removed 10 and 11, added 13, context.
+        let hunk = DiffHunk {
+            old_start: 10,
+            new_start: 12,
+            context: None,
+            lines: vec![
+                line(Context, "x"),
+                line(Removed, "x"),
+                line(Removed, "x"),
+                line(Added, "x"),
+                line(Context, "x"),
+            ],
+        };
+        assert_eq!(line_index_at(&hunk, (Some(11), None)), Some(1));
+        assert_eq!(line_index_at(&hunk, (Some(12), None)), Some(2));
+        assert_eq!(line_index_at(&hunk, (None, Some(13))), Some(3));
+        assert_eq!(line_index_at(&hunk, (Some(10), Some(12))), None);
+        assert_eq!(line_index_at(&hunk, (None, Some(99))), None);
+    }
+
+    fn keep_before_after() -> FileDiff {
+        use DiffLineKind::*;
+        FileDiff {
+            path: "src/a.ts".into(),
+            status: FileStatus::Modified,
+            renamed_from: None,
+            has_conflict: false,
+            content: FileDiffContent::Text {
+                hunks: vec![
+                    DiffHunk {
+                        old_start: 3,
+                        new_start: 3,
+                        context: None,
+                        lines: vec![
+                            line(Context, "keep"),
+                            line(Removed, "before"),
+                            line(Added, "after"),
+                        ],
+                    },
+                    DiffHunk {
+                        old_start: 10,
+                        new_start: 10,
+                        context: None,
+                        lines: vec![line(Added, "tail")],
+                    },
+                ],
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_patch_carries_git_s_headers_and_prefixes() {
+        let mut file = keep_before_after();
+        let FileDiffContent::Text { hunks, .. } = &mut file.content else {
+            unreachable!()
+        };
+        hunks.truncate(1);
+        assert_eq!(
+            unified_patch(&file, None),
+            "--- a/src/a.ts\n+++ b/src/a.ts\n@@ -3,2 +3,2 @@\n keep\n-before\n+after\n"
+        );
+    }
+
+    #[test]
+    fn a_patch_of_one_hunk_and_of_added_or_removed_files() {
+        let file = keep_before_after();
+        let FileDiffContent::Text { hunks, .. } = &file.content else {
+            unreachable!()
+        };
+        assert!(unified_patch(&file, Some(&hunks[1])).contains("@@ -10,0 +10,1 @@"));
+        let added = FileDiff {
+            status: FileStatus::Added,
+            ..keep_before_after()
+        };
+        assert!(unified_patch(&added, None).contains("--- /dev/null"));
+        let removed = FileDiff {
+            status: FileStatus::Removed,
+            ..keep_before_after()
+        };
+        assert!(unified_patch(&removed, None).contains("+++ /dev/null"));
+    }
+
+    #[test]
+    fn a_rename_s_patch_names_its_source_and_non_text_has_none() {
+        let renamed = FileDiff {
+            renamed_from: Some("src/old.ts".into()),
+            ..keep_before_after()
+        };
+        assert!(unified_patch(&renamed, None).contains("--- a/src/old.ts"));
+        let binary = FileDiff {
+            content: FileDiffContent::Binary {
+                old_size: Some(100),
+                new_size: Some(200),
+            },
+            ..keep_before_after()
+        };
+        assert_eq!(unified_patch(&binary, None), "");
+    }
+
+    #[test]
+    fn a_review_bookmark_is_pr_n_unless_a_local_one_has_the_name() {
+        assert_eq!(review_bookmark(213), "pr/213");
+        let bookmarks = [
+            bookmark(|b| b.name = "pr/213".into()),
+            bookmark(|b| {
+                b.name = "remote-only".into();
+                b.is_local = false;
+            }),
+        ];
+        assert!(bookmark_taken("pr/213", &bookmarks));
+        assert!(bookmark_taken(" pr/213 ", &bookmarks));
+        // A remote-only entry leaves the name free locally.
+        assert!(!bookmark_taken("remote-only", &bookmarks));
+        assert!(!bookmark_taken("pr/7", &bookmarks));
+        assert!(!bookmark_taken("pr/7", &[]));
     }
 }
