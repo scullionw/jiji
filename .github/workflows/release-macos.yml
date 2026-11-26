@@ -25,7 +25,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # What fails here usually fails after the build (signing,
+      # notarization, packaging): the next attempt keeps the build.
       - uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: check tag matches app version
         run: |
@@ -126,7 +130,18 @@ jobs:
           mkdir -p "$STAGE"
           ditto "$APP" "$STAGE/Jiji.app"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname Jiji -srcfolder "$STAGE" -format UDZO "$DMG"
+          # Sized by hand: left to measure the folder itself, hdiutil can
+          # make its working volume too small on a runner and stop with
+          # "No space left on device". A runner also holds a fresh volume
+          # busy now and then, so the image gets three tries.
+          SIZE_MB=$(( $(du -sm "$STAGE" | cut -f1) + 64 ))
+          for TRY in 1 2 3; do
+            rm -f "$DMG"
+            hdiutil create -volname Jiji -srcfolder "$STAGE" -fs HFS+ \
+              -size "${SIZE_MB}m" -format UDZO "$DMG" && break
+            test "$TRY" -lt 3
+            sleep 10
+          done
           codesign --force --timestamp --sign "$JIJI_SIGN_IDENTITY" "$DMG"
           notarize "$DMG"
           xcrun stapler staple "$DMG"
