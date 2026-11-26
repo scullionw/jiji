@@ -48,6 +48,24 @@ jobs:
             echo "Download the DMG below: a universal build, signed and notarized. Existing installs update in place."
           } >> "$NOTES"
 
+      # Apple refuses notarization while the developer account has an
+      # agreement to accept or a lapsed membership. Asking for the
+      # account's history needs the same standing and answers in seconds,
+      # before the build instead of after it.
+      - name: check the notary service accepts this account
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY"
+          if ! OUT="$(xcrun notarytool history \
+            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" 2>&1)"; then
+            echo "$OUT"
+            exit 1
+          fi
+
       - name: import the signing certificate
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}

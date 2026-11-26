@@ -1,0 +1,30 @@
+name: notary-check
+
+# Asks Apple whether this account can notarize right now, in seconds:
+#   gh workflow run notary-check && gh run watch
+# Apple refuses (HTTP 403) while the developer account has an agreement to
+# accept or its membership has lapsed, and the release workflow would only
+# find out after its build. Run this before tagging a release.
+on:
+  workflow_dispatch:
+
+jobs:
+  notary-check:
+    runs-on: macos-latest
+    steps:
+      - name: ask the notary service for this account's history
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY"
+          # The answer is the exit status; the history itself stays out of
+          # the log.
+          if ! OUT="$(xcrun notarytool history \
+            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" 2>&1)"; then
+            echo "$OUT"
+            exit 1
+          fi
+          echo "Apple accepts notarization requests from this account."

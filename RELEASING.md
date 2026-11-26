@@ -53,6 +53,8 @@ Publishing is the moment every install is offered the update. A draft that turns
 
 It publishes, tags and changes nothing; the build is the only thing it writes, and `CARGO_TARGET_DIR` moves it.
 
+One thing it cannot see is whether Apple will notarize: the key for that lives only in the repository's secrets. `gh workflow run notary-check && gh run watch` asks Apple in a few seconds. A refusal with `HTTP status code: 403. A required agreement is missing or has expired` means the Apple Developer account has an agreement to accept, or its membership has lapsed: the Account Holder signs in at [developer.apple.com/account](https://developer.apple.com/account) and clears it. The release workflow asks the same question before it builds; if it stopped there, re-run it once the account is in order (`gh run rerun <run id>`). The tag stays where it is.
+
 ## Secrets
 
 ```txt
