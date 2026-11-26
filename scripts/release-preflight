@@ -6,10 +6,10 @@
 #   scripts/release-preflight            for the tag app-v<workspace version>
 #   scripts/release-preflight app-v0.5.0 for the tag you are about to push
 #
-# It builds the bundle the workflow builds (universal when both Rust
-# targets are installed, into target/release/bundle/Jiji.app) and reads the
-# repository's secret names and visibility through `gh` when it is signed
-# in. Nothing is published, tagged or changed.
+# It builds the bundle the workflow builds (Apple Silicon, into
+# target/release/bundle/Jiji.app) and reads the repository's secret names
+# and visibility through `gh` when it is signed in. Nothing is published,
+# tagged or changed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -67,30 +67,13 @@ else
   fail "the update feed is $feed, not $repo's latest release"
 fi
 
-# Both slices of the universal binary.
-missing=()
-installed="$(rustup target list --installed 2>/dev/null || true)"
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
-  if grep -qx "$target" <<<"$installed"; then
-    ok "Rust target $target is installed"
-  else
-    missing+=("$target")
-    fail "Rust target $target is not installed (rustup target add $target)"
-  fi
-done
-
-# The bundle, as the workflow builds it. Without both targets this Mac's
-# own slice still shows whether the bundle builds and holds together.
+# The bundle, as the workflow builds it: for Apple Silicon, whatever this
+# Mac is.
+RUST_TARGET=aarch64-apple-darwin
 log="$(mktemp -t jiji-preflight)"
-if [[ ${#missing[@]} -eq 0 ]]; then
-  build=(env JIJI_UNIVERSAL=1 scripts/bundle.sh)
-  archs="arm64 x86_64"
-else
-  build=(scripts/bundle.sh)
-  archs="$(uname -m)"
-  warn "building this Mac's slice only ($archs): the universal build needs both targets"
-fi
-if "${build[@]}" >"$log" 2>&1; then
+if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then
+  fail "Rust target $RUST_TARGET is not installed (rustup target add $RUST_TARGET)"
+elif env JIJI_TARGET="$RUST_TARGET" scripts/bundle.sh >"$log" 2>&1; then
   ok "the bundle builds: $APP"
 else
   fail "the bundle does not build; the end of its log ($log):"
@@ -110,19 +93,22 @@ if [[ -d "$APP" ]]; then
   else
     fail "the bundle says it is ${shown:-no version}, not $VERSION"
   fi
-  # The system checks the bundle's floor, the loader each slice's.
-  floor="$(plutil -extract LSMinimumSystemVersion raw "$plist" 2>/dev/null || true)"
+  # One architecture, so the download stays small.
   binary="$APP/Contents/MacOS/jiji-desktop"
-  for arch in $archs; do
-    minos="$(vtool -arch "$arch" -show-build "$binary" 2>/dev/null | awk '$1 == "minos" { print $2 }')"
-    if [[ -z "$minos" ]]; then
-      fail "the binary has no $arch slice"
-    elif [[ "$minos" == "$floor" ]]; then
-      ok "the $arch slice is built for macOS $floor, the bundle's floor"
-    else
-      fail "the $arch slice is built for macOS $minos, but the bundle declares $floor"
-    fi
-  done
+  archs="$(lipo -archs "$binary" 2>/dev/null || true)"
+  if [[ "$archs" == arm64 ]]; then
+    ok "the binary is Apple Silicon only"
+  else
+    fail "the binary holds ${archs:-no architecture}, not arm64 alone"
+  fi
+  # The system checks the bundle's floor, the loader the binary's.
+  floor="$(plutil -extract LSMinimumSystemVersion raw "$plist" 2>/dev/null || true)"
+  minos="$(vtool -show-build "$binary" 2>/dev/null | awk '$1 == "minos" { print $2 }')"
+  if [[ "$minos" == "$floor" ]]; then
+    ok "the binary is built for macOS $floor, the bundle's floor"
+  else
+    fail "the binary is built for macOS ${minos:-nothing}, but the bundle declares $floor"
+  fi
   if verified="$(codesign --verify --deep --strict "$APP" 2>&1)"; then
     ok "codesign verifies the bundle"
   else

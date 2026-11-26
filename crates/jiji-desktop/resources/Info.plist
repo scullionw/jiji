@@ -23,7 +23,7 @@
 	<string>0.0.0</string>
 	<!-- The oldest macOS this GPUI runs on: it reads Low Power Mode
 	     (macOS 12) as it starts, and links UniformTypeIdentifiers
-	     (macOS 11). scripts/bundle.sh builds both slices for it. -->
+	     (macOS 11). scripts/bundle.sh builds for it. -->
 	<key>LSMinimumSystemVersion</key>
 	<string>12.0</string>
 	<key>LSApplicationCategoryType</key>

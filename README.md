@@ -7,7 +7,7 @@ A desktop workbench for [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) repositor
   <img alt="Jiji showing the jj repository: the change graph on the left, a change's diff on the right" src="docs/images/workbench-light.png">
 </picture>
 
-**[Download for macOS](https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_universal.dmg)** (universal, signed and notarized) · [jijiworkbench.com](https://jijiworkbench.com) · [Changelog](CHANGELOG.md)
+**[Download for macOS](https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_aarch64.dmg)** (Apple Silicon, signed and notarized) · [jijiworkbench.com](https://jijiworkbench.com) · [Changelog](CHANGELOG.md)
 
 Jiji puts jj's model on screen: the change graph, the diff of whatever you
 select, and the operation log that makes every rewrite undoable. It is built
@@ -45,7 +45,10 @@ Open a plain Git repository and Jiji offers to set jj up in it, the way
 Download the DMG above. Jiji updates itself: a new version downloads in the
 background and waits for you to click "Restart to update".
 
-- macOS only for now. Linux and Windows builds aren't available yet.
+- macOS on Apple Silicon only for now. Linux and Windows builds aren't
+  available yet.
+- Intel Macs can run [0.5.0](https://github.com/scullionw/jiji/releases/tag/app-v0.5.0),
+  the last build made for them.
 - Supported on the current macOS release and the one before it. Older
   systems back to macOS 12 can open it, untested.
 - `git` must be on your `PATH` for fetch and push, as with `jj` itself.

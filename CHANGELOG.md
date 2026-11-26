@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 - 2026-11-26
+
+- Jiji is now built for Apple Silicon only, which halves the download
+  (about 18 MB, down from 36). The universal build carried an Intel half
+  that an Apple Silicon Mac never runs.
+- Intel Macs are not offered this update. 0.5.0 is the last build that
+  runs on them, and it stays on the Releases page.
+
 ## 0.5.0 - 2026-11-26
 
 Jiji is now a native app. The interface was rewritten from a web view to

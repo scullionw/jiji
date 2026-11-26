@@ -1,6 +1,8 @@
 //! App updates from the release feed: a `latest.json` manifest on the
-//! newest GitHub release, naming one signed `.app.tar.gz` per architecture
-//! (the release workflow publishes a universal archive under both).
+//! newest GitHub release, naming one signed `.app.tar.gz` per architecture.
+//! Releases are built for Apple Silicon only, so the manifest has that one
+//! entry: a copy running on another architecture finds none for itself and
+//! is offered nothing.
 //!
 //! A found update downloads in the background and then waits — nothing
 //! restarts until the user asks, so a release never interrupts a describe
@@ -527,6 +529,25 @@ mod tests {
         assert_eq!(release_in(manifest("0.5.0+build.2"), "0.5.0"), Ok(None));
         let broken = release_in(manifest("0.5.0.1"), "0.5.0").unwrap_err();
         assert!(broken.contains("0.5.0.1"), "{broken}");
+    }
+
+    /// Releases are built for one architecture. A copy on another finds
+    /// nothing for itself in the feed and stays as it is: no error, and
+    /// never the other architecture's archive.
+    #[test]
+    fn a_release_with_no_build_for_this_mac_offers_nothing() {
+        let other = match platform_key() {
+            "darwin-aarch64" => "darwin-x86_64",
+            _ => "darwin-aarch64",
+        };
+        let feed: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "9.0.0",
+            "platforms": {
+                other: {"signature": "c2ln", "url": "https://example.invalid/a.tar.gz"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(release_in(feed, "0.5.0"), Ok(None));
     }
 
     #[test]

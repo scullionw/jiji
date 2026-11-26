@@ -1,12 +1,14 @@
 # Releasing Jiji for macOS
 
-Jiji ships outside the Mac App Store through GitHub Releases. Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`, which builds a universal `Jiji.app`, signs and notarizes it, and drafts a release with:
+Jiji ships outside the Mac App Store through GitHub Releases. Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`, which builds `Jiji.app` for Apple Silicon, signs and notarizes it, and drafts a release with:
 
 | Asset | |
 |---|---|
-| `Jiji_darwin_universal.dmg` | The download. `https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_universal.dmg` always serves the newest; the README and the website link to it. |
-| `Jiji_darwin_universal.app.tar.gz` and `.sig` | What an installed copy downloads to update itself, and its signature. |
-| `latest.json` | The updater's manifest: the version, the notes, and where the archive is. |
+| `Jiji_darwin_aarch64.dmg` | The download. `https://github.com/scullionw/jiji/releases/latest/download/Jiji_darwin_aarch64.dmg` always serves the newest; the README and the website link to it. |
+| `Jiji_darwin_aarch64.app.tar.gz` and `.sig` | What an installed copy downloads to update itself, and its signature. |
+| `latest.json` | The updater's manifest: the version, the notes, and where the archive is. It has one entry, `darwin-aarch64`. |
+
+Jiji ships for Apple Silicon only, which keeps the download small. If another architecture is ever added, it is a separate build with its own DMG, archive and manifest entry (`JIJI_TARGET` in `scripts/bundle.sh`), never a second half of a universal binary. An Intel install finds no entry for itself in the manifest and stays on 0.5.0, the last universal release.
 
 The app binary is `jiji-desktop`, and it embeds the `jiji` command line from `crates/jiji-cli`: the `jiji` entry point the app installs forwards to it, so the DMG carries the CLI without a second executable.
 
@@ -32,7 +34,7 @@ The workflow refuses a tag that does not match the workspace version.
 
 ```bash
 gh release download app-v0.5.0 --pattern '*.dmg' --dir /tmp/jiji-0.5.0
-open /tmp/jiji-0.5.0/Jiji_darwin_universal.dmg
+open /tmp/jiji-0.5.0/Jiji_darwin_aarch64.dmg
 
 gh release edit app-v0.5.0 --draft=false --latest
 ```
@@ -46,9 +48,8 @@ Publishing is the moment every install is offered the update. A draft that turns
 - the tag matches the workspace version, and does not already tag another commit (a version that has shipped);
 - `CHANGELOG.md` has a section for the version, with notes in it;
 - the update feed in `crates/jiji-desktop/src/host/update.rs` is the latest release of the repository `origin` points at;
-- both Rust targets are installed (`rustup target add x86_64-apple-darwin` on an Apple Silicon Mac);
-- the bundle builds, universal as the workflow builds it (this Mac's slice alone, with a blocker, when a target is missing), into `target/release/bundle/Jiji.app`;
-- its `Info.plist` passes `plutil -lint` and names the version, each slice is built for the macOS floor the bundle declares, and `codesign --verify --deep --strict` passes;
+- the bundle builds for Apple Silicon, as the workflow builds it, into `target/release/bundle/Jiji.app`;
+- its `Info.plist` passes `plutil -lint` and names the version, the binary is Apple Silicon only and built for the macOS floor the bundle declares, and `codesign --verify --deep --strict` passes;
 - with `gh` signed in: every secret the workflow names is set (names only; an unset `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is a warning, since an updater key may have no password), and the repository is public, which downloads and update checks need. Without `gh`, or signed out of it, these are skipped with a note.
 
 It publishes, tags and changes nothing; the build is the only thing it writes, and `CARGO_TARGET_DIR` moves it.
