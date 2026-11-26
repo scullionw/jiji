@@ -1,6 +1,6 @@
 # Releasing Jiji for macOS
 
-Jiji ships outside the Mac App Store through GitHub Releases. Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`, which builds a universal `Jiji.app`, signs and notarizes it, and publishes:
+Jiji ships outside the Mac App Store through GitHub Releases. Pushing an `app-v*` tag starts `.github/workflows/release-macos.yml`, which builds a universal `Jiji.app`, signs and notarizes it, and drafts a release with:
 
 | Asset | |
 |---|---|
@@ -27,6 +27,17 @@ git push origin HEAD app-v0.5.0
 ```
 
 The workflow refuses a tag that does not match the workspace version.
+
+4. The workflow leaves the release as a draft, so nothing reaches installed copies or the download link yet. Open the build it made, then publish:
+
+```bash
+gh release download app-v0.5.0 --pattern '*.dmg' --dir /tmp/jiji-0.5.0
+open /tmp/jiji-0.5.0/Jiji_darwin_universal.dmg
+
+gh release edit app-v0.5.0 --draft=false --latest
+```
+
+Publishing is the moment every install is offered the update. A draft that turns out wrong costs nothing: delete it (`gh release delete app-v0.5.0 --cleanup-tag`), fix, and tag again.
 
 ## Preflight
 

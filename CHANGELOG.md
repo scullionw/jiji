@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.5.0 - 2026-11-26
+
+Jiji is now a native app. The interface was rewritten from a web view to
+GPUI, the toolkit behind the Zed editor, so the graph and the diffs are
+drawn on the GPU by the same Rust program that reads your repository with
+jj-lib. It is the same workbench, with the same layout, shortcuts and
+`jiji` command line. Your open tabs, preferences, saved views, window
+placement and license carry over the first time it opens.
+
+- A refreshed look. Change ids in the graph take their workstream's lane
+  color. The change header leads with a larger title, then the author,
+  where the change sits in its stack ("4 of 4 in Op log filter") and a
+  five-block diffstat. Added and removed runs carry a bar down the left
+  edge of the diff.
+- The title bar has one command field (⌘K) in place of separate buttons,
+  with trunk's state and Fetch beside it. History search stays on ⌘⇧F,
+  themes and the license moved into Settings, and a tab's close button
+  shows on hover.
+- A comparison against a pinned change or a range is read-only. File, hunk
+  and line actions are offered on a change's own diff, where they cannot
+  land on the wrong change.
+- Updates are checked twice: after the download, and again at "Restart to
+  update" on the exact bytes that get installed. If the swap fails, the
+  app you had is put back. An app in a folder you cannot write to asks for
+  an administrator password instead of failing.
+- Jiji keeps a log at `~/Library/Logs/com.lauf.jiji/Jiji.log`. If it quits
+  unexpectedly, the next launch restores your tabs, says so, and offers the
+  log.
+- Requires macOS 12 or later, and is tested on the current macOS release
+  and the one before it. 0.4.1 ran on older systems: a Mac on macOS 11 or
+  earlier cannot open this release and should decline the update. 0.4.1
+  stays on the Releases page.
+- Building from source is `cargo build`. Node, Bun and the web toolchain
+  are gone, and the repository is one Cargo workspace.
+
+Known gaps in this release:
+
+- An error while drawing a view quits the app, where 0.4.1 showed the
+  error inside that view. Your tabs come back on the next launch; a
+  description you were typing at that moment does not.
+- Keyboard focus for buttons and VoiceOver labels were rebuilt for the new
+  toolkit and have had less use than the rest. If something that worked in
+  0.4.1 does not work here, please open an issue.
+
 ## 0.4.1 - 2026-10-06
 
 A cleaner Publish section, in the same flat style as the workbench.

@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "jiji-cli"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "clap",
  "gix",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "jiji-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "base64",
  "chrono",
@@ -4035,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "jiji-desktop"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "base64",
  "chrono",
@@ -4071,7 +4071,7 @@ dependencies = [
 
 [[package]]
 name = "jiji-forge"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "base64",
  "jiji-core",

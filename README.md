@@ -13,7 +13,8 @@ Jiji puts jj's model on screen: the change graph, the diff of whatever you
 select, and the operation log that makes every rewrite undoable. It is built
 on jj-lib, so it reads your repo and your `jj` config (revset aliases,
 `immutable_heads()`, merge tools) exactly the way the CLI does, and it keeps
-up with whatever you do in a terminal alongside it.
+up with whatever you do in a terminal alongside it. It is a native app: one
+Rust program, drawn with [GPUI](https://www.gpui.rs), with no web view.
 
 ## What it does
 
@@ -45,6 +46,8 @@ Download the DMG above. Jiji updates itself: a new version downloads in the
 background and waits for you to click "Restart to update".
 
 - macOS only for now. Linux and Windows builds aren't available yet.
+- Supported on the current macOS release and the one before it. Older
+  systems back to macOS 12 can open it, untested.
 - `git` must be on your `PATH` for fetch and push, as with `jj` itself.
 - The `jj` CLI is optional. Jiji embeds jj-lib 0.45, so repositories and
   config stay compatible with `jj` 0.45.

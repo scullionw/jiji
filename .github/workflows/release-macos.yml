@@ -138,10 +138,13 @@ jobs:
                             "darwin-x86_64":  { signature: $signature, url: $url } } }' \
             > dist/latest.json
 
-      - name: publish the release
+      # A draft: installed copies and the download link keep getting the
+      # previous release until someone has opened this build and published
+      # it (RELEASING.md).
+      - name: draft the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
             --title "Jiji v$VERSION" --notes-file "$NOTES" \
             "$DMG" "$ARCHIVE" "$ARCHIVE.sig" dist/latest.json
