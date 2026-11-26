@@ -376,6 +376,7 @@ mod tests {
                 .map(|(message, wait)| LandBlocker {
                     message: (*message).into(),
                     wait: *wait,
+                    fetch: false,
                 })
                 .collect(),
             warnings: vec![],

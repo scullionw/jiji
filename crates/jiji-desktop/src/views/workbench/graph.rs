@@ -1855,14 +1855,11 @@ impl WorkbenchView {
             cx,
         );
         // The chain runs edge to edge under the workstream's own band; the
-        // immutable base(s) and their terminal `~` rows sit in a recessed
-        // zone below.
-        let split_at = focus
-            .graph
-            .rows
-            .iter()
-            .position(|row| matches!(row, GraphRow::Node(node) if snapshot.nodes[node.node].kind == NodeKind::Immutable))
-            .unwrap_or(focus.graph.rows.len());
+        // settled base(s) and their terminal `~` rows sit in a recessed
+        // zone below. A change someone else's branch holds is immutable
+        // to jj and is still the workstream's own: it stays in the chain,
+        // and is not filed under "Trunk".
+        let split_at = focus.base_from(&snapshot);
         let chain = self.rows(&focus.graph.rows[..split_at], 0, &style, cx);
         let base = self.rows(&focus.graph.rows[split_at..], split_at, &style, cx);
         let gutter = style.gutter;

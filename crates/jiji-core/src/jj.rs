@@ -50,8 +50,8 @@ use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::ui_path::RepoPathUiConverter;
 use jj_lib::revset::{
-    self, ResolvedRevsetExpression, RevsetDiagnostics, RevsetExpression, RevsetExtensions,
-    RevsetParseContext, RevsetWorkspaceContext, SymbolResolver,
+    self, ResolvedRevsetExpression, RevsetAliasesMap, RevsetDiagnostics, RevsetExpression,
+    RevsetExtensions, RevsetParseContext, RevsetWorkspaceContext, SymbolResolver,
 };
 use jj_lib::absorb::{absorb_hunks, split_hunks_to_trees, AbsorbSource};
 use jj_lib::annotate::FileAnnotator;
@@ -117,6 +117,9 @@ const MAX_CHANGED_FILES: usize = 1000;
 /// `trunk_text_file` reads repo docs (a PR template) destined for PR
 /// bodies; anything bigger than this is not a document worth inlining.
 const MAX_TRUNK_TEXT_FILE_BYTES: u64 = 100 * 1024;
+
+/// How many paths a failed landing check names; the rest are counted.
+const MAX_LANDED_CHECK_PATHS: usize = 12;
 /// Per-side file size limit for content diffs; larger files render as a
 /// "too large" placeholder instead of hunks.
 const MAX_DIFF_FILE_BYTES: usize = 1 << 20;
@@ -212,6 +215,211 @@ impl JjBackend {
         let guard = RepoWriteLock::acquire(workspace.repo_path());
         let repo = load_head(&workspace)?;
         Ok((guard, workspace, repo))
+    }
+
+    /// Shared body of `delete_bookmark` and `delete_bookmark_at`. With
+    /// `expected`, the bookmark is deleted only while it points at exactly
+    /// that commit; the test runs under the write lock, after the working
+    /// copy is snapshotted, so nothing can move it in between.
+    fn delete_bookmark_if(
+        &self,
+        path: &Path,
+        name: &str,
+        expected: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError> {
+        let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let name = name.trim();
+        let target = repo.view().get_local_bookmark(RefName::new(name)).clone();
+        if target.is_absent() {
+            return Err(BackendError::BookmarkMissing(name.to_owned()));
+        }
+        if let Some(expected) = expected {
+            // `expected` has to name one commit, and the bookmark has to
+            // point at that commit and no other.
+            let still_there = match (resolve_commit_id(&repo, expected)?, target.as_normal()) {
+                (Some(expected), Some(at)) => expected == *at,
+                _ => false,
+            };
+            if !still_there {
+                return Err(BackendError::MutationFailed(format!(
+                    "bookmark \u{201c}{name}\u{201d} no longer points at {expected}; it was \
+                     left in place"
+                )));
+            }
+        }
+        let target_change = target
+            .added_ids()
+            .next()
+            .map(|id| display_id_of(repo.as_ref(), id))
+            .transpose()?;
+        let mut tx = repo.start_transaction();
+        tx.repo_mut()
+            .set_local_bookmark_target(RefName::new(name), RefTarget::absent());
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("delete bookmark {name}"),
+        )?;
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary: format!("Deleted {name}"),
+            target_change,
+        })
+    }
+
+    /// Shared body of `abandon_changes` and `abandon_landed`. With
+    /// `leaves_only`, nothing is abandoned while a change that is not in
+    /// the set sits on it. The look runs under the write lock, after the
+    /// working copy is snapshotted, so a change started a moment ago
+    /// counts.
+    fn abandon_set(
+        &self,
+        path: &Path,
+        change_ids: &[String],
+        leaves_only: bool,
+    ) -> Result<MutationOutcome, BackendError> {
+        // Curated deviation: the CLI prints "No revisions to abandon." and
+        // exits cleanly; an empty list from a confirmed plan is a stale
+        // plan, so it refuses instead.
+        if change_ids.is_empty() {
+            return Err(BackendError::MutationFailed(
+                "there are no changes to abandon".to_owned(),
+            ));
+        }
+        let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let mut commits: Vec<Commit> = Vec::new();
+        let mut display_ids: Vec<String> = Vec::new();
+        for change_id in change_ids {
+            let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+            if leaves_only {
+                // A landed commit that someone else's branch still has
+                // in its history is immutable to jj and is swept all the
+                // same: it landed, and hiding it here rewrites nothing.
+                check_not_settled(&workspace, repo.as_ref(), &commit, change_id)?;
+            } else {
+                check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
+            }
+            // Duplicates collapse like the CLI's revset union.
+            if !commits.iter().any(|c| c.id() == commit.id()) {
+                commits.push(commit);
+                display_ids.push(change_id.clone());
+            }
+        }
+        // The CLI resolves its arguments as one revset, which iterates
+        // newest-first, and quotes whichever commit comes first in that
+        // order in the op description — match it by evaluating the same
+        // set (probed empirically: input order does not matter).
+        let expr = RevsetExpression::commits(commits.iter().map(|c| c.id().clone()).collect());
+        if leaves_only {
+            // What sits on the set, among what is visible here. Asked by
+            // itself: taken together with `immutable_heads()`, which can
+            // name commits hidden here, the hidden would count too.
+            let outside = collect_revset(
+                expr.children().minus(&expr),
+                repo.as_ref(),
+                MAX_MUTABLE_NODES,
+            )?;
+            // Someone else's commits sitting on the landed ones: a pull
+            // request that was based on the landed branch and has not
+            // been rebased yet. Abandoning under them would rewrite them.
+            // The landed commits stay, as part of that branch's history,
+            // and that is not a failure of the sweep. Someone else's are
+            // the commits of a branch that is no bookmark here and under
+            // no bookmark of the user's; anything else that sits there
+            // (a change of the user's that such a branch holds, a tagged
+            // commit) stops the sweep below and is named.
+            let theirs = collect_revset(
+                RevsetExpression::commits(outside.clone())
+                    .intersection(&someone_elses_expression(&workspace, repo.as_ref())?),
+                repo.as_ref(),
+                MAX_MUTABLE_NODES,
+            )?;
+            let theirs_sit = !theirs.is_empty();
+            let mut sitting: Vec<String> = Vec::new();
+            for commit_id in outside.iter().filter(|id| !theirs.contains(id)) {
+                sitting.push(display_id_of(repo.as_ref(), commit_id)?);
+            }
+            if sitting.is_empty() && theirs_sit {
+                let set: Vec<CommitId> = commits.iter().map(|c| c.id().clone()).collect();
+                let resting = branches_resting_on(repo.as_ref(), &set)?;
+                return Ok(MutationOutcome {
+                    operation_id: None,
+                    summary: format!(
+                        "{}{} in place: {} still {} on {}",
+                        crate::backend::LANDED_LEFT_IN_PLACE,
+                        display_ids.join(", "),
+                        if resting.is_empty() {
+                            "a branch that is not a bookmark here".to_owned()
+                        } else {
+                            name_list(&resting)
+                        },
+                        if resting.len() > 1 { "build" } else { "builds" },
+                        if display_ids.len() == 1 { "it" } else { "them" },
+                    ),
+                    target_change: None,
+                });
+            }
+            if !sitting.is_empty() {
+                return Err(BackendError::MutationFailed(format!(
+                    "{} {} on the landed commits and {} not one of them: abandoning them \
+                     would move it onto what was below them",
+                    sitting.join(", "),
+                    if sitting.len() == 1 { "sits" } else { "sit" },
+                    if sitting.len() == 1 { "is" } else { "are" },
+                )));
+            }
+        }
+        let revset = expr.evaluate(repo.as_ref()).map_err(snapshot_err)?;
+        let mut ordered: Vec<Commit> = Vec::new();
+        for commit_id in revset.iter_blocking() {
+            let commit_id = commit_id.map_err(snapshot_err)?;
+            let commit = repo.store().get_commit(&commit_id).map_err(snapshot_err)?;
+            ordered.push(commit);
+        }
+        let newest = ordered.first().expect("the set is non-empty");
+        let oldest = ordered.last().expect("the set is non-empty");
+        // The selection ends up where the graph collapses to: the first
+        // parent of the oldest abandoned change (outside the set by
+        // topological order).
+        let parent = repo
+            .store()
+            .get_commit(&oldest.parent_ids()[0])
+            .map_err(snapshot_err)?;
+        let parent_display = display_id(repo.as_ref(), &parent);
+
+        let description = if ordered.len() == 1 {
+            format!("abandon commit {}", newest.id().hex())
+        } else {
+            format!(
+                "abandon commit {} and {} more",
+                newest.id().hex(),
+                ordered.len() - 1
+            )
+        };
+        let mut tx = repo.start_transaction();
+        for commit in &ordered {
+            tx.repo_mut().record_abandoned_commit(commit);
+        }
+        // Same semantics as the single abandon: bookmarks on abandoned
+        // changes are deleted, an abandoned working copy respawns inside
+        // the rebase, and chains inside the set reparent transitively.
+        let options = RebaseOptions {
+            rewrite_refs: RewriteRefsOptions {
+                delete_abandoned_bookmarks: true,
+            },
+            ..Default::default()
+        };
+        pollster::block_on(tx.repo_mut().rebase_descendants_with_options(&RevsetExpression::none(), &options, |_, _| {}))
+            .map_err(mutation_err)?;
+        let new_repo = finish_mutation(&mut workspace, &repo, tx, description)?;
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary: format!("Abandoned {}", display_ids.join(", ")),
+            target_change: Some(parent_display),
+        })
     }
 
     /// Shared body of `rebase_change` (`jj rebase -s`) and `move_change`
@@ -670,80 +878,15 @@ impl RepoBackend for JjBackend {
         path: &Path,
         change_ids: &[String],
     ) -> Result<MutationOutcome, BackendError> {
-        // Curated deviation: the CLI prints "No revisions to abandon." and
-        // exits cleanly; an empty list from a confirmed plan is a stale
-        // plan, so it refuses instead.
-        if change_ids.is_empty() {
-            return Err(BackendError::MutationFailed(
-                "there are no changes to abandon".to_owned(),
-            ));
-        }
-        let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
-        let repo = sync_workspace(&mut workspace, repo)?;
-        let mut commits: Vec<Commit> = Vec::new();
-        let mut display_ids: Vec<String> = Vec::new();
-        for change_id in change_ids {
-            let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
-            check_mutable(&workspace, repo.as_ref(), &commit, change_id)?;
-            // Duplicates collapse like the CLI's revset union.
-            if !commits.iter().any(|c| c.id() == commit.id()) {
-                commits.push(commit);
-                display_ids.push(change_id.clone());
-            }
-        }
-        // The CLI resolves its arguments as one revset, which iterates
-        // newest-first, and quotes whichever commit comes first in that
-        // order in the op description — match it by evaluating the same
-        // set (probed empirically: input order does not matter).
-        let expr = RevsetExpression::commits(commits.iter().map(|c| c.id().clone()).collect());
-        let revset = expr.evaluate(repo.as_ref()).map_err(snapshot_err)?;
-        let mut ordered: Vec<Commit> = Vec::new();
-        for commit_id in revset.iter_blocking() {
-            let commit_id = commit_id.map_err(snapshot_err)?;
-            let commit = repo.store().get_commit(&commit_id).map_err(snapshot_err)?;
-            ordered.push(commit);
-        }
-        let newest = ordered.first().expect("the set is non-empty");
-        let oldest = ordered.last().expect("the set is non-empty");
-        // The selection ends up where the graph collapses to: the first
-        // parent of the oldest abandoned change (outside the set by
-        // topological order).
-        let parent = repo
-            .store()
-            .get_commit(&oldest.parent_ids()[0])
-            .map_err(snapshot_err)?;
-        let parent_display = display_id(repo.as_ref(), &parent);
+        self.abandon_set(path, change_ids, false)
+    }
 
-        let description = if ordered.len() == 1 {
-            format!("abandon commit {}", newest.id().hex())
-        } else {
-            format!(
-                "abandon commit {} and {} more",
-                newest.id().hex(),
-                ordered.len() - 1
-            )
-        };
-        let mut tx = repo.start_transaction();
-        for commit in &ordered {
-            tx.repo_mut().record_abandoned_commit(commit);
-        }
-        // Same semantics as the single abandon: bookmarks on abandoned
-        // changes are deleted, an abandoned working copy respawns inside
-        // the rebase, and chains inside the set reparent transitively.
-        let options = RebaseOptions {
-            rewrite_refs: RewriteRefsOptions {
-                delete_abandoned_bookmarks: true,
-            },
-            ..Default::default()
-        };
-        pollster::block_on(tx.repo_mut().rebase_descendants_with_options(&RevsetExpression::none(), &options, |_, _| {}))
-            .map_err(mutation_err)?;
-        let new_repo = finish_mutation(&mut workspace, &repo, tx, description)?;
-        Ok(MutationOutcome {
-            operation_id: Some(short_operation_id(new_repo.op_id())),
-            summary: format!("Abandoned {}", display_ids.join(", ")),
-            target_change: Some(parent_display),
-        })
+    fn abandon_landed(
+        &self,
+        path: &Path,
+        commits: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        self.abandon_set(path, commits, true)
     }
 
     fn squash_change(&self, path: &Path, change_id: &str) -> Result<MutationOutcome, BackendError> {
@@ -1392,6 +1535,195 @@ impl RepoBackend for JjBackend {
         self.rebase_onto(path, change_id, destination_id, RebaseScope::WithDescendants)
     }
 
+    fn rebase_onto_trunk(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        change_id: &str,
+        landed: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
+        let repo = sync_workspace(&mut workspace, repo)?;
+        let commit = resolve_change_commit_for_mutation(&repo, change_id)?;
+        // What is left of a stack moves onto trunk although someone
+        // else's branch holds it: the part below it has landed, and its
+        // own pull requests have to show what is left.
+        check_not_settled(&workspace, repo.as_ref(), &commit, change_id)?;
+        // The commit `landed_check` judges landings against, so a stack
+        // is rebuilt on what was checked.
+        let trunk = landing_trunk(repo.as_ref(), remote, trunk)
+            .map_err(BackendError::MutationFailed)?;
+        let trunk_label = display_id_of(repo.as_ref(), &trunk)?;
+        let landed: Vec<CommitId> = landed
+            .iter()
+            .filter_map(|id| resolve_commit_id(&repo, id).transpose())
+            .collect::<Result<_, _>>()?;
+        // Trunk takes the place of every parent that landed: the ones the
+        // caller names, and any that are part of trunk already (a segment
+        // a merge commit landed, or an older trunk commit). Every other
+        // parent stays. `jj rebase -s` would put the change on the
+        // destination alone, and a change that merges a side branch in
+        // would lose that branch's content from its tree.
+        let mut parents: Vec<CommitId> = Vec::new();
+        let mut moved = false;
+        for parent in commit.parent_ids() {
+            let off = landed.contains(parent) || is_ancestor(repo.as_ref(), parent, &trunk);
+            let onto = if off { &trunk } else { parent };
+            moved |= off;
+            if !parents.contains(onto) {
+                parents.push(onto.clone());
+            }
+        }
+        if !moved {
+            return Ok(MutationOutcome {
+                operation_id: None,
+                summary: format!("{change_id} no longer sits on a landed change; it was left where it is"),
+                target_change: Some(change_id.to_owned()),
+            });
+        }
+        // Someone else's commits above the change: those of a branch
+        // that is no bookmark here, under no local bookmark. (A commit
+        // above the change that is immutable for a reason of its own, a
+        // tag for one, makes the change itself settled, and the check
+        // above has refused.) A rebase carries every descendant along, and
+        // theirs are not this repository's to rewrite. Those that nothing
+        // of the user's sits on are hidden here first, so the rebase does
+        // not reach them; their branch on the remote stays where it is,
+        // on the commits this rebase replaces. (One the user built on
+        // moves with that work: it could not stay behind.)
+        //
+        // Each set is asked for by the ids of the one before. A revset
+        // that names a hidden commit is evaluated as if that commit were
+        // visible, and `immutable_heads()` names one whenever a remote
+        // bookmark points at a commit hidden here (their branch, after an
+        // earlier round of this). Descendants taken in the same
+        // expression would then include what is hidden.
+        let above = collect_revset(
+            RevsetExpression::commits(vec![commit.id().clone()]).descendants(),
+            repo.as_ref(),
+            MAX_MUTABLE_NODES,
+        )?;
+        let theirs = collect_revset(
+            RevsetExpression::commits(above.clone())
+                .intersection(&someone_elses_expression(&workspace, repo.as_ref())?),
+            repo.as_ref(),
+            MAX_MUTABLE_NODES,
+        )?;
+        let ours: Vec<CommitId> = above
+            .iter()
+            .filter(|id| !theirs.contains(id))
+            .cloned()
+            .collect();
+        let hidden = collect_revset(
+            RevsetExpression::commits(theirs).minus(&RevsetExpression::commits(ours).ancestors()),
+            repo.as_ref(),
+            MAX_MUTABLE_NODES,
+        )?;
+        let resting = if hidden.is_empty() {
+            Vec::new()
+        } else {
+            branches_resting_on(repo.as_ref(), &hidden)?
+        };
+        let mut tx = repo.start_transaction();
+        if !hidden.is_empty() {
+            for id in &hidden {
+                let theirs = tx.repo().store().get_commit(id).map_err(snapshot_err)?;
+                tx.repo_mut().record_abandoned_commit(&theirs);
+            }
+            pollster::block_on(tx.repo_mut().rebase_descendants()).map_err(mutation_err)?;
+        }
+        let stats = pollster::block_on(move_commits(
+            tx.repo_mut(),
+            &MoveCommitsLocation {
+                new_parent_ids: parents,
+                new_child_ids: vec![],
+                target: MoveCommitsTarget::Roots(vec![commit.id().clone()]),
+            },
+            &RebaseOptions::default(),
+        ))
+        .map_err(mutation_err)?;
+        if stats.num_rebased_targets == 0 && stats.num_rebased_descendants == 0 {
+            // Everything was already in place; like the CLI, record nothing.
+            return Ok(MutationOutcome {
+                operation_id: None,
+                summary: format!("{change_id} is already on {trunk_label}"),
+                target_change: Some(change_id.to_owned()),
+            });
+        }
+        let rewritten = match stats.rebased_commits.get(commit.id()) {
+            Some(jj_lib::rewrite::RebasedCommit::Rewritten(new_commit)) => Some(new_commit.clone()),
+            _ => None,
+        };
+        let new_repo = finish_mutation(
+            &mut workspace,
+            &repo,
+            tx,
+            format!("rebase commit {} and descendants onto trunk", commit.id().hex()),
+        )?;
+        let target_change = match rewritten {
+            Some(new_commit) => display_id(new_repo.as_ref(), &new_commit),
+            None => change_id.to_owned(),
+        };
+        let descendants = stats.num_rebased_targets.saturating_sub(1);
+        let mut summary = if descendants == 0 {
+            format!("Rebased {change_id} onto {trunk_label}")
+        } else {
+            format!(
+                "Rebased {change_id} and {descendants} descendant{} onto {trunk_label}",
+                if descendants == 1 { "" } else { "s" }
+            )
+        };
+        if !resting.is_empty() {
+            summary.push_str(&format!(
+                "; {} still {} on the commits this replaced and {} left as {}",
+                name_list(&resting),
+                if resting.len() == 1 { "builds" } else { "build" },
+                if resting.len() == 1 { "was" } else { "were" },
+                if resting.len() == 1 { "it is" } else { "they are" },
+            ));
+        }
+        Ok(MutationOutcome {
+            operation_id: Some(short_operation_id(new_repo.op_id())),
+            summary,
+            target_change: Some(target_change),
+        })
+    }
+
+    fn branches_resting_on(
+        &self,
+        path: &Path,
+        commits: &[String],
+    ) -> Result<Vec<String>, BackendError> {
+        let (workspace, repo) = self.load_repo_at_head(path)?;
+        // Ids that name nothing here any more rest under nothing.
+        let mut known: Vec<CommitId> = commits
+            .iter()
+            .filter_map(|id| resolve_commit_id(&repo, id).transpose())
+            .collect::<Result<_, _>>()?;
+        if known.is_empty() {
+            return Ok(Vec::new());
+        }
+        // What is part of trunk's history is under every branch made
+        // since, and none of them rests on it in this sense. (A commit
+        // that landed with its own id, and trunk's copy of a change that
+        // landed by a rebase merge, which keeps the change id.)
+        let trunk_history = resolve_revset_text(&workspace, repo.as_ref(), "::present(trunk())")
+            .map_err(BackendError::RevsetInvalid)?;
+        let in_trunk: HashSet<CommitId> = RevsetExpression::commits(known.clone())
+            .intersection(&trunk_history)
+            .evaluate(repo.as_ref())
+            .map_err(snapshot_err)?
+            .iter_blocking()
+            .collect::<Result<_, _>>()
+            .map_err(snapshot_err)?;
+        known.retain(|id| !in_trunk.contains(id));
+        if known.is_empty() {
+            return Ok(Vec::new());
+        }
+        branches_resting_on(repo.as_ref(), &known)
+    }
+
     fn move_change(
         &self,
         path: &Path,
@@ -1550,32 +1882,16 @@ impl RepoBackend for JjBackend {
     }
 
     fn delete_bookmark(&self, path: &Path, name: &str) -> Result<MutationOutcome, BackendError> {
-        let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
-        let repo = sync_workspace(&mut workspace, repo)?;
-        let name = name.trim();
-        let target = repo.view().get_local_bookmark(RefName::new(name)).clone();
-        if target.is_absent() {
-            return Err(BackendError::BookmarkMissing(name.to_owned()));
-        }
-        let target_change = target
-            .added_ids()
-            .next()
-            .map(|id| display_id_of(repo.as_ref(), id))
-            .transpose()?;
-        let mut tx = repo.start_transaction();
-        tx.repo_mut()
-            .set_local_bookmark_target(RefName::new(name), RefTarget::absent());
-        let new_repo = finish_mutation(
-            &mut workspace,
-            &repo,
-            tx,
-            format!("delete bookmark {name}"),
-        )?;
-        Ok(MutationOutcome {
-            operation_id: Some(short_operation_id(new_repo.op_id())),
-            summary: format!("Deleted {name}"),
-            target_change,
-        })
+        self.delete_bookmark_if(path, name, None)
+    }
+
+    fn delete_bookmark_at(
+        &self,
+        path: &Path,
+        name: &str,
+        commit: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.delete_bookmark_if(path, name, Some(commit))
     }
 
     fn track_bookmark(
@@ -2185,6 +2501,207 @@ impl RepoBackend for JjBackend {
         Ok(None)
     }
 
+    fn landed_check(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        landing: &str,
+        head: &str,
+        bottom: &str,
+        top: &str,
+    ) -> Result<LandedCheck, BackendError> {
+        let (_workspace, repo) = self.load_repo_at_head(path)?;
+        let trunk = landing_trunk(repo.as_ref(), remote, trunk)
+            .map_err(BackendError::SnapshotFailed)?;
+        let bottom = resolve_change_commit(&repo, bottom)?;
+        let top = resolve_change_commit(&repo, top)?;
+        // The run's diff starts at the commit below it in the stack, which
+        // the stack walk reaches through first parents. A merge of all of
+        // `bottom`'s parents would already contain whatever a side branch
+        // brings in, and the diff would come out without it.
+        let below = bottom.parent_ids().first().ok_or_else(|| {
+            BackendError::MutationFailed("the root commit is not part of any stack".to_owned())
+        })?;
+        let base_tree = repo.store().get_commit(below).map_err(snapshot_err)?.tree();
+        let top_tree = top.tree();
+        // What applying the run's whole diff on top of `onto` would still
+        // change: the paths where the tree a rebase of the run onto it
+        // ends with differs from `onto` itself. Nothing means `onto` holds
+        // the run.
+        let lacking = |onto: &Commit,
+                       base_tree: &MergedTree|
+         -> Result<(Vec<String>, u32), BackendError> {
+            let onto_tree = onto.tree();
+            let reapplied = reapply(&onto_tree, base_tree, &top_tree)?;
+            Ok(differing_paths(&onto_tree, &reapplied))
+        };
+        let tip = repo.store().get_commit(&trunk).map_err(snapshot_err)?;
+
+        // The commits themselves are part of trunk's history (a merge
+        // commit, or a branch trunk was moved onto). That alone proves
+        // nothing: a merge can take a branch in and keep none of its
+        // content (seen on GitHub, which then names that merge as the pull
+        // request's). So the commit where they entered trunk's line is
+        // asked, whatever commit the forge names. A later revert does not
+        // count against them; content dropped at that merge does.
+        if is_ancestor(repo.as_ref(), top.id(), &trunk) {
+            let entry = entry_into(repo.as_ref(), top.id(), &tip)?;
+            // And that commit is asked about everything it brought in,
+            // not about the span the caller happens to know. A caller
+            // that has only the pull request's head (a landed bookmark
+            // found again, with nothing mutable left to walk) names one
+            // commit; the merge brought in the whole branch, and it can
+            // keep the last commit's change and drop an earlier one's.
+            // A history where trunk and the branch merged each other
+            // before has more than one such place. Then each of them is
+            // asked about, and the span the caller named as well (it is
+            // what was asked before there was more than one answer, and
+            // nothing that was kept on its account is deleted now). One
+            // tree has to hold them all: the commit where the branch came
+            // in, or else trunk's tip. A branch part of which is at the
+            // one and part at the other never was on trunk whole, and its
+            // bookmark stays.
+            let left_at = branch_points(repo.as_ref(), &entry, top.id())?;
+            let mut spans: Vec<MergedTree> = left_at.iter().map(Commit::tree).collect();
+            if spans.len() != 1 {
+                spans.push(base_tree.clone());
+            }
+            let mut missing: Option<(Vec<String>, u32)> = None;
+            for span_base in &spans {
+                let (paths, more) = lacking(&entry, span_base)?;
+                if !paths.is_empty() {
+                    missing.get_or_insert((paths, more));
+                }
+            }
+            let Some((paths, more)) = missing else {
+                return Ok(LandedCheck::Landed);
+            };
+            for span_base in &spans {
+                if !lacking(&tip, span_base)?.0.is_empty() {
+                    return Ok(LandedCheck::Missing { paths, more });
+                }
+            }
+            return Ok(LandedCheck::Held);
+        }
+
+        let Some(landing_id) = resolve_commit_id(&repo, landing)? else {
+            return Ok(LandedCheck::Unfetched);
+        };
+        let on_trunk = is_ancestor(repo.as_ref(), &landing_id, &trunk);
+        // The pull request's merge speaks for these changes only if it
+        // was merged from exactly these commits.
+        let same_head = resolve_commit_id(&repo, head)?.is_some_and(|id| id == *top.id());
+        if same_head && on_trunk {
+            let landing = repo.store().get_commit(&landing_id).map_err(snapshot_err)?;
+            let (paths, more) = lacking(&landing, &base_tree)?;
+            if paths.is_empty() {
+                return Ok(LandedCheck::Landed);
+            }
+            // The named commit lacks something. Trunk's tip may still
+            // hold the changes: they can arrive by another road.
+            if lacking(&tip, &base_tree)?.0.is_empty() {
+                return Ok(LandedCheck::Held);
+            }
+            return Ok(LandedCheck::Missing { paths, more });
+        }
+        let (paths, more) = lacking(&tip, &base_tree)?;
+        Ok(if paths.is_empty() {
+            LandedCheck::Held
+        } else if on_trunk {
+            LandedCheck::Missing { paths, more }
+        } else {
+            LandedCheck::Elsewhere
+        })
+    }
+
+    fn lands_as_tip(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        bottom: &str,
+        first_top: &str,
+        tip: &str,
+    ) -> Result<TipCheck, BackendError> {
+        let (_workspace, repo) = self.load_repo_at_head(path)?;
+        let trunk = landing_trunk(repo.as_ref(), remote, trunk)
+            .map_err(BackendError::SnapshotFailed)?;
+        let bottom = resolve_change_commit(&repo, bottom)?;
+        let first_top = resolve_change_commit(&repo, first_top)?;
+        let tip = resolve_change_commit(&repo, tip)?;
+        // The stack's own line, from the tip down to `bottom`. A merge on
+        // it is rebased by other rules than a plain commit, and a line
+        // that does not pass through the commits named is not the stack
+        // the caller means: neither is judged.
+        let mut line: Vec<Commit> = Vec::new();
+        let mut at = tip;
+        loop {
+            let [parent] = at.parent_ids() else {
+                return Ok(TipCheck::Unknown);
+            };
+            let parent = parent.clone();
+            let reached = at.id() == bottom.id();
+            line.push(at);
+            if reached {
+                break;
+            }
+            if line.len() >= MAX_TIP_CHECK_COMMITS {
+                return Ok(TipCheck::Unknown);
+            }
+            at = repo.store().get_commit(&parent).map_err(snapshot_err)?;
+        }
+        line.reverse();
+        let Some(first) = line.iter().position(|c| c.id() == first_top.id()) else {
+            return Ok(TipCheck::Unknown);
+        };
+        let below = &bottom.parent_ids()[0];
+        if *below == trunk {
+            // Trunk has not moved under the stack: one pull request at a
+            // time and the tip in one go are the same commits.
+            return Ok(TipCheck::Same);
+        }
+        let trunk_tree = repo.store().get_commit(&trunk).map_err(snapshot_err)?.tree();
+        let base_tree = repo.store().get_commit(below).map_err(snapshot_err)?.tree();
+        if !is_ancestor(repo.as_ref(), below, &trunk) {
+            // What the stack sits on is not part of trunk's history. It
+            // can be on trunk all the same: a pull request that landed as
+            // a squash leaves its own commits here until they are swept,
+            // with the rest of the stack still on top of them. That is
+            // judged too, when trunk holds everything those commits hold,
+            // measured from where they left trunk's history. A stack on
+            // anything else is not.
+            let forks = pollster::block_on(
+                repo.index()
+                    .common_ancestors(std::slice::from_ref(below), std::slice::from_ref(&trunk)),
+            )
+            .map_err(snapshot_err)?;
+            let [fork] = forks.as_slice() else {
+                return Ok(TipCheck::Unknown);
+            };
+            let fork_tree = repo.store().get_commit(fork).map_err(snapshot_err)?.tree();
+            let with_base = reapply(&trunk_tree, &fork_tree, &base_tree)?;
+            if !differing_paths(&trunk_tree, &with_base).0.is_empty() {
+                return Ok(TipCheck::Unknown);
+            }
+        }
+        // The tip in one go: the stack's net change, merged into trunk.
+        let whole = reapply(&trunk_tree, &base_tree, &line[line.len() - 1].tree())?;
+        // One pull request at a time: the first in one piece, as the
+        // forge merges it, then each commit above it in turn, as the
+        // rebase that follows a landing replays them.
+        let mut stepwise = reapply(&trunk_tree, &base_tree, &line[first].tree())?;
+        for pair in line[first..].windows(2) {
+            stepwise = reapply(&stepwise, &pair[0].tree(), &pair[1].tree())?;
+        }
+        let (paths, more) = differing_paths(&whole, &stepwise);
+        Ok(if paths.is_empty() {
+            TipCheck::Same
+        } else {
+            TipCheck::Differs { paths, more }
+        })
+    }
+
     fn revert_operation(&self, path: &Path, op_id: &str) -> Result<MutationOutcome, BackendError> {
         let (_write, mut workspace, repo) = self.load_repo_for_write(path)?;
         let repo = sync_workspace(&mut workspace, repo)?;
@@ -2737,14 +3254,37 @@ fn build_snapshot(
     let mutable_expr: Arc<ResolvedRevsetExpression> = RevsetExpression::visible_heads()
         .ancestors()
         .minus(&immutable_heads.union(&RevsetExpression::root()).ancestors());
-    let mutable_ids = collect_revset(mutable_expr, repo_ref, MAX_MUTABLE_NODES)?;
+    // The user's own changes that someone else's branch holds: immutable
+    // to jj, and still work in progress here. They are drawn and grouped
+    // with the mutable set, so a stack does not vanish from the default
+    // view the moment a fetch brings a branch that was pushed on top of
+    // it; their kind stays immutable.
+    let held_ids = held_commit_ids(workspace, repo_ref)?;
+    let held_set: HashSet<CommitId> = held_ids.iter().cloned().collect();
+    let own_expr = if held_ids.is_empty() {
+        mutable_expr
+    } else {
+        mutable_expr.union(&RevsetExpression::commits(held_ids))
+    };
+    // Topological order, children before parents.
+    let own_ids = collect_revset(own_expr, repo_ref, MAX_MUTABLE_NODES)?;
+    let own_set: HashSet<CommitId> = own_ids.iter().cloned().collect();
+    let mutable_ids: Vec<CommitId> = own_ids
+        .iter()
+        .filter(|id| !held_set.contains(*id))
+        .cloned()
+        .collect();
     let mutable_set: HashSet<CommitId> = mutable_ids.iter().cloned().collect();
 
-    // Topological order, children before parents.
-    let mutable_commits: Vec<Commit> = mutable_ids
+    let own_commits: Vec<Commit> = own_ids
         .iter()
         .map(|id| store.get_commit(id).map_err(snapshot_err))
         .collect::<Result<_, _>>()?;
+    let mutable_commits: Vec<Commit> = own_commits
+        .iter()
+        .filter(|commit| mutable_set.contains(commit.id()))
+        .cloned()
+        .collect();
 
     // The view lens: commits drawn beyond (or instead of) the mutable set.
     // Presets are ordinary revsets parsed with the user's alias context, so
@@ -2770,7 +3310,7 @@ fn build_snapshot(
             }
         };
         if view_keeps_default_set(view_choice) {
-            mutable_ids.iter().for_each(&mut draw);
+            own_ids.iter().for_each(&mut draw);
         } else if let Some(wc) = &wc_commit_id {
             draw(wc);
         }
@@ -2812,12 +3352,45 @@ fn build_snapshot(
     for commit in drawn_commits
         .iter()
         .chain(&base_commits)
-        .chain(mutable_commits.iter().filter(|c| !drawn_set.contains(c.id())))
+        .chain(own_commits.iter().filter(|c| !drawn_set.contains(c.id())))
     {
         if is_divergent(repo_ref, commit) {
             divergent.insert(commit.id().clone());
         }
         change_ids.insert(commit.id().clone(), node_id(repo_ref, commit));
+    }
+
+    // Divergence the user cannot resolve: the other commits of the
+    // change are all someone else's to keep (see `old_copies_held`).
+    let mut old_copies_held: HashSet<CommitId> = HashSet::new();
+    for commit in own_commits.iter().filter(|c| divergent.contains(c.id())) {
+        let others: Vec<CommitId> =
+            pollster::block_on(repo_ref.resolve_change_id(commit.change_id()))
+                .map_err(snapshot_err)?
+                .map(|targets| {
+                    targets
+                        .visible_with_offsets()
+                        .map(|(_, id)| id.clone())
+                        .filter(|id| id != commit.id())
+                        .collect()
+                })
+                .unwrap_or_default();
+        if others.is_empty() || others.iter().any(|id| own_set.contains(id)) {
+            continue;
+        }
+        // Not trunk's copy either (a rebase merge lands commits that keep
+        // their change ids), nor one a tag pins.
+        let settled = settled_expression(workspace, repo_ref)?;
+        let any_settled = RevsetExpression::commits(others)
+            .intersection(&settled)
+            .evaluate(repo_ref)
+            .map_err(snapshot_err)?
+            .iter_blocking()
+            .next()
+            .is_some();
+        if !any_settled {
+            old_copies_held.insert(commit.id().clone());
+        }
     }
 
     let elided_links = elided_base_links(repo_ref, &base_commits, &change_ids);
@@ -2854,6 +3427,8 @@ fn build_snapshot(
                 view,
                 commit,
                 kind,
+                held_set.contains(commit.id()),
+                old_copies_held.contains(commit.id()),
                 &trunk,
                 &change_ids,
                 &divergent,
@@ -2863,11 +3438,13 @@ fn build_snapshot(
         })
         .collect();
 
+    // Held changes group like mutable ones: a stack is one workstream
+    // whether or not someone else's branch sits on part of it.
     let workstreams = build_workstreams(
         repo_ref,
         view,
-        &mutable_commits,
-        &mutable_set,
+        &own_commits,
+        &own_set,
         &wc_commit_id,
         &trunk,
         &change_ids,
@@ -3078,8 +3655,20 @@ fn resolve_revset_text(
     repo: &dyn Repo,
     text: &str,
 ) -> Result<Arc<ResolvedRevsetExpression>, String> {
+    resolve_revset_with(workspace, repo, text, &revset_aliases(workspace.settings()))
+}
+
+/// [`resolve_revset_text`] with the aliases given, in place of the user's:
+/// the user's with one of the caller's own laid over them, or none at all,
+/// so that every name in `text` is jj's own function whatever the user's
+/// configuration calls by that name.
+fn resolve_revset_with(
+    workspace: &Workspace,
+    repo: &dyn Repo,
+    text: &str,
+    aliases: &RevsetAliasesMap,
+) -> Result<Arc<ResolvedRevsetExpression>, String> {
     let settings = workspace.settings();
-    let aliases = revset_aliases(settings);
     let path_converter = RepoPathUiConverter::Fs {
         cwd: workspace.workspace_root().to_owned(),
         base: workspace.workspace_root().to_owned(),
@@ -3087,7 +3676,7 @@ fn resolve_revset_text(
     let fileset_aliases = FilesetAliasesMap::new();
     let extensions = RevsetExtensions::default();
     let context = RevsetParseContext {
-        aliases_map: &aliases,
+        aliases_map: aliases,
         local_variables: HashMap::new(),
         user_email: settings.user_email(),
         date_pattern_context: chrono::Local::now().into(),
@@ -3117,6 +3706,121 @@ fn error_chain(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+/// Commits under a local bookmark that are not part of trunk and that jj
+/// calls immutable. Nearly always none, and cheap to ask: a range near the
+/// tips. Only when there are some is [`settled_expression`] worked out.
+const IMMUTABLE_UNDER_BOOKMARKS: &str =
+    "(present(trunk())..bookmarks()) & ::immutable_heads()";
+
+/// jj's function for the remote branches that are no bookmarks here. Their
+/// commits are the ones that may be someone else's.
+const UNTRACKED_REMOTE_BOOKMARKS: &str = "untracked_remote_bookmarks";
+
+/// The untracked remote bookmarks that are someone else's work the user
+/// built on. An untracked remote bookmark strictly below a local bookmark,
+/// and not at one, is of that kind. One that is at a local bookmark, above
+/// one, or off to the side rests on the user's own work and settles
+/// nothing by itself.
+const BASES_OF_OTHERS: &str = "untracked_remote_bookmarks() & (::(bookmarks()-) ~ bookmarks())";
+
+/// Trunk, as the user's configuration names it, and the root.
+const TRUNK_AND_ROOT: &str = "present(trunk()) | root()";
+
+/// What is immutable for good, as opposed to held: trunk, someone else's
+/// work that the user built on, and everything the user's
+/// `immutable_heads()` names for a reason of its own. A tag keeps its
+/// commit immutable whoever's branch also rests there, and so does
+/// anything a configuration adds.
+///
+/// The last is that very alias, asked with jj's
+/// `untracked_remote_bookmarks()` counting for nothing: an alias of that
+/// name, defined as `none()`, is laid over the user's for the one
+/// evaluation, and the user's definition is otherwise evaluated as
+/// written. That can be asked only where it is certain what it sets
+/// aside. It is not when the user's configuration defines a helper of
+/// that name itself: what it names is then the user's own reason, and it
+/// would be replaced whole. And it is not when the expression calls the
+/// function with an argument: an alias shadows a function by name,
+/// whatever its arguments, and takes none by keyword, so the evaluation
+/// fails. In both cases nothing is taken apart. Settled is then exactly
+/// what jj calls immutable: nothing is held, nothing a landing does
+/// rewrites under it, and nothing is refused that jj would allow. A
+/// configuration that names remote branches some other way
+/// (`remote_bookmarks()`) ends the same: the override does not touch them.
+fn settled_expression(
+    workspace: &Workspace,
+    repo: &dyn Repo,
+) -> Result<Arc<ResolvedRevsetExpression>, BackendError> {
+    let mut aliases = revset_aliases(workspace.settings());
+    let own_helper = aliases
+        .function_names()
+        .any(|name| name == UNTRACKED_REMOTE_BOOKMARKS);
+    let set_aside = if own_helper {
+        None
+    } else {
+        aliases
+            .insert(format!("{UNTRACKED_REMOTE_BOOKMARKS}()"), "none()", None)
+            .ok()
+            .and_then(|()| resolve_revset_with(workspace, repo, "immutable_heads()", &aliases).ok())
+    };
+    let heads = match set_aside {
+        // Their branches are out. Back in come the ones that are someone
+        // else's work the user built on.
+        Some(for_its_own_reasons) => {
+            let bases = resolve_revset_text(workspace, repo, BASES_OF_OTHERS)
+                .map_err(BackendError::RevsetInvalid)?;
+            for_its_own_reasons.union(&bases)
+        }
+        // As written, and as jj reads it. A configuration that is broken
+        // altogether fails here as it does everywhere else.
+        None => immutable_heads_expression(workspace, repo)?,
+    };
+    let trunk = resolve_revset_text(workspace, repo, TRUNK_AND_ROOT)
+        .map_err(BackendError::RevsetInvalid)?;
+    Ok(heads.union(&trunk).ancestors())
+}
+
+/// The user's own changes that someone else's branch holds: under a local
+/// bookmark, not part of trunk, and immutable only because an untracked
+/// remote bookmark has them in its history (jj's default
+/// `immutable_heads()` counts every untracked remote bookmark). That is
+/// what a fetch leaves when someone pushed a branch on top of a stack.
+/// Children before parents.
+fn held_commit_ids(workspace: &Workspace, repo: &dyn Repo) -> Result<Vec<CommitId>, BackendError> {
+    let candidates = resolve_revset_text(workspace, repo, IMMUTABLE_UNDER_BOOKMARKS)
+        .map_err(BackendError::RevsetInvalid)?;
+    let any = candidates.clone().evaluate(repo).map_err(snapshot_err)?;
+    if any.iter_blocking().next().is_none() {
+        return Ok(Vec::new());
+    }
+    collect_revset(
+        candidates.minus(&settled_expression(workspace, repo)?),
+        repo,
+        MAX_MUTABLE_NODES,
+    )
+}
+
+/// Someone else's commits: in the history of a remote branch that is no
+/// bookmark here, and under no local bookmark. Said with
+/// `untracked_remote_bookmarks()` and not with `immutable_heads()`: a
+/// commit that is immutable for another reason (a tag, the user's own
+/// configuration) is not someone else's on that account, and is never
+/// hidden or skipped as if it were. And said in jj's own words, with no
+/// alias of the user's: a helper of that name in a configuration says
+/// what the user wants immutable, not whose a commit is.
+fn someone_elses_expression(
+    workspace: &Workspace,
+    repo: &dyn Repo,
+) -> Result<Arc<ResolvedRevsetExpression>, BackendError> {
+    resolve_revset_with(
+        workspace,
+        repo,
+        "::untracked_remote_bookmarks() ~ ::bookmarks()",
+        &RevsetAliasesMap::new(),
+    )
+    .map_err(BackendError::RevsetInvalid)
 }
 
 /// Parses and resolves the user's `immutable_heads()` revset alias. This is
@@ -3233,6 +3937,80 @@ fn check_mutable(
         None => Ok(()),
         Some(Ok(_)) => Err(BackendError::ImmutableChange(display_id.to_owned())),
         Some(Err(err)) => Err(snapshot_err(err)),
+    }
+}
+
+/// The check landing uses in place of [`check_mutable`]: a commit jj calls
+/// immutable may still be moved or swept when it is immutable only on
+/// account of someone else's branch (see [`held_commit_ids`]). Landed
+/// history, tagged commits and other people's work that the user built on
+/// stay refused. The caller names commits of the stack it lands, so this
+/// never lets through a commit that is someone else's to rewrite.
+fn check_not_settled(
+    workspace: &Workspace,
+    repo: &dyn Repo,
+    commit: &Commit,
+    display_id: &str,
+) -> Result<(), BackendError> {
+    let settled = settled_expression(workspace, repo)?;
+    let expr = RevsetExpression::commits(vec![commit.id().clone()]).intersection(&settled);
+    let revset = expr.evaluate(repo).map_err(snapshot_err)?;
+    match revset.iter_blocking().next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(BackendError::ImmutableChange(display_id.to_owned())),
+        Some(Err(err)) => Err(snapshot_err(err)),
+    }
+}
+
+/// The untracked remote bookmarks that have any of `commits` in their
+/// history, as `name@remote`, in name order: whose branches still build
+/// on those commits.
+fn branches_resting_on(repo: &dyn Repo, commits: &[CommitId]) -> Result<Vec<String>, BackendError> {
+    let mut branches: Vec<(String, Vec<CommitId>)> = Vec::new();
+    for (symbol, reference) in repo.view().all_remote_bookmarks() {
+        if symbol.remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO
+            || reference.state == RemoteRefState::Tracked
+        {
+            continue;
+        }
+        let targets: Vec<CommitId> = reference.target.added_ids().cloned().collect();
+        if !targets.is_empty() {
+            let name = format!("{}@{}", symbol.name.as_str(), symbol.remote.as_str());
+            branches.push((name, targets));
+        }
+    }
+    if branches.is_empty() || commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One question for all of them, however many branches the remote
+    // has: which of the commits they point at have any of `commits` at or
+    // below them. (A branch may point at a commit hidden here; named in
+    // the expression, it is looked at as if it were visible.)
+    let heads: Vec<CommitId> = branches
+        .iter()
+        .flat_map(|(_, targets)| targets.iter().cloned())
+        .collect();
+    let resting: HashSet<CommitId> = RevsetExpression::commits(heads)
+        .intersection(&RevsetExpression::commits(commits.to_vec()).descendants())
+        .evaluate(repo)
+        .map_err(snapshot_err)?
+        .iter_blocking()
+        .collect::<Result<_, _>>()
+        .map_err(snapshot_err)?;
+    let mut names: Vec<String> = branches
+        .into_iter()
+        .filter(|(_, targets)| targets.iter().any(|id| resting.contains(id)))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+fn name_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -5314,6 +6092,135 @@ fn resolve_trunk(workspace: &Workspace, repo: &dyn Repo) -> Result<Option<TrunkR
     Ok(candidates.into_iter().next())
 }
 
+/// The commit landings are judged against and stacks are rebuilt on: the
+/// branch `branch` as `remote` has it after the last fetch. The caller
+/// names the branch, the one its plan was made for and a person
+/// confirmed. `trunk()` is not asked again here. A fetch can change what
+/// it answers: Jiji's default takes the latest of `main`, `master` and
+/// `trunk`, so another of those moving ahead on the remote would switch
+/// the destination in the middle of a run (the reason this takes a name).
+/// And it can name a commit the remote does not have: a commit made on
+/// the local `main` and not pushed becomes `trunk()`, while what lands,
+/// lands on the remote's branch.
+///
+/// Without that branch from that remote there is nothing to judge
+/// against, and the answer is the reason, for the caller to stop on. The
+/// one exception is a repository that has nothing from `remote` at all
+/// (this crate's test fixtures): it has no remote branch to be behind
+/// of, and the local bookmark of that name answers.
+fn landing_trunk(repo: &dyn Repo, remote: &str, branch: &str) -> Result<CommitId, String> {
+    let view = repo.view();
+    let symbol = RemoteRefSymbol {
+        name: RefName::new(branch),
+        remote: RemoteName::new(remote),
+    };
+    if let Some(target) = view.get_remote_bookmark(symbol).target.as_normal() {
+        return Ok(target.clone());
+    }
+    let knows_remote = view.remote_bookmarks(RemoteName::new(remote)).next().is_some();
+    match view.get_local_bookmark(RefName::new(branch)).as_normal() {
+        Some(target) if !knows_remote => Ok(target.clone()),
+        _ => Err(format!(
+            "there is no \u{201c}{branch}\u{201d} from {remote} here to land on \u{2014} fetch, \
+             and plan again"
+        )),
+    }
+}
+
+/// What applying the change from `from` to `to` on top of `onto` ends
+/// with: the tree a rebase of those changes onto it would have.
+fn reapply(
+    onto: &MergedTree,
+    from: &MergedTree,
+    to: &MergedTree,
+) -> Result<MergedTree, BackendError> {
+    pollster::block_on(MergedTree::merge(Merge::from_vec(vec![
+        (onto.clone(), "trunk".to_owned()),
+        (from.clone(), "below the changes".to_owned()),
+        (to.clone(), "the changes".to_owned()),
+    ])))
+    .map_err(snapshot_err)
+}
+
+/// The paths at which two trees differ, capped, and how many more there
+/// are. Nothing when they are the same tree.
+fn differing_paths(a: &MergedTree, b: &MergedTree) -> (Vec<String>, u32) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut more = 0u32;
+    if a.tree_ids() != b.tree_ids() {
+        let mut stream = a.diff_stream(b, &EverythingMatcher);
+        pollster::block_on(async {
+            while let Some(entry) = stream.next().await {
+                if paths.len() < MAX_LANDED_CHECK_PATHS {
+                    paths.push(entry.path.as_internal_file_string().to_owned());
+                } else {
+                    more += 1;
+                }
+            }
+        });
+    }
+    (paths, more)
+}
+
+/// How many commits of a stack `lands_as_tip` walks before it gives up.
+const MAX_TIP_CHECK_COMMITS: usize = 500;
+
+/// Where the branch that `entry` brought into trunk's line left that
+/// line: the merge bases of `entry`'s first parent and `top`, the
+/// branch's tip. One, usually; several when trunk and the branch merged
+/// each other before. None when `entry` is `top` itself (trunk was moved
+/// onto the branch and nothing was merged), or when `entry`'s first
+/// parent has `top` in its history already. Then `entry` is not where the
+/// branch came in (`entry_into` ran out of commits to walk), the merge
+/// base would be `top` itself, and a span measured from there is empty
+/// and holds whatever is asked of it.
+fn branch_points(
+    repo: &dyn Repo,
+    entry: &Commit,
+    top: &CommitId,
+) -> Result<Vec<Commit>, BackendError> {
+    if entry.id() == top {
+        return Ok(Vec::new());
+    }
+    let Some(first) = entry.parent_ids().first() else {
+        return Ok(Vec::new());
+    };
+    if is_ancestor(repo, top, first) {
+        return Ok(Vec::new());
+    }
+    let bases = pollster::block_on(
+        repo.index()
+            .common_ancestors(std::slice::from_ref(first), std::slice::from_ref(top)),
+    )
+    .map_err(snapshot_err)?;
+    bases
+        .iter()
+        .map(|base| repo.store().get_commit(base).map_err(snapshot_err))
+        .collect()
+}
+
+/// How far back along trunk's first parents `entry_into` looks.
+const MAX_ENTRY_WALK: usize = 10_000;
+
+/// The commit on trunk's first-parent line where `commit`, an ancestor of
+/// `tip`, entered it: the oldest one on that line that still has it as an
+/// ancestor. For a merge commit that is the merge; for a branch trunk was
+/// moved onto it is `commit` itself. A walk that runs out answers the
+/// oldest commit it reached, which still has `commit` in its history.
+fn entry_into(repo: &dyn Repo, commit: &CommitId, tip: &Commit) -> Result<Commit, BackendError> {
+    let mut at = tip.clone();
+    for _ in 0..MAX_ENTRY_WALK {
+        let Some(first) = at.parent_ids().first() else {
+            break;
+        };
+        if !is_ancestor(repo, commit, first) {
+            break;
+        }
+        at = repo.store().get_commit(first).map_err(snapshot_err)?;
+    }
+    Ok(at)
+}
+
 fn remote_rank(name: &str) -> usize {
     match name {
         "origin" => 0,
@@ -5400,6 +6307,8 @@ fn graph_node(
     view: &View,
     commit: &Commit,
     kind: NodeKind,
+    held: bool,
+    old_copies_held: bool,
     trunk: &Option<TrunkRef>,
     change_ids: &HashMap<CommitId, String>,
     divergent: &HashSet<CommitId>,
@@ -5417,9 +6326,9 @@ fn graph_node(
     }
 
     // Parents are limited to commits the snapshot draws; emptiness only
-    // matters for the mutable part of the graph, so bases skip the extra
-    // tree loads.
-    let is_base = kind == NodeKind::Immutable;
+    // matters for the part of the graph that is still worked on, so bases
+    // skip the extra tree loads.
+    let is_base = kind == NodeKind::Immutable && !held;
     let parents = commit
         .parent_ids()
         .iter()
@@ -5446,6 +6355,8 @@ fn graph_node(
         is_empty,
         has_conflict: commit.has_conflict(),
         is_divergent: divergent.contains(commit.id()),
+        held,
+        old_copies_held,
     }
 }
 
@@ -9744,6 +10655,9 @@ mod tests {
         for copy in &copies {
             assert_eq!(copy.id, copy.commit_id, "divergent nodes key by commit id");
             assert!(copy.id.chars().all(|c| c.is_ascii_hexdigit()));
+            // Both copies are the user's own: this divergence is theirs
+            // to resolve, unlike a copy someone else's branch keeps.
+            assert!(!copy.old_copies_held && copy.diverged_here());
         }
         // Everything else keeps the change-id key.
         let wc = snapshot
@@ -11072,6 +11986,714 @@ mod tests {
         assert_eq!(wc_node.parents, vec![first.clone()], "working copy rebased onto the parent");
     }
 
+    /// trunk ─ lower ─ upper, both bookmarked and pushed, in `root`
+    /// with `bare` as origin. Answers the two changes' ids.
+    fn pushed_pair(root: &Path, bare: &Path, backend: &JjBackend) -> (String, String) {
+        let first = build_colocated_repo(root, backend);
+        add_bare_origin(root, bare);
+        let (lower, _) = record_change(root, backend, &first, "lower", &[("lower.txt", "l\n")]);
+        let (upper, _) = record_change(root, backend, &lower, "upper", &[("upper.txt", "u\n")]);
+        backend.create_bookmark(root, "lower", &lower).unwrap();
+        backend.create_bookmark(root, "upper", &upper).unwrap();
+        let names = ["main".to_owned(), "lower".to_owned(), "upper".to_owned()];
+        backend.push_bookmarks(root, &names, None).unwrap();
+        (lower, upper)
+    }
+
+    /// Someone pushes a branch on top of a published stack: a teammate,
+    /// or the same person from another clone. jj calls everything an
+    /// untracked remote bookmark contains immutable, so after the fetch
+    /// the whole stack is. It is still the user's stack: drawn in the
+    /// default view, one workstream, each change marked as held.
+    #[test]
+    fn a_stack_someone_else_built_on_is_held_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+
+        let before = backend.open(root).unwrap();
+        assert!(before.nodes.iter().all(|n| !n.held));
+
+        // Their branch arrives, on top of `upper`.
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        backend.git_fetch(root, None).unwrap();
+
+        let snapshot = backend.open(root).unwrap();
+        for id in [&lower, &upper] {
+            let node = snapshot.nodes.iter().find(|n| n.id == *id).expect("still drawn");
+            // jj's answer stands: nothing here may rewrite it by hand.
+            assert_eq!(node.kind, NodeKind::Immutable, "{id}");
+            assert!(node.held, "{id}");
+            assert!(!node.is_settled(), "{id}");
+        }
+        assert!(matches!(
+            backend.describe(root, &upper, "edited").unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+        // Their commit is theirs: not drawn here, and not held.
+        assert!(!snapshot.nodes.iter().any(|n| n.description == "theirs: on top"));
+        // The stack is one workstream still, named by its bookmark.
+        let stream = snapshot
+            .workstreams
+            .iter()
+            .find(|ws| ws.node_ids.contains(&upper))
+            .expect("the stack is a workstream");
+        assert!(stream.node_ids.contains(&lower), "{:?}", stream.node_ids);
+        // Trunk is settled history, as ever.
+        let trunk = snapshot.nodes.iter().find(|n| n.bookmarks.contains(&"main".to_owned())).unwrap();
+        assert!(trunk.is_settled() && !trunk.held);
+
+        // In the Team view their commit is drawn too, as the immutable
+        // context it is.
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let theirs = team.nodes.iter().find(|n| n.description == "theirs: on top").unwrap();
+        assert!(theirs.is_settled());
+        assert!(team.nodes.iter().find(|n| n.id == upper).unwrap().held);
+    }
+
+    /// Only a branch that rests on the user's work makes it held. A
+    /// teammate's branch the user built on is the other way round: their
+    /// commits are below the user's bookmark, and stay plain immutable
+    /// history. A second remote branch at the very commit of a local
+    /// bookmark holds it like one above.
+    #[test]
+    fn held_is_for_work_under_someone_elses_branch_not_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        build_colocated_repo(root, &backend);
+        add_bare_origin(root, bare.path());
+        backend.push_bookmarks(root, &["main".into()], None).unwrap();
+
+        // A teammate's branch on trunk, and the user's change on top of it.
+        let main_commit = bare_branch(bare.path(), "main").unwrap();
+        bare_commit(bare.path(), "their-base", &main_commit, "theirs: a base");
+        backend.git_fetch(root, None).unwrap();
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let base = team.nodes.iter().find(|n| n.description == "theirs: a base").unwrap().id.clone();
+        let (mine, _) = record_change(root, &backend, &base, "mine", &[("mine.txt", "m\n")]);
+        backend.create_bookmark(root, "mine", &mine).unwrap();
+        backend.push_bookmarks(root, &["mine".into()], None).unwrap();
+
+        let snapshot = backend.open(root).unwrap();
+        let base_node = snapshot.nodes.iter().find(|n| n.id == base).expect("drawn as the base");
+        assert!(base_node.is_settled() && !base_node.held);
+        let mine_node = snapshot.nodes.iter().find(|n| n.id == mine).unwrap();
+        assert_eq!(mine_node.kind, NodeKind::Mutable);
+
+        // Another branch appears on the remote at the commit `mine` is on.
+        let mine_commit = bare_branch(bare.path(), "mine").unwrap();
+        git(bare.path(), &["update-ref", "refs/heads/copy-of-mine", &mine_commit]);
+        backend.git_fetch(root, None).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let mine_node = snapshot.nodes.iter().find(|n| n.id == mine).unwrap();
+        assert_eq!(mine_node.kind, NodeKind::Immutable);
+        assert!(mine_node.held);
+        // The teammate's base under it is still theirs.
+        assert!(!snapshot.nodes.iter().find(|n| n.id == base).unwrap().held);
+    }
+
+    /// What GitHub's squash merge leaves on the remote: one commit on
+    /// main with `commit`'s tree. `commit` must sit directly on main.
+    fn bare_squash(bare: &Path, commit: &str, message: &str) -> String {
+        let tree = git(bare, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        let parent = bare_branch(bare, "main").unwrap();
+        let squash = git(
+            bare,
+            &[
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                message,
+            ],
+        );
+        git(bare, &["update-ref", "refs/heads/main", &squash]);
+        squash
+    }
+
+    /// Landing the bottom of a stack while someone else's pull request
+    /// sits on its top. The fetch that brings the squash brings their
+    /// branch too, and jj then calls what is left of the stack immutable.
+    /// It still has to move onto trunk; their commit must not be
+    /// rewritten on the way, and no copy of it may appear here.
+    #[test]
+    fn landing_moves_a_held_stack_and_leaves_someone_elses_commits_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        let squash = bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+        assert!(backend.open(root).unwrap().nodes.iter().find(|n| n.id == upper).unwrap().held);
+
+        // A hand edit is refused as before; the landing's rebase is not.
+        assert!(matches!(
+            backend.rebase_change(root, &upper, &lower).unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+        // Before that rebase, `upper` still sits on the landed commit. It
+        // is the user's own, though their branch holds it: the sweep
+        // stops for it as for any change of the user's, and does not take
+        // it for someone else's commit that may stay behind.
+        let err = backend
+            .abandon_landed(root, std::slice::from_ref(&lower_commit))
+            .unwrap_err();
+        assert!(err.to_string().contains("on the landed commits"), "{err}");
+        let outcome = backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        assert!(
+            outcome.summary.ends_with(
+                "; theirs@origin still builds on the commits this replaced and was left as it is"
+            ),
+            "{}",
+            outcome.summary
+        );
+
+        let snapshot = backend.open(root).unwrap();
+        let moved = snapshot.nodes.iter().find(|n| n.id == upper).unwrap();
+        let parent = snapshot.nodes.iter().find(|n| n.id == moved.parents[0]).unwrap();
+        assert!(squash.starts_with(&parent.commit_id), "upper sits on the squash now");
+        // Nothing holds it any more: their branch is on the old commits.
+        assert_eq!(moved.kind, NodeKind::Mutable);
+        assert!(!moved.held && !moved.is_divergent);
+        // Their branch is where it was, on the commit they pushed, and
+        // no visible commit here is a copy of theirs.
+        assert_eq!(git(root, &["rev-parse", "refs/remotes/origin/theirs"]), theirs);
+        let all = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(
+            !all.nodes.iter().any(|n| n.description == "theirs: on top"),
+            "their commit is neither rewritten nor shown"
+        );
+
+        // The landed commit is swept although their branch still has it
+        // in its history (which is all that makes it immutable now).
+        let outcome = backend.abandon_landed(root, std::slice::from_ref(&lower_commit)).unwrap();
+        assert!(outcome.summary.starts_with("Abandoned"), "{}", outcome.summary);
+        let all = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(!all.nodes.iter().any(|n| n.id == lower));
+    }
+
+    /// Their commit moves only when something of the user's sits on it:
+    /// that work cannot stay behind, and it needs what it was built on.
+    #[test]
+    fn someone_elses_commit_the_user_built_on_moves_with_that_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        backend.git_fetch(root, None).unwrap();
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let theirs = team.nodes.iter().find(|n| n.description == "theirs: on top").unwrap().id.clone();
+        let (mine, _) = record_change(root, &backend, &theirs, "mine on theirs", &[("m.txt", "m\n")]);
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+
+        let outcome = backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        assert!(!outcome.summary.contains("left as"), "{}", outcome.summary);
+        let snapshot = backend.open(root).unwrap();
+        let mine_node = snapshot.nodes.iter().find(|n| n.id == mine).unwrap();
+        let below = snapshot.nodes.iter().find(|n| n.id == mine_node.parents[0]).unwrap();
+        assert_eq!(below.description, "theirs: on top");
+        assert_eq!(below.parents.as_slice(), std::slice::from_ref(&upper));
+    }
+
+    /// Their pull request was based on the branch that landed, beside
+    /// what is left of the stack. The sweep would abandon the landed
+    /// commit under their commit, and jj would rebase theirs onto what
+    /// was below it. The landed commit stays instead, as part of their
+    /// branch's history, and the sweep says so without failing.
+    #[test]
+    fn the_sweep_leaves_a_landed_commit_someone_elses_branch_sits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &lower_commit, "theirs: beside upper");
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        backend.delete_bookmark(root, "lower").unwrap();
+
+        let outcome = backend.abandon_landed(root, std::slice::from_ref(&lower_commit)).unwrap();
+        assert_eq!(outcome.operation_id, None, "nothing was recorded");
+        assert!(
+            outcome.summary.starts_with(crate::backend::LANDED_LEFT_IN_PLACE)
+                && outcome.summary.ends_with("in place: theirs@origin still builds on it"),
+            "{}",
+            outcome.summary
+        );
+        // Asked by itself, the same answer: whose branch keeps the landed
+        // commit. A commit that is part of trunk rests under none, and
+        // neither does an id that names nothing here.
+        assert_eq!(
+            backend.branches_resting_on(root, std::slice::from_ref(&lower_commit)).unwrap(),
+            ["theirs@origin"]
+        );
+        // Nor does anything rest on a commit of trunk's history, however
+        // many branches were made on top of it since.
+        let trunk_commit = bare_branch(bare.path(), "main").unwrap();
+        bare_commit(bare.path(), "later", &trunk_commit, "later: started on trunk");
+        backend.git_fetch(root, None).unwrap();
+        assert!(backend.branches_resting_on(root, &[trunk_commit]).unwrap().is_empty());
+        assert_eq!(
+            backend.branches_resting_on(root, std::slice::from_ref(&lower_commit)).unwrap(),
+            ["theirs@origin"]
+        );
+        assert!(backend
+            .branches_resting_on(root, &["0123456789abcdef0123456789abcdef01234567".into()])
+            .unwrap()
+            .is_empty());
+        // Their commit is as they pushed it, on the landed commit.
+        assert_eq!(git(root, &["rev-parse", "refs/remotes/origin/theirs"]), theirs);
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let theirs_node = team.nodes.iter().find(|n| n.description == "theirs: beside upper").unwrap();
+        assert_eq!(theirs_node.parents.as_slice(), std::slice::from_ref(&lower));
+
+        // A change of the user's own on a landed commit still stops the
+        // sweep, as before: that one would lose what landed.
+        let (_late, _) = record_change(root, &backend, &lower, "late", &[("late.txt", "x\n")]);
+        let err = backend.abandon_landed(root, std::slice::from_ref(&lower_commit)).unwrap_err();
+        assert!(err.to_string().contains("on the landed commits"), "{err}");
+    }
+
+    /// A commit made on the remote by someone else: `parent`'s tree with
+    /// `file` set to `text`, on `branch`. Returns the full commit hex.
+    fn bare_file_commit(
+        bare: &Path,
+        branch: &str,
+        parent: &str,
+        message: &str,
+        file: &str,
+        text: &str,
+    ) -> String {
+        let piped = |args: &[&str], input: &str| -> String {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("git")
+                .arg("-C")
+                .arg(bare)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("git binary available");
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let blob = piped(&["hash-object", "-w", "--stdin"], text);
+        let mut entries: Vec<String> = git(bare, &["ls-tree", parent])
+            .lines()
+            .filter(|line| !line.ends_with(&format!("\t{file}")))
+            .map(str::to_owned)
+            .collect();
+        entries.push(format!("100644 blob {blob}\t{file}"));
+        let tree = piped(&["mktree"], &(entries.join("\n") + "\n"));
+        let commit = git(
+            bare,
+            &[
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "commit-tree",
+                &tree,
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+        );
+        git(bare, &["update-ref", &format!("refs/heads/{branch}"), &commit]);
+        commit
+    }
+
+    /// The user rewrote a change after someone else had built on it. The
+    /// fetch that brings their branch brings the old commit back into
+    /// view: the change now has two commits, and the old one is not the
+    /// user's to abandon. The snapshot says which kind of divergence
+    /// this is, and a landing's rebase goes on with the user's commit and
+    /// leaves their branch, and the old commit it keeps, where they are.
+    #[test]
+    fn an_old_copy_someone_elses_branch_keeps_is_not_the_users_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let old_upper = bare_branch(bare.path(), "upper").unwrap();
+        // They build on `upper` as it is. The user amends it before
+        // fetching, and publishes the amended one.
+        let theirs = bare_file_commit(
+            bare.path(),
+            "theirs",
+            &old_upper,
+            "theirs: on top",
+            "theirs.txt",
+            "t\n",
+        );
+        backend.describe(root, &upper, "upper, amended").unwrap();
+        backend.push_bookmarks(root, &["upper".into()], None).unwrap();
+        backend.git_fetch(root, None).unwrap();
+
+        let amended = |snapshot: &RepoSnapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|n| n.description == "upper, amended")
+                .cloned()
+                .expect("the amended change is drawn")
+        };
+        let snapshot = backend.open(root).unwrap();
+        let node = amended(&snapshot);
+        // Two commits of one change, and the other is theirs to keep.
+        assert!(node.is_divergent && node.old_copies_held && !node.diverged_here());
+        assert_eq!(node.kind, NodeKind::Mutable);
+        assert!(snapshot.nodes.iter().find(|n| n.id == lower).unwrap().held);
+        // Their branch rests on the commit it was built on, and on that
+        // one only: the amended commit is not in its history.
+        let new_upper = bare_branch(bare.path(), "upper").unwrap();
+        assert_ne!(new_upper, old_upper);
+        assert_eq!(
+            backend.branches_resting_on(root, std::slice::from_ref(&old_upper)).unwrap(),
+            ["theirs@origin"]
+        );
+        assert!(backend
+            .branches_resting_on(root, std::slice::from_ref(&new_upper))
+            .unwrap()
+            .is_empty());
+
+        // `lower` lands and what is left moves onto trunk. Nothing here
+        // pushes to their branch: it stays where its author left it, the
+        // change still has two commits here, and ending that is still
+        // theirs to do (by rebasing their branch, or deleting it).
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+        let landed = std::slice::from_ref(&lower_commit);
+        backend.rebase_onto_trunk(root, "origin", "main", &node.id, landed).unwrap();
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), theirs);
+        let snapshot = backend.open(root).unwrap();
+        let node = amended(&snapshot);
+        assert!(node.is_divergent && node.old_copies_held && !node.diverged_here());
+        assert_eq!(node.kind, NodeKind::Mutable);
+    }
+
+    /// A commit can be immutable twice over: someone else's branch rests
+    /// on it, and it carries a tag. Leaving their branch out of the
+    /// reckoning must leave the tag standing: the change is settled, not
+    /// held, and a landing rewrites nothing under it. What is immutable
+    /// on account of their branch alone, above the tag, is still held.
+    /// (Found in review: a tagged change with someone's branch at the
+    /// same commit read as held, and the landing's rebase rewrote it.)
+    #[test]
+    fn a_tag_keeps_a_change_settled_whoever_else_rests_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let (top, _) = record_change(root, &backend, &upper, "top", &[("top.txt", "t\n")]);
+        backend.create_bookmark(root, "top", &top).unwrap();
+        backend.push_bookmarks(root, &["top".into()], None).unwrap();
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let top_commit = bare_branch(bare.path(), "top").unwrap();
+        // On the remote: a tag on `upper`, someone's branch at that very
+        // commit, and another at `top`'s.
+        git(bare.path(), &["tag", "v1", &upper_commit]);
+        git(bare.path(), &["update-ref", "refs/heads/copy-of-upper", &upper_commit]);
+        git(bare.path(), &["update-ref", "refs/heads/copy-of-top", &top_commit]);
+        backend.git_fetch(root, None).unwrap();
+
+        let snapshot = backend.open(root).unwrap();
+        let node = |id: &str| snapshot.nodes.iter().find(|n| n.id == id).cloned();
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        for id in [&lower, &upper] {
+            // Settled history is not drawn with the user's own changes.
+            let found = node(id).or_else(|| team.nodes.iter().find(|n| n.id == *id).cloned());
+            let found = found.expect("the tagged change is in view somewhere");
+            assert_eq!(found.kind, NodeKind::Immutable, "{id}");
+            assert!(!found.held && found.is_settled(), "{id}");
+        }
+        let top_node = node(&top).expect("the change above the tag is still the user's");
+        assert!(top_node.held && !top_node.is_settled());
+
+        // The landing's two mutations refuse the tagged changes.
+        assert!(matches!(
+            backend
+                .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+                .unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+        assert!(matches!(
+            backend.abandon_landed(root, std::slice::from_ref(&upper_commit)).unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+        // Nothing was rewritten: the tag and the branch are where they were.
+        assert_eq!(bare_branch(bare.path(), "upper").unwrap(), upper_commit);
+        let after = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let upper_after = after.nodes.iter().find(|n| n.id == upper).unwrap();
+        assert!(upper_commit.starts_with(&upper_after.commit_id));
+    }
+
+    /// The same for whatever the user's own `immutable_heads()` names: a
+    /// change it makes immutable stays settled when someone else's branch
+    /// also rests on it. And a configuration that names every remote
+    /// branch some other way than jj's `untracked_remote_bookmarks()`
+    /// cannot be taken apart: under it nothing is held.
+    #[test]
+    fn what_the_users_immutable_heads_names_for_its_own_reasons_stays_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        backend.git_fetch(root, None).unwrap();
+        let held = |id: &str| {
+            let snapshot = backend.open_with(root, &SnapshotView::Team).unwrap();
+            snapshot.nodes.iter().find(|n| n.id == id).map(|n| n.held)
+        };
+        // jj's default: both are held by their branch.
+        assert_eq!((held(&lower), held(&upper)), (Some(true), Some(true)));
+
+        // The user's configuration protects `lower` as well.
+        write_repo_config(
+            root,
+            "[revset-aliases]\n'immutable_heads()' = \
+             'builtin_immutable_heads() | bookmarks(exact:\"lower\")'\n",
+        );
+        assert_eq!((held(&lower), held(&upper)), (Some(false), Some(true)));
+
+        // Every remote branch, by another name: their branch cannot be
+        // told from the user's reasons, and stays one of them.
+        write_repo_config(
+            root,
+            "[revset-aliases]\n'immutable_heads()' = \
+             'present(trunk()) | tags() | remote_bookmarks()'\n",
+        );
+        assert_eq!((held(&lower), held(&upper)), (Some(false), Some(false)));
+    }
+
+    /// A configuration can call jj's `untracked_remote_bookmarks` with an
+    /// argument: a remote, a name pattern. An alias cannot stand in for a
+    /// call with arguments, so their branches cannot be set aside in such
+    /// an `immutable_heads()`. Then nothing is taken apart: everything it
+    /// names is settled, nothing is held, and the repository opens as it
+    /// does for jj. (Found in review: once someone's branch had been
+    /// fetched onto a stack, every snapshot failed with a configuration
+    /// error.)
+    #[test]
+    fn untracked_remote_bookmarks_called_with_an_argument_leaves_everything_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        backend.git_fetch(root, None).unwrap();
+
+        for call in [
+            "untracked_remote_bookmarks(remote=\"origin\")",
+            "untracked_remote_bookmarks(\"theirs\")",
+        ] {
+            write_repo_config(
+                root,
+                &format!(
+                    "[revset-aliases]\n'immutable_heads()' = 'present(trunk()) | tags() | {call}'\n"
+                ),
+            );
+            // Both views open, and the stack under their branch reads as
+            // it does for jj: immutable, and not held.
+            backend.open(root).unwrap_or_else(|err| panic!("{call}: {err}"));
+            let team = backend
+                .open_with(root, &SnapshotView::Team)
+                .unwrap_or_else(|err| panic!("{call}: {err}"));
+            for id in [&lower, &upper] {
+                let node = team.nodes.iter().find(|n| n.id == *id).expect("in view");
+                assert_eq!(node.kind, NodeKind::Immutable, "{call}: {id}");
+                assert!(!node.held && node.is_settled(), "{call}: {id}");
+            }
+            // The landing's two mutations rewrite nothing under it.
+            assert!(
+                matches!(
+                    backend
+                        .rebase_onto_trunk(
+                            root,
+                            "origin",
+                            "main",
+                            &upper,
+                            std::slice::from_ref(&lower_commit)
+                        )
+                        .unwrap_err(),
+                    BackendError::ImmutableChange(_)
+                ),
+                "{call}"
+            );
+            assert!(
+                matches!(
+                    backend.abandon_landed(root, std::slice::from_ref(&upper_commit)).unwrap_err(),
+                    BackendError::ImmutableChange(_)
+                ),
+                "{call}"
+            );
+        }
+    }
+
+    /// `untracked_remote_bookmarks()` can be an alias of the user's own,
+    /// standing in for jj's function. What it names is then the user's
+    /// reason like any other, and it is not set aside: a change it makes
+    /// immutable is settled, with or without someone's branch on it, and
+    /// a landing rewrites nothing under it. (Found in review: the user's
+    /// helper was replaced whole, the change read as held, and the
+    /// landing's rebase was let through.)
+    #[test]
+    fn a_helper_of_the_users_own_named_untracked_remote_bookmarks_is_not_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        write_repo_config(
+            root,
+            "[revset-aliases]\n'untracked_remote_bookmarks()' = 'bookmarks(exact:\"upper\")'\n",
+        );
+        let settled = |when: &str| {
+            let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+            for id in [&lower, &upper] {
+                let node = team.nodes.iter().find(|n| n.id == *id).expect("in view");
+                assert_eq!(node.kind, NodeKind::Immutable, "{when}: {id}");
+                assert!(!node.held && node.is_settled(), "{when}: {id}");
+            }
+        };
+        settled("before anyone else's branch");
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        backend.git_fetch(root, None).unwrap();
+        settled("with their branch on it");
+
+        assert!(matches!(
+            backend
+                .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+                .unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+        assert!(matches!(
+            backend.abandon_landed(root, std::slice::from_ref(&upper_commit)).unwrap_err(),
+            BackendError::ImmutableChange(_)
+        ));
+    }
+
+    /// Where nothing is taken apart, settled is what jj calls immutable
+    /// and no more. Here the user's own helper names nothing, so their
+    /// commit, which the user built on and bookmarked above, is mutable
+    /// for jj. The landing's rebase then moves the stack as jj would, their
+    /// commit with the work that sits on it, and does not stop half-way
+    /// over a commit that only jj's default would have protected.
+    #[test]
+    fn under_a_helper_of_the_users_own_nothing_is_refused_that_jj_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        write_repo_config(
+            root,
+            "[revset-aliases]\n'untracked_remote_bookmarks()' = 'none()'\n",
+        );
+        backend.git_fetch(root, None).unwrap();
+        let team = backend.open_with(root, &SnapshotView::Team).unwrap();
+        let theirs = team.nodes.iter().find(|n| n.description == "theirs: on top").unwrap().id.clone();
+        let (mine, _) = record_change(root, &backend, &theirs, "mine on theirs", &[("m.txt", "m\n")]);
+        backend.create_bookmark(root, "mine", &mine).unwrap();
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+
+        backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let mine_node = snapshot.nodes.iter().find(|n| n.id == mine).unwrap();
+        let below = snapshot.nodes.iter().find(|n| n.id == mine_node.parents[0]).unwrap();
+        assert_eq!(below.description, "theirs: on top");
+        assert_eq!(below.parents.as_slice(), std::slice::from_ref(&upper));
+    }
+
+    /// Whose commits are someone else's is read from the repository, not
+    /// through a helper the user may have redefined. Here the user's own
+    /// `untracked_remote_bookmarks()` names nothing, so their branch makes
+    /// nothing immutable and the stack lands as plain mutable work. Their
+    /// commit is still theirs: the landing's rebase does not rewrite it.
+    #[test]
+    fn someone_elses_commits_are_told_by_the_repository_not_by_the_users_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        write_repo_config(
+            root,
+            "[revset-aliases]\n'untracked_remote_bookmarks()' = 'none()'\n",
+        );
+        backend.git_fetch(root, None).unwrap();
+        let node = backend.open(root).unwrap().nodes.into_iter().find(|n| n.id == upper).unwrap();
+        assert_eq!(node.kind, NodeKind::Mutable);
+
+        let outcome = backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        assert!(
+            outcome.summary.ends_with(
+                "; theirs@origin still builds on the commits this replaced and was left as it is"
+            ),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(git(root, &["rev-parse", "refs/remotes/origin/theirs"]), theirs);
+        let all = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(
+            !all.nodes.iter().any(|n| n.description == "theirs: on top"),
+            "their commit is neither rewritten nor shown"
+        );
+    }
+
     #[test]
     fn team_view_draws_untracked_remote_branches() {
         let dir = tempfile::tempdir().unwrap();
@@ -11587,6 +13209,1150 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Records one described change on top of `parent` that writes
+    /// `files`, and answers its node id and commit id. The working copy
+    /// ends up on a fresh change above it.
+    fn record_change(
+        root: &Path,
+        backend: &JjBackend,
+        parent: &str,
+        description: &str,
+        files: &[(&str, &str)],
+    ) -> (String, String) {
+        backend.new_change(root, parent).unwrap();
+        for (name, text) in files {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let id = backend.refresh(root).unwrap().working_copy;
+        backend.describe(root, &id, description).unwrap();
+        backend.new_change(root, &id).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let commit = snapshot.nodes.iter().find(|n| n.id == id).unwrap().commit_id.clone();
+        (id, commit)
+    }
+
+    #[test]
+    fn landed_check_asks_whether_a_trunk_commit_holds_the_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+
+        // A stack of two on trunk: `a` rewrites file.txt's only line and
+        // adds a.txt, `b` rewrites the same line again and adds b.txt.
+        let (a, a_commit) =
+            record_change(root, &backend, &first, "a", &[("file.txt", "two\n"), ("a.txt", "a\n")]);
+        let (b, b_commit) =
+            record_change(root, &backend, &a, "b", &[("file.txt", "three\n"), ("b.txt", "b\n")]);
+
+        // Nothing has landed: a commit that is not on trunk is elsewhere,
+        // one this repository has never seen is unfetched.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &a_commit, &a_commit, &a, &a).unwrap(),
+            LandedCheck::Elsewhere
+        );
+        assert_eq!(
+            backend
+                .landed_check(root, "origin", "main", "0123456789abcdef0123456789abcdef01234567", &a_commit, &a, &a)
+                .unwrap(),
+            LandedCheck::Unfetched
+        );
+
+        // Trunk gains someone else's commit, then a commit that carries
+        // only half of `a`: the line, without a.txt. The loss is named.
+        let (other, _) = record_change(root, &backend, &first, "other", &[("other.txt", "o\n")]);
+        let (lossy, lossy_commit) =
+            record_change(root, &backend, &other, "a (#1)", &[("file.txt", "two\n")]);
+        backend.move_bookmark(root, "main", &lossy).unwrap();
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &lossy_commit, &a_commit, &a, &a).unwrap(),
+            LandedCheck::Missing { paths: vec!["a.txt".to_owned()], more: 0 }
+        );
+
+        // A squash of all of `a`, as GitHub makes one: a new commit with
+        // `a`'s content on a trunk that moved underneath it. It holds `a`
+        // and does not hold `b`: both of b's paths would still change.
+        let (squash, squash_commit) =
+            record_change(root, &backend, &lossy, "a (#2)", &[("a.txt", "a\n")]);
+        backend.move_bookmark(root, "main", &squash).unwrap();
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &a_commit, &a, &a).unwrap(),
+            LandedCheck::Landed
+        );
+        let b_missing = LandedCheck::Missing {
+            paths: vec!["b.txt".to_owned(), "file.txt".to_owned()],
+            more: 0,
+        };
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &b_commit, &b, &b).unwrap(),
+            b_missing
+        );
+        // The run `a..=b` as one question: `a` is there, `b` is not.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &b_commit, &a, &b).unwrap(),
+            b_missing
+        );
+
+        // A later trunk commit that rewrites the same line does not turn
+        // the landing into a missing one: the question is about the
+        // landing commit, not about trunk's tip.
+        let (later, _) =
+            record_change(root, &backend, &squash, "later", &[("file.txt", "rewritten\n")]);
+        backend.move_bookmark(root, "main", &later).unwrap();
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &a_commit, &a, &a).unwrap(),
+            LandedCheck::Landed
+        );
+        // Asked about the earlier, lossy commit: it does not hold `a`,
+        // and trunk's tip no longer does either (the line was rewritten),
+        // so the loss stands.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &lossy_commit, &a_commit, &a, &a).unwrap(),
+            LandedCheck::Missing { paths: vec!["a.txt".to_owned()], more: 0 }
+        );
+    }
+
+    #[test]
+    fn landed_check_finds_changes_that_reached_trunk_another_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        // `b` sits on `a`. Its pull request merged into a's branch, as the
+        // commit `into_a` (never on trunk); then a's branch landed whole,
+        // as one squash holding both.
+        let (a, _) = record_change(root, &backend, &first, "a", &[("a.txt", "a\n")]);
+        let (b, b_commit) = record_change(root, &backend, &a, "b", &[("b.txt", "b\n")]);
+        let (_, into_a) = record_change(root, &backend, &a, "b (#2)", &[("b.txt", "b\n")]);
+
+        // Before anything landed, b's merge is elsewhere and that is all.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &into_a, &b_commit, &b, &b).unwrap(),
+            LandedCheck::Elsewhere
+        );
+
+        let (squash, _) = record_change(
+            root,
+            &backend,
+            &first,
+            "a (#1)",
+            &[("a.txt", "a\n"), ("b.txt", "b\n")],
+        );
+        backend.move_bookmark(root, "main", &squash).unwrap();
+        // The commit GitHub names for b's merge is still not on trunk, but
+        // trunk holds b's changes: they arrived inside a's squash.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &into_a, &b_commit, &b, &b).unwrap(),
+            LandedCheck::Held
+        );
+    }
+
+    /// A segment whose bottom change is a merge: the branch it merges in
+    /// is part of what its pull request carries, so the diff is measured
+    /// from the commit below it in the stack (its first parent), never
+    /// from all its parents merged.
+    #[test]
+    fn landed_check_measures_a_merge_from_the_commit_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        // `topic` merges a side branch (which adds side.txt) into a branch
+        // at trunk. Its pull request was "merged" at its own head, into
+        // some integration branch: never on trunk.
+        let (topic, landing) = {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let base = resolve_change_commit(&repo, &first).unwrap();
+            let store = repo.store().clone();
+            let with_side = file_tree(&store, &[("file.txt", "one\n"), ("side.txt", "side\n")]);
+            let mut tx = repo.start_transaction();
+            let side =
+                write_commit_with_tree(&mut tx, vec![base.id().clone()], "side", with_side.clone());
+            let topic = write_commit_with_tree(
+                &mut tx,
+                vec![base.id().clone(), side.id().clone()],
+                "topic: merge side",
+                with_side.clone(),
+            );
+            // The same content landed properly, as a squash on trunk,
+            // kept aside until the bookmark moves to it.
+            let landing = write_commit_with_tree(
+                &mut tx,
+                vec![base.id().clone()],
+                "topic (#1)",
+                with_side,
+            );
+            pollster::block_on(tx.commit("a merge and its squash")).unwrap();
+            (topic.id().hex(), landing.id().hex())
+        };
+
+        // Trunk has no side.txt, and the pull request's merge is off
+        // trunk: the changes have not landed.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &topic, &topic, &topic, &topic).unwrap(),
+            LandedCheck::Elsewhere
+        );
+        // Asked about a trunk commit that lacks the file, the loss is named.
+        let first_commit = {
+            let snapshot = backend.open(root).unwrap();
+            snapshot.nodes.iter().find(|n| n.id == first).unwrap().commit_id.clone()
+        };
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &first_commit, &topic, &topic, &topic).unwrap(),
+            LandedCheck::Missing { paths: vec!["side.txt".to_owned()], more: 0 }
+        );
+        // Once the squash is trunk, it holds the merge's content.
+        backend.move_bookmark(root, "main", &landing).unwrap();
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &landing, &topic, &topic, &topic).unwrap(),
+            LandedCheck::Landed
+        );
+    }
+
+    /// A branch name can outlive its pull request. The earlier pull
+    /// request's merge vouches for the commits it was merged from and for
+    /// nothing else: new work under the same name is judged by trunk's
+    /// tip, even when the old merge happens to contain the same patch
+    /// (it was reverted since).
+    #[test]
+    fn landed_check_asks_trunks_tip_when_the_pull_request_had_another_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        // The flag goes on in a pull request that lands as a squash, and
+        // is turned off again on trunk.
+        let (old, old_commit) =
+            record_change(root, &backend, &first, "flag on", &[("file.txt", "on\n")]);
+        let (squash, squash_commit) =
+            record_change(root, &backend, &first, "flag on (#1)", &[("file.txt", "on\n")]);
+        let (revert, _) =
+            record_change(root, &backend, &squash, "revert", &[("file.txt", "one\n")]);
+        backend.move_bookmark(root, "main", &revert).unwrap();
+        // The pull request's own change did land, revert or no revert.
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &old_commit, &old, &old).unwrap(),
+            LandedCheck::Landed
+        );
+
+        // A fresh change turns the flag on again, under the old branch
+        // name. The old merge holds the very same patch, and it says
+        // nothing about this change: trunk's tip has the flag off.
+        let (again, again_commit) =
+            record_change(root, &backend, &revert, "flag on again", &[("file.txt", "on\n")]);
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &old_commit, &again, &again).unwrap(),
+            LandedCheck::Missing { paths: vec!["file.txt".to_owned()], more: 0 }
+        );
+        // The same holds when the forge names a head this repository has
+        // never seen.
+        assert_eq!(
+            backend
+                .landed_check(
+                    root, "origin", "main",
+                    &squash_commit,
+                    "0123456789abcdef0123456789abcdef01234567",
+                    &again,
+                    &again,
+                )
+                .unwrap(),
+            LandedCheck::Missing { paths: vec!["file.txt".to_owned()], more: 0 }
+        );
+        // When trunk's tip does hold it, a pull request with another head
+        // is no obstacle: a change reworded after it merged still counts.
+        let (relanded, _) =
+            record_change(root, &backend, &revert, "flag on again (#2)", &[("file.txt", "on\n")]);
+        backend.move_bookmark(root, "main", &relanded).unwrap();
+        assert_eq!(
+            backend.landed_check(root, "origin", "main", &squash_commit, &old_commit, &again, &again).unwrap(),
+            LandedCheck::Held
+        );
+        let _ = again_commit;
+    }
+
+    /// Commits that are part of trunk's history are judged where they
+    /// entered it. A merge commit that kept their content landed them,
+    /// whatever commit the forge names; a merge that took the branch in
+    /// and kept none of its content did not (GitHub marks that pull
+    /// request merged all the same, and names the merge).
+    #[test]
+    fn landed_check_asks_the_commit_where_a_branch_entered_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (topic, topic_commit) =
+            record_change(root, &backend, &first, "topic", &[("topic.txt", "t\n")]);
+        let (other, _) = record_change(root, &backend, &first, "other", &[("other.txt", "o\n")]);
+        // Two merges of the topic into trunk's line: one keeps its file,
+        // one keeps trunk's content only (`git merge -s ours`).
+        let merge_of = |files: &[(&str, &str)], description: &str| {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let line = resolve_change_commit(&repo, &other).unwrap();
+            let head = resolve_change_commit(&repo, &topic).unwrap();
+            let store = repo.store().clone();
+            let tree = file_tree(&store, files);
+            let mut tx = repo.start_transaction();
+            let merge = write_commit_with_tree(
+                &mut tx,
+                vec![line.id().clone(), head.id().clone()],
+                description,
+                tree,
+            );
+            pollster::block_on(tx.commit("a merge commit")).unwrap();
+            merge.id().hex()
+        };
+        let kept = merge_of(
+            &[("file.txt", "one\n"), ("other.txt", "o\n"), ("topic.txt", "t\n")],
+            "Merge pull request #1",
+        );
+        let dropped = merge_of(
+            &[("file.txt", "one\n"), ("other.txt", "o\n")],
+            "Merge topic, keeping ours",
+        );
+        let unknown = "0123456789abcdef0123456789abcdef01234567";
+        let check = |landing: &str| {
+            backend
+                .landed_check(root, "origin", "main", landing, &topic_commit, &topic_commit, &topic_commit)
+                .unwrap()
+        };
+        // Not on trunk yet.
+        assert_eq!(check(&kept), LandedCheck::Elsewhere);
+
+        // The merge that kept the file: landed, also when the commit the
+        // forge names has not been seen here, and also when it names the
+        // pull request's own head.
+        backend.move_bookmark(root, "main", &kept).unwrap();
+        for landing in [kept.as_str(), unknown, topic_commit.as_str()] {
+            assert_eq!(check(landing), LandedCheck::Landed, "{landing}");
+        }
+        // A later commit on trunk that removes the file again does not
+        // undo that: the question is about the merge.
+        backend.new_change(root, &kept).unwrap();
+        std::fs::remove_file(root.join("topic.txt")).unwrap();
+        let removal = backend.refresh(root).unwrap().working_copy;
+        backend.describe(root, &removal, "remove topic.txt again").unwrap();
+        backend.new_change(root, &removal).unwrap();
+        backend.move_bookmark(root, "main", &removal).unwrap();
+        assert_eq!(check(&kept), LandedCheck::Landed);
+
+        // The merge that dropped it: the commits are in trunk's history
+        // and the file is not on trunk. Whatever the forge names.
+        backend.move_bookmark(root, "main", &dropped).unwrap();
+        for landing in [dropped.as_str(), unknown, topic_commit.as_str()] {
+            assert_eq!(
+                check(landing),
+                LandedCheck::Missing { paths: vec!["topic.txt".to_owned()], more: 0 },
+                "{landing}"
+            );
+        }
+        // Trunk moved straight onto the branch (a push of trunk to the
+        // topic): the commit entered trunk as itself.
+        backend.move_bookmark(root, "main", &topic).unwrap();
+        assert_eq!(check(&topic_commit), LandedCheck::Landed);
+    }
+
+    /// After a landing the rest of a stack is rebuilt on trunk as the
+    /// remote has it after the fetch. The local bookmark of the same name
+    /// can be ahead of it with commits nobody pushed, and is the one the
+    /// snapshot marks as trunk.
+    #[test]
+    fn rebase_onto_trunk_follows_the_remote_past_an_unpushed_local_bookmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        write_repo_config(
+            root,
+            "user.name = \"Test User\"\nuser.email = \"test@example.com\"\n\
+             [revset-aliases]\n'trunk()' = 'main@origin'\n",
+        );
+        add_bare_origin(root, bare.path());
+        backend.push_bookmarks(root, &["main".into()], None).unwrap();
+
+        // A change waiting to land, and work committed on the local main
+        // that was never pushed.
+        let (topic, _) = record_change(root, &backend, &first, "topic", &[("topic.txt", "t\n")]);
+        let (unpushed, _) =
+            record_change(root, &backend, &first, "unpushed", &[("local.txt", "l\n")]);
+        backend.move_bookmark(root, "main", &unpushed).unwrap();
+        // The remote's main moves on, and a fetch brings it.
+        let remote_first = bare_branch(bare.path(), "main").unwrap();
+        let landed = bare_commit(bare.path(), "main", &remote_first, "landed on the remote");
+        backend.git_fetch(root, None).unwrap();
+
+        let snapshot = backend.open(root).unwrap();
+        let marked = snapshot.bookmarks.iter().find(|b| b.is_trunk).unwrap();
+        assert!(marked.is_local, "the local main is the bookmark marked as trunk");
+        assert_eq!(marked.target, unpushed, "and it still sits on the unpushed commit");
+
+        backend.rebase_onto_trunk(root, "origin", "main", &topic, &[]).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let moved = snapshot.nodes.iter().find(|n| n.id == topic).unwrap();
+        let parent = snapshot.nodes.iter().find(|n| n.id == moved.parents[0]).unwrap();
+        assert_eq!(parent.description, "landed on the remote");
+        assert!(landed.starts_with(&parent.commit_id));
+        // Already there: nothing more is recorded.
+        assert!(backend
+            .rebase_onto_trunk(root, "origin", "main", &topic, &[])
+            .unwrap()
+            .operation_id
+            .is_none());
+    }
+
+    /// With no `trunk()` of the user's own, Jiji's default takes the
+    /// latest of the remote's main and the local one. A commit made on
+    /// the local main after the last fetch is then `trunk()`, and it is
+    /// not what a pull request lands on. Landing goes by the remote's
+    /// branch: for the check and for the rebase.
+    #[test]
+    fn landing_goes_by_the_remotes_trunk_when_the_default_trunk_is_a_local_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        add_bare_origin(root, bare.path());
+        backend.push_bookmarks(root, &["main".into()], None).unwrap();
+        let (lower, lower_commit) =
+            record_change(root, &backend, &first, "lower", &[("lower.txt", "l\n")]);
+        let (upper, _) = record_change(root, &backend, &lower, "upper", &[("upper.txt", "u\n")]);
+
+        // The lower change's pull request is squashed on the remote, and
+        // a fetch brings the squash; the local main follows it.
+        let squash = {
+            // `lower` sits directly on trunk, so its tree is the squash's.
+            // The bare repository needs that tree before it can commit it.
+            let lower_tree = git(root, &["rev-parse", &format!("{lower_commit}^{{tree}}")]);
+            let scratch = format!("{lower_commit}:refs/heads/scratch-lower");
+            git(root, &["push", "--quiet", bare.path().to_str().unwrap(), &scratch]);
+            let parent = bare_branch(bare.path(), "main").unwrap();
+            let commit = git(
+                bare.path(),
+                &[
+                    "-c",
+                    "user.name=Upstream",
+                    "-c",
+                    "user.email=upstream@example.com",
+                    "commit-tree",
+                    &lower_tree,
+                    "-p",
+                    &parent,
+                    "-m",
+                    "lower (#1)",
+                ],
+            );
+            git(bare.path(), &["update-ref", "refs/heads/main", &commit]);
+            git(bare.path(), &["update-ref", "-d", "refs/heads/scratch-lower"]);
+            commit
+        };
+        backend.git_fetch(root, None).unwrap();
+        // Then a commit on the local main, not pushed. It is newer than
+        // the squash, so the default `trunk()` now names it.
+        let squash_node = {
+            let snapshot = backend.open(root).unwrap();
+            snapshot.nodes.iter().find(|n| squash.starts_with(&n.commit_id)).unwrap().id.clone()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (unpushed, _) = record_change(
+            root,
+            &backend,
+            &squash_node,
+            "unpushed",
+            &[("unpublished.txt", "x\n")],
+        );
+        backend.move_bookmark(root, "main", &unpushed).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let unpushed_node = snapshot.nodes.iter().find(|n| n.id == unpushed).unwrap();
+        assert_eq!(
+            unpushed_node.kind,
+            NodeKind::Immutable,
+            "the default trunk() has moved onto the unpushed commit"
+        );
+
+        // The check judges the squash against the remote's main.
+        assert_eq!(
+            backend
+                .landed_check(root, "origin", "main", &squash, &lower_commit, &lower, &lower)
+                .unwrap(),
+            LandedCheck::Landed
+        );
+        // And the rest of the stack goes onto the squash, not onto the
+        // unpushed commit.
+        backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let moved = snapshot.nodes.iter().find(|n| n.id == upper).unwrap();
+        let parent = snapshot.nodes.iter().find(|n| n.id == moved.parents[0]).unwrap();
+        assert!(squash.starts_with(&parent.commit_id), "{}", parent.description);
+        // Its tree has nothing of the unpushed commit.
+        let tree = git(root, &["ls-tree", "-r", "--name-only", &resolved_commit_id(root, &upper)]);
+        assert!(tree.contains("upper.txt") && tree.contains("lower.txt"), "{tree}");
+        assert!(!tree.contains("unpublished.txt"), "{tree}");
+
+        // A fetch can also change which branch `trunk()` names. The
+        // default alias takes the latest of `main`, `master` and `trunk`:
+        // someone moves `master` ahead of `main` on the remote.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let squash_tree = git(bare.path(), &["rev-parse", &format!("{squash}^{{tree}}")]);
+        let legacy = git(
+            bare.path(),
+            &[
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "commit-tree",
+                &squash_tree,
+                "-p",
+                &squash,
+                "-m",
+                "legacy",
+            ],
+        );
+        git(bare.path(), &["update-ref", "refs/heads/master", &legacy]);
+        backend.git_fetch(root, None).unwrap();
+        assert_eq!(
+            backend.open(root).unwrap().trunk_bookmark,
+            "master",
+            "trunk() names the other branch now"
+        );
+        // A landing that was planned for `main` stays on `main`: the
+        // stack is where it should be, and is not moved onto `master`.
+        backend.rebase_onto_trunk(root, "origin", "main", &upper, &[]).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let moved = snapshot.nodes.iter().find(|n| n.id == upper).unwrap();
+        let parent = snapshot.nodes.iter().find(|n| n.id == moved.parents[0]).unwrap();
+        assert!(squash.starts_with(&parent.commit_id), "{}", parent.description);
+
+        // And a branch the remote does not have is refused, not replaced
+        // by a local bookmark of that name.
+        backend.create_bookmark(root, "develop", &upper).unwrap();
+        let err = backend
+            .landed_check(root, "origin", "develop", &squash, &lower_commit, &lower, &lower)
+            .unwrap_err();
+        assert!(err.to_string().contains("from origin here to land on"), "{err}");
+        let err = backend
+            .rebase_onto_trunk(root, "origin", "develop", &upper, &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("from origin here to land on"), "{err}");
+    }
+
+    /// A change that merges a side branch in keeps that branch when the
+    /// stack moves onto trunk. Only the parent that landed is replaced:
+    /// with the destination as its one parent, the change would lose
+    /// everything the side branch brings.
+    #[test]
+    fn rebase_onto_trunk_keeps_the_other_parent_of_a_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        // `lower` lands as a squash. `upper` sits on it and merges `side`.
+        let (lower, lower_commit) =
+            record_change(root, &backend, &first, "lower", &[("lower.txt", "l\n")]);
+        let (side, _) = record_change(root, &backend, &first, "side", &[("side.txt", "s\n")]);
+        let upper = {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let below = resolve_change_commit(&repo, &lower).unwrap();
+            let other = resolve_change_commit(&repo, &side).unwrap();
+            let store = repo.store().clone();
+            let tree = file_tree(
+                &store,
+                &[("file.txt", "one\n"), ("lower.txt", "l\n"), ("side.txt", "s\n"), ("upper.txt", "u\n")],
+            );
+            let mut tx = repo.start_transaction();
+            let upper = write_commit_with_tree(
+                &mut tx,
+                vec![below.id().clone(), other.id().clone()],
+                "upper: merge side",
+                tree,
+            );
+            pollster::block_on(tx.commit("a merge on the stack")).unwrap();
+            upper.id().hex()
+        };
+        let (squash, _) =
+            record_change(root, &backend, &first, "lower (#1)", &[("lower.txt", "l\n")]);
+        backend.move_bookmark(root, "main", &squash).unwrap();
+
+        let files_of = |commit: &str| {
+            let mut files: Vec<String> = git(root, &["ls-tree", "-r", "--name-only", commit])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            files.sort();
+            files
+        };
+        // What landing the original tip would put on trunk.
+        let expected = vec!["file.txt", "lower.txt", "side.txt", "upper.txt"];
+        assert_eq!(files_of(&upper), expected);
+
+        let outcome = backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        let moved = outcome.target_change.unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let node = snapshot.nodes.iter().find(|n| n.id == moved).unwrap();
+        assert_eq!(node.parents, vec![squash.clone(), side.clone()], "trunk, and the side branch");
+        let rebased = resolved_commit_id(root, &moved);
+        assert_eq!(files_of(&rebased), expected);
+        // Trunk is the squash of what was under the tip and nothing else,
+        // so the rebased change has the very tree the tip had: landing it
+        // leaves trunk as landing the tip would have.
+        let tree_of = |commit: &str| git(root, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree_of(&rebased), tree_of(&upper));
+
+        // A change none of whose parents landed is left where it is.
+        let (loose, _) = record_change(root, &backend, &side, "loose", &[("loose.txt", "x\n")]);
+        let outcome = backend
+            .rebase_onto_trunk(root, "origin", "main", &loose, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        assert!(outcome.operation_id.is_none());
+        assert!(outcome.summary.contains("left where it is"), "{}", outcome.summary);
+    }
+
+    /// "Update branch" on GitHub adds a merge of trunk to a pull request's
+    /// branch, and the pull request is then merged there. A Land planned
+    /// from the commit that was here checks that commit, sweeps it, and
+    /// leaves the bookmark, which the fetch moved onto GitHub's merge. A
+    /// second Land plans from what is left and finishes: this pins the
+    /// two answers that makes true.
+    #[test]
+    fn a_branch_updated_on_github_before_its_merge_is_cleaned_up_in_two_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (topic, topic_commit) =
+            record_change(root, &backend, &first, "topic", &[("topic.txt", "t\n")]);
+        backend.create_bookmark(root, "topic", &topic).unwrap();
+        let (other, _) = record_change(root, &backend, &first, "other", &[("other.txt", "o\n")]);
+        backend.move_bookmark(root, "main", &other).unwrap();
+        // GitHub's "Update branch": a merge of main into the topic.
+        let updated = {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let head = resolve_change_commit(&repo, &topic).unwrap();
+            let trunk = resolve_change_commit(&repo, &other).unwrap();
+            let store = repo.store().clone();
+            let tree = file_tree(
+                &store,
+                &[("file.txt", "one\n"), ("other.txt", "o\n"), ("topic.txt", "t\n")],
+            );
+            let mut tx = repo.start_transaction();
+            let merge = write_commit_with_tree(
+                &mut tx,
+                vec![head.id().clone(), trunk.id().clone()],
+                "Merge branch 'main' into topic",
+                tree,
+            );
+            pollster::block_on(tx.commit("update branch")).unwrap();
+            merge.id().hex()
+        };
+        // GitHub squashes that head onto main, and the fetch moves the
+        // bookmark to it.
+        let (squash, squash_commit) =
+            record_change(root, &backend, &other, "topic (#1)", &[("topic.txt", "t\n")]);
+        backend.move_bookmark(root, "main", &squash).unwrap();
+        backend.move_bookmark(root, "topic", &updated).unwrap();
+
+        // First Land: planned from the topic's own commit. The pull
+        // request had another head, so trunk's tip vouches for it.
+        assert_eq!(
+            backend
+                .landed_check(root, "origin", "main", &squash_commit, &updated, &topic_commit, &topic_commit)
+                .unwrap(),
+            LandedCheck::Held
+        );
+        // The bookmark is no longer there, so it stays; the checked
+        // commit is abandoned, which rewrites the merge above it.
+        assert!(backend.delete_bookmark_at(root, "topic", &topic_commit).is_err());
+        backend.abandon_changes(root, &[topic_commit]).unwrap();
+
+        // Second Land: the stack under "topic" is what is left of the
+        // merge, and trunk holds all of it.
+        let snapshot = backend.open(root).unwrap();
+        let bookmark = snapshot.bookmarks.iter().find(|b| b.name == "topic").unwrap();
+        let left = snapshot.nodes.iter().find(|n| n.id == bookmark.target).unwrap();
+        assert_eq!(left.kind, NodeKind::Mutable);
+        let left_commit = left.commit_id.clone();
+        assert_eq!(
+            backend
+                .landed_check(root, "origin", "main", &squash_commit, &updated, &left_commit, &left_commit)
+                .unwrap(),
+            LandedCheck::Held
+        );
+        backend.delete_bookmark_at(root, "topic", &left_commit).unwrap();
+        backend.abandon_changes(root, &[left_commit]).unwrap();
+        let snapshot = backend.open(root).unwrap();
+        assert!(!snapshot.bookmarks.iter().any(|b| b.name == "topic"));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|n| n.kind != NodeKind::Mutable || n.description.is_empty()),
+            "nothing of the topic is left"
+        );
+    }
+
+    /// A pull request of two commits, taken into trunk by a merge that
+    /// keeps the second commit's file and drops the first one's change. A
+    /// caller that has only the pull request's head (a landed bookmark
+    /// found again, with nothing mutable left to walk) names that one
+    /// commit as the whole span. The merge is asked about everything it
+    /// brought in all the same.
+    #[test]
+    fn landed_check_asks_a_merge_about_the_whole_branch_it_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (flag, _) = record_change(root, &backend, &first, "topic: flag on", &[("flag.txt", "on\n")]);
+        let (topic, head) = record_change(root, &backend, &flag, "topic: a file", &[("new.txt", "n\n")]);
+        let (other, _) = record_change(root, &backend, &first, "other", &[("other.txt", "o\n")]);
+        let merge_of = |files: &[(&str, &str)], description: &str| {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let line = resolve_change_commit(&repo, &other).unwrap();
+            let branch = resolve_change_commit(&repo, &topic).unwrap();
+            let store = repo.store().clone();
+            let tree = file_tree(&store, files);
+            let mut tx = repo.start_transaction();
+            let merge = write_commit_with_tree(
+                &mut tx,
+                vec![line.id().clone(), branch.id().clone()],
+                description,
+                tree,
+            );
+            pollster::block_on(tx.commit("a merge commit")).unwrap();
+            merge.id().hex()
+        };
+        let partial = merge_of(
+            &[("file.txt", "one\n"), ("new.txt", "n\n"), ("other.txt", "o\n")],
+            "Merge topic, without its flag",
+        );
+        let whole = merge_of(
+            &[("file.txt", "one\n"), ("flag.txt", "on\n"), ("new.txt", "n\n"), ("other.txt", "o\n")],
+            "Merge pull request #1",
+        );
+        // Head, head, head: all a caller without the commits can say.
+        let by_head = |landing: &str| {
+            backend.landed_check(root, "origin", "main", landing, &head, &head, &head).unwrap()
+        };
+        backend.move_bookmark(root, "main", &partial).unwrap();
+        assert_eq!(
+            by_head(&partial),
+            LandedCheck::Missing { paths: vec!["flag.txt".to_owned()], more: 0 }
+        );
+        backend.move_bookmark(root, "main", &whole).unwrap();
+        assert_eq!(by_head(&whole), LandedCheck::Landed);
+    }
+
+    /// Seen on GitHub. A flag is off. The lower pull request turns it on,
+    /// the upper one turns it off again, and trunk turns it on by itself.
+    /// The tip, merged in one go, leaves trunk's "on" alone: the stack as
+    /// a whole does not touch the flag. One pull request at a time, the
+    /// lower one merges cleanly (trunk already has its change) and the
+    /// upper one then turns the flag off. Both ways are computed and
+    /// compared before anything merges.
+    #[test]
+    fn landing_one_at_a_time_is_compared_with_landing_the_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (base, _) = record_change(root, &backend, &first, "flag off", &[("flag.txt", "off\n")]);
+        backend.move_bookmark(root, "main", &base).unwrap();
+        let (lower, lower_commit) = record_change(
+            root,
+            &backend,
+            &base,
+            "lower: flag on",
+            &[("flag.txt", "on\n"), ("lower.txt", "l\n")],
+        );
+        let (_, upper_commit) = record_change(
+            root,
+            &backend,
+            &lower,
+            "upper: flag off again",
+            &[("flag.txt", "off\n"), ("upper.txt", "u\n")],
+        );
+        let (flag_on, _) =
+            record_change(root, &backend, &base, "someone turns the flag on", &[("flag.txt", "on\n")]);
+        let (elsewhere, _) =
+            record_change(root, &backend, &base, "someone adds a file", &[("other.txt", "o\n")]);
+        let two_pull_requests = || {
+            backend
+                .lands_as_tip(root, "origin", "main", &lower_commit, &lower_commit, &upper_commit)
+                .unwrap()
+        };
+
+        // Trunk where the stack was based: nothing to compare.
+        assert_eq!(two_pull_requests(), TipCheck::Same);
+        // Trunk moved somewhere the stack does not go: both ways agree.
+        backend.move_bookmark(root, "main", &elsewhere).unwrap();
+        assert_eq!(two_pull_requests(), TipCheck::Same);
+        // Trunk made the lower pull request's change itself.
+        backend.move_bookmark(root, "main", &flag_on).unwrap();
+        assert_eq!(
+            two_pull_requests(),
+            TipCheck::Differs { paths: vec!["flag.txt".to_owned()], more: 0 }
+        );
+        // The same two commits as one pull request are the tip, merged in
+        // one piece: there is nothing to differ from.
+        assert_eq!(
+            backend
+                .lands_as_tip(root, "origin", "main", &lower_commit, &upper_commit, &upper_commit)
+                .unwrap(),
+            TipCheck::Same
+        );
+        // A stack that does not sit on trunk's history is not judged.
+        assert_eq!(
+            backend
+                .lands_as_tip(root, "origin", "main", &upper_commit, &upper_commit, &upper_commit)
+                .unwrap(),
+            TipCheck::Unknown
+        );
+    }
+
+    /// The same comparison once the bottom of a stack has landed, which
+    /// is when what is left gets rebased onto trunk one change at a time.
+    /// A squash leaves the landed commits here, off trunk's history, with
+    /// the rest of the stack on them: that base counts when trunk holds
+    /// its content. (Seen on GitHub: the lower pull request merged, trunk
+    /// turned a flag on by itself, the middle one turns it on and the
+    /// upper one off again. Resumed, the stack landed with the flag off.)
+    #[test]
+    fn the_rest_of_a_stack_is_compared_with_its_tip_once_what_is_below_has_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (base, _) = record_change(root, &backend, &first, "flag off", &[("flag.txt", "off\n")]);
+        backend.move_bookmark(root, "main", &base).unwrap();
+        let (lower, _) = record_change(root, &backend, &base, "lower", &[("lower.txt", "l\n")]);
+        let (middle, middle_commit) =
+            record_change(root, &backend, &lower, "middle: flag on", &[("flag.txt", "on\n")]);
+        let (_, upper_commit) = record_change(
+            root,
+            &backend,
+            &middle,
+            "upper: flag off again",
+            &[("flag.txt", "off\n"), ("upper.txt", "u\n")],
+        );
+        let (squash, _) =
+            record_change(root, &backend, &base, "lower (#1)", &[("lower.txt", "l\n")]);
+        let (flag_on, _) =
+            record_change(root, &backend, &squash, "someone turns the flag on", &[("flag.txt", "on\n")]);
+        // Every commit of the rest in turn: the first one stands for itself.
+        let rest = || {
+            backend
+                .lands_as_tip(root, "origin", "main", &middle_commit, &middle_commit, &upper_commit)
+                .unwrap()
+        };
+
+        // Trunk without the landing: what the rest sits on is not on
+        // trunk, and nothing can be said.
+        assert_eq!(rest(), TipCheck::Unknown);
+        // Landed, and nothing else moved: both ways agree.
+        backend.move_bookmark(root, "main", &squash).unwrap();
+        assert_eq!(rest(), TipCheck::Same);
+        // Landed, and trunk has turned the flag on by itself.
+        backend.move_bookmark(root, "main", &flag_on).unwrap();
+        assert_eq!(
+            rest(),
+            TipCheck::Differs { paths: vec!["flag.txt".to_owned()], more: 0 }
+        );
+    }
+
+    /// Trunk and a branch that merged each other before have two merge
+    /// bases, and "where the branch left trunk" has two answers. A merge
+    /// that then takes the branch in, keeps its last file and drops an
+    /// earlier change has to hold what came in from each of them: with
+    /// one answer picked, or none, the check looked at the last commit
+    /// only and the bookmark went.
+    #[test]
+    fn landed_check_asks_about_every_place_a_branch_left_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (a, _) = record_change(root, &backend, &first, "trunk side", &[("a.txt", "a\n")]);
+        let (b, _) = record_change(root, &backend, &first, "topic side", &[("b.txt", "b\n")]);
+        let merge = |parents: [&str; 2], files: &[(&str, &str)], description: &str| -> String {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let ids: Vec<CommitId> = parents
+                .iter()
+                .map(|p| resolve_change_commit(&repo, p).unwrap().id().clone())
+                .collect();
+            let store = repo.store().clone();
+            let tree = file_tree(&store, files);
+            let mut tx = repo.start_transaction();
+            let commit = write_commit_with_tree(&mut tx, ids, description, tree);
+            pollster::block_on(tx.commit("a merge commit")).unwrap();
+            commit.id().hex()
+        };
+        // Each side takes the other in: from here on there are two.
+        let both = [("a.txt", "a\n"), ("b.txt", "b\n"), ("file.txt", "one\n")];
+        let on_trunk = merge([&a, &b], &both, "trunk takes the topic side in");
+        let on_topic = merge([&b, &a], &both, "the topic takes trunk in");
+        let (flag, _) =
+            record_change(root, &backend, &on_topic, "topic: flag on", &[("flag.txt", "on\n")]);
+        let (topic, head) =
+            record_change(root, &backend, &flag, "topic: a file", &[("new.txt", "n\n")]);
+        let (line, _) = record_change(root, &backend, &on_trunk, "other", &[("other.txt", "o\n")]);
+        let partial = merge(
+            [&line, &topic],
+            &[
+                ("a.txt", "a\n"),
+                ("b.txt", "b\n"),
+                ("file.txt", "one\n"),
+                ("new.txt", "n\n"),
+                ("other.txt", "o\n"),
+            ],
+            "Merge topic, without its flag",
+        );
+        let whole = merge(
+            [&line, &topic],
+            &[
+                ("a.txt", "a\n"),
+                ("b.txt", "b\n"),
+                ("file.txt", "one\n"),
+                ("flag.txt", "on\n"),
+                ("new.txt", "n\n"),
+                ("other.txt", "o\n"),
+            ],
+            "Merge pull request #1",
+        );
+        let by_head = |landing: &str| {
+            backend.landed_check(root, "origin", "main", landing, &head, &head, &head).unwrap()
+        };
+        backend.move_bookmark(root, "main", &partial).unwrap();
+        assert_eq!(
+            by_head(&partial),
+            LandedCheck::Missing { paths: vec!["flag.txt".to_owned()], more: 0 }
+        );
+        backend.move_bookmark(root, "main", &whole).unwrap();
+        assert_eq!(by_head(&whole), LandedCheck::Landed);
+    }
+
+    /// Two flags make a feature, on top of a file it starts with. The
+    /// flags were written on two lines that trunk merged one by one before
+    /// it merged the feature, so the branch left trunk in two places, one
+    /// holding each flag. One tree has to hold everything the feature
+    /// brought, whichever span the caller names:
+    ///
+    /// - The merge of the feature kept the first flag only, and a later
+    ///   commit on trunk turned the first off and the second on. Each
+    ///   place is accounted for somewhere, one at the merge and one at
+    ///   trunk's tip, and at no time did trunk have both flags on.
+    /// - The merge kept both flags and dropped the file. Both places are
+    ///   accounted for at the merge; the span the caller names, from below
+    ///   the file, is not, and that span is what was asked before there
+    ///   was more than one place to ask about.
+    #[test]
+    fn landed_check_wants_one_tree_to_hold_every_place_a_branch_left_trunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (off, _) = record_change(
+            root,
+            &backend,
+            &first,
+            "flags off",
+            &[("flag1.txt", "off\n"), ("flag2.txt", "off\n")],
+        );
+        let (seed, seed_commit) =
+            record_change(root, &backend, &off, "feature: its first file", &[("seed.txt", "s\n")]);
+        let (one, _) =
+            record_change(root, &backend, &seed, "feature: flag one", &[("flag1.txt", "on\n")]);
+        let (two, _) =
+            record_change(root, &backend, &seed, "feature: flag two", &[("flag2.txt", "on\n")]);
+        let (other, _) = record_change(root, &backend, &off, "other", &[("other.txt", "o\n")]);
+        // A merge of two commits with exactly these files.
+        let merge = |parents: [&str; 2], files: &[(&str, &str)], description: &str| -> String {
+            let (_write, _workspace, repo) = backend.load_repo_for_write(root).unwrap();
+            let ids: Vec<CommitId> = parents
+                .iter()
+                .map(|p| resolve_change_commit(&repo, p).unwrap().id().clone())
+                .collect();
+            let store = repo.store().clone();
+            let mut all = vec![("file.txt", "one\n")];
+            all.extend_from_slice(files);
+            all.sort();
+            let tree = file_tree(&store, &all);
+            let mut tx = repo.start_transaction();
+            let commit = write_commit_with_tree(&mut tx, ids, description, tree);
+            pollster::block_on(tx.commit("a merge commit")).unwrap();
+            commit.id().hex()
+        };
+        let (on, no) = ("on\n", "off\n");
+        // The feature's head: both lines, both flags on.
+        let head = merge(
+            [&one, &two],
+            &[("flag1.txt", on), ("flag2.txt", on), ("seed.txt", "s\n")],
+            "feature: both flags",
+        );
+        // Trunk takes each line in by itself, and leaves the second flag off.
+        let trunk_files = [("flag1.txt", on), ("flag2.txt", no), ("other.txt", "o\n"), ("seed.txt", "s\n")];
+        let with_one = merge([&other, &one], &trunk_files, "trunk takes flag one in");
+        let with_two = merge([&with_one, &two], &trunk_files, "trunk takes flag two in, off");
+        // Asked with the feature's whole span, and with its head alone.
+        let whole_span = |landing: &str| {
+            backend
+                .landed_check(root, "origin", "main", landing, &head, &seed_commit, &head)
+                .unwrap()
+        };
+        let by_head = |landing: &str| {
+            backend.landed_check(root, "origin", "main", landing, &head, &head, &head).unwrap()
+        };
+
+        // The merge of the feature keeps the first flag only.
+        let partial = merge([&with_two, &head], &trunk_files, "Merge feature, first flag only");
+        let (swapped, _) = record_change(
+            root,
+            &backend,
+            &partial,
+            "swap the flags",
+            &[("flag1.txt", "off\n"), ("flag2.txt", "on\n")],
+        );
+        let no_second = LandedCheck::Missing { paths: vec!["flag2.txt".to_owned()], more: 0 };
+        backend.move_bookmark(root, "main", &partial).unwrap();
+        assert_eq!(whole_span(&partial), no_second);
+        assert_eq!(by_head(&partial), no_second);
+        // With the flags swapped on trunk, each half is somewhere and the
+        // whole is nowhere.
+        backend.move_bookmark(root, "main", &swapped).unwrap();
+        assert_eq!(whole_span(&partial), no_second);
+        assert_eq!(by_head(&partial), no_second);
+
+        // The merge keeps both flags and drops the file.
+        let without_seed = merge(
+            [&with_two, &head],
+            &[("flag1.txt", on), ("flag2.txt", on), ("other.txt", "o\n")],
+            "Merge feature, without its first file",
+        );
+        backend.move_bookmark(root, "main", &without_seed).unwrap();
+        assert_eq!(
+            whole_span(&without_seed),
+            LandedCheck::Missing { paths: vec!["seed.txt".to_owned()], more: 0 }
+        );
+        // And the merge that keeps everything is a landing.
+        let everything = merge(
+            [&with_two, &head],
+            &[("flag1.txt", on), ("flag2.txt", on), ("other.txt", "o\n"), ("seed.txt", "s\n")],
+            "Merge pull request #1",
+        );
+        backend.move_bookmark(root, "main", &everything).unwrap();
+        assert_eq!(whole_span(&everything), LandedCheck::Landed);
+        assert_eq!(by_head(&everything), LandedCheck::Landed);
+    }
+
+    /// The sweep after a landing abandons the landed commits and nothing
+    /// may sit on them then: jj would rebase a child onto what was below
+    /// them, and its tree would lose what they hold. A change started on
+    /// one after the caller looked stops the sweep, with its tree as it
+    /// was.
+    #[test]
+    fn abandon_landed_refuses_while_a_change_sits_on_the_landed_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (landed, landed_commit) =
+            record_change(root, &backend, &first, "landed: flag on", &[("flag.txt", "on\n")]);
+        let (follow, follow_commit) =
+            record_change(root, &backend, &landed, "follow-up", &[("uses_flag.txt", "x\n")]);
+
+        let err = backend
+            .abandon_landed(root, std::slice::from_ref(&landed_commit))
+            .unwrap_err();
+        assert!(err.to_string().contains("on the landed commits"), "{err}");
+        let snapshot = backend.open(root).unwrap();
+        assert!(snapshot.nodes.iter().any(|n| n.id == landed), "nothing was abandoned");
+        assert!(
+            resolved_commit_id(root, &follow).starts_with(&follow_commit),
+            "the follow-up is untouched"
+        );
+        assert_eq!(git(root, &["show", &format!("{follow_commit}:flag.txt")]), "on");
+
+        // With nothing on them, they go.
+        backend.rebase_change(root, &follow, &first).unwrap();
+        backend
+            .abandon_landed(root, std::slice::from_ref(&landed_commit))
+            .unwrap();
+        let snapshot = backend.open(root).unwrap();
+        assert!(!snapshot.nodes.iter().any(|n| n.id == landed));
+    }
+
+    /// Cleanup after a landing deletes a bookmark only while it points at
+    /// the commit that landed. A bookmark that moved, by a rewrite or by
+    /// an edit the working copy has not recorded yet, stays.
+    #[test]
+    fn delete_bookmark_at_spares_a_bookmark_that_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let commit_of = |id: &str| {
+            let snapshot = backend.open(root).unwrap();
+            snapshot.nodes.iter().find(|n| n.id == id).unwrap().commit_id.clone()
+        };
+        let (topic, planned) = record_change(root, &backend, &first, "topic", &[("t.txt", "t\n")]);
+        backend.create_bookmark(root, "topic", &topic).unwrap();
+
+        // Reworded since: the same change, another commit.
+        backend.describe(root, &topic, "topic, reworded").unwrap();
+        let err = backend.delete_bookmark_at(root, "topic", &planned).unwrap_err();
+        assert!(err.to_string().contains("no longer points at"), "{err}");
+        assert!(backend.open(root).unwrap().bookmarks.iter().any(|b| b.name == "topic"));
+
+        // Edited in the working copy, with nothing having recorded the
+        // edit yet: the mutation records it first, and then refuses.
+        backend.edit_change(root, &topic).unwrap();
+        let planned = commit_of(&topic);
+        std::fs::write(root.join("late.txt"), "late\n").unwrap();
+        let err = backend.delete_bookmark_at(root, "topic", &planned).unwrap_err();
+        assert!(err.to_string().contains("no longer points at"), "{err}");
+        assert!(backend.open(root).unwrap().bookmarks.iter().any(|b| b.name == "topic"));
+
+        // Unmoved, it goes.
+        let planned = commit_of(&topic);
+        backend.delete_bookmark_at(root, "topic", &planned).unwrap();
+        assert!(!backend.open(root).unwrap().bookmarks.iter().any(|b| b.name == "topic"));
+    }
+
+    /// Cleanup abandons landed changes by commit id, so a change edited
+    /// since (here in the working copy, not yet recorded) is refused
+    /// whole and nothing is lost.
+    #[test]
+    fn abandoning_by_commit_id_refuses_a_change_edited_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let first = build_colocated_repo(root, &backend);
+        let (lower, lower_commit) =
+            record_change(root, &backend, &first, "lower", &[("l.txt", "l\n")]);
+        let (upper, upper_commit) =
+            record_change(root, &backend, &lower, "upper", &[("u.txt", "u\n")]);
+        backend.edit_change(root, &upper).unwrap();
+        std::fs::write(root.join("late.txt"), "late\n").unwrap();
+
+        let err = backend
+            .abandon_changes(root, &[upper_commit, lower_commit.clone()])
+            .unwrap_err();
+        assert!(err.to_string().contains("has been rewritten"), "{err}");
+        let snapshot = backend.open(root).unwrap();
+        assert!(snapshot.nodes.iter().any(|n| n.id == lower));
+        assert!(snapshot.nodes.iter().any(|n| n.id == upper));
+        assert!(root.join("late.txt").exists());
+        // The untouched one alone still goes.
+        backend.abandon_changes(root, &[lower_commit]).unwrap();
+        assert!(!backend.open(root).unwrap().nodes.iter().any(|n| n.id == lower));
+        assert!(root.join("late.txt").exists());
     }
 
     fn build_conflicted_repo(root: &Path, backend: &JjBackend) -> (String, String, String) {

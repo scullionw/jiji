@@ -1425,6 +1425,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 
@@ -1966,6 +1968,9 @@ mod tests {
             body: None,
             review: ReviewDecision::None,
             checks,
+            merge_commit: None,
+            stack: None,
+            author: None,
         }
     }
 

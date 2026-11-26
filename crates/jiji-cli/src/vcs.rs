@@ -1,6 +1,7 @@
 //! Local host for the shared workflow executors. Each read uses a full,
 //! fresh snapshot; every write goes through the same jj-lib backend as the app.
 
+use jiji_core::snapshot::{LandedCheck, TipCheck};
 use jiji_core::{BackendError, JjBackend, RepoBackend, RepoSnapshot};
 use jiji_forge::{LandVcs, ShipVcs, SubmitVcs};
 use std::path::PathBuf;
@@ -38,7 +39,73 @@ impl LandVcs for LocalVcs {
             .git_fetch(&self.path, Some(&[remote.to_owned()]))
             .map(|o| o.summary)
     }
+    fn rebase_onto_trunk(
+        &self,
+        remote: &str,
+        trunk: &str,
+        root_change: &str,
+        landed: &[String],
+    ) -> Result<String, BackendError> {
+        // Onto the plan's trunk branch as the remote has it after the
+        // fetch, the commit the landing was checked against. Not onto
+        // `trunk()` or the local trunk bookmark: a fetch can change what
+        // the first names, and both can be ahead with commits nobody
+        // pushed.
+        self.backend
+            .rebase_onto_trunk(&self.path, remote, trunk, root_change, landed)
+            .map(|o| o.summary)
+    }
+    fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError> {
+        SubmitVcs::push_bookmarks(self, bookmarks, remote)
+    }
+    fn delete_bookmark_at(&self, name: &str, commit: &str) -> Result<String, BackendError> {
+        self.backend
+            .delete_bookmark_at(&self.path, name, commit)
+            .map(|o| o.summary)
+    }
+    fn abandon_changes(&self, commits: &[String]) -> Result<String, BackendError> {
+        // The sweep after a landing: refused while anything else sits on
+        // the landed commits.
+        self.backend
+            .abandon_landed(&self.path, commits)
+            .map(|o| o.summary)
+    }
+    fn landed(
+        &self,
+        remote: &str,
+        trunk: &str,
+        landing: &str,
+        head: &str,
+        bottom: &str,
+        top: &str,
+    ) -> Result<LandedCheck, BackendError> {
+        self.backend
+            .landed_check(&self.path, remote, trunk, landing, head, bottom, top)
+    }
+    fn lands_as_tip(
+        &self,
+        remote: &str,
+        trunk: &str,
+        bottom: &str,
+        first_top: &str,
+        tip: &str,
+    ) -> Result<TipCheck, BackendError> {
+        self.backend
+            .lands_as_tip(&self.path, remote, trunk, bottom, first_top, tip)
+    }
+    fn resting_on(&self, commits: &[String]) -> Result<Vec<String>, BackendError> {
+        self.backend.branches_resting_on(&self.path, commits)
+    }
+}
+
+impl ShipVcs for LocalVcs {
+    fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
+        self.snapshot()
+    }
     fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
+        // Ship moves the local trunk bookmark onto the stack and pushes
+        // it, so the stack goes onto that bookmark, unpushed commits and
+        // all: they ship with it.
         let trunk = self
             .snapshot()?
             .bookmarks
@@ -52,28 +119,6 @@ impl LandVcs for LocalVcs {
         self.backend
             .rebase_change(&self.path, root_change, &trunk.target)
             .map(|o| o.summary)
-    }
-    fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError> {
-        SubmitVcs::push_bookmarks(self, bookmarks, remote)
-    }
-    fn delete_bookmark(&self, name: &str) -> Result<String, BackendError> {
-        self.backend
-            .delete_bookmark(&self.path, name)
-            .map(|o| o.summary)
-    }
-    fn abandon_changes(&self, ids: &[String]) -> Result<String, BackendError> {
-        self.backend
-            .abandon_changes(&self.path, ids)
-            .map(|o| o.summary)
-    }
-}
-
-impl ShipVcs for LocalVcs {
-    fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
-        self.snapshot()
-    }
-    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
-        LandVcs::rebase_onto_trunk(self, root_change)
     }
     fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError> {
         SubmitVcs::push_bookmarks(self, bookmarks, remote)

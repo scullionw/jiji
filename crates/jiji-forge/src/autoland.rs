@@ -30,19 +30,21 @@
 //! Deliberately deferred: queue-position/ETA supervision beyond polling
 //! until GitHub's automation finishes.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+use jiji_core::snapshot::{GraphNode, RepoSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ForgeError;
 use crate::land::{
     execute_land, plan_land, LandAction, LandForge, LandOptions, LandOutcome, LandPlan,
-    LandSegment, LandSegmentStatus, LandVcs,
+    LandSegment, LandSegmentStatus, LandStep, LandVcs,
 };
-use crate::pr::RepoPrState;
+use crate::pr::{PrState, RepoPrState};
 use crate::remote::ForgeRepo;
 use crate::submit::SubmitStepStatus;
 
@@ -175,8 +177,9 @@ impl AutoLandPhase {
     }
 }
 
-/// A PR the job saw land — merged by a round or recognized as merged on
-/// GitHub (auto-merge, the queue, or someone clicking the button).
+/// A PR the job saw land: merged by a round, or by GitHub (auto-merge,
+/// the queue, someone clicking the button), and then found on trunk by
+/// the round's own check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoLandMerged {
@@ -419,6 +422,9 @@ pub fn run_autoland(
     // Pinned from the first snapshot: the job must never act on a
     // different repo than the one it was queued for.
     let mut repo_path: Option<String> = None;
+    // The "branch moved on GitHub" blockers the job last fetched for, so
+    // a fetch that did not clear them is not repeated on every poll.
+    let mut fetched_for: Option<Vec<String>> = None;
 
     loop {
         if stop.is_stopped() {
@@ -435,6 +441,7 @@ pub fn run_autoland(
             &mut state,
             &mut consecutive_errors,
             &mut repo_path,
+            &mut fetched_for,
             publish,
         );
         match step {
@@ -468,6 +475,7 @@ fn poll_once(
     state: &mut AutoLandState,
     consecutive_errors: &mut u32,
     repo_path: &mut Option<String>,
+    fetched_for: &mut Option<Vec<String>>,
     publish: &mut dyn FnMut(&AutoLandState),
 ) -> Step {
     // Transient failures (network flakes, GitHub hiccups, a jj op-store
@@ -532,19 +540,180 @@ fn poll_once(
         repo,
         &state.head_bookmark,
         forge,
+        vcs,
         &state.options,
     ) {
         Ok(plan) => plan,
         Err(err) => return transient(config, consecutive_errors, err.to_string()),
     };
-    state.segments = plan.segments.clone();
-    // Merges recognized at plan time (GitHub's automation or a manual
-    // merge finishing) are progress worth recording before any round runs.
-    for segment in &plan.segments {
-        if let LandSegmentStatus::Merged { number, url } = &segment.status {
-            note_merged(state, *number, url, &segment.bookmark);
+    // A branch that moved on GitHub since the last fetch (a bot's commit,
+    // an "update branch") stops a person's Land so they can look first.
+    // Nobody is looking here, and the job was asked to land what passes:
+    // fetch once, so the repository has what GitHub has, and plan again.
+    // The plan then lands only commits that are here, and the round's
+    // check compares against them. If the bookmark did not follow (it had
+    // moved here too), the fresh plan says what is in the way, and the
+    // job does not fetch for the same reason again.
+    let mut fetched: Option<String> = None;
+    let behind: Vec<String> = plan
+        .blockers
+        .iter()
+        .filter(|b| b.fetch)
+        .map(|b| b.message.clone())
+        .collect();
+    let (plan, snapshot) = if !behind.is_empty() && fetched_for.as_ref() != Some(&behind) {
+        let story = match vcs.git_fetch(&repo.remote) {
+            Ok(story) => story,
+            // Not remembered as fetched for: the next poll tries again,
+            // within the job's budget for failures.
+            Err(err) => return transient(config, consecutive_errors, err.to_string()),
+        };
+        *fetched_for = Some(behind);
+        let before = snapshot;
+        let snapshot = match vcs.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return transient(config, consecutive_errors, err.to_string()),
+        };
+        // The fetch is for a branch that gained commits. One that was
+        // rewritten or cut back on GitHub comes in the same way: the
+        // bookmark follows, and the commits the remote no longer has are
+        // dropped here, or stay above the bookmark when another bookmark
+        // holds them. Either way they are no longer under the stack's
+        // head. Every change the stack had before must still be there; if
+        // one is not, the job ends here rather than land what is left.
+        // (It has to end: on the next poll the bookmark and GitHub would
+        // agree, and nothing would stop the shorter branch from landing.)
+        let stack = under(&snapshot, &state.head_bookmark);
+        let gone: Vec<&str> = plan
+            .segments
+            .iter()
+            .flat_map(|segment| segment.change_ids.iter())
+            .filter(|id| {
+                // A change is still there under its change id, or under a
+                // commit id if it now has more than one commit.
+                let change = before
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == **id)
+                    .map_or(id.as_str(), |n| n.change_id.as_str());
+                !stack.iter().any(|n| n.id == **id || n.change_id == change)
+            })
+            .map(String::as_str)
+            .collect();
+        if !gone.is_empty() {
+            return Step::End(AutoLandPhase::Failed {
+                message: format!(
+                    "A branch of \u{201c}{}\u{201d} was rewritten or cut back on GitHub: after \
+                     the fetch, {} {} no longer in the stack. Auto-land stopped rather than land \
+                     what is left — look at the stack, and queue it again if that is what you want",
+                    state.head_bookmark,
+                    gone.join(", "),
+                    if gone.len() == 1 { "is" } else { "are" },
+                ),
+            });
         }
+        match plan_land(
+            &snapshot,
+            &pr_state,
+            repo,
+            &state.head_bookmark,
+            forge,
+            vcs,
+            &state.options,
+        ) {
+            Ok(plan) => {
+                fetched = Some(story);
+                (plan, snapshot)
+            }
+            Err(err) => return transient(config, consecutive_errors, err.to_string()),
+        }
+    } else {
+        (plan, snapshot)
+    };
+    // The same question across looks, and across a restart, where
+    // `state.segments` is what the job last saw (saved with the job). A
+    // fetch somebody else made can bring a cut-back branch just as the
+    // job's own can; the bookmark and GitHub then agree at once, and the
+    // job would land the shorter branch without ever having fetched. So
+    // for every branch still to land, each change the last look listed
+    // under it has to be under the stack's head still. A branch that has
+    // landed since, by this job or by anyone, is not asked about.
+    let stack = under(&snapshot, &state.head_bookmark);
+    let short: Vec<(&str, Vec<&str>)> = plan
+        .segments
+        .iter()
+        .filter(|fresh| !matches!(fresh.status, LandSegmentStatus::Merged { .. }))
+        .filter_map(|fresh| {
+            let before = state.segments.iter().find(|s| s.bookmark == fresh.bookmark)?;
+            let gone: Vec<&str> = before
+                .change_ids
+                .iter()
+                .filter(|id| !stack.iter().any(|n| n.id == **id || n.change_id == **id))
+                .map(String::as_str)
+                .collect();
+            (!gone.is_empty()).then_some((fresh.bookmark.as_str(), gone))
+        })
+        .collect();
+    if let Some((bookmark, gone)) = short.first() {
+        return Step::End(AutoLandPhase::Failed {
+            message: format!(
+                "\u{201c}{bookmark}\u{201d} no longer holds {}, which this job was asked to \
+                 land: the branch was rewritten or cut back, here or on GitHub. Auto-land \
+                 stopped rather than land what is left \u{2014} look at the stack, and queue it \
+                 again if that is what you want",
+                gone.join(", "),
+            ),
+        });
     }
+    // And a branch the last look listed that is not part of the stack at
+    // all any more. Its changes may still be under the head (its bookmark
+    // was deleted or renamed), or it may have landed by another hand.
+    // Otherwise the stack was reshaped around it, and landing what is
+    // left would end "done" with one of the job's pull requests open.
+    for before in state.segments.iter().filter(|before| {
+        !matches!(before.status, LandSegmentStatus::Merged { .. })
+            && !state.merged.iter().any(|m| m.bookmark == before.bookmark)
+            && !plan.segments.iter().any(|fresh| fresh.bookmark == before.bookmark)
+    }) {
+        let gone: Vec<&str> = before
+            .change_ids
+            .iter()
+            .filter(|id| !stack.iter().any(|n| n.id == **id || n.change_id == **id))
+            .map(String::as_str)
+            .collect();
+        if gone.is_empty() {
+            continue;
+        }
+        // Landed by another hand means: the pull request the last look
+        // recorded for this branch, that one and no other, has merged,
+        // and into trunk. A branch name can have had an earlier pull
+        // request that merged, and a pull request can be merged into some
+        // other branch; neither is this work on trunk.
+        let landed = match &before.pr {
+            Some(pr) => match forge.pr_land_state(pr.number, &plan.base_branch) {
+                Ok(land) => {
+                    land.state == PrState::Merged && land.merged_into() == plan.base_branch
+                }
+                Err(err) => return transient(config, consecutive_errors, err.to_string()),
+            },
+            None => false,
+        };
+        if landed {
+            continue;
+        }
+        return Step::End(AutoLandPhase::Failed {
+            message: format!(
+                "\u{201c}{}\u{201d} is no longer part of the stack under \u{201c}{}\u{201d}, \
+                 and it has not landed: the stack was reshaped, here or on GitHub. Auto-land \
+                 stopped rather than land the rest without {} \u{2014} look at the stack, and \
+                 queue it again if that is what you want",
+                before.bookmark,
+                state.head_bookmark,
+                gone.join(", "),
+            ),
+        });
+    }
+    state.segments = plan.segments.clone();
 
     if !plan.blockers.is_empty() {
         *consecutive_errors = 0;
@@ -573,17 +742,38 @@ fn poll_once(
     // just-in-time re-checks included.
     state.phase = AutoLandPhase::Round;
     publish(state);
-    let outcome = match execute_land(&plan, vcs, forge) {
+    let mut outcome = match execute_land(&plan, vcs, forge) {
         Ok(outcome) => outcome,
         Err(err) => return transient(config, consecutive_errors, err.to_string()),
     };
+    // The fetch that came before the plan is part of what this round did,
+    // and it is how commits nobody here pushed came to land: say so first.
+    if let Some(story) = fetched {
+        outcome.steps.insert(
+            0,
+            LandStep {
+                action: LandAction::FetchRemote {
+                    remote: repo.remote.clone(),
+                },
+                status: SubmitStepStatus::Done,
+                detail: Some(format!(
+                    "{story} — a branch of this stack had moved on GitHub since the last \
+                     fetch; the round lands what is there now"
+                )),
+            },
+        );
+    }
     state.rounds += 1;
-    // A merge that went through is progress even when a later step failed.
+    // A landing is progress even when a later step failed, and it is
+    // recorded where it is proven: at the check that found the pull
+    // request's changes on trunk. GitHub calling a pull request merged is
+    // not that (it says so of one pushed under another branch), so
+    // neither a merge step nor a plan that merely read "merged" counts.
     for step in &outcome.steps {
         if step.status != SubmitStepStatus::Done {
             continue;
         }
-        if let LandAction::MergePr {
+        if let LandAction::CheckLanded {
             number, bookmark, ..
         } = &step.action
         {
@@ -591,8 +781,10 @@ fn poll_once(
                 .segments
                 .iter()
                 .find(|s| s.bookmark == *bookmark)
-                .and_then(|s| s.pr.as_ref())
-                .map(|pr| pr.url.clone())
+                .and_then(|s| match &s.status {
+                    LandSegmentStatus::Merged { url, .. } => Some(url.clone()),
+                    _ => s.pr.as_ref().map(|pr| pr.url.clone()),
+                })
                 .unwrap_or_default();
             note_merged(state, *number, &url, bookmark);
         }
@@ -636,6 +828,34 @@ fn poll_once(
         attention: false,
         reasons: vec![reason],
     })
+}
+
+/// What a bookmark's stack is made of, as far as the snapshot draws it:
+/// the bookmark's commit and everything below it, landed commits
+/// included. When the bookmark's commit is not drawn there is nothing to
+/// walk from, and the answer is everything the snapshot draws.
+fn under<'a>(snapshot: &'a RepoSnapshot, bookmark: &str) -> Vec<&'a GraphNode> {
+    let by_id: HashMap<&str, &GraphNode> =
+        snapshot.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let top = snapshot
+        .bookmarks
+        .iter()
+        .find(|b| b.name == bookmark && b.is_local)
+        .and_then(|b| by_id.get(b.target.as_str()).copied());
+    let Some(top) = top else {
+        return snapshot.nodes.iter().collect();
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = Vec::new();
+    let mut queue = vec![top];
+    while let Some(node) = queue.pop() {
+        if !seen.insert(node.id.as_str()) {
+            continue;
+        }
+        stack.push(node);
+        queue.extend(node.parents.iter().filter_map(|p| by_id.get(p.as_str()).copied()));
+    }
+    stack
 }
 
 /// The round handed the *candidate's* merge to GitHub's automation
@@ -694,7 +914,9 @@ mod tests {
     use crate::land::{Mergeable, PrLandState};
     use crate::pr::{ChecksRollup, PrState, PrStateReport, PrSummary, ReviewDecision};
     use crate::remote::ForgeProvider;
-    use jiji_core::snapshot::{BookmarkState, GraphNode, NodeKind, RepoSnapshot, SyncState};
+    use jiji_core::snapshot::{
+        BookmarkState, GraphNode, LandedCheck, NodeKind, RepoSnapshot, SyncState, TipCheck,
+    };
     use jiji_core::BackendError;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -722,6 +944,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 
@@ -769,18 +993,23 @@ mod tests {
             state: PrState::Open,
             is_draft: false,
             head_branch: head.into(),
-            head_commit: "feedface".into(),
+            head_commit: "ca2feedface".into(),
             head_owner: Some("o".into()),
             base_branch: base.into(),
             body: None,
             review: ReviewDecision::None,
             checks: ChecksRollup::None,
+            merge_commit: None,
+            stack: None,
+            author: None,
         }
     }
 
+    /// A PR GitHub merged into trunk, as commit `landed<number>`.
     fn merged_pr(number: u64, head: &str) -> PrSummary {
         PrSummary {
             state: PrState::Merged,
+            merge_commit: Some(format!("landed{number}")),
             ..open_pr(number, head, "main")
         }
     }
@@ -805,7 +1034,9 @@ mod tests {
             review: ReviewDecision::Approved,
             checks: ChecksRollup::Passing,
             base_branch: "main".into(),
-            head_commit: "feedface".into(),
+            head_commit: "ca2feedface".into(),
+            merge_commit: None,
+            stack: None,
             auto_merge_enabled: false,
             in_merge_queue: false,
             auto_merge_allowed: true,
@@ -849,13 +1080,13 @@ mod tests {
         );
         // The simulator's push is a no-op, so seed the Git head the
         // chained auto-merge lease would see after a real push.
-        answer.nodes[0].commit_id = "feedface".into();
+        answer.nodes[0].commit_id = "ca2feedface".into();
         answer
     }
 
     /// After auth landed and reconciled: profile alone on the new trunk.
     fn after_first_land() -> RepoSnapshot {
-        snapshot(
+        let mut answer = snapshot(
             vec![
                 node("b1", "profile: avatars", NodeKind::WorkingCopy, &["s"], &["profile"]),
                 node("s", "auth (squash)", NodeKind::Immutable, &["m"], &["main"]),
@@ -865,7 +1096,11 @@ mod tests {
                 bookmark("main", "s", SyncState::Synced, true),
                 bookmark("profile", "b1", SyncState::Synced, false),
             ],
-        )
+        );
+        // The rebased commit that was pushed: what GitHub reports as #7's
+        // head from here on.
+        answer.nodes[0].commit_id = "ca2feedface".into();
+        answer
     }
 
     /// The scripted world one job run acts on. `script` mutates it at the
@@ -878,6 +1113,14 @@ mod tests {
         merged: HashMap<String, PrSummary>,
         prs_fail: bool,
         merge_fails: bool,
+        /// What the repository says of a landing commit; one it has no
+        /// answer for is on trunk and holds the changes.
+        landings: HashMap<String, LandedCheck>,
+        /// What the repository looks like once a fetch has run, when a
+        /// fetch changes it: a bookmark that followed its branch.
+        after_fetch: Option<RepoSnapshot>,
+        /// How many fetches fail before one goes through.
+        fetch_fails: u32,
     }
 
     /// Poll-indexed world mutations a test scripts ahead of time.
@@ -930,13 +1173,35 @@ mod tests {
     impl LandVcs for Sim {
         fn git_fetch(&self, remote: &str) -> Result<String, BackendError> {
             self.calls.borrow_mut().push(format!("fetch:{remote}"));
+            let mut world = self.world.borrow_mut();
+            if world.fetch_fails > 0 {
+                world.fetch_fails -= 1;
+                return Err(BackendError::MutationFailed("the remote hung up".into()));
+            }
+            if let Some(fetched) = world.after_fetch.take() {
+                world.snapshot = fetched;
+            }
             Ok("Fetched".into())
         }
         fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
             Ok(self.world.borrow().snapshot.clone())
         }
-        fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
+        fn rebase_onto_trunk(
+            &self,
+            _remote: &str,
+            _trunk: &str,
+            root_change: &str,
+            _landed: &[String],
+        ) -> Result<String, BackendError> {
             self.calls.borrow_mut().push(format!("rebase:{root_change}"));
+            // The chain leaves what it sat on, as jj's rebase does.
+            let mut world = self.world.borrow_mut();
+            let trunk = world.snapshot.bookmarks.iter().find(|b| b.is_trunk).map(|b| b.target.clone());
+            if let (Some(trunk), Some(root)) =
+                (trunk, world.snapshot.nodes.iter_mut().find(|n| n.id == root_change))
+            {
+                root.parents = vec![trunk];
+            }
             Ok(format!("Rebased {root_change}"))
         }
         fn push_bookmarks(
@@ -949,15 +1214,73 @@ mod tests {
                 .push(format!("push:{}:{remote}", bookmarks.join(",")));
             Ok("Pushed".into())
         }
-        fn delete_bookmark(&self, name: &str) -> Result<String, BackendError> {
+        fn delete_bookmark_at(&self, name: &str, _commit: &str) -> Result<String, BackendError> {
             self.calls.borrow_mut().push(format!("delete:{name}"));
+            // The bookmark goes, as in the repository: the sweep that
+            // follows reads from the snapshot whether it was left.
+            let mut world = self.world.borrow_mut();
+            world
+                .snapshot
+                .bookmarks
+                .retain(|b| !(b.name == name && b.is_local));
+            for node in world.snapshot.nodes.iter_mut() {
+                node.bookmarks.retain(|b| b != name);
+            }
             Ok(format!("Deleted {name}"))
         }
-        fn abandon_changes(&self, change_ids: &[String]) -> Result<String, BackendError> {
+        fn resting_on(&self, _commits: &[String]) -> Result<Vec<String>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn abandon_changes(&self, commits: &[String]) -> Result<String, BackendError> {
             self.calls
                 .borrow_mut()
-                .push(format!("abandon:{}", change_ids.join(",")));
+                .push(format!("abandon:{}", commits.join(",")));
+            // The commits go, and what sat on them sits on what was below
+            // them, as after jj's abandon.
+            let mut world = self.world.borrow_mut();
+            let gone: Vec<(String, Vec<String>)> = world
+                .snapshot
+                .nodes
+                .iter()
+                .filter(|n| commits.contains(&n.commit_id))
+                .map(|n| (n.id.clone(), n.parents.clone()))
+                .collect();
+            world.snapshot.nodes.retain(|n| !gone.iter().any(|(id, _)| *id == n.id));
+            for node in world.snapshot.nodes.iter_mut() {
+                for parent in node.parents.iter_mut() {
+                    while let Some((_, below)) = gone.iter().find(|(id, _)| id == parent) {
+                        *parent = below.first().cloned().unwrap_or_default();
+                    }
+                }
+            }
             Ok("Abandoned".into())
+        }
+        fn lands_as_tip(
+            &self,
+            _remote: &str,
+            _trunk: &str,
+            _bottom: &str,
+            _first_top: &str,
+            _tip: &str,
+        ) -> Result<TipCheck, BackendError> {
+            Ok(TipCheck::Same)
+        }
+        fn landed(
+            &self,
+            _remote: &str,
+            _trunk: &str,
+            landing: &str,
+            _head: &str,
+            _bottom: &str,
+            _top: &str,
+        ) -> Result<LandedCheck, BackendError> {
+            Ok(self
+                .world
+                .borrow()
+                .landings
+                .get(landing)
+                .cloned()
+                .unwrap_or(LandedCheck::Landed))
         }
     }
 
@@ -965,12 +1288,31 @@ mod tests {
         fn find_merged_pr(&self, branch: &str) -> Result<Option<PrSummary>, ForgeError> {
             Ok(self.world.borrow().merged.get(branch).cloned())
         }
-        fn pr_land_state(&self, number: u64, _base: &str) -> Result<PrLandState, ForgeError> {
-            self.world
+        fn open_prs_based_on(&self, base: &str) -> Result<Vec<PrSummary>, ForgeError> {
+            // As GitHub lists them: the open ones, by the base they have.
+            Ok(self
+                .world
                 .borrow()
-                .land_states
-                .get(&number)
+                .prs
+                .iter()
+                .filter(|pr| pr.base_branch == base)
                 .cloned()
+                .collect())
+        }
+        fn pr_land_state(&self, number: u64, _base: &str) -> Result<PrLandState, ForgeError> {
+            let world = self.world.borrow();
+            // A PR that merged before the run answers as GitHub does for
+            // one: merged, with the commit it landed as.
+            let recognized = world.merged.values().find(|pr| pr.number == number).map(|pr| {
+                PrLandState {
+                    state: PrState::Merged,
+                    base_branch: pr.base_branch.clone(),
+                    merge_commit: pr.merge_commit.clone(),
+                    ..ready_state()
+                }
+            });
+            recognized
+                .or_else(|| world.land_states.get(&number).cloned())
                 .ok_or_else(|| ForgeError::Api(format!("no stub state for #{number}")))
         }
         fn merge_pr(
@@ -987,6 +1329,11 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("merge:{number}:{}", method.rest_name()));
+            // From here on GitHub reports the PR merged, as a new commit.
+            if let Some(state) = self.world.borrow_mut().land_states.get_mut(&number) {
+                state.state = PrState::Merged;
+                state.merge_commit = Some(format!("landed{number}"));
+            }
             Ok(())
         }
         fn enable_auto_merge(
@@ -1010,11 +1357,61 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("retarget:{number}:{base}"));
+            // GitHub reports the new base from here on.
+            if let Some(state) = self.world.borrow_mut().land_states.get_mut(&number) {
+                state.base_branch = base.to_owned();
+            }
             Ok(())
         }
         fn mark_ready(&self, node_id: &str) -> Result<(), ForgeError> {
             self.calls.borrow_mut().push(format!("mark_ready:{node_id}"));
             Ok(())
+        }
+        fn merge_stacked(
+            &self,
+            number: u64,
+            method: crate::land::MergeMethod,
+            _expected_head: &str,
+            _commit_title: Option<&str>,
+            _commit_message: Option<&str>,
+            _bypass: bool,
+        ) -> Result<crate::github::AsyncMerge, ForgeError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("merge_stacked:{number}:{}", method.rest_name()));
+            // GitHub lands the PR asked for and every stacked PR below it.
+            let mut world = self.world.borrow_mut();
+            let Some(seat) = world.land_states.get(&number).and_then(|s| s.stack.clone()) else {
+                return Err(ForgeError::Api(format!("#{number} is not in a stack")));
+            };
+            for (below, state) in world.land_states.iter_mut() {
+                let in_merge = state.stack.as_ref().is_some_and(|s| {
+                    s.number == seat.number && s.position <= seat.position
+                });
+                if in_merge && state.state == PrState::Open {
+                    state.state = PrState::Merged;
+                    state.merge_commit = Some(format!("landed{below}"));
+                }
+            }
+            Ok(crate::github::AsyncMerge::Merged {
+                commit: format!("landed{number}"),
+            })
+        }
+        fn enqueue_stacked(
+            &self,
+            number: u64,
+            _expected_head: &str,
+        ) -> Result<crate::github::AsyncMerge, ForgeError> {
+            self.calls.borrow_mut().push(format!("enqueue_stacked:{number}"));
+            Ok(crate::github::AsyncMerge::Enqueued)
+        }
+        fn await_restack(
+            &self,
+            number: u64,
+            _from_head: &str,
+        ) -> Result<crate::github::Restack, ForgeError> {
+            self.calls.borrow_mut().push(format!("await_restack:{number}"));
+            Ok(crate::github::Restack::Rebased)
         }
     }
 
@@ -1111,6 +1508,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
 
         let (state, log) = run(&sim, "auth", &test_config(), &StopSignal::new());
@@ -1131,7 +1531,7 @@ mod tests {
         assert_eq!(log[1].phase, AutoLandPhase::Done);
         let calls = sim.calls.borrow();
         assert!(calls.contains(&"merge:1:squash".to_owned()), "{calls:?}");
-        assert!(calls.contains(&"abandon:a2,a1".to_owned()), "{calls:?}");
+        assert!(calls.contains(&"abandon:ca2,ca1".to_owned()), "{calls:?}");
     }
 
     #[test]
@@ -1152,6 +1552,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
         // The checks pass before the third poll.
         sim.at_poll(2, |world| {
@@ -1194,6 +1597,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
 
         // Stop after the first published wait; the point is the phrasing.
@@ -1247,6 +1653,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
         // GitHub's auto-merge finishes before the second poll: the open PR
         // disappears and the merged-PR recognition finds it.
@@ -1299,6 +1708,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
         // After the first round reconciled, the world looks freshly
         // rebased: profile alone on the new trunk, its PR retargeted and
@@ -1332,6 +1744,133 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_that_did_not_land_asks_for_attention_and_touches_nothing() {
+        // Reproduced on GitHub: a reordered push closed #1 as merged into
+        // the branch above it. The old job recognized "merged", ran the
+        // reconcile, and dropped the change.
+        let sim = Sim::new(World {
+            snapshot: two_stack(),
+            prs: vec![open_pr(7, "profile", "main")],
+            land_states: HashMap::new(),
+            merged: HashMap::from([(
+                "auth".to_owned(),
+                PrSummary {
+                    base_branch: "profile".into(),
+                    merge_commit: Some("ca2feedface".into()),
+                    ..merged_pr(1, "auth")
+                },
+            )]),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::from([("ca2feedface".to_owned(), LandedCheck::Elsewhere)]),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        let (state, log) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        // The job keeps watching (publishing again resumes it) and says
+        // what is wrong every time; the safety stop ends the test.
+        assert_eq!(state.phase, AutoLandPhase::Stopped);
+        assert!(log.iter().all(|s| match &s.phase {
+            AutoLandPhase::Waiting { attention, reasons } => {
+                reasons == &["Sizing up the stack".to_owned()]
+                    || (*attention
+                        && reasons
+                            .iter()
+                            .any(|r| r.contains("merged into \u{201c}profile\u{201d}, not \u{201c}main\u{201d}")))
+            }
+            AutoLandPhase::Stopped => true,
+            _ => false,
+        }));
+        // No round ran, nothing is listed as landed, nothing was touched.
+        assert_eq!(state.rounds, 0);
+        assert!(state.merged.is_empty(), "{:?}", state.merged);
+        assert!(sim.calls.borrow().is_empty(), "{:?}", sim.calls);
+    }
+
+    #[test]
+    fn a_landing_counts_only_once_the_check_found_it_on_trunk() {
+        // GitHub says #1 merged into main as a commit not fetched yet; the
+        // round fetches, and the repository then says trunk lacks part of
+        // it. The pull request must not be listed as landed.
+        let sim = Sim::new(World {
+            snapshot: single_stack(),
+            prs: vec![],
+            land_states: HashMap::new(),
+            merged: HashMap::from([("auth".to_owned(), merged_pr(1, "auth"))]),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::from([("landed1".to_owned(), LandedCheck::Unfetched)]),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        // Once the round has fetched, the repository knows the commit.
+        sim.at_poll(1, |world| {
+            world.landings.insert(
+                "landed1".to_owned(),
+                LandedCheck::Missing { paths: vec!["auth.rs".into()], more: 0 },
+            );
+        });
+        let (state, log) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Stopped);
+        assert_eq!(state.rounds, 1);
+        assert!(state.merged.is_empty(), "{:?}", state.merged);
+        // The failed round's story, then the plan's own blocker.
+        assert!(log.iter().any(|s| matches!(
+            &s.phase,
+            AutoLandPhase::Waiting { attention: true, reasons }
+                if reasons.iter().any(|r| r.contains("the fetch did not bring that commit"))
+        )));
+        assert!(log.iter().any(|s| matches!(
+            &s.phase,
+            AutoLandPhase::Waiting { attention: true, reasons }
+                if reasons.iter().any(|r| r.contains("does not hold everything under \u{201c}auth\u{201d} (auth.rs)"))
+        )));
+        // The one round fetched and stopped at the check.
+        assert_eq!(sim.calls.borrow().as_slice(), ["fetch:origin"]);
+    }
+
+    #[test]
+    fn lands_a_github_stack_in_one_round() {
+        let seat = |position| {
+            Some(crate::pr::StackSeat { number: 90, position, size: 2, base: "main".into() })
+        };
+        let mut land_states = HashMap::new();
+        land_states.insert(1, PrLandState { stack: seat(1), ..ready_state() });
+        land_states.insert(
+            7,
+            PrLandState { stack: seat(2), base_branch: "auth".into(), ..ready_state() },
+        );
+        let sim = Sim::new(World {
+            snapshot: two_stack(),
+            prs: vec![
+                PrSummary { stack: seat(1), ..open_pr(1, "auth", "main") },
+                PrSummary { stack: seat(2), ..open_pr(7, "profile", "auth") },
+            ],
+            land_states,
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        let (state, _) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Done);
+        assert_eq!(state.rounds, 1);
+        // Both landed, bottom first, from one request for the top.
+        assert_eq!(
+            state.merged.iter().map(|m| m.number).collect::<Vec<_>>(),
+            vec![1, 7]
+        );
+        let calls = sim.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("merge")).collect::<Vec<_>>(),
+            ["merge_stacked:7:squash"]
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("auto_merge")), "{calls:?}");
+    }
+
+    #[test]
     fn parks_after_the_error_budget() {
         let sim = Sim::new(World {
             snapshot: single_stack(),
@@ -1340,6 +1879,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: true,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
 
         let config = AutoLandConfig {
@@ -1374,6 +1916,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: true,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
 
         let config = AutoLandConfig {
@@ -1420,6 +1965,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
         sim.at_poll(1, |world| {
             world.snapshot.bookmarks.retain(|b| b.name != "auth");
@@ -1452,6 +2000,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
         sim.at_poll(1, |world| {
             world.snapshot.repo_path = "/somewhere/else".into();
@@ -1608,6 +2159,9 @@ mod tests {
             merged: HashMap::new(),
             prs_fail: false,
             merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
         });
 
         let initial = AutoLandState::resumed(waiting_record("auth").state);
@@ -1623,5 +2177,532 @@ mod tests {
             vec![100, 1],
             "the pre-restart merge stays first in the story"
         );
+    }
+
+    #[test]
+    fn a_branch_someone_else_pushed_to_is_fetched_once_and_then_landed() {
+        // A bot added a commit to #1's branch. The plan a person would
+        // get stops there ("fetch and look"). The job fetches, so the
+        // repository has what GitHub has, and lands what is there.
+        let mut land_states = HashMap::new();
+        land_states.insert(
+            1,
+            PrLandState { head_commit: "cbot0123".into(), ..ready_state() },
+        );
+        let followed = snapshot(
+            vec![
+                node("bot", "style: format", NodeKind::WorkingCopy, &["a2"], &["auth"]),
+                node("a2", "auth: sessions", NodeKind::Mutable, &["a1"], &[]),
+                node("a1", "auth: login flow", NodeKind::Mutable, &["m"], &[]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "bot", SyncState::Synced, false),
+            ],
+        );
+        let world = |after_fetch: Option<RepoSnapshot>, fetch_fails: u32| World {
+            snapshot: single_stack(),
+            prs: vec![PrSummary { head_commit: "cbot0123".into(), ..open_pr(1, "auth", "main") }],
+            land_states: land_states.clone(),
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch,
+            fetch_fails,
+        };
+
+        let sim = Sim::new(world(Some(followed.clone()), 0));
+        let (state, _) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Done, "{:?}", state.phase);
+        assert_eq!(state.merged.len(), 1);
+        let calls = sim.calls.borrow();
+        assert_eq!(&calls[..2], ["fetch:origin", "merge:1:squash"], "{calls:?}");
+        // What landed is all three commits, the bot's included, and the
+        // round's story begins with how they got here.
+        assert!(calls.contains(&"abandon:cbot,ca2,ca1".to_owned()), "{calls:?}");
+        let first = &state.last_outcome.as_ref().unwrap().steps[0];
+        assert!(matches!(first.action, LandAction::FetchRemote { .. }));
+        assert!(
+            first.detail.as_deref().unwrap().contains("had moved on GitHub since the last fetch"),
+            "{:?}",
+            first.detail
+        );
+
+        // A fetch that does not bring the bookmark along (it had moved
+        // here too) leaves the blocker standing: the job asks for the
+        // user, and does not fetch again for the same reason.
+        let sim = Sim::new(world(None, 0));
+        let stop = StopSignal::new();
+        let polls = Cell::new(0);
+        let log: RefCell<Vec<AutoLandState>> = RefCell::new(vec![]);
+        let mut publish = |state: &AutoLandState| {
+            log.borrow_mut().push(state.clone());
+            polls.set(polls.get() + 1);
+            if polls.get() >= 3 {
+                stop.stop();
+            }
+        };
+        run_autoland(
+            &forge_repo(),
+            AutoLandState::queued("auth"),
+            &sim,
+            &sim,
+            &sim,
+            &test_config(),
+            &stop,
+            &mut publish,
+        );
+        let log = log.into_inner();
+        assert!(
+            matches!(&log[0].phase, AutoLandPhase::Waiting { attention: true, reasons }
+                if reasons[0].contains("#1's branch on GitHub is at")),
+            "{:?}",
+            log[0].phase
+        );
+        assert_eq!(
+            sim.calls.borrow().iter().filter(|c| c.starts_with("fetch")).count(),
+            1,
+            "{:?}",
+            sim.calls
+        );
+        assert!(!sim.calls.borrow().iter().any(|c| c.starts_with("merge")));
+
+        // A fetch that fails is tried again on the next poll, like any
+        // other failure, and the job goes on once it gets through.
+        let sim = Sim::new(world(Some(followed), 1));
+        let (state, log) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Done, "{:?}", state.phase);
+        assert!(
+            matches!(&log[0].phase, AutoLandPhase::Waiting { attention: false, reasons }
+                if reasons[0].contains("the remote hung up") && reasons[0].contains("retrying")),
+            "{:?}",
+            log[0].phase
+        );
+        let calls = sim.calls.borrow();
+        assert_eq!(&calls[..3], ["fetch:origin", "fetch:origin", "merge:1:squash"], "{calls:?}");
+    }
+
+    #[test]
+    fn a_branch_cut_back_on_github_ends_the_job_instead_of_landing_what_is_left() {
+        // Someone force-pushed #1's branch back to its first commit. The
+        // plan sees GitHub's head differ from the bookmark and the job
+        // fetches; jj then drops the second commit here too, and from the
+        // next poll on the bookmark and GitHub would agree.
+        let mut land_states = HashMap::new();
+        land_states.insert(
+            1,
+            PrLandState { head_commit: "ca1feedface".into(), ..ready_state() },
+        );
+        let cut_back = snapshot(
+            vec![
+                node("a1", "auth: login flow", NodeKind::WorkingCopy, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+            ],
+        );
+        let sim = Sim::new(World {
+            snapshot: single_stack(),
+            prs: vec![PrSummary { head_commit: "ca1feedface".into(), ..open_pr(1, "auth", "main") }],
+            land_states,
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: Some(cut_back),
+            fetch_fails: 0,
+        });
+        let (state, _) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("rewritten or cut back on GitHub")
+                    && message.contains("a2 is no longer in the stack")),
+            "{:?}",
+            state.phase
+        );
+        assert_eq!(sim.calls.borrow().as_slice(), ["fetch:origin"]);
+        assert!(state.merged.is_empty());
+
+        // The same when another bookmark holds the dropped commit, so jj
+        // keeps it: it is above "auth" now, not under it, and #1 no
+        // longer has it.
+        let mut land_states = HashMap::new();
+        land_states.insert(
+            1,
+            PrLandState { head_commit: "ca1feedface".into(), ..ready_state() },
+        );
+        let held = snapshot(
+            vec![
+                node("a2", "auth: sessions", NodeKind::WorkingCopy, &["a1"], &["later"]),
+                node("a1", "auth: login flow", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("later", "a2", SyncState::LocalOnly, false),
+            ],
+        );
+        let mut before = single_stack();
+        before.bookmarks.push(bookmark("later", "a2", SyncState::LocalOnly, false));
+        let sim = Sim::new(World {
+            snapshot: before,
+            prs: vec![PrSummary { head_commit: "ca1feedface".into(), ..open_pr(1, "auth", "main") }],
+            land_states,
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: Some(held),
+            fetch_fails: 0,
+        });
+        let (state, _) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("a2 is no longer in the stack")),
+            "{:?}",
+            state.phase
+        );
+        assert_eq!(sim.calls.borrow().as_slice(), ["fetch:origin"]);
+    }
+
+    /// The cut-back branch can also arrive by a fetch the job did not
+    /// make (the app's own, or `jj git fetch` in a terminal): the bookmark
+    /// and GitHub agree by the job's next look, and nothing asks it to
+    /// fetch. The job remembers what it was asked to land, across looks
+    /// and across a restart, and ends when a change of a branch that is
+    /// still to land is no longer under the stack.
+    #[test]
+    fn a_branch_cut_back_between_looks_or_before_a_restart_ends_the_job() {
+        let waiting = || PrLandState {
+            checks: ChecksRollup::Pending,
+            auto_merge_allowed: false,
+            ..ready_state()
+        };
+        fn cut_back() -> RepoSnapshot {
+            snapshot(
+                vec![
+                    node("a1", "auth: login flow", NodeKind::WorkingCopy, &["m"], &["auth"]),
+                    node("m", "release", NodeKind::Immutable, &[], &["main"]),
+                ],
+                vec![
+                    bookmark("main", "m", SyncState::Synced, true),
+                    bookmark("auth", "a1", SyncState::Synced, false),
+                ],
+            )
+        }
+        let shorter_and_ready = |world: &mut World| {
+            world.snapshot = cut_back();
+            world.prs = vec![PrSummary { head_commit: "ca1feedface".into(), ..open_pr(1, "auth", "main") }];
+            world.land_states.insert(
+                1,
+                PrLandState { head_commit: "ca1feedface".into(), ..ready_state() },
+            );
+        };
+        let world = |snapshot: RepoSnapshot, state: PrLandState| World {
+            snapshot,
+            prs: vec![open_pr(1, "auth", "main")],
+            land_states: HashMap::from([(1, state)]),
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        };
+
+        // Between two looks. The first one waits on checks and lists a1
+        // and a2 under "auth".
+        let sim = Sim::new(world(single_stack(), waiting()));
+        sim.at_poll(1, shorter_and_ready);
+        let (state, log) = run(&sim, "auth", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("\u{201c}auth\u{201d} no longer holds a2")
+                    && message.contains("here or on GitHub")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().iter().all(|c| !c.starts_with("merge")), "{:?}", sim.calls);
+        assert!(state.merged.is_empty());
+
+        // Across a restart: the saved job, resumed against the shorter
+        // stack.
+        let saved = log
+            .iter()
+            .find(|s| s.segments.iter().any(|seg| seg.change_ids == ["a1", "a2"]))
+            .cloned()
+            .expect("the first look saved what it saw");
+        let mut later = world(cut_back(), ready_state());
+        shorter_and_ready(&mut later);
+        let sim = Sim::new(later);
+        let (state, _) =
+            run_from(&sim, AutoLandState::resumed(saved), &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("no longer holds a2")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().is_empty(), "{:?}", sim.calls);
+    }
+
+    /// What the job is asked about is the branches still to land. One
+    /// that someone else landed and cleaned up between two looks took its
+    /// changes with it, and that ends nothing.
+    #[test]
+    fn a_branch_someone_else_landed_between_looks_does_not_end_the_job() {
+        let mut land_states = HashMap::new();
+        land_states.insert(
+            1,
+            PrLandState {
+                checks: ChecksRollup::Pending,
+                auto_merge_allowed: false,
+                ..ready_state()
+            },
+        );
+        land_states.insert(7, PrLandState { base_branch: "auth".into(), ..ready_state() });
+        let sim = Sim::new(World {
+            snapshot: two_stack(),
+            prs: vec![open_pr(1, "auth", "main"), open_pr(7, "profile", "auth")],
+            land_states,
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        sim.at_poll(1, |world| {
+            world.snapshot = after_first_land();
+            world.prs = vec![open_pr(7, "profile", "main")];
+            world.land_states.insert(7, ready_state());
+            // Landed: GitHub calls #1 merged.
+            world.merged.insert("auth".to_owned(), merged_pr(1, "auth"));
+        });
+        let (state, _) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        assert_eq!(state.phase, AutoLandPhase::Done, "{:?}", state.phase);
+        assert_eq!(state.merged.iter().map(|m| m.number).collect::<Vec<_>>(), vec![7]);
+    }
+
+    /// A branch can also leave the stack without landing. While "auth"
+    /// waits on its checks, "profile" is moved off it onto trunk and its
+    /// pull request pointed there. The stack under "profile" is then
+    /// "profile" alone, and landing it would end the job as done with
+    /// #1 open and its changes where they were. The job was asked to land
+    /// both: it ends and says which one is gone, at the next look and
+    /// when resumed.
+    #[test]
+    fn a_branch_that_left_the_stack_without_landing_ends_the_job() {
+        fn reshaped() -> RepoSnapshot {
+            let mut answer = snapshot(
+                vec![
+                    node("b1", "profile: avatars", NodeKind::WorkingCopy, &["m"], &["profile"]),
+                    node("a2", "auth: sessions", NodeKind::Mutable, &["a1"], &["auth"]),
+                    node("a1", "auth: login flow", NodeKind::Mutable, &["m"], &[]),
+                    node("m", "release", NodeKind::Immutable, &[], &["main"]),
+                ],
+                vec![
+                    bookmark("main", "m", SyncState::Synced, true),
+                    bookmark("auth", "a2", SyncState::Synced, false),
+                    bookmark("profile", "b1", SyncState::Synced, false),
+                ],
+            );
+            answer.nodes[0].commit_id = "ca2feedface".into();
+            answer
+        }
+        let waiting = PrLandState {
+            checks: ChecksRollup::Pending,
+            auto_merge_allowed: false,
+            ..ready_state()
+        };
+        let world = |snapshot: RepoSnapshot, first: PrLandState| World {
+            snapshot,
+            prs: vec![open_pr(1, "auth", "main"), open_pr(7, "profile", "auth")],
+            land_states: HashMap::from([
+                (1, first),
+                (7, PrLandState { base_branch: "auth".into(), ..ready_state() }),
+            ]),
+            merged: HashMap::new(),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        };
+        let moved_off = |world: &mut World| {
+            world.snapshot = reshaped();
+            world.prs = vec![open_pr(1, "auth", "main"), open_pr(7, "profile", "main")];
+            world.land_states.insert(7, ready_state());
+        };
+
+        let sim = Sim::new(world(two_stack(), waiting.clone()));
+        sim.at_poll(1, moved_off);
+        let (state, log) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("\u{201c}auth\u{201d} is no longer part of the stack under \u{201c}profile\u{201d}")
+                    && message.contains("it has not landed")
+                    && message.contains("without a1, a2")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().iter().all(|c| !c.starts_with("merge")), "{:?}", sim.calls);
+        assert!(state.merged.is_empty());
+
+        // Resumed against the reshaped stack.
+        let saved = log
+            .iter()
+            .find(|s| s.segments.iter().any(|seg| seg.bookmark == "auth"))
+            .cloned()
+            .expect("the first look saved both branches");
+        let mut later = world(two_stack(), waiting.clone());
+        moved_off(&mut later);
+        let sim = Sim::new(later);
+        let (state, _) =
+            run_from(&sim, AutoLandState::resumed(saved), &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("is no longer part of the stack")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().iter().all(|c| !c.starts_with("merge")), "{:?}", sim.calls);
+
+        // What counts as landed is the pull request the job recorded, #1,
+        // merged into trunk. Not an earlier pull request that once merged
+        // from a branch of the same name:
+        let mut reused = world(two_stack(), waiting.clone());
+        reused.merged.insert("auth".to_owned(), merged_pr(3, "auth"));
+        let sim = Sim::new(reused);
+        sim.at_poll(1, moved_off);
+        let (state, _) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("it has not landed")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().iter().all(|c| !c.starts_with("merge")), "{:?}", sim.calls);
+        // And not #1 itself merged into some other branch.
+        let sim = Sim::new(world(two_stack(), waiting));
+        sim.at_poll(1, |world| {
+            world.snapshot = reshaped();
+            world.prs = vec![open_pr(7, "profile", "main")];
+            world.land_states.insert(7, ready_state());
+            world.merged.insert(
+                "auth".to_owned(),
+                PrSummary { base_branch: "integration".into(), ..merged_pr(1, "auth") },
+            );
+        });
+        let (state, _) = run(&sim, "profile", &test_config(), &StopSignal::new());
+        assert!(
+            matches!(&state.phase, AutoLandPhase::Failed { message }
+                if message.contains("it has not landed")),
+            "{:?}",
+            state.phase
+        );
+        assert!(sim.calls.borrow().iter().all(|c| !c.starts_with("merge")), "{:?}", sim.calls);
+    }
+
+    #[test]
+    fn a_job_resumed_after_a_merge_commit_landing_finishes_it() {
+        // The round merged #1 with a merge commit and fetched, and the
+        // job stopped there. "auth" now points at trunk history: there is
+        // no mutable stack under it. Resumed, the job used to read that
+        // as an error and give up after its retries with nothing counted.
+        let landed = snapshot(
+            vec![
+                node("mm", "Merge pull request #1", NodeKind::Immutable, &["m", "a2"], &["main"]),
+                node("a2", "auth: sessions", NodeKind::Immutable, &["a1"], &["auth"]),
+                node("a1", "auth: login flow", NodeKind::Immutable, &["m"], &[]),
+                node("m", "release", NodeKind::Immutable, &[], &[]),
+            ],
+            vec![
+                bookmark("main", "mm", SyncState::Synced, true),
+                bookmark("auth", "a2", SyncState::Synced, false),
+            ],
+        );
+        let sim = Sim::new(World {
+            snapshot: landed,
+            prs: vec![],
+            land_states: HashMap::new(),
+            merged: HashMap::from([("auth".to_owned(), merged_pr(1, "auth"))]),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        let prior = AutoLandState { rounds: 1, ..AutoLandState::queued("auth") };
+        let (state, _) = run_from(
+            &sim,
+            AutoLandState::resumed(prior),
+            &test_config(),
+            &StopSignal::new(),
+        );
+        assert_eq!(state.phase, AutoLandPhase::Done, "{:?}", state.phase);
+        assert_eq!(
+            state.merged,
+            vec![AutoLandMerged {
+                number: 1,
+                url: "https://github.com/o/r/pull/1".into(),
+                bookmark: "auth".into(),
+            }]
+        );
+        assert_eq!(
+            sim.calls.borrow().as_slice(),
+            ["fetch:origin", "delete:auth", "push:auth:origin"],
+            "the bookmark is cleaned up and nothing immutable is abandoned"
+        );
+
+        // The same for a job saved with what it had been asked to land,
+        // when the snapshot no longer draws the landed commits at all (it
+        // draws nothing inside trunk's history that no mutable change
+        // sits on). They landed. They were not cut back.
+        let mut undrawn = snapshot(
+            vec![
+                node("mm", "Merge pull request #1", NodeKind::Immutable, &["m"], &["main"]),
+                node("m", "release", NodeKind::Immutable, &[], &[]),
+            ],
+            vec![
+                bookmark("main", "mm", SyncState::Synced, true),
+                bookmark("auth", "a2", SyncState::Synced, false),
+            ],
+        );
+        undrawn.bookmarks[1].is_merged = true;
+        let sim = Sim::new(World {
+            snapshot: undrawn,
+            prs: vec![],
+            land_states: HashMap::new(),
+            merged: HashMap::from([("auth".to_owned(), merged_pr(1, "auth"))]),
+            prs_fail: false,
+            merge_fails: false,
+            landings: HashMap::new(),
+            after_fetch: None,
+            fetch_fails: 0,
+        });
+        let prior = AutoLandState {
+            rounds: 1,
+            segments: vec![LandSegment {
+                bookmark: "auth".into(),
+                change_ids: vec!["a1".into(), "a2".into()],
+                pr: None,
+                status: LandSegmentStatus::Landing,
+            }],
+            ..AutoLandState::queued("auth")
+        };
+        let (state, _) = run_from(
+            &sim,
+            AutoLandState::resumed(prior),
+            &test_config(),
+            &StopSignal::new(),
+        );
+        assert_eq!(state.phase, AutoLandPhase::Done, "{:?}", state.phase);
+        assert!(sim.calls.borrow().contains(&"delete:auth".to_owned()), "{:?}", sim.calls);
     }
 }

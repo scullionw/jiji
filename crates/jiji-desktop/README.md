@@ -50,6 +50,7 @@ variables:
 | `JIJI_DATA_DIR=<dir>` | keep preferences, recents, licence and the log here instead of the real data and log directories, and never read the Tauri app's — set it for any test run |
 | `JIJI_MOCK_BACKEND=1` | serve the mock repository (needs a directory containing `.jj`) |
 | `JIJI_OFFLINE=1` | reach nothing on its own: no GitHub token is looked up (the Keychain, `GITHUB_TOKEN`, `gh`) and GitHub is never asked, so Publish reads as not connected, and upstream checks are off for the run (a Fetch now still fetches) — set it for any scripted run |
+| `JIJI_MOCK_FORGE=1\|stack\|stray\|others` | `headless` builds, with the mock backend: put GitHub as the tests capture it (`testing::forge`) behind the mock repository, so a scripted run can draw Publish with pull requests on it. `1` is the mock stack's two pull requests as a plain chain, `stack` the same two linked as a GitHub stack, `stray` the lower one closed as merged without having landed, `others` the plain chain with two pull requests by other people on it. Nothing is looked up or reached |
 | `JIJI_DEV_LICENSE=unregistered\|real` | debug builds only: exercise the unregistered state, or read the real licence |
 | `JIJI_SCRIPT=<steps>` | drive the window: see `src/script.rs` |
 | `JIJI_HEADLESS=1` | never show the window; a scripted run nobody sees (needs a `headless` build) |
@@ -121,9 +122,11 @@ The host takes its forge (`host::forge::Forge`) as it takes its backend:
 GitHub in the app, `Offline` in an offline run, and in tests either nothing
 or GitHub as a test captured it (`testing::forge::Fixture` through
 `testing::install_mock_over`: pull requests, what each merge button says,
-the repository's merge rules), so Publish, review, land, ship and auto-land
-run their real planning and execution and the test reads what GitHub was
-asked. The real forge finds no token under test either, so nothing reads
+the repository's merge rules, GitHub stacks and what GitHub refuses inside
+one), so Publish, review, land, ship and auto-land run their real planning
+and execution and the test reads what GitHub was asked. The double's own
+notes say where it cannot follow GitHub: it never sees a push, and the mock
+repository cannot receive a commit. The real forge finds no token under test either, so nothing reads
 credentials or reaches the network. Keep it that way: a test that needs a
 token-bearing path uses the fixture, never lifts the guard in
 `host::forge::GitHub::token`. An auto-land job works on a thread of its
@@ -179,7 +182,8 @@ One look, stated once so new surfaces keep it. The tokens are in
   command field (⌘K), the one entry to every command and search; the
   palette and history search open out of it, their search line where the
   field was. Beside it, trunk's state and the fetch age read quietly, and
-  one Settings control holds appearance, integrations and the licence.
+  one Settings control holds appearance, integrations, whether a publish
+  links new stacks as GitHub stacks, and the licence.
   An unregistered copy adds a single Register control. Nothing else.
 - **Hue is identity.** Every color names something: a line (lanes), a
   section (`Section::hue`, its rail tile and page mark), a repository or

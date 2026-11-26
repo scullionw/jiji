@@ -429,6 +429,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 
@@ -700,6 +702,8 @@ mod tests {
         let copy = |id: &str| GraphNode {
             change_id: "rzvqnkom".into(),
             is_divergent: true,
+            held: false,
+            old_copies_held: false,
             ..node(id, NodeKind::Mutable, &["trunk"])
         };
         let snapshot = graph(

@@ -7,7 +7,7 @@ mod plan;
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Window};
 use jiji_core::snapshot::RepoSnapshot;
-use jiji_forge::{AutoLandStatus, LandSegment, PublishStack, SubmitHead};
+use jiji_forge::{AutoLandStatus, LandSegment, PublishStack, StackLink, SubmitHead, SubmitOptions};
 
 use super::{Mode, Page, PublishView};
 use crate::logic::publish::stack_summary;
@@ -48,6 +48,7 @@ impl PublishView {
         self.ship_loading = false;
         self.land_method = None;
         self.land_bypass = false;
+        self.stack_link = StackLink::Follow;
         self.more.reset();
         if self.connected(cx) {
             match (stack.pr_count > 0, stack.head_bookmark, stack.submit_head) {
@@ -72,10 +73,14 @@ impl PublishView {
         self.plan_error = None;
         self.plan_loading = true;
         cx.notify();
-        let planned = self
-            .app
-            .read(cx)
-            .bg(cx, move |host| host.submit_plan(&repo, &head));
+        // What this card was told wins; untouched, the setting decides.
+        let options = SubmitOptions {
+            stack: self.stack_link,
+        }
+        .under_setting(self.app.read(cx).link_new_stacks());
+        let planned = self.app.read(cx).bg(cx, move |host| {
+            host.submit_plan(&repo, &head, Some(options))
+        });
         cx.spawn(async move |this, cx| {
             let result = planned.await;
             let _ = this.update(cx, |this, cx| {
@@ -371,6 +376,17 @@ impl PublishView {
             },
             cx,
         )));
+        if let Some(linked) = stack.github_stack {
+            // GitHub's own stack, and how much of the chain is in it.
+            meta_bar = meta_bar.child(fact().child(if linked.linked == stack.pr_count {
+                format!("GitHub stack {}", linked.number)
+            } else {
+                format!(
+                    "GitHub stack {} · {} of {} linked",
+                    linked.number, linked.linked, stack.pr_count
+                )
+            }));
+        }
         if stack.is_active {
             meta_bar = meta_bar.child(fact().child(dot(t.working_copy, 6.)).child("Current stack"));
         } else if stack.submit_head.is_none() {

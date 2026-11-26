@@ -4,7 +4,8 @@
 
 use jiji_forge::{
     AutoLandPhase, AutoLandStatus, ChecksRollup, CiRerunReport, LandAction, LandOptions, LandPlan,
-    MergeMethod, PrState, PrSummary, RepoPrState, ShipAction, StackStatus, SubmitAction,
+    MergeMethod, PrState, PrSummary, RepoPrState, ShipAction, StackLink, StackStatus, SubmitAction,
+    SubmitPlan,
 };
 
 use super::autoland::is_interrupted;
@@ -22,6 +23,54 @@ pub fn stack_summary(status: StackStatus) -> (&'static str, Tone) {
         StackStatus::ChecksRunning => ("Checks running", Tone::Warn),
         StackStatus::InReview => ("In review", Tone::Warn),
         StackStatus::Published => ("Published", Tone::Ok),
+    }
+}
+
+/// Whether the chain will be a GitHub stack once `plan` has run: what the
+/// card's "Link as a GitHub stack" box shows. `linked` says it is one now.
+/// Read off the plan, which was made under the setting too.
+pub fn stack_link_wanted(plan: &SubmitPlan, linked: bool) -> bool {
+    match plan.options.stack {
+        StackLink::Link => true,
+        StackLink::Unlink => false,
+        StackLink::Follow => linked,
+        StackLink::LinkNew => {
+            linked
+                || plan
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, SubmitAction::LinkStack { .. }))
+        }
+    }
+}
+
+/// What a click on that box asks of the next plan. Asking for what GitHub
+/// already has is leaving it be. A chain that is about to be linked is
+/// told not to be: left alone, the setting that links new stacks could
+/// link it all the same.
+pub fn stack_link_after_click(linked: bool, wanted: bool) -> StackLink {
+    match (linked, wanted) {
+        (true, true) | (false, true) => StackLink::Unlink,
+        (false, false) => StackLink::Link,
+        (true, false) => StackLink::Follow,
+    }
+}
+
+/// "#12, #13 and #14".
+fn pr_numbers(numbers: &[u64]) -> String {
+    let listed: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+    match listed.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// A pull request that is someone else's, by number and author.
+pub fn other_pr(number: u64, author: Option<&str>) -> String {
+    match author {
+        Some(login) => format!("#{number} by @{login}"),
+        None => format!("#{number}"),
     }
 }
 
@@ -61,10 +110,36 @@ pub fn land_action_text(action: &LandAction, remote: &str) -> String {
         }
         LandAction::MergePr {
             number,
+            method,
+            with,
+            ..
+        } if !with.is_empty() => {
+            let below: Vec<String> = with
+                .iter()
+                .map(|lower| format!("#{}", lower.number))
+                .collect();
+            format!(
+                "{} {} and #{number} in one request — GitHub lands a stack\u{2019}s pull \
+                 requests together, all or none",
+                method_label(*method),
+                below.join(", ")
+            )
+        }
+        LandAction::MergePr {
+            number,
             bookmark,
             method,
             ..
         } => format!("{} #{number} ({bookmark})", method_label(*method)),
+        LandAction::AwaitRestack { number, .. } => format!(
+            "Wait for GitHub to rebase the rest of the stack (#{number}) onto the new trunk"
+        ),
+        LandAction::CheckLanded {
+            number, bookmark, ..
+        } => format!(
+            "Check that trunk holds {bookmark}\u{2019}s changes — #{number} must really have \
+             landed before anything here is rewritten"
+        ),
         LandAction::EnableAutoMerge { number, method, .. } => format!(
             "Enable auto-merge ({}) on #{number} — GitHub merges it once its requirements are met",
             method_word(*method)
@@ -81,9 +156,9 @@ pub fn land_action_text(action: &LandAction, remote: &str) -> String {
         LandAction::FetchRemote { remote } => {
             format!("Fetch from {remote} so the merged trunk arrives locally")
         }
-        LandAction::RebaseOntoTrunk { root_change, moves } => {
-            rebase_text(root_change, *moves, "the new trunk")
-        }
+        LandAction::RebaseOntoTrunk {
+            root_change, moves, ..
+        } => rebase_text(root_change, *moves, "the new trunk"),
         LandAction::PushStack { bookmarks } => {
             format!("Push the rebased {} to {remote}", bookmarks.join(", "))
         }
@@ -92,12 +167,23 @@ pub fn land_action_text(action: &LandAction, remote: &str) -> String {
             bookmark,
             to_base,
         } => format!("Retarget #{number} ({bookmark}) onto {to_base}"),
-        LandAction::CleanupBookmark { bookmark } => {
+        LandAction::RetargetOther {
+            number,
+            author,
+            branch,
+            from_base,
+            to_base,
+        } => format!(
+            "Retarget {} ({branch}) onto {to_base}: its base {from_base} lands and is removed",
+            other_pr(*number, author.as_deref())
+        ),
+        LandAction::CleanupBookmark { bookmark, .. } => {
             format!("Remove the landed bookmark {bookmark} here and on {remote}")
         }
         LandAction::AbandonLanded {
             bookmark,
             change_ids,
+            ..
         } => match change_ids.as_slice() {
             [only] => {
                 format!("Sweep {bookmark}'s landed change {only} — its content lives on trunk now")
@@ -174,6 +260,40 @@ pub fn submit_action_text(action: &SubmitAction, remote: &str) -> String {
             "Update the stack comment on #{}",
             number.map_or_else(String::new, |number| number.to_string())
         ),
+        SubmitAction::Unstack { stack, members } => format!(
+            "Dissolve GitHub stack {stack}{} — GitHub cannot reorder or retarget inside a \
+             stack, so the pull requests leave it first",
+            if members.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", pr_numbers(members))
+            }
+        ),
+        SubmitAction::LinkStack {
+            bookmarks,
+            onto: None,
+            above,
+        } if above.is_empty() => format!("Link as a GitHub stack: {}", bookmarks.join(", ")),
+        // Pull requests above the published head that were in the stack
+        // and still sit on it go back in, on top.
+        SubmitAction::LinkStack {
+            bookmarks,
+            onto: None,
+            above,
+        } => format!(
+            "Link as a GitHub stack: {}, with {} back on top",
+            bookmarks.join(", "),
+            above
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        SubmitAction::LinkStack {
+            bookmarks,
+            onto: Some(stack),
+            ..
+        } => format!("Add {} to GitHub stack {stack}", bookmarks.join(", ")),
     }
 }
 
@@ -183,12 +303,44 @@ pub fn ship_action_text(action: &ShipAction) -> String {
         ShipAction::RebaseOntoTrunk { root_change, moves } => {
             rebase_text(root_change, *moves, "the fetched trunk first")
         }
+        ShipAction::PushBranches { bookmarks, remote } => format!(
+            "Push {} to {remote} — each pull request gets the commit that ships",
+            bookmarks.join(", ")
+        ),
+        ShipAction::Unstack { stack, members } => format!(
+            "Dissolve GitHub stack {stack} ({}) — GitHub does not retarget inside a stack",
+            pr_numbers(members)
+        ),
+        ShipAction::RetargetPr {
+            number,
+            bookmark,
+            to_base,
+            ..
+        } => format!("Retarget #{number} ({bookmark}) onto {to_base} — the push then merges it"),
         ShipAction::MoveTrunk { bookmark, to } => {
             format!("Point {bookmark} at {to} — the stack becomes trunk history")
         }
         ShipAction::PushTrunk { bookmark, remote } => {
             format!("Push {bookmark} to {remote} — this is the shipping step")
         }
+        ShipAction::ConfirmMerged { numbers } => {
+            format!("Check that GitHub marked {} merged", pr_numbers(numbers))
+        }
+        ShipAction::RetargetAbove {
+            number,
+            author,
+            theirs,
+            branch,
+            to_base,
+            ..
+        } => format!(
+            "Retarget {} ({branch}) onto {to_base} — it stays open",
+            if *theirs {
+                other_pr(*number, author.as_deref())
+            } else {
+                format!("#{number}")
+            }
+        ),
         ShipAction::NewWorkingCopy { on } => {
             format!("Start a fresh working copy on {on} — the current one ships with the stack")
         }
@@ -198,7 +350,9 @@ pub fn ship_action_text(action: &ShipAction) -> String {
 /// What the manual button does this round, named for its first real step.
 pub fn manual_land_label(plan: &LandPlan) -> &'static str {
     let has = |wanted: fn(&LandAction) -> bool| plan.actions.iter().any(wanted);
-    if has(|action| matches!(action, LandAction::MergePr { .. })) {
+    if has(|action| matches!(action, LandAction::MergePr { with, .. } if !with.is_empty())) {
+        "Land ready PRs"
+    } else if has(|action| matches!(action, LandAction::MergePr { .. })) {
         "Land next PR"
     } else if has(|action| matches!(action, LandAction::EnqueuePr { .. })) {
         "Join merge queue"
@@ -336,6 +490,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_stack_box_reads_the_plan_and_a_click_holds_against_the_setting() {
+        let plan = |stack: StackLink, links: bool| SubmitPlan {
+            head_bookmark: "profile".into(),
+            remote: "origin".into(),
+            base_branch: "main".into(),
+            options: jiji_forge::SubmitOptions { stack },
+            segments: Vec::new(),
+            actions: if links {
+                vec![SubmitAction::LinkStack {
+                    bookmarks: vec!["auth".into(), "profile".into()],
+                    onto: None,
+                    above: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            },
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            stack_comment_preview: None,
+            pr_template_path: None,
+        };
+        // Told, the box shows what was told; left alone, what GitHub has.
+        assert!(stack_link_wanted(&plan(StackLink::Link, true), false));
+        assert!(!stack_link_wanted(&plan(StackLink::Unlink, false), true));
+        assert!(stack_link_wanted(&plan(StackLink::Follow, false), true));
+        assert!(!stack_link_wanted(&plan(StackLink::Follow, false), false));
+        // Under the setting: ticked when this plan links, or the chain is
+        // a stack already; not for a plain chain that only changes.
+        assert!(stack_link_wanted(&plan(StackLink::LinkNew, true), false));
+        assert!(stack_link_wanted(&plan(StackLink::LinkNew, false), true));
+        assert!(!stack_link_wanted(&plan(StackLink::LinkNew, false), false));
+
+        // A click asks for the other state. Unticking a chain the setting
+        // is about to link has to say no outright: left to the setting,
+        // the next plan would link it again.
+        assert_eq!(stack_link_after_click(false, true), StackLink::Unlink);
+        assert_eq!(stack_link_after_click(false, false), StackLink::Link);
+        assert_eq!(stack_link_after_click(true, true), StackLink::Unlink);
+        assert_eq!(stack_link_after_click(true, false), StackLink::Follow);
+    }
+
+    #[test]
     fn land_actions_read_as_plain_steps() {
         let merge = LandAction::MergePr {
             number: 12,
@@ -344,6 +540,8 @@ mod tests {
             expected_head: "abc".into(),
             commit_title: None,
             commit_message: None,
+            with: vec![],
+            stack: None,
         };
         assert_eq!(
             land_action_text(&merge, "origin"),
@@ -352,6 +550,7 @@ mod tests {
         let rebase = |moves| LandAction::RebaseOntoTrunk {
             root_change: "kxyz".into(),
             moves,
+            off: vec![],
         };
         assert_eq!(
             land_action_text(&rebase(1), "origin"),
@@ -453,6 +652,9 @@ mod tests {
             body: None,
             review: jiji_forge::ReviewDecision::None,
             checks: ChecksRollup::None,
+            merge_commit: None,
+            stack: None,
+            author: None,
         };
         edit(&mut pr);
         pr
@@ -544,6 +746,8 @@ mod tests {
             expected_head: "feedface".into(),
             commit_title: None,
             commit_message: None,
+            with: vec![],
+            stack: None,
         };
         assert_eq!(
             land(merge(1, "auth", MergeMethod::Squash)),
@@ -597,7 +801,8 @@ mod tests {
         );
         assert_eq!(
             land(LandAction::CleanupBookmark {
-                bookmark: "auth".into()
+                bookmark: "auth".into(),
+                commit: "ca2".into(),
             }),
             "Remove the landed bookmark auth here and on origin"
         );
@@ -605,6 +810,7 @@ mod tests {
             land(LandAction::AbandonLanded {
                 bookmark: "auth".into(),
                 change_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+                commits: ids.iter().map(|id| format!("c{id}")).collect(),
             })
         };
         assert!(swept(&["a1"]).contains("landed change a1"));
@@ -631,6 +837,82 @@ mod tests {
         assert!(
             ship_action_text(&ShipAction::NewWorkingCopy { on: "abcd".into() })
                 .contains("fresh working copy")
+        );
+    }
+
+    /// A ship that finishes pull requests names each one and what happens
+    /// to it; so does a landing for a pull request that is someone else's.
+    #[test]
+    fn steps_for_pull_requests_name_them_and_say_whose_they_are() {
+        assert_eq!(
+            ship_action_text(&ShipAction::PushBranches {
+                bookmarks: vec!["auth".into(), "profile".into()],
+                remote: "origin".into(),
+            }),
+            "Push auth, profile to origin — each pull request gets the commit that ships"
+        );
+        assert_eq!(
+            ship_action_text(&ShipAction::Unstack {
+                stack: 90,
+                members: vec![41, 42],
+            }),
+            "Dissolve GitHub stack 90 (#41 and #42) — GitHub does not retarget inside a stack"
+        );
+        assert_eq!(
+            ship_action_text(&ShipAction::RetargetPr {
+                number: 42,
+                bookmark: "profile".into(),
+                from_base: "auth".into(),
+                to_base: "main".into(),
+            }),
+            "Retarget #42 (profile) onto main — the push then merges it"
+        );
+        assert_eq!(
+            ship_action_text(&ShipAction::ConfirmMerged {
+                numbers: vec![41, 42, 43]
+            }),
+            "Check that GitHub marked #41, #42 and #43 merged"
+        );
+        let above = |theirs: bool| {
+            ship_action_text(&ShipAction::RetargetAbove {
+                number: 50,
+                author: Some("kim".into()),
+                theirs,
+                branch: "their-fix".into(),
+                from_base: "profile".into(),
+                to_base: "main".into(),
+            })
+        };
+        assert_eq!(
+            above(true),
+            "Retarget #50 by @kim (their-fix) onto main — it stays open"
+        );
+        // One's own next pull request is not told as somebody's.
+        assert_eq!(
+            above(false),
+            "Retarget #50 (their-fix) onto main — it stays open"
+        );
+
+        assert_eq!(
+            land(LandAction::RetargetOther {
+                number: 50,
+                author: Some("kim".into()),
+                branch: "their-fix".into(),
+                from_base: "auth".into(),
+                to_base: "main".into(),
+            }),
+            "Retarget #50 by @kim (their-fix) onto main: its base auth lands and is removed"
+        );
+        // An account that has since been deleted has no name.
+        assert_eq!(
+            land(LandAction::RetargetOther {
+                number: 50,
+                author: None,
+                branch: "their-fix".into(),
+                from_base: "auth".into(),
+                to_base: "main".into(),
+            }),
+            "Retarget #50 (their-fix) onto main: its base auth lands and is removed"
         );
     }
 

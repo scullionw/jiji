@@ -60,6 +60,28 @@ pub struct PublishStack {
     pub pr_count: u32,
     pub search_text: String,
     pub status: StackStatus,
+    /// The GitHub stack these pull requests are linked into, when any are.
+    #[serde(default)]
+    pub github_stack: Option<GithubStack>,
+    /// Open pull requests that rest on this stack and are someone else's:
+    /// each is based on one of its branches, or on another of these, and
+    /// its own branch is no bookmark here ([`crate::pr::others_on`]). A
+    /// base comes before what rests on it. They are shown with the stack
+    /// and are never its segments: nothing here pushes or merges them.
+    #[serde(default)]
+    pub others: Vec<PrSummary>,
+}
+
+/// How a stack's pull requests sit in one of GitHub's own stacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubStack {
+    /// The stack's number on GitHub.
+    pub number: u64,
+    /// How many of this stack's open pull requests are linked into it.
+    /// Fewer than `pr_count` means the chain grew or changed since; the
+    /// next publish brings the two back in step.
+    pub linked: u32,
 }
 
 impl PublishStack {
@@ -81,12 +103,50 @@ impl PublishStack {
             name: name.to_owned(),
         });
         stack.change_count = stack.segments.iter().map(|s| s.changes.len() as u32).sum();
+        // Of someone else's pull requests, those that rest on what is
+        // left: on a kept branch, or on one of them that does.
+        let mut bases: Vec<String> = stack
+            .segments
+            .iter()
+            .filter_map(|s| s.bookmark.clone())
+            .collect();
+        stack.others.retain(|other| {
+            let rests = bases.contains(&other.base_branch);
+            if rests {
+                bases.push(other.head_branch.clone());
+            }
+            rests
+        });
         Some(stack.finish())
+    }
+
+    /// Whether jj calls any of the stack's changes immutable because one
+    /// of [`PublishStack::others`] (or another branch that is no bookmark
+    /// here) builds on it. Publishing and landing go on as usual; editing
+    /// such a change by hand does not, until that branch is tracked here
+    /// or has moved off it.
+    pub fn held(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.changes.iter().any(|change| change.held))
     }
 
     fn finish(mut self) -> Self {
         let prs: Vec<_> = self.segments.iter().filter_map(|s| s.pr.as_ref()).collect();
         self.pr_count = prs.len() as u32;
+        // The stack the bottom-most linked pull request sits in; a chain
+        // spread over two GitHub stacks reads as the lower one, partly
+        // linked.
+        self.github_stack = prs
+            .iter()
+            .find_map(|pr| pr.stack.as_ref())
+            .map(|seat| GithubStack {
+                number: seat.number,
+                linked: prs
+                    .iter()
+                    .filter(|pr| pr.stack.as_ref().is_some_and(|s| s.number == seat.number))
+                    .count() as u32,
+            });
         self.status = if self
             .segments
             .iter()
@@ -185,7 +245,7 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
         let mut visited = HashSet::new();
         let mut node = nodes.get(head).copied();
         while let Some(current) = node {
-            if current.kind == NodeKind::Immutable || !visited.insert(&current.id) {
+            if current.is_settled() || !visited.insert(&current.id) {
                 break;
             }
             chain.push(current);
@@ -273,9 +333,25 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
                 pr_count: 0,
                 search_text: String::new(),
                 status: StackStatus::Local,
+                github_stack: None,
+                others: Vec::new(),
             }
             .finish(),
         );
+    }
+    // Someone else's pull requests on each local stack.
+    if let Some(prs) = prs {
+        for stack in &mut result {
+            let branches: Vec<&str> = stack
+                .segments
+                .iter()
+                .filter_map(|segment| segment.bookmark.as_deref())
+                .collect();
+            stack.others = crate::pr::others_on(snapshot, prs, &branches)
+                .into_iter()
+                .cloned()
+                .collect();
+        }
     }
     let represented: HashSet<_> = result
         .iter()
@@ -302,7 +378,14 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
                 changes: vec![],
                 pr: Some(pr.clone()),
             });
-            current = by_branch.get(&pr.base_branch);
+            // Down to where a stack that is here begins, and no further:
+            // a pull request someone else opened on top of a local stack
+            // is a stack of its own, based on that one's branch. Walked
+            // on, it would list the local stack a second time as
+            // something that is on GitHub only.
+            current = by_branch
+                .get(&pr.base_branch)
+                .filter(|below| !represented.contains(&below.head_branch));
         }
         segments.reverse();
         result.push(
@@ -319,6 +402,8 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
                 pr_count: 0,
                 search_text: String::new(),
                 status: StackStatus::Published,
+                github_stack: None,
+                others: Vec::new(),
             }
             .finish(),
         );
@@ -397,6 +482,106 @@ mod tests {
             .unwrap()
             .submit_head
             .is_none());
+    }
+
+    /// Pull requests other people opened on a local stack: one on its
+    /// top, one on a branch in the middle, one on top of theirs.
+    fn with_others(prs: &RepoPrState) -> RepoPrState {
+        let theirs = |number: u64, head: &str, base: &str, author: &str| PrSummary {
+            number,
+            title: format!("{head} by {author}"),
+            head_branch: head.into(),
+            base_branch: base.into(),
+            author: Some(author.into()),
+            ..prs.report.prs[0].clone()
+        };
+        let mut report = prs.report.clone();
+        report.prs.push(theirs(900, "their-top", "ws/tu3-emission", "kim"));
+        report.prs.push(theirs(901, "their-mid", "ws/tu2", "sam"));
+        report.prs.push(theirs(902, "their-next", "their-top", "kim"));
+        RepoPrState::new(report, "org")
+    }
+
+    #[test]
+    fn someone_elses_pull_requests_show_with_the_stack_and_are_not_its_segments() {
+        let (snapshot, prs, _) = fixture();
+        let prs = with_others(&prs);
+        let stacks = discover_stacks(&snapshot, Some(&prs));
+
+        // The local stack is what it was: five segments, five pull
+        // requests of its own.
+        let own = &stacks[0];
+        assert_eq!((own.segments.len(), own.pr_count), (5, 5));
+        assert!(own.submit_head.is_some());
+        // And it says who else is on it: bases before what rests on them.
+        assert_eq!(
+            own.others
+                .iter()
+                .map(|pr| (pr.number, pr.base_branch.as_str()))
+                .collect::<Vec<_>>(),
+            [(901, "ws/tu2"), (900, "ws/tu3-emission"), (902, "their-top")]
+        );
+        assert!(!own.held());
+
+        // Theirs are stacks of their own, on GitHub only, and each starts
+        // where the local stack ends: the local one is not listed twice.
+        let remote: Vec<(&str, Vec<&str>, &str)> = stacks
+            .iter()
+            .filter(|stack| stack.submit_head.is_none())
+            .map(|stack| {
+                (
+                    stack.key.as_str(),
+                    stack
+                        .segments
+                        .iter()
+                        .filter_map(|s| s.bookmark.as_deref())
+                        .collect(),
+                    stack.base.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            remote,
+            [
+                ("remote:their-next", vec!["their-top", "their-next"], "ws/tu3-emission"),
+                ("remote:their-mid", vec!["their-mid"], "ws/tu2"),
+            ]
+        );
+
+        // A prefix of the stack keeps only what rests on that prefix.
+        let lower = own.through_bookmark("ws/tu2").unwrap();
+        assert_eq!(lower.others.iter().map(|pr| pr.number).collect::<Vec<_>>(), [901]);
+        let bottom = own.through_bookmark("ws/tu1").unwrap();
+        assert!(bottom.others.is_empty());
+    }
+
+    #[test]
+    fn a_stack_whose_changes_someone_elses_branch_holds_is_still_a_stack() {
+        // What a fetch leaves once their branch is here: jj calls the
+        // stack's changes immutable, and the snapshot marks them as held.
+        let (mut snapshot, prs, _) = fixture();
+        let prs = with_others(&prs);
+        let stack_ids: Vec<String> = discover_stacks(&snapshot, Some(&prs))[0]
+            .segments
+            .iter()
+            .flat_map(|segment| segment.changes.iter().map(|change| change.id.clone()))
+            .collect();
+        for node in snapshot.nodes.iter_mut().filter(|n| stack_ids.contains(&n.id)) {
+            node.kind = NodeKind::Immutable;
+            node.held = true;
+        }
+        let stacks = discover_stacks(&snapshot, Some(&prs));
+        let own = &stacks[0];
+        assert_eq!((own.segments.len(), own.pr_count), (5, 5));
+        assert_eq!(own.change_count as usize, stack_ids.len());
+        assert!(own.held());
+
+        // Without the mark they would be landed history, and no stack.
+        for node in snapshot.nodes.iter_mut() {
+            node.held = false;
+        }
+        let stacks = discover_stacks(&snapshot, Some(&prs));
+        assert!(stacks.iter().all(|stack| stack.submit_head.is_none() || stack.pr_count == 0));
     }
 
     #[test]

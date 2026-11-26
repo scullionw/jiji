@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use jiji_core::snapshot::RepoSnapshot;
+use jiji_core::snapshot::{LandedCheck, RepoSnapshot, TipCheck};
 use jiji_core::BackendError;
 use jiji_forge::{
     detect_github_repo, execute_land, execute_ship, execute_submit, no_github_remote, plan_land,
@@ -15,7 +15,8 @@ use jiji_forge::{
     ForgeAuth, ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandForge,
     LandOptions, LandOutcome, LandPlan, LandRepoForge, LandVcs, PrSummary, PrTemplate,
     PublishStack, RepoForge, RepoPrState, ResolvedToken, ShipOutcome, ShipPlan, ShipVcs,
-    SubmitForge, SubmitHead, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource, TokenStore as _,
+    SubmitForge, SubmitHead, SubmitOptions, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource,
+    TokenStore as _,
 };
 
 use super::{CommandError, Host, HostResult};
@@ -57,6 +58,7 @@ pub trait ForgeClient: Send + Sync {
     fn rerun_failed_ci(&self, repo: &ForgeRepo, head: &str) -> Result<CiRerunReport, ForgeError>;
     fn submit<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn SubmitForge + 'a>;
     fn land<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn LandForge + 'a>;
+    fn ship<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn jiji_forge::ShipForge + 'a>;
 }
 
 /// GitHub, with the user's own token: the keychain's, the environment's,
@@ -126,6 +128,10 @@ impl ForgeClient for GitHubClient {
 
     fn land<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn LandForge + 'a> {
         Box::new(LandRepoForge { client: self, repo })
+    }
+
+    fn ship<'a>(&'a self, repo: &'a ForgeRepo) -> Box<dyn jiji_forge::ShipForge + 'a> {
+        Box::new(RepoForge { client: self, repo })
     }
 }
 
@@ -339,16 +345,31 @@ impl Host {
     /// Plan submitting the stack under a head. Read-only — GitHub is asked
     /// for fresh open-PR state and existing stack comments, nothing else
     /// runs.
-    pub fn submit_plan(&self, repo_path: &str, head: &SubmitHead) -> HostResult<SubmitPlan> {
+    pub fn submit_plan(
+        &self,
+        repo_path: &str,
+        head: &SubmitHead,
+        options: Option<SubmitOptions>,
+    ) -> HostResult<SubmitPlan> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
         let template = self.pr_template(repo_path);
         let forge = client.submit(&repo);
-        plan_submit(&snapshot, &prs, &repo, head, &*forge, template.as_ref()).map_err(Into::into)
+        plan_submit(
+            &snapshot,
+            &prs,
+            &repo,
+            head,
+            &*forge,
+            template.as_ref(),
+            &options.unwrap_or_default(),
+        )
+        .map_err(Into::into)
     }
 
-    /// Execute a confirmed submit plan. The plan is re-derived first and
-    /// refused when it no longer matches what the user confirmed.
+    /// Execute a confirmed submit plan. The plan is re-derived first,
+    /// under the options the confirmed plan carries, and refused when it
+    /// no longer matches what the user confirmed.
     pub fn submit_stack(
         &self,
         repo_path: &str,
@@ -359,7 +380,15 @@ impl Host {
         let (repo, client, prs) = self.submit_context(repo_path)?;
         let template = self.pr_template(repo_path);
         let forge = client.submit(&repo);
-        let fresh = plan_submit(&snapshot, &prs, &repo, head, &*forge, template.as_ref())?;
+        let fresh = plan_submit(
+            &snapshot,
+            &prs,
+            &repo,
+            head,
+            &*forge,
+            template.as_ref(),
+            &plan.options,
+        )?;
         if fresh.actions != plan.actions {
             return Err(plan_stale("The stack or its pull requests", "publish"));
         }
@@ -409,12 +438,19 @@ impl Host {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
         let forge = client.land(&repo);
+        // Planning asks the repository whether merges GitHub reports are
+        // on trunk here; it reads, nothing more.
+        let vcs = HostVcs {
+            host: self,
+            repo_path: repo_path.to_owned(),
+        };
         plan_land(
             &snapshot,
             &prs,
             &repo,
             head_bookmark,
             &*forge,
+            &vcs,
             &options.unwrap_or_default(),
         )
         .map_err(Into::into)
@@ -432,21 +468,22 @@ impl Host {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let (repo, client, prs) = self.submit_context(repo_path)?;
         let forge = client.land(&repo);
+        let vcs = HostVcs {
+            host: self,
+            repo_path: repo_path.to_owned(),
+        };
         let fresh = plan_land(
             &snapshot,
             &prs,
             &repo,
             head_bookmark,
             &*forge,
+            &vcs,
             &plan.options,
         )?;
         if fresh.actions != plan.actions {
             return Err(plan_stale("The stack or its pull requests", "land"));
         }
-        let vcs = HostVcs {
-            host: self,
-            repo_path: repo_path.to_owned(),
-        };
         execute_land(&fresh, &vcs, &*forge).map_err(Into::into)
     }
 
@@ -461,18 +498,40 @@ impl Host {
             backend.git_fetch(path, Some(&remotes))
         })?;
         let snapshot = self.workflow_snapshot(repo_path)?;
-        // PR facts feed the marks-it-merged warning only: shipping needs no
-        // GitHub API, so no token (or a failed read) plans without it.
-        let prs = self
-            .forge_client(repo_path)
-            .ok()
-            .and_then(|(repo, client, _)| client.open_prs(&repo).ok());
-        plan_ship(&snapshot, prs.as_ref(), &repo.remote, head_change).map_err(Into::into)
+        let prs = self.ship_side(repo_path, &repo)?.map(|(_, prs)| prs);
+        let mut plan = plan_ship(&snapshot, prs.as_ref(), &repo.remote, head_change)?;
+        if prs.is_none() {
+            plan.warnings
+                .push(jiji_forge::SHIPPED_WITHOUT_GITHUB.into());
+        }
+        Ok(plan)
+    }
+
+    /// GitHub for a ship: the client and the open pull requests, or
+    /// nothing when no token is connected. Shipping itself needs no
+    /// GitHub API, so without a token the plan is made without pull
+    /// requests and says so. A token that is there and a read that fails
+    /// is another matter: a ship that could not see the pull requests
+    /// would leave them open without a word, so the failure is told.
+    fn ship_side(
+        &self,
+        repo_path: &str,
+        repo: &ForgeRepo,
+    ) -> HostResult<Option<(Box<dyn ForgeClient>, RepoPrState)>> {
+        let client = match self.forge_client(repo_path) {
+            Ok((_, client, _)) => client,
+            Err(err) if err.code == "no_token" => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let prs = client.open_prs(repo)?;
+        Ok(Some((client, prs)))
     }
 
     /// Execute a confirmed ship plan. Deliberately no second fetch: the
     /// plan's fetch set the lease, and a remote moved since is the push
-    /// step's honest refusal.
+    /// step's honest refusal. The plan is derived again, with the pull
+    /// requests as GitHub has them now (the plan finishes them), and
+    /// refused when it is no longer what the user confirmed.
     pub fn ship_stack(
         &self,
         repo_path: &str,
@@ -481,16 +540,20 @@ impl Host {
     ) -> HostResult<ShipOutcome> {
         let snapshot = self.workflow_snapshot(repo_path)?;
         let repo = self.detected_repo(repo_path).ok_or_else(no_github_remote)?;
-        // PR facts feed warnings only, never actions — skip the network call.
-        let fresh = plan_ship(&snapshot, None, &repo.remote, head_change)?;
+        // As in `ship_plan`: no token plans without pull requests, and
+        // such a plan asks GitHub nothing; a read that fails is told.
+        let side = self.ship_side(repo_path, &repo)?;
+        let prs = side.as_ref().map(|(_, prs)| prs);
+        let fresh = plan_ship(&snapshot, prs, &repo.remote, head_change)?;
         if fresh.actions != plan.actions {
-            return Err(plan_stale("The stack", "ship"));
+            return Err(plan_stale("The stack or its pull requests", "ship"));
         }
         let vcs = HostVcs {
             host: self,
             repo_path: repo_path.to_owned(),
         };
-        execute_ship(&fresh, &vcs).map_err(Into::into)
+        let forge = side.as_ref().map(|(client, _)| client.ship(&repo));
+        execute_ship(&fresh, &vcs, forge.as_deref()).map_err(Into::into)
     }
 }
 
@@ -543,7 +606,91 @@ impl LandVcs for HostVcs<'_> {
             .map(|snapshot| (*snapshot).clone())
     }
 
+    fn rebase_onto_trunk(
+        &self,
+        remote: &str,
+        trunk: &str,
+        root_change: &str,
+        landed: &[String],
+    ) -> Result<String, BackendError> {
+        // Onto the plan's trunk branch as the remote has it after the
+        // fetch, the commit the landing was checked against. Not onto
+        // `trunk()` or the local trunk bookmark: a fetch can change what
+        // the first names, and both can be ahead with commits nobody
+        // pushed.
+        self.run(|backend, path| {
+            backend.rebase_onto_trunk(path, remote, trunk, root_change, landed)
+        })
+    }
+
+    fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError> {
+        SubmitVcs::push_bookmarks(self, bookmarks, remote)
+    }
+
+    fn delete_bookmark_at(&self, name: &str, commit: &str) -> Result<String, BackendError> {
+        self.run(|backend, path| backend.delete_bookmark_at(path, name, commit))
+    }
+
+    fn abandon_changes(&self, commits: &[String]) -> Result<String, BackendError> {
+        // The sweep after a landing: refused while anything else sits on
+        // the landed commits.
+        self.run(|backend, path| backend.abandon_landed(path, commits))
+    }
+
+    fn resting_on(&self, commits: &[String]) -> Result<Vec<String>, BackendError> {
+        self.host
+            .backend()
+            .branches_resting_on(std::path::Path::new(&self.repo_path), commits)
+    }
+
+    fn landed(
+        &self,
+        remote: &str,
+        trunk: &str,
+        landing: &str,
+        head: &str,
+        bottom: &str,
+        top: &str,
+    ) -> Result<LandedCheck, BackendError> {
+        self.host.backend().landed_check(
+            std::path::Path::new(&self.repo_path),
+            remote,
+            trunk,
+            landing,
+            head,
+            bottom,
+            top,
+        )
+    }
+
+    fn lands_as_tip(
+        &self,
+        remote: &str,
+        trunk: &str,
+        bottom: &str,
+        first_top: &str,
+        tip: &str,
+    ) -> Result<TipCheck, BackendError> {
+        self.host.backend().lands_as_tip(
+            std::path::Path::new(&self.repo_path),
+            remote,
+            trunk,
+            bottom,
+            first_top,
+            tip,
+        )
+    }
+}
+
+impl ShipVcs for HostVcs<'_> {
+    fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
+        LandVcs::snapshot(self)
+    }
+
     fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
+        // Ship moves the local trunk bookmark onto the stack and pushes
+        // it, so the stack goes onto that bookmark, unpushed commits and
+        // all: they ship with it.
         let trunk_target = LandVcs::snapshot(self)?
             .bookmarks
             .iter()
@@ -555,28 +702,6 @@ impl LandVcs for HostVcs<'_> {
                 )
             })?;
         self.run(|backend, path| backend.rebase_change(path, root_change, &trunk_target))
-    }
-
-    fn push_bookmarks(&self, bookmarks: &[String], remote: &str) -> Result<String, BackendError> {
-        SubmitVcs::push_bookmarks(self, bookmarks, remote)
-    }
-
-    fn delete_bookmark(&self, name: &str) -> Result<String, BackendError> {
-        self.run(|backend, path| backend.delete_bookmark(path, name))
-    }
-
-    fn abandon_changes(&self, change_ids: &[String]) -> Result<String, BackendError> {
-        self.run(|backend, path| backend.abandon_changes(path, change_ids))
-    }
-}
-
-impl ShipVcs for HostVcs<'_> {
-    fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
-        LandVcs::snapshot(self)
-    }
-
-    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
-        LandVcs::rebase_onto_trunk(self, root_change)
     }
 
     fn move_bookmark(&self, name: &str, to_change: &str) -> Result<String, BackendError> {

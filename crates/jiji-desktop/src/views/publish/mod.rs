@@ -17,8 +17,8 @@ use gpui::{
 use jiji_core::snapshot::RepoSnapshot;
 use jiji_forge::{
     AutoLandStatus, LandOptions, LandOutcome, LandPlan, MergeMethod, PrSummary, PublishStack,
-    RepoPrState, ShipOutcome, ShipPlan, SubmitHead, SubmitOutcome, SubmitPlan, SubmitStepStatus,
-    TokenSource,
+    RepoPrState, ShipOutcome, ShipPlan, StackLink, SubmitHead, SubmitOutcome, SubmitPlan,
+    SubmitStepStatus, TokenSource,
 };
 
 use crate::app::{app, AppEvent, AppModel, ForgePhase, UiIntent};
@@ -96,6 +96,9 @@ pub struct PublishView {
     /// options shape the plan itself.
     land_method: Option<MergeMethod>,
     land_bypass: bool,
+    /// What the next publish does about GitHub's own stack. Changing it
+    /// re-plans too.
+    stack_link: StackLink,
 
     ship_for: Option<String>,
     ship: Option<ShipPlan>,
@@ -253,6 +256,7 @@ impl PublishView {
             land_seq: 0,
             land_method: None,
             land_bypass: false,
+            stack_link: StackLink::Follow,
             ship_for: None,
             ship: None,
             ship_loading: false,
@@ -1300,9 +1304,10 @@ mod tests {
 
     use gpui::{Entity, TestAppContext, WindowHandle};
     use jiji_core::snapshot::SnapshotView;
+    use jiji_forge::PrState;
     use jiji_forge::{
-        AutoLandPhase, AutoLandRecord, AutoLandState, ChecksRollup, LandAction, MergeMethod,
-        ReviewDecision, SubmitAction,
+        AutoLandPhase, AutoLandRecord, AutoLandState, ChecksRollup, LandAction, LandSegmentStatus,
+        MergeMethod, ReviewDecision, StackLink, SubmitAction, SubmitHead,
     };
 
     use super::{Mode, Page, PublishView};
@@ -1725,6 +1730,257 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_pull_request_github_closed_without_landing_it_is_not_treated_as_landed(
+        cx: &mut TestAppContext,
+    ) {
+        // What GitHub reports after a reordered push, as seen on the real
+        // thing: #41 closed as merged into the branch above it, "as" its
+        // own head commit. Nothing reached trunk.
+        let fixture = Fixture::mock_stack();
+        fixture.pull(41, |pull| {
+            pull.summary.base_branch = "diff-virtualization".into();
+            pull.merged_as("8b19f3c2");
+        });
+        fixture.pull(42, |pull| pull.summary.base_branch = "main".into());
+        let bench = bench("publish-false-merge", &fixture, true, cx);
+        let plan = bench.land(cx);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        let blockers = blocking(&plan);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            blockers[0].contains("#41 (diff-model) is closed as merged on GitHub")
+                && blockers[0].contains(
+                    "merged into \u{201c}diff-virtualization\u{201d}, not \u{201c}main\u{201d}"
+                ),
+            "{blockers:?}"
+        );
+        // The ledger does not show it as merged.
+        assert!(plan
+            .segments
+            .iter()
+            .all(|segment| !matches!(segment.status, LandSegmentStatus::Merged { .. })));
+        // Pressing Land does nothing: no request, and the change and its
+        // bookmark are still here.
+        bench.publish.update(cx, |view, cx| view.land_stack(cx));
+        cx.run_until_parked();
+        assert_eq!(fixture.take_asked(), Vec::<String>::new());
+        let snapshot = bench
+            .model
+            .read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        assert!(snapshot.bookmarks.iter().any(|b| b.name == "diff-model"));
+        assert!(snapshot.nodes.iter().any(|node| node.id == "nzpwlxvr"));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn a_github_stack_lands_in_one_request_and_says_so(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        assert_eq!(fixture.link_stack(&[41, 42]), 90);
+        fixture.take_asked();
+        let bench = bench("publish-land-stack", &fixture, true, cx);
+        // The stack is known as GitHub's, and the round takes both.
+        bench.publish.read_with(cx, |view, _| {
+            let linked = view.selected_stack().unwrap().github_stack.unwrap();
+            assert_eq!((linked.number, linked.linked), (90, 2));
+        });
+        let plan = bench.land(cx);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(merges(&plan), [(42, MergeMethod::Squash)]);
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            LandAction::MergePr { number: 42, with, stack: Some(90), .. }
+                if with.len() == 1 && with[0].number == 41
+        )));
+        assert!(!plan.actions.iter().any(|action| matches!(
+            action,
+            LandAction::RetargetPr { .. } | LandAction::EnableAutoMerge { .. }
+        )));
+        assert_eq!(
+            crate::logic::publish::manual_land_label(&plan),
+            "Land ready PRs"
+        );
+
+        bench.publish.update(cx, |view, cx| view.land_stack(cx));
+        cx.run_until_parked();
+        // The whole stack landed, so there is no stack left on the page
+        // to hold a result card; what happened is read off GitHub and the
+        // repository.
+        bench
+            .publish
+            .read_with(cx, |view, _| assert_eq!(view.land_error, None));
+        // One request through the stacked endpoint; the plain one, which
+        // GitHub refuses for a stack, was never asked.
+        assert_eq!(
+            fixture.take_asked(),
+            ["merge #41, #42 together by squash (stack 90)"]
+        );
+        let snapshot = bench
+            .model
+            .read_with(cx, |model, _| model.snapshot().cloned().unwrap());
+        assert!(!snapshot
+            .bookmarks
+            .iter()
+            .any(|b| b.name == "diff-model" || b.name == "diff-virtualization"));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn publish_links_a_github_stack_only_when_asked(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-link-stack", &fixture, true, cx);
+        let head = SubmitHead::Bookmark {
+            name: "diff-virtualization".into(),
+        };
+        let link_steps = |view: &PublishView| -> Vec<SubmitAction> {
+            view.plan
+                .as_ref()
+                .expect("a publish plan is on the card")
+                .actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        SubmitAction::LinkStack { .. } | SubmitAction::Unstack { .. }
+                    )
+                })
+                .cloned()
+                .collect()
+        };
+        // Left alone, the chain stays a chain.
+        bench
+            .publish
+            .update(cx, |view, cx| view.load_plan(head.clone(), cx));
+        cx.run_until_parked();
+        bench
+            .publish
+            .read_with(cx, |view, _| assert_eq!(link_steps(view), []));
+
+        // Asked, the plan ends by linking both, bottom first.
+        bench.publish.update(cx, |view, cx| {
+            view.stack_link = StackLink::Link;
+            view.load_plan(head.clone(), cx)
+        });
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(
+                link_steps(view),
+                [SubmitAction::LinkStack {
+                    bookmarks: vec!["diff-model".into(), "diff-virtualization".into()],
+                    onto: None,
+                    above: vec![],
+                }]
+            );
+        });
+        bench.publish.update(cx, |view, cx| view.publish(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.plan_error, None);
+            let outcome = view.outcome.as_ref().expect("the publish ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+        });
+        assert!(fixture
+            .take_asked()
+            .contains(&"stack 90 = [41, 42]".to_owned()));
+        // The stack reads as GitHub's from here on, with nothing left to
+        // ask for.
+        bench.publish.update(cx, |view, cx| {
+            view.stack_link = StackLink::Follow;
+            view.load_plan(head.clone(), cx)
+        });
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(link_steps(view), []);
+            let linked = view.selected_stack().unwrap().github_stack.unwrap();
+            assert_eq!((linked.number, linked.linked), (90, 2));
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// The setting in Settings: a publish that opens pull requests for a
+    /// stack links them without being asked. It is kept where the `jiji`
+    /// command reads it, and the card's own choice still wins.
+    #[gpui::test]
+    fn the_setting_links_a_new_stack_and_the_card_can_still_say_no(cx: &mut TestAppContext) {
+        // Nothing is published yet: the plan opens both pull requests.
+        let fixture = Fixture::new();
+        let bench = bench("publish-link-setting", &fixture, false, cx);
+        let head = SubmitHead::Bookmark {
+            name: "diff-virtualization".into(),
+        };
+        let links = |view: &PublishView| -> usize {
+            view.plan
+                .as_ref()
+                .expect("a publish plan is on the card")
+                .actions
+                .iter()
+                .filter(|action| matches!(action, SubmitAction::LinkStack { .. }))
+                .count()
+        };
+        let replan = |cx: &mut TestAppContext| {
+            bench
+                .publish
+                .update(cx, |view, cx| view.load_plan(head.clone(), cx));
+            cx.run_until_parked();
+        };
+
+        // Off, as it is unless turned on: a plain chain.
+        replan(cx);
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(links(view), 0);
+            assert_eq!(view.plan.as_ref().unwrap().options.stack, StackLink::Follow);
+        });
+        let data = bench.dir.join("data");
+        assert!(!jiji_forge::prefs::link_new_stacks(&data));
+
+        // Turned on in Settings: written to the file the command reads,
+        // and the same plan now ends by linking what it opens.
+        bench
+            .model
+            .update(cx, |model, cx| model.set_link_new_stacks(true, cx));
+        assert!(bench
+            .model
+            .read_with(cx, |model, _| model.link_new_stacks()));
+        assert!(jiji_forge::prefs::link_new_stacks(&data));
+        replan(cx);
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(
+                view.plan.as_ref().unwrap().options.stack,
+                StackLink::LinkNew
+            );
+            assert_eq!(links(view), 1);
+        });
+
+        // The card says no for this publish, and that holds against the
+        // setting.
+        bench.publish.update(cx, |view, cx| {
+            view.stack_link = StackLink::Unlink;
+            view.load_plan(head.clone(), cx)
+        });
+        cx.run_until_parked();
+        bench
+            .publish
+            .read_with(cx, |view, _| assert_eq!(links(view), 0));
+
+        // Left to the setting again, the publish links the stack.
+        bench.publish.update(cx, |view, cx| {
+            view.stack_link = StackLink::Follow;
+            view.load_plan(head.clone(), cx)
+        });
+        cx.run_until_parked();
+        bench.publish.update(cx, |view, cx| view.publish(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.plan_error, None);
+            let outcome = view.outcome.as_ref().expect("the publish ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+        });
+        assert!(fixture
+            .take_asked()
+            .contains(&"stack 90 = [41, 42]".to_owned()));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
     fn shipping_moves_trunk_to_the_stack_and_pushes_it(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         let bench = bench("publish-ship", &fixture, false, cx);
@@ -1761,6 +2017,220 @@ mod tests {
         assert_eq!(trunk.sync, jiji_core::snapshot::SyncState::Synced);
         // Shipping is git's alone: GitHub was asked nothing.
         assert_eq!(fixture.take_asked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// Shipping a published stack finishes its pull requests: the upper
+    /// one is pointed at trunk before the push, and both are merged by it.
+    #[gpui::test]
+    fn shipping_a_published_stack_merges_every_pull_request_of_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-ship-prs", &fixture, true, cx);
+        let head = bench
+            .publish
+            .read_with(cx, |view, _| {
+                view.selected_stack().unwrap().head_change.clone()
+            })
+            .unwrap();
+        bench
+            .publish
+            .update(cx, |view, cx| view.load_ship_plan(head.clone(), cx));
+        cx.run_until_parked();
+        // The card names each pull request and what happens to it.
+        let steps: Vec<String> = bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.ship_error, None);
+            let plan = view.ship.as_ref().expect("a ship plan is on the card");
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            plan.actions
+                .iter()
+                .map(crate::logic::publish::ship_action_text)
+                .collect()
+        });
+        assert!(
+            steps.contains(
+                &"Retarget #42 (diff-virtualization) onto main — the push then merges it"
+                    .to_owned()
+            ),
+            "{steps:?}"
+        );
+        assert!(
+            steps.contains(&"Check that GitHub marked #41 and #42 merged".to_owned()),
+            "{steps:?}"
+        );
+        bench.publish.update(cx, |view, cx| view.ship_stack(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.ship_error, None);
+            let outcome = view.ship_outcome.as_ref().expect("the ship ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+            assert!(outcome.steps.iter().any(|step| {
+                step.detail.as_deref() == Some("GitHub marked #41 and #42 merged")
+            }));
+        });
+        // The one thing asked of GitHub that changes something, and it
+        // was asked before trunk moved.
+        assert_eq!(fixture.take_asked(), ["retarget #42 → main"]);
+        let merged = |number: u64| {
+            fixture
+                .github()
+                .prs
+                .iter()
+                .find(|pull| pull.summary.number == number)
+                .map(|pull| pull.summary.state)
+        };
+        assert_eq!(merged(41), Some(PrState::Merged));
+        assert_eq!(merged(42), Some(PrState::Merged));
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// A pull request someone else opened on the stack shows with it and
+    /// is no part of it: the stack keeps its two pull requests, and a
+    /// landing points theirs at trunk before the branch under it goes.
+    /// Ship needs no GitHub to push. With no token its plan knows of no
+    /// pull requests and says what GitHub will do all the same. With a
+    /// token and a read that fails, there is no plan: a ship that could
+    /// not see the pull requests would leave them open without a word.
+    /// (Found in review: the failed read was planned around in silence.)
+    #[gpui::test]
+    fn a_ship_tells_a_failed_read_of_github_and_says_what_it_leaves_without_a_token(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::mock_stack();
+        let bench = bench("publish-ship-unread", &fixture, true, cx);
+        let head = bench
+            .publish
+            .read_with(cx, |view, _| {
+                view.selected_stack().unwrap().head_change.clone()
+            })
+            .unwrap();
+
+        fixture.github().refuse_prs = Some("GitHub is having a moment".into());
+        bench
+            .publish
+            .update(cx, |view, cx| view.load_ship_plan(head.clone(), cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert!(view.ship.is_none(), "no plan is made around a failed read");
+            let told = view.ship_error.as_deref().unwrap_or_default();
+            assert!(told.contains("GitHub is having a moment"), "{told}");
+        });
+
+        fixture.github().token = None;
+        bench
+            .publish
+            .update(cx, |view, cx| view.load_ship_plan(head.clone(), cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.ship_error, None);
+            let plan = view.ship.as_ref().expect("a plan without pull requests");
+            assert!(!plan
+                .actions
+                .iter()
+                .any(|action| matches!(action, jiji_forge::ShipAction::RetargetPr { .. })));
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|note| note == jiji_forge::SHIPPED_WITHOUT_GITHUB),
+                "{:?}",
+                plan.warnings
+            );
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    #[gpui::test]
+    fn someone_elses_pull_request_shows_with_the_stack_and_is_only_retargeted(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::mock_stack();
+        {
+            let mut theirs = crate::testing::forge::open_pr(
+                50,
+                "their-fix",
+                "diff-model",
+                "0ddba11c",
+                "A fix on top of the sticky headers",
+            );
+            theirs.summary.author = Some("kim".into());
+            fixture.github().prs.push(theirs);
+        }
+        let bench = bench("publish-others", &fixture, true, cx);
+        bench.publish.read_with(cx, |view, _| {
+            let stack = view.selected_stack().expect("the mock stack is selected");
+            assert_eq!(stack.pr_count, 2);
+            assert_eq!(
+                stack
+                    .others
+                    .iter()
+                    .map(|pr| (pr.number, pr.by_author(), pr.base_branch.as_str()))
+                    .collect::<Vec<_>>(),
+                [(50, "#50 by @kim".to_owned(), "diff-model")]
+            );
+        });
+        // Drawn in the ledger, with the segment it rests on, and not as a
+        // third station of the stack.
+        {
+            let mut visual = gpui::VisualTestContext::from_window(bench._window.into(), cx);
+            assert!(
+                visual.debug_bounds("seg-other-50").is_some(),
+                "their pull request has a row of its own"
+            );
+            assert!(visual.debug_bounds("seg-other-41").is_none());
+        }
+        let plan = bench.land(cx);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        // Only the stack's own bottom pull request merges.
+        assert_eq!(merges(&plan), [(41, MergeMethod::Squash)]);
+        let steps: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|action| crate::logic::publish::land_action_text(action, &plan.remote))
+            .collect();
+        assert!(
+            steps.contains(
+                &"Retarget #50 by @kim (their-fix) onto main: its base diff-model lands and \
+                  is removed"
+                    .to_owned()
+            ),
+            "{steps:?}"
+        );
+        // That is the one step for it: nothing pushes to its branch, and
+        // the plan says what it will show.
+        assert!(!steps
+            .iter()
+            .any(|step| step.contains("their-fix") && step.starts_with("Rebase")));
+        assert!(
+            plan.warnings.iter().any(|note| note.contains(
+                "#50 by @kim rests on this stack and is someone else's: Land never merges it and \
+                 never pushes to its branch"
+            )),
+            "{:?}",
+            plan.warnings
+        );
+        bench.publish.update(cx, |view, cx| view.land_stack(cx));
+        cx.run_until_parked();
+        bench
+            .publish
+            .read_with(cx, |view, _| assert_eq!(view.land_error, None));
+        let asked = fixture.take_asked();
+        assert!(
+            asked.contains(&"retarget #50 → main".to_owned()),
+            "{asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|what| what.contains("merge #50")),
+            "{asked:?}"
+        );
+        // Theirs is open still, and on trunk.
+        let github = fixture.github();
+        let theirs = github
+            .prs
+            .iter()
+            .find(|pull| pull.summary.number == 50)
+            .unwrap();
+        assert_eq!(theirs.summary.state, PrState::Open);
+        assert_eq!(theirs.summary.base_branch, "main");
+        drop(github);
         let _ = std::fs::remove_dir_all(bench.dir);
     }
 

@@ -529,6 +529,22 @@ pub struct FocusModel {
     pub behind_trunk: u32,
 }
 
+impl FocusModel {
+    /// The row where the base zone begins: the first node that is settled
+    /// history. The rows before it are the workstream's own chain. A
+    /// change someone else's branch holds is immutable to jj and still
+    /// one of the chain's: it is not filed with the base.
+    pub fn base_from(&self, snapshot: &RepoSnapshot) -> usize {
+        self.graph
+            .rows
+            .iter()
+            .position(
+                |row| matches!(row, GraphRow::Node(node) if snapshot.nodes[node.node].is_settled()),
+            )
+            .unwrap_or(self.graph.rows.len())
+    }
+}
+
 pub fn build_focus_model(snapshot: &RepoSnapshot, workstream: &WorkstreamSummary) -> FocusModel {
     let by_id: HashMap<&str, &GraphNode> = snapshot
         .nodes
@@ -826,6 +842,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 
@@ -958,6 +976,32 @@ mod tests {
         };
         assert_eq!(head.lane, Some(1));
         assert!(!focus.trunk_on_base);
+    }
+
+    /// Someone else's branch on a stack makes its changes immutable to
+    /// jj. In Focus mode they are still the workstream's chain, above
+    /// the base zone. (Found in review, and seen in a headless run: they
+    /// were drawn under the heading "Trunk".)
+    #[test]
+    fn a_held_change_stays_in_the_focus_chain_and_out_of_the_base_zone() {
+        let mut held = node("a1", &["base"], NodeKind::Immutable, 1);
+        held.held = true;
+        let snapshot = with(
+            snapshot(),
+            vec![
+                node("base", &[], NodeKind::Immutable, 0),
+                held,
+                node("a2", &["a1"], NodeKind::Mutable, 2),
+            ],
+            vec![stream("a", &["a2", "a1"], true)],
+        );
+        let focus = build_focus_model(&snapshot, &snapshot.workstreams[0]);
+        assert_eq!(ids(&focus.graph, &snapshot), ["a2", "a1", "base"]);
+        let split = focus.base_from(&snapshot);
+        assert!(
+            matches!(&focus.graph.rows[split], GraphRow::Node(row) if snapshot.nodes[row.node].id == "base"),
+            "the base zone starts at trunk, not at the held change"
+        );
     }
 
     #[test]

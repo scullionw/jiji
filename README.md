@@ -32,7 +32,9 @@ Rust program, drawn with [GPUI](https://www.gpui.rs), with no web view.
   side against the base. Take a side or open your merge tool.
 - **Publish stacks.** Push a stack as one GitHub PR per change (stacks made
   with [jjpr](https://github.com/michaeldhopkins/jjpr) are recognized), follow checks
-  and reviews, land one round, or let auto-land merge the whole stack.
+  and reviews, land one round, or let auto-land merge the whole stack. Every
+  landing is checked against trunk before anything local is rewritten, and a
+  stack can be linked as one of GitHub's own stacked pull requests.
 - **Use the terminal too.** The `jiji` CLI runs the same stack engine:
   `jiji status`, `jiji publish`, `jiji land`, `jiji watch`. See
   [the CLI guide](docs/cli.md).

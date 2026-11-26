@@ -548,6 +548,21 @@ impl WorkbenchView {
             NodeKind::WorkingCopy => {
                 who.push(tag("working copy", t.working_copy).into_any_element())
             }
+            // Immutable only because someone else's branch builds on it:
+            // the tag says why, since nothing else here would.
+            NodeKind::Immutable if node.held => who.push(
+                tag("immutable", t.text3)
+                    .id("change-held")
+                    .debug_selector(|| "change-held".into())
+                    .tooltip(tooltip(
+                        "Immutable to jj while a branch that is not a bookmark here builds on \
+                         it. It is still part of your stack: Publish and Land work as usual. \
+                         Tracking that branch makes this change editable again; the branch is \
+                         then a bookmark of yours, and its pull request a part of this stack \
+                         to publish and land",
+                    ))
+                    .into_any_element(),
+            ),
             NodeKind::Immutable => who.push(tag("immutable", t.text3).into_any_element()),
             NodeKind::Mutable => {}
         }

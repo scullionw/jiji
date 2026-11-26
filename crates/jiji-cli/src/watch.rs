@@ -94,7 +94,7 @@ pub fn run(vcs: &LocalVcs, args: WatchArgs, out: &mut Output) -> Result<i32> {
     let initial = initial_state(&records, &snapshot.repo_path, &head, &args)?;
     // Preview uses the saved options too, with no record or lock file writes.
     if args.land.write.dry_run {
-        let plan = forge.land_plan(&snapshot, &head, &initial.options)?;
+        let plan = forge.land_plan(&snapshot, &head, vcs, &initial.options)?;
         let exit = if plan.blockers.iter().any(|b| !b.wait) {
             3
         } else {

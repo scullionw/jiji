@@ -15,6 +15,12 @@ pub enum ForgeError {
     NotFound(String),
     #[error("GitHub request failed: {0}")]
     Api(String),
+    /// The repository, or its host, has no stacked pull requests: the
+    /// stacks endpoints answer a bare 404 there. Kept apart from other
+    /// failed requests because a publish that links a stack only by a
+    /// setting goes on without the link.
+    #[error("GitHub request failed: {0}")]
+    NoStacks(String),
     #[error("Could not reach GitHub: {0}")]
     Network(String),
     #[error("Could not access the system keychain: {0}")]
@@ -35,7 +41,7 @@ impl ForgeError {
             ForgeError::AuthFailed(_) => "auth_failed",
             ForgeError::RateLimited(_) => "rate_limited",
             ForgeError::NotFound(_) => "not_found",
-            ForgeError::Api(_) => "api_failed",
+            ForgeError::Api(_) | ForgeError::NoStacks(_) => "api_failed",
             ForgeError::Network(_) => "network_failed",
             ForgeError::Keychain(_) => "keychain_failed",
             ForgeError::Plan(_) => "plan_failed",

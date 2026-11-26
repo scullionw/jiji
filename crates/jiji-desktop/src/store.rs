@@ -20,26 +20,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub(crate) const APP_ID: &str = "com.lauf.jiji";
+pub(crate) use jiji_forge::prefs::APP_ID;
 const MAX_RECENT: usize = 8;
 
 /// Where the store lives. `JIJI_DATA_DIR` redirects it (tests, scripted
-/// runs) so they never touch a real install's files.
+/// runs) so they never touch a real install's files. The `jiji` command
+/// reads one preference from the same place, so the rule is the shared
+/// one.
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("JIJI_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support").join(APP_ID)
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join(APP_ID)
-    }
+    jiji_forge::prefs::data_dir()
 }
 
 /// One JSON object on disk, written whole and atomically on every change.

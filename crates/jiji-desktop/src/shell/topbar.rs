@@ -16,8 +16,8 @@ use crate::theme::{
     theme, theme_defs, Scheme, RADIUS_M, RADIUS_S, TEXT_M, TEXT_S, TEXT_XS, TITLEBAR_H,
 };
 use crate::ui::{
-    btn, h_flex, icon, icon_btn, input::field, kbd, menu_label, popover, popover_layer, ring,
-    segmented, tooltip, v_flex, IconName, NodeExt as _, Segment, Tabbable as _, Tabular as _,
+    btn, checkbox, h_flex, icon, icon_btn, input::field, kbd, menu_label, popover, popover_layer,
+    ring, segmented, tooltip, v_flex, IconName, NodeExt as _, Segment, Tabbable as _, Tabular as _,
 };
 
 /// "just now", "3m ago", "2h ago" — minutes-granular like the chip's
@@ -707,8 +707,9 @@ impl Shell {
     // ── Settings ──
 
     /// Everything the app remembers per device, in one panel: how it looks,
-    /// what its menus launch, how often it checks upstream, the `jiji`
-    /// command, and the licence.
+    /// what its menus launch, how often it checks upstream, whether a
+    /// publish links new stacks as GitHub stacks, the `jiji` command, and
+    /// the licence.
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let open = self.settings_menu.is_open();
@@ -750,6 +751,7 @@ impl Shell {
         let editors = model.editors.clone();
         let terminals = model.terminals.clone();
         let interval = model.upstream.interval_minutes;
+        let link_new_stacks = model.link_new_stacks();
         let cli = model.cli.status.clone();
         let installing = model.cli.installing;
         let (registered, plan, display_key) = (
@@ -878,6 +880,33 @@ impl Shell {
                 },
             )),
         );
+        // What a publish does about GitHub's own stacks when it is not
+        // told. The `jiji` command reads the same preference.
+        let app = self.app.clone();
+        machine = machine
+            .child(menu_label("GitHub stacks", cx))
+            .child(
+                h_flex()
+                    .gap(px(8.))
+                    .h(px(26.))
+                    .px(px(8.))
+                    .text_size(px(TEXT_S))
+                    .child(checkbox(
+                        "link-new-stacks",
+                        "Link new stacks as GitHub stacks",
+                        Some(link_new_stacks),
+                        cx,
+                        move |_, _, cx| {
+                            app.update(cx, |m, cx| m.set_link_new_stacks(!link_new_stacks, cx))
+                        },
+                    ))
+                    .child("Link new stacks as GitHub stacks"),
+            )
+            .child(note(
+                "A publish that opens a pull request for a stack links the stack on GitHub. \
+                 Each publish can still choose, and so can jiji publish --stack and --no-stack."
+                    .into(),
+            ));
         if let Some(cli) = cli {
             machine = machine.child(menu_label("Command line", cx));
             if cli.installed {
@@ -1150,6 +1179,51 @@ mod tests {
                 .0,
             "Fetch"
         );
+    }
+
+    /// A change of the user's own that someone else's branch holds reads
+    /// "immutable" like trunk's history does. Its tag says why, and that
+    /// the stack still publishes and lands.
+    #[gpui::test]
+    fn a_held_change_says_why_it_is_immutable(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, VisualTestContext};
+        use jiji_core::snapshot::NodeKind;
+
+        let dir = crate::testing::scratch("held-tip");
+        let (model, repo) = crate::testing::install_mock(&dir, cx);
+        let mut snapshot = jiji_core::mock::mock_snapshot(std::path::Path::new(&repo));
+        let held = snapshot
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::Mutable)
+            .expect("the mock has a mutable change");
+        held.kind = NodeKind::Immutable;
+        held.held = true;
+        let id = held.id.clone();
+        model.update(cx, |model, cx| model.plant_repo(snapshot, cx));
+        let window = cx.add_window(Shell::new);
+        cx.run_until_parked();
+        model.update(cx, |model, cx| model.select_node(Some(id), cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let tag = cx
+            .debug_bounds("change-held")
+            .expect("the tag is on screen");
+        cx.simulate_mouse_move(tag.center(), None, Modifiers::none());
+        cx.executor()
+            .advance_clock(crate::ui::tooltip::SHOW_DELAY * 2);
+        cx.run_until_parked();
+        let shown = cx.update(|_, cx| crate::ui::tooltip::showing(cx));
+        assert_eq!(
+            shown.as_deref(),
+            Some(
+                "Immutable to jj while a branch that is not a bookmark here builds on it. It is \
+                 still part of your stack: Publish and Land work as usual. Tracking that branch \
+                 makes this change editable again; the branch is then a bookmark of yours, and \
+                 its pull request a part of this stack to publish and land"
+            )
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[gpui::test]

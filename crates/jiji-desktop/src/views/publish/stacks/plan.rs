@@ -10,7 +10,7 @@ use super::ACTIONS_W;
 use crate::logic::autoland::can_queue;
 use crate::logic::publish::{
     comment_preview, land_action_text, manual_land_label, method_word, ship_action_text,
-    submit_action_text,
+    stack_link_after_click, stack_link_wanted, submit_action_text,
 };
 use crate::logic::text::plural_s;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_S, TEXT_XS, TOOLBAR_H};
@@ -242,7 +242,13 @@ impl PublishView {
                     cx,
                 ))
                 .child(self.plan_text(
-                    if stack.pr_count > 1 {
+                    if stack.pr_count > 1 && stack.github_stack.is_some() {
+                        format!(
+                            "Land {} pull requests in order. GitHub lands the ones that \
+                             are ready together and rebases the rest.",
+                            stack.pr_count
+                        )
+                    } else if stack.pr_count > 1 {
                         format!(
                             "Land {} pull requests in order, rebasing the stack as it goes.",
                             stack.pr_count
@@ -555,6 +561,71 @@ impl PublishView {
                         .large()
                         .disabled(executing || !plan.blockers.is_empty() || job_active)
                         .on_click(cx.listener(|this, _, _, cx| this.publish(cx))),
+                    ),
+                );
+            }
+            // GitHub's own stack: offered once there are two pull
+            // requests to link, and always while one exists to dissolve.
+            let linked = stack.github_stack.is_some();
+            if plan.segments.len() >= 2 || linked {
+                let wanted = stack_link_wanted(plan, linked);
+                let t = theme(cx);
+                card = card.child(
+                    self.disclosure(
+                        "submit-stack",
+                        "GitHub stack",
+                        Some(
+                            match (linked, wanted) {
+                                (true, true) => "Linked",
+                                (true, false) => "Will be dissolved",
+                                (false, true) => "Will be linked",
+                                (false, false) => "Not linked",
+                            }
+                            .to_owned(),
+                        ),
+                        |cx| {
+                            v_flex()
+                            .gap(px(8.))
+                            .pt(px(4.))
+                            .pb(px(8.))
+                            .text_size(px(TEXT_S))
+                            .text_color(t.text2)
+                            .child(
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(checkbox(
+                                        "submit-stack-link",
+                                        "Link as a GitHub stack",
+                                        Some(wanted),
+                                        cx,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if this.executing() {
+                                                return;
+                                            }
+                                            this.stack_link =
+                                                stack_link_after_click(linked, wanted);
+                                            if let Some(head) = this.plan_head.clone() {
+                                                this.load_plan(head, cx);
+                                            }
+                                        }),
+                                    ))
+                                    .child("Link as a GitHub stack"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_XS))
+                                    .line_height(gpui::relative(1.5))
+                                    .text_color(t.text3)
+                                    .child(
+                                        "GitHub shows the pull requests as one stack and lands \
+                                         them together. It has no auto-merge for stacked pull \
+                                         requests, and other tools must merge them through \
+                                         its newer merge endpoint.",
+                                    ),
+                            )
+                            .into_any_element()
+                        },
+                        cx,
                     ),
                 );
             }

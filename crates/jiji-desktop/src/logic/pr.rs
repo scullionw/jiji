@@ -156,6 +156,9 @@ mod tests {
             body: None,
             review: ReviewDecision::Approved,
             checks: ChecksRollup::Failing,
+            merge_commit: None,
+            stack: None,
+            author: None,
         }
     }
 
@@ -196,6 +199,9 @@ mod tests {
             body: None,
             review: ReviewDecision::None,
             checks: ChecksRollup::None,
+            merge_commit: None,
+            stack: None,
+            author: None,
         };
         edit(&mut pr);
         pr

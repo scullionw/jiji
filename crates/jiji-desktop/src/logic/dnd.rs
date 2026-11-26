@@ -300,6 +300,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 

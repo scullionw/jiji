@@ -35,6 +35,70 @@ pub struct PrSummary {
     pub body: Option<String>,
     pub review: ReviewDecision,
     pub checks: ChecksRollup,
+    /// The commit GitHub recorded as this PR's merge: the squash or merge
+    /// commit, the last replayed commit of a rebase merge, or the PR's own
+    /// head when GitHub closed it as merged because the head turned up
+    /// inside its base branch. Read through REST, so `None` on open PRs
+    /// from the batched query.
+    #[serde(default)]
+    pub merge_commit: Option<String>,
+    /// The PR's seat in a GitHub stack, when it is linked into one.
+    #[serde(default)]
+    pub stack: Option<StackSeat>,
+    /// Login of whoever opened the PR, when GitHub says (an account that
+    /// has since been deleted has none). It is how a plan names a pull
+    /// request that is someone else's to push, retarget and merge.
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
+impl PrSummary {
+    /// "#12 by @sam", or "#12" when GitHub names no author: how plans,
+    /// warnings and stack listings refer to a pull request that is not
+    /// one of the stack's own.
+    pub fn by_author(&self) -> String {
+        match &self.author {
+            Some(login) => format!("#{} by @{login}", self.number),
+            None => format!("#{}", self.number),
+        }
+    }
+
+    /// The branch this PR lands on. A PR in a GitHub stack lands on the
+    /// stack's base however far up it sits, and its own base ref keeps
+    /// naming the branch below even after it merged.
+    pub fn landing_branch(&self) -> &str {
+        self.stack
+            .as_ref()
+            .map_or(self.base_branch.as_str(), |seat| seat.base.as_str())
+    }
+
+    /// The branch a merged PR's commits went into, as far as GitHub's
+    /// answer tells. A merge commit that is the PR's own head means
+    /// GitHub closed it as merged because that head turned up inside its
+    /// base branch, and for a PR in a GitHub stack that base is the branch
+    /// below it, not the stack's.
+    pub fn merged_into(&self) -> &str {
+        if self.merge_commit.as_deref() == Some(self.head_commit.as_str()) {
+            &self.base_branch
+        } else {
+            self.landing_branch()
+        }
+    }
+}
+
+/// One pull request's place in a GitHub stack (GitHub's own stacked pull
+/// requests, as opposed to a plain chain of PRs based on one another).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackSeat {
+    /// The stack's number. Stacks are numbered from the same counter as
+    /// issues and pull requests.
+    pub number: u64,
+    /// 1 at the bottom. Merged pull requests keep their seats.
+    pub position: u32,
+    pub size: u32,
+    /// The branch the whole stack lands on.
+    pub base: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +158,17 @@ impl RepoPrState {
             .map(|(branch, pr)| (branch.to_owned(), pr.clone()))
             .collect();
         Self { report, by_branch }
+    }
+
+    /// Whether `pr` is the one this repository's own branch of that name
+    /// has. A pull request from a fork has a branch name too, and it may
+    /// be the name of a bookmark here; it names nothing here. A plan
+    /// matches a pull request to a bookmark, a segment or a branch pushed
+    /// from here only when it passes this.
+    pub fn of_this_repository(&self, pr: &PrSummary) -> bool {
+        self.by_branch
+            .get(&pr.head_branch)
+            .is_some_and(|own| own.number == pr.number)
     }
 }
 
@@ -164,6 +239,21 @@ fn parse_pr_node(node: &Value) -> Result<PrSummary, ForgeError> {
         body: node["body"].as_str().map(str::to_owned),
         review,
         checks,
+        merge_commit: node["mergeCommit"]["oid"].as_str().map(str::to_owned),
+        stack: parse_graphql_seat(node),
+        author: node["author"]["login"].as_str().map(str::to_owned),
+    })
+}
+
+/// A PR's stack seat from the GraphQL `stack` and `stackEntry` fields.
+/// Absent fields (a host without stacks, a PR outside any) read as none.
+pub(crate) fn parse_graphql_seat(node: &Value) -> Option<StackSeat> {
+    let stack = node.get("stack").filter(|v| !v.is_null())?;
+    Some(StackSeat {
+        number: stack["number"].as_u64()?,
+        position: node["stackEntry"]["position"].as_u64()? as u32,
+        size: stack["size"].as_u64().unwrap_or(0) as u32,
+        base: stack["baseRefName"].as_str()?.to_owned(),
     })
 }
 
@@ -209,6 +299,20 @@ pub fn parse_rest_pr(pr: &Value) -> Result<PrSummary, ForgeError> {
         body: pr["body"].as_str().map(str::to_owned),
         review: ReviewDecision::None,
         checks: ChecksRollup::None,
+        // On an open PR this field is GitHub's throwaway test merge, which
+        // is not where anything landed.
+        merge_commit: (state == PrState::Merged)
+            .then(|| pr["merge_commit_sha"].as_str().map(str::to_owned))
+            .flatten(),
+        stack: pr.get("stack").filter(|v| !v.is_null()).and_then(|stack| {
+            Some(StackSeat {
+                number: stack["number"].as_u64()?,
+                position: stack["position"].as_u64()? as u32,
+                size: stack["size"].as_u64().unwrap_or(0) as u32,
+                base: stack["base"]["ref"].as_str()?.to_owned(),
+            })
+        }),
+        author: pr["user"]["login"].as_str().map(str::to_owned),
     })
 }
 
@@ -236,6 +340,51 @@ pub fn prs_by_branch<'a>(
         }
     }
     map
+}
+
+/// The open pull requests that rest on `branches` and are someone else's
+/// to push, retarget and merge. Each is based on one of `branches`, or on
+/// the branch of another one in the answer, and its own branch is no
+/// bookmark here (`snapshot`'s local bookmarks say which are). It may be
+/// a teammate's, or the same person's from another clone: what tells it
+/// apart is only that nothing here names its branch. A base comes before
+/// what rests on it, and pull requests on one base come in number order.
+pub fn others_on<'a>(
+    snapshot: &jiji_core::snapshot::RepoSnapshot,
+    prs: &'a RepoPrState,
+    branches: &[&str],
+) -> Vec<&'a PrSummary> {
+    // A fork's branch names nothing here, whatever it is called.
+    let listed = |pr: &PrSummary| prs.of_this_repository(pr);
+    let ours = |pr: &PrSummary| {
+        listed(pr)
+            && snapshot
+                .bookmarks
+                .iter()
+                .any(|b| b.is_local && !b.is_trunk && b.name == pr.head_branch)
+    };
+    let mut bases: Vec<&str> = branches.to_vec();
+    let mut found: Vec<&PrSummary> = Vec::new();
+    let mut at = 0;
+    while at < bases.len() {
+        let base = bases[at];
+        at += 1;
+        let mut on_it: Vec<&PrSummary> = prs
+            .report
+            .prs
+            .iter()
+            .filter(|pr| pr.base_branch == base && !ours(pr))
+            .filter(|pr| !found.iter().any(|seen| seen.number == pr.number))
+            .collect();
+        on_it.sort_by_key(|pr| pr.number);
+        for pr in on_it {
+            if listed(pr) && !bases.contains(&pr.head_branch.as_str()) {
+                bases.push(&pr.head_branch);
+            }
+            found.push(pr);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -301,6 +450,134 @@ mod tests {
         assert_eq!(p[0].head_branch, "branch-1");
         assert_eq!(p[0].base_branch, "main");
         assert_eq!(p[0].head_commit, "aaaabbbbccccddddeeeeffff0000111122223333");
+    }
+
+    #[test]
+    fn the_author_is_read_where_github_names_one() {
+        let report = parse_open_prs(&data(
+            vec![
+                node(1, json!({ "author": { "login": "sam" } })),
+                // An account that has since been deleted.
+                node(2, json!({ "author": null })),
+            ],
+            false,
+        ))
+        .unwrap();
+        assert_eq!(report.prs[0].author.as_deref(), Some("sam"));
+        assert_eq!(report.prs[0].by_author(), "#1 by @sam");
+        assert_eq!(report.prs[1].author, None);
+        assert_eq!(report.prs[1].by_author(), "#2");
+
+        let rest = parse_rest_pr(&json!({
+            "number": 9, "title": "t", "html_url": "u", "state": "open", "draft": false,
+            "head": { "ref": "theirs", "sha": "abc", "repo": { "owner": { "login": "o" } } },
+            "base": { "ref": "upper" },
+            "user": { "login": "sam" },
+        }))
+        .unwrap();
+        assert_eq!(rest.by_author(), "#9 by @sam");
+    }
+
+    /// A snapshot with nothing but these local bookmarks (`main` is trunk).
+    fn local_bookmarks(names: &[&str]) -> jiji_core::snapshot::RepoSnapshot {
+        use jiji_core::snapshot::{BookmarkState, RepoSnapshot, SnapshotView, SyncState};
+        RepoSnapshot {
+            repo_path: "/tmp/repo".into(),
+            repo_name: "repo".into(),
+            backend: "test".into(),
+            view: SnapshotView::default(),
+            truncated: false,
+            trunk_bookmark: "main".into(),
+            working_copy: String::new(),
+            workspaces: vec![],
+            workstreams: vec![],
+            nodes: vec![],
+            bookmarks: names
+                .iter()
+                .map(|name| BookmarkState {
+                    name: (*name).into(),
+                    target: format!("at-{name}"),
+                    remote: Some("origin".into()),
+                    sync: SyncState::Synced,
+                    is_trunk: *name == "main",
+                    is_local: true,
+                    tracked: true,
+                    is_merged: false,
+                    target_description: String::new(),
+                    target_author: String::new(),
+                    target_timestamp: String::new(),
+                })
+                .collect(),
+            git_remotes: vec![],
+            conflicts: vec![],
+            operations: vec![],
+            resolve_tool: None,
+        }
+    }
+
+    #[test]
+    fn someone_elses_pull_requests_are_those_on_our_branches_with_no_bookmark_here() {
+        let pr = |number: u64, head: &str, base: &str, owner: &str| {
+            node(
+                number,
+                json!({
+                    "headRefName": head,
+                    "baseRefName": base,
+                    "headRepositoryOwner": { "login": owner },
+                    "author": { "login": "sam" },
+                }),
+            )
+        };
+        let report = parse_open_prs(&data(
+            vec![
+                // The stack's own: lower into main, upper on lower.
+                pr(1, "lower", "main", "o"),
+                pr(2, "upper", "lower", "o"),
+                // Someone else's: on the top, on the middle, and one more
+                // on top of theirs.
+                pr(5, "their-top", "upper", "o"),
+                pr(4, "their-mid", "lower", "o"),
+                pr(6, "their-next", "their-top", "o"),
+                // A branch of the user's own, off to the side: a bookmark
+                // here, so not someone else's.
+                pr(7, "side", "lower", "o"),
+                // From a fork, based on the top: someone else's whatever
+                // its branch is called, and no base for anything here.
+                pr(8, "upper", "upper", "a-fork"),
+                pr(10, "fork-topic", "upper", "a-fork"),
+                // Based on a branch of this repository that happens to
+                // have the name of the fork's: it rests on that branch,
+                // not on the fork's pull request, and not on the stack.
+                pr(9, "on-a-fork-name", "fork-topic", "o"),
+                // Nothing to do with the stack.
+                pr(3, "unrelated", "main", "o"),
+            ],
+            false,
+        ))
+        .unwrap();
+        let prs = RepoPrState::new(report, "o");
+        let snapshot = local_bookmarks(&["main", "lower", "upper", "side"]);
+        let numbers = |branches: &[&str]| -> Vec<u64> {
+            others_on(&snapshot, &prs, branches)
+                .iter()
+                .map(|pr| pr.number)
+                .collect()
+        };
+        // Bases first, then what rests on them; number order on one base.
+        assert_eq!(numbers(&["lower", "upper"]), [4, 5, 8, 10, 6]);
+        assert_eq!(numbers(&["upper"]), [5, 8, 10, 6]);
+        assert_eq!(numbers(&["lower"]), [4]);
+        assert!(numbers(&["side"]).is_empty());
+
+        // The same person's second clone is the same case: with no
+        // bookmark here for `upper`, its pull request is not this
+        // clone's either.
+        let elsewhere = local_bookmarks(&["main", "lower"]);
+        let numbers: Vec<u64> = others_on(&elsewhere, &prs, &["lower"])
+            .iter()
+            .map(|pr| pr.number)
+            .collect();
+        assert_eq!(numbers, [2, 4, 7, 5, 8, 10, 6]);
     }
 
     #[test]

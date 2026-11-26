@@ -35,6 +35,8 @@ fn node(
         is_empty: false,
         has_conflict: false,
         is_divergent: false,
+        held: false,
+        old_copies_held: false,
     }
 }
 
@@ -51,6 +53,8 @@ fn divergent_node(
         id: commit_id.into(),
         change_id: change_id.into(),
         is_divergent: true,
+        held: false,
+        old_copies_held: false,
         ..node(
             change_id,
             commit_id,
@@ -1069,6 +1073,8 @@ pub fn apply_mutation(
                     is_empty: false,
                     has_conflict: false,
                     is_divergent: false,
+                    held: false,
+                    old_copies_held: false,
                 };
                 if node.kind == NodeKind::WorkingCopy {
                     node.kind = NodeKind::Mutable;
@@ -1500,6 +1506,8 @@ pub fn apply_mutation(
                     is_empty: false,
                     has_conflict: false,
                     is_divergent: false,
+                    held: false,
+                    old_copies_held: false,
                 },
             );
             let entry = local_bookmark_entry(snapshot, bookmark, &new_id);
@@ -1626,6 +1634,8 @@ pub fn apply_mutation(
                 is_empty: original.is_empty,
                 has_conflict: original.has_conflict,
                 is_divergent: false,
+                held: false,
+                old_copies_held: false,
             };
             let commit = original.commit_id.clone();
             snapshot.nodes.insert(position, copy);
@@ -1670,6 +1680,8 @@ pub fn apply_mutation(
                     is_empty: false,
                     has_conflict: false,
                     is_divergent: false,
+                    held: false,
+                    old_copies_held: false,
                 },
             );
             // The back-out heads the workstream the working copy headed.
@@ -1892,6 +1904,8 @@ fn spawn_working_copy(snapshot: &mut RepoSnapshot, parent: &str, index: usize) -
             is_empty: true,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         },
     );
     set_working_copy(snapshot, &new_id);

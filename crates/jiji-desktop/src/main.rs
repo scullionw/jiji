@@ -15,6 +15,15 @@ mod shell;
 mod store;
 #[cfg(test)]
 mod testing;
+/// GitHub as a test captured it, for a scripted run to draw Publish over
+/// (`JIJI_MOCK_FORGE`). Only the double itself: the rest of the test
+/// support stays in test builds.
+#[cfg(all(feature = "headless", not(test)))]
+#[allow(dead_code)]
+mod testing {
+    #[path = "forge.rs"]
+    pub mod forge;
+}
 mod theme;
 mod ui;
 mod upgrade;

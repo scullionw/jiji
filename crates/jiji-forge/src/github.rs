@@ -5,7 +5,8 @@
 //! and the auto-land loop's thread. Callers must not invoke it on the UI
 //! thread.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
@@ -30,12 +31,20 @@ query($owner: String!, $name: String!) {
         number title url isDraft state body
         baseRefName headRefName headRefOid
         headRepositoryOwner { login }
+        author { login }
         reviewDecision
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        #stack
       }
     }
   }
 }";
+
+/// A pull request's seat in a GitHub stack, spliced into the queries above
+/// and below where they say `#stack`. A host whose schema has no stacks
+/// (an older GitHub Enterprise Server) refuses the fields by name; the
+/// client then asks again without them and stops sending them.
+const STACK_FIELDS: &str = "stack { number size baseRefName } stackEntry { position }";
 
 /// The land flow's per-PR question: is this PR ready to merge right now,
 /// and what landing automation does the repo offer? One query per landing
@@ -56,7 +65,9 @@ query($owner: String!, $name: String!, $number: Int!, $base: String!) {
       id state isDraft mergeable mergeStateStatus reviewDecision isInMergeQueue
       autoMergeRequest { enabledAt }
       baseRefName headRefOid
+      mergeCommit { oid }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      #stack
     }
   }
 }";
@@ -107,10 +118,60 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }";
 
+/// The REST API version that documents the stacks and asynchronous merge
+/// endpoints. Sent on those requests only; everything else stays on the
+/// version the client has always asked for.
+const STACKS_API_VERSION: &str = "2026-03-10";
+
+/// How long a merge GitHub runs in the background may take before the
+/// client stops waiting for it. GitHub's own figure is "a few minutes" for
+/// a long stack.
+const ASYNC_MERGE_PATIENCE: Duration = Duration::from_secs(300);
+
+/// How many pages of a hundred `open_prs_based_on` reads before it says
+/// that there are too many to check.
+const OPEN_PRS_BY_BASE_MAX_PAGES: u32 = 10;
+
+/// How long GitHub gets to rebase the rest of a stack after part of it
+/// merged, or to say that it cannot, before landing stops waiting.
+const RESTACK_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How long a "conflicting" answer has to stand, the branch unmoved,
+/// before it counts as GitHub refusing to rebase. On its way to a rebase
+/// that succeeds, GitHub answers "dirty" for about a second: it has
+/// already pointed the pull request at trunk, the branch still carries
+/// the merged commits, and the two do conflict (seen on the sandbox when
+/// the pull request above edits a line the merged one added).
+const RESTACK_REFUSAL_HOLD: Duration = Duration::from_secs(10);
+
+/// Where a merge requested through the asynchronous endpoint ended up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncMerge {
+    /// Merged; the commit GitHub names as the result.
+    Merged { commit: String },
+    /// Added to the base branch's merge queue. GitHub lands it from there.
+    Enqueued,
+}
+
+/// What GitHub did with the pull request left above a merge in a stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restack {
+    /// Its branch moved: GitHub rebased it (or it is no longer open).
+    Rebased,
+    /// GitHub reports that it conflicts with its new base and left the
+    /// branch alone. It will not rebase it.
+    Conflicting,
+    /// Nothing either way for the whole wait.
+    Unmoved,
+}
+
 pub struct GitHubClient {
     http: Client,
     api_root: String,
     graphql_url: String,
+    /// Whether the host's GraphQL schema has the stack fields; cleared the
+    /// first time it refuses them.
+    stack_fields: AtomicBool,
 }
 
 impl GitHubClient {
@@ -149,6 +210,7 @@ impl GitHubClient {
             http,
             api_root,
             graphql_url,
+            stack_fields: AtomicBool::new(true),
         })
     }
 
@@ -164,7 +226,8 @@ impl GitHubClient {
 
     /// The repo's open-PR state via the batched GraphQL query.
     pub fn open_prs(&self, owner: &str, name: &str) -> Result<PrStateReport, ForgeError> {
-        let data = self.graphql(OPEN_PRS_QUERY, json!({ "owner": owner, "name": name }))?;
+        let data =
+            self.graphql_with_stacks(OPEN_PRS_QUERY, json!({ "owner": owner, "name": name }))?;
         parse_open_prs(&data)
     }
 
@@ -355,6 +418,56 @@ impl GitHubClient {
         Ok(None)
     }
 
+    /// Every open pull request whose base branch is `base` (`GET
+    /// …/pulls?state=open&base=…`, page after page). The batched open-PR
+    /// query stops at the hundred most recently updated in the whole
+    /// repository; a publish that moves a branch has to know every pull
+    /// request based on it, because the push can close one. When the
+    /// tenth page comes back full the answer is an error and not a list
+    /// that may be partial.
+    pub fn open_prs_based_on(
+        &self,
+        owner: &str,
+        name: &str,
+        base: &str,
+    ) -> Result<Vec<PrSummary>, ForgeError> {
+        let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
+        // Every page: the reason for asking is that no pull request based
+        // on this branch may be missing.
+        let mut found: Vec<PrSummary> = Vec::new();
+        for page in 1..=OPEN_PRS_BY_BASE_MAX_PAGES {
+            let answer = self.get(&format!(
+                "repos/{owner}/{name}/pulls?base={encoded}&state=open&per_page=100&page={page}"
+            ))?;
+            let listed = answer
+                .as_array()
+                .ok_or_else(|| ForgeError::Api("open-PR answer was not a list".to_owned()))?;
+            for pr in listed {
+                found.push(parse_rest_pr(pr)?);
+            }
+            if listed.len() < 100 {
+                return Ok(found);
+            }
+        }
+        // The last page read was full, so there may be more or exactly
+        // this many: either way the list cannot be called complete.
+        Err(ForgeError::Api(format!(
+            "{} or more open pull requests are based on \u{201c}{base}\u{201d}; Jiji reads no \
+             more than that, and cannot be sure it saw them all",
+            OPEN_PRS_BY_BASE_MAX_PAGES * 100
+        )))
+    }
+
+    /// The commit a branch is at (`GET …/branches/{branch}`).
+    pub fn branch_head(&self, owner: &str, name: &str, branch: &str) -> Result<String, ForgeError> {
+        let encoded: String = url::form_urlencoded::byte_serialize(branch.as_bytes()).collect();
+        let answer = self.get(&format!("repos/{owner}/{name}/branches/{encoded}"))?;
+        answer["commit"]["sha"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| ForgeError::Api(format!("no commit in the answer for branch {branch}")))
+    }
+
     /// One PR's land readiness plus the repo's landing capabilities, via
     /// [`PR_LAND_QUERY`]. `base` is the branch the merge queue check runs
     /// against — the trunk branch the PR is expected to land on.
@@ -365,7 +478,7 @@ impl GitHubClient {
         number: u64,
         base: &str,
     ) -> Result<PrLandState, ForgeError> {
-        let data = self.graphql(
+        let data = self.graphql_with_stacks(
             PR_LAND_QUERY,
             json!({ "owner": owner, "name": name, "number": number, "base": base }),
         )?;
@@ -480,6 +593,216 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Link pull requests into a GitHub stack (`POST
+    /// /repos/{owner}/{name}/stacks`), bottom first. GitHub wants at least
+    /// two, each based on the branch of the one before. Answers the new
+    /// stack's number.
+    pub fn create_stack(
+        &self,
+        owner: &str,
+        name: &str,
+        pull_requests: &[u64],
+    ) -> Result<u64, ForgeError> {
+        let answer = self.stacks_request(
+            reqwest::Method::POST,
+            &format!("repos/{owner}/{name}/stacks"),
+            Some(&json!({ "pull_requests": pull_requests })),
+        )?;
+        answer["number"]
+            .as_u64()
+            .ok_or_else(|| ForgeError::Api("the new stack answered without a number".to_owned()))
+    }
+
+    /// Put pull requests on top of an existing stack (`POST
+    /// …/stacks/{stack}/add`), bottom first; the first one's base must be
+    /// the branch of the stack's current top.
+    pub fn add_to_stack(
+        &self,
+        owner: &str,
+        name: &str,
+        stack: u64,
+        pull_requests: &[u64],
+    ) -> Result<(), ForgeError> {
+        self.stacks_request(
+            reqwest::Method::POST,
+            &format!("repos/{owner}/{name}/stacks/{stack}/add"),
+            Some(&json!({ "pull_requests": pull_requests })),
+        )?;
+        Ok(())
+    }
+
+    /// Take every unmerged pull request out of a stack (`POST
+    /// …/stacks/{stack}/unstack`). They keep their bases and go back to
+    /// being a plain chain; merged ones stay in the stack, which then
+    /// reads as closed. The stacks API has no reorder, insert or remove:
+    /// this, followed by linking again, is how a stack changes shape.
+    ///
+    /// Answers the open pull requests GitHub left in the stack. Its
+    /// documentation names one case: a pull request queued to merge cannot
+    /// leave. Usually there are none.
+    pub fn unstack(&self, owner: &str, name: &str, stack: u64) -> Result<Vec<u64>, ForgeError> {
+        let answer = self.stacks_request(
+            reqwest::Method::POST,
+            &format!("repos/{owner}/{name}/stacks/{stack}/unstack"),
+            None,
+        )?;
+        Ok(still_stacked(&answer))
+    }
+
+    fn stacks_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, ForgeError> {
+        let url = format!("{}{}", self.api_root, path);
+        let verb = method.to_string();
+        let mut request = self
+            .http
+            .request(method, &url)
+            .header("X-GitHub-Api-Version", STACKS_API_VERSION);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request
+            .send()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        Self::read_json(&verb, path, response)
+    }
+
+    /// Merge through the asynchronous endpoint (`PUT
+    /// …/pulls/{number}/merge-async`) and wait for the result. This is the
+    /// only way to merge a pull request in a GitHub stack, and it lands
+    /// every open pull request below it in the stack in the same request:
+    /// all of them or none. `expected_head` is the lease on the requested
+    /// pull request's head; the title and message shape that pull
+    /// request's own commit and nothing below it. With `queue`, the pull
+    /// request joins its base branch's merge queue instead and the method
+    /// is the queue's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_async(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        method: MergeMethod,
+        expected_head: &str,
+        commit_title: Option<&str>,
+        commit_message: Option<&str>,
+        bypass: bool,
+        queue: bool,
+    ) -> Result<AsyncMerge, ForgeError> {
+        let path = format!("repos/{owner}/{name}/pulls/{number}/merge-async");
+        let mut body = json!({ "sha": expected_head });
+        if queue {
+            body["merge_action"] = json!("merge_queue");
+        } else {
+            body["merge_action"] = json!("direct_merge");
+            body["merge_method"] = json!(method.rest_name());
+            if let Some(title) = commit_title {
+                body["commit_title"] = json!(title);
+            }
+            if let Some(message) = commit_message {
+                body["commit_message"] = json!(message);
+            }
+        }
+        if bypass {
+            body["bypass_rules"] = json!(true);
+        }
+        let url = format!("{}{}", self.api_root, path);
+        let response = self
+            .http
+            .put(&url)
+            .header("X-GitHub-Api-Version", STACKS_API_VERSION)
+            .json(&body)
+            .send()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .map_err(|err| ForgeError::Network(err.to_string()))?;
+        let answer: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        // 200, 202 and 400 all answer the request's own status. A 409
+        // answers another request, already pending on this pull request,
+        // with the options it was made with. One made for the same head
+        // in the same way is this request (sent before, its answer lost,
+        // or a run that was interrupted) and is the one to wait for. Any
+        // other is somebody else's merge, and waiting on it would report
+        // their result as this run's.
+        if answer["status"].is_null() {
+            return Err(classify_http_failure(status, &text));
+        }
+        if status == StatusCode::CONFLICT
+            && !same_merge_request(&answer["details"], expected_head, method, bypass, queue)
+        {
+            return Err(ForgeError::Api(format!(
+                "another merge of #{number} is already running on GitHub, asked for with \
+                 other options or for another commit — land again when it has finished"
+            )));
+        }
+        let deadline = Instant::now() + ASYNC_MERGE_PATIENCE;
+        let mut answer = answer;
+        let mut polls = 0u32;
+        loop {
+            match async_merge_outcome(&answer, number)? {
+                Some(outcome) => return Ok(outcome),
+                None if Instant::now() >= deadline => {
+                    return Err(ForgeError::Api(format!(
+                        "GitHub is still merging #{number} after {} minutes; run Land \
+                         again to pick up the result",
+                        ASYNC_MERGE_PATIENCE.as_secs() / 60
+                    )))
+                }
+                None => {}
+            }
+            let uuid = answer["details"]["uuid"].as_str().ok_or_else(|| {
+                ForgeError::Api(format!(
+                    "GitHub left #{number}'s merge pending without a request id"
+                ))
+            })?;
+            std::thread::sleep(poll_pause(polls));
+            polls += 1;
+            answer = self.stacks_request(
+                reqwest::Method::GET,
+                &format!("{path}/{uuid}"),
+                None,
+            )?;
+        }
+    }
+
+    /// Wait for GitHub to rebase and push the rest of a stack after part
+    /// of it merged: it retargets the next pull request at once, and
+    /// rewrites the remaining branches a moment after the merge is
+    /// reported. When the rebase would conflict it leaves the branch as it
+    /// is and the pull request reads as conflicting instead (seen on the
+    /// sandbox: `mergeable: false`, `mergeable_state: "dirty"`). That
+    /// answer also shows up briefly before a rebase that goes through, so
+    /// it counts only once it has stood for [`RESTACK_REFUSAL_HOLD`].
+    /// Answers which of the two happened to pull request `number`, whose
+    /// head was `from_head`, or that neither did for the whole wait.
+    pub fn await_restack(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        from_head: &str,
+    ) -> Result<Restack, ForgeError> {
+        let deadline = Instant::now() + RESTACK_PATIENCE;
+        let mut watch = RestackWatch::default();
+        let mut polls = 0u32;
+        loop {
+            let pr = self.get(&format!("repos/{owner}/{name}/pulls/{number}"))?;
+            if let Some(answer) = watch.see(restack_look(&pr, from_head), Instant::now()) {
+                return Ok(answer);
+            }
+            if Instant::now() >= deadline {
+                return Ok(Restack::Unmoved);
+            }
+            std::thread::sleep(poll_pause(polls));
+            polls += 1;
+        }
+    }
+
     fn get(&self, path: &str) -> Result<Value, ForgeError> {
         let url = format!("{}{}", self.api_root, path);
         let response = self
@@ -546,6 +869,20 @@ impl GitHubClient {
         })
     }
 
+    /// Run a query that has a `#stack` splice point: with the stack fields
+    /// while the host knows them, without from the first refusal on.
+    fn graphql_with_stacks(&self, query: &str, variables: Value) -> Result<Value, ForgeError> {
+        if self.stack_fields.load(Ordering::Relaxed) {
+            match self.graphql(&query.replace("#stack", STACK_FIELDS), variables.clone()) {
+                Err(ForgeError::Api(message)) if message.contains(UNDEFINED_FIELD) => {
+                    self.stack_fields.store(false, Ordering::Relaxed);
+                }
+                answer => return answer,
+            }
+        }
+        self.graphql(&query.replace("#stack", ""), variables)
+    }
+
     /// POST a GraphQL query and unwrap the `data` object; GraphQL-level
     /// errors map to the same forge errors HTTP failures do.
     fn graphql(&self, query: &str, variables: Value) -> Result<Value, ForgeError> {
@@ -579,6 +916,9 @@ fn classify_http_failure(status: StatusCode, body: &str) -> ForgeError {
         403 | 429 if message.to_lowercase().contains("rate limit") => {
             ForgeError::RateLimited(message)
         }
+        // GitHub answers 403 for a merge through the endpoint that cannot
+        // merge stacked pull requests. That is not about the token.
+        403 if message.contains("not supported") => ForgeError::Api(message),
         // Missing scopes, SSO enforcement, or org policy — an access
         // problem, not a missing resource.
         403 => ForgeError::AuthFailed(message),
@@ -632,8 +972,136 @@ fn graphql_failure(body: &Value) -> Option<ForgeError> {
         .any(|e| e["type"].as_str() == Some("RATE_LIMITED"))
     {
         Some(ForgeError::RateLimited(joined))
+    } else if errors
+        .iter()
+        .any(|e| e["extensions"]["code"].as_str() == Some("undefinedField"))
+    {
+        Some(ForgeError::Api(format!("{UNDEFINED_FIELD}: {joined}")))
     } else {
         Some(ForgeError::Api(joined))
+    }
+}
+
+/// How a query for a field the host's schema does not have reads once it
+/// is a forge error: what `graphql_with_stacks` looks for.
+const UNDEFINED_FIELD: &str = "the host's API has no such field";
+
+/// One look at the pull request above a merge in a stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestackLook {
+    /// Its head is no longer the one it had, or it is no longer open.
+    Moved,
+    /// The old head, and GitHub says it conflicts with its base.
+    Conflicting,
+    /// The old head, and GitHub says anything else (it answers "unknown"
+    /// while it works mergeability out).
+    Waiting,
+}
+
+fn restack_look(pr: &Value, from_head: &str) -> RestackLook {
+    if pr["state"].as_str() != Some("open") || pr["head"]["sha"].as_str() != Some(from_head) {
+        return RestackLook::Moved;
+    }
+    if pr["mergeable"].as_bool() == Some(false) && pr["mergeable_state"].as_str() == Some("dirty")
+    {
+        RestackLook::Conflicting
+    } else {
+        RestackLook::Waiting
+    }
+}
+
+/// What the looks add up to. A moved branch settles it at once. A
+/// conflict settles it only after standing unbroken for
+/// [`RESTACK_REFUSAL_HOLD`]: any other answer in between starts the count
+/// again.
+#[derive(Default)]
+struct RestackWatch {
+    conflicting_since: Option<Instant>,
+}
+
+impl RestackWatch {
+    fn see(&mut self, look: RestackLook, now: Instant) -> Option<Restack> {
+        match look {
+            RestackLook::Moved => Some(Restack::Rebased),
+            RestackLook::Conflicting => {
+                let since = *self.conflicting_since.get_or_insert(now);
+                (now.duration_since(since) >= RESTACK_REFUSAL_HOLD).then_some(Restack::Conflicting)
+            }
+            RestackLook::Waiting => {
+                self.conflicting_since = None;
+                None
+            }
+        }
+    }
+}
+
+/// The open pull requests an unstack answer still lists: a 204 has no
+/// body and lists none; a 200 is the stack as it stands, merged pull
+/// requests included.
+fn still_stacked(answer: &Value) -> Vec<u64> {
+    answer["pull_requests"]
+        .as_array()
+        .map(|prs| {
+            prs.iter()
+                .filter(|pr| pr["state"].as_str() == Some("open"))
+                .filter_map(|pr| pr["number"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a pending asynchronous merge, as a 409 describes it, is the
+/// request being made: the same head, the same action and method, the
+/// same word on bypassing rules.
+fn same_merge_request(
+    details: &Value,
+    expected_head: &str,
+    method: MergeMethod,
+    bypass: bool,
+    queue: bool,
+) -> bool {
+    let action = if queue { "merge_queue" } else { "direct_merge" };
+    details["expected_head_sha"].as_str() == Some(expected_head)
+        && details["merge_action"].as_str() == Some(action)
+        && (queue || details["merge_method"].as_str() == Some(method.rest_name()))
+        && details["bypass_rules"].as_bool().unwrap_or(false) == bypass
+}
+
+/// The pause before the next look at something GitHub is still doing:
+/// a second at first, then three.
+fn poll_pause(polls: u32) -> Duration {
+    Duration::from_secs(if polls < 10 { 1 } else { 3 })
+}
+
+/// Read one asynchronous merge answer: `Some` when it is over, `None`
+/// while it is pending, the failure as GitHub words it otherwise.
+fn async_merge_outcome(answer: &Value, number: u64) -> Result<Option<AsyncMerge>, ForgeError> {
+    let message = || {
+        answer["details"]["message"]
+            .as_str()
+            .unwrap_or("no reason given")
+            .to_owned()
+    };
+    match answer["status"].as_str() {
+        Some("merged") => answer["details"]["sha"]
+            .as_str()
+            .map(|commit| {
+                Some(AsyncMerge::Merged {
+                    commit: commit.to_owned(),
+                })
+            })
+            .ok_or_else(|| {
+                ForgeError::Api(format!("GitHub merged #{number} without naming the commit"))
+            }),
+        Some("enqueued") => Ok(Some(AsyncMerge::Enqueued)),
+        Some("pending") => Ok(None),
+        Some("failed") => Err(ForgeError::Api(format!(
+            "GitHub did not merge #{number}: {}",
+            message()
+        ))),
+        other => Err(ForgeError::Api(format!(
+            "unexpected merge status {other:?} for #{number}"
+        ))),
     }
 }
 
@@ -669,6 +1137,105 @@ mod tests {
             classify_http_failure(StatusCode::BAD_GATEWAY, "oops").code(),
             "api_failed"
         );
+    }
+
+    #[test]
+    fn a_pending_merge_is_adopted_only_when_it_is_the_same_request() {
+        let pending = json!({
+            "uuid": "u",
+            "message": "pending",
+            "merge_method": "squash",
+            "merge_action": "direct_merge",
+            "expected_head_sha": "abc",
+        });
+        assert!(same_merge_request(&pending, "abc", MergeMethod::Squash, false, false));
+        // Another head, another method, a queue request, or one that
+        // bypasses rules is somebody else's merge.
+        assert!(!same_merge_request(&pending, "def", MergeMethod::Squash, false, false));
+        assert!(!same_merge_request(&pending, "abc", MergeMethod::Rebase, false, false));
+        assert!(!same_merge_request(&pending, "abc", MergeMethod::Squash, true, false));
+        assert!(!same_merge_request(&pending, "abc", MergeMethod::Squash, false, true));
+        let queued = json!({
+            "merge_method": "default",
+            "merge_action": "merge_queue",
+            "expected_head_sha": "abc",
+            "bypass_rules": false,
+        });
+        assert!(same_merge_request(&queued, "abc", MergeMethod::Squash, false, true));
+        assert!(!same_merge_request(&queued, "abc", MergeMethod::Squash, false, false));
+    }
+
+    #[test]
+    fn a_restack_reads_as_moved_conflicting_or_still_open() {
+        let open = |sha: &str, mergeable: Value, state: &str| {
+            json!({ "state": "open", "head": { "sha": sha }, "mergeable": mergeable, "mergeable_state": state })
+        };
+        // Still the old head and nothing known yet: keep waiting.
+        assert_eq!(restack_look(&open("old", Value::Null, "unknown"), "old"), RestackLook::Waiting);
+        assert_eq!(restack_look(&open("old", json!(true), "clean"), "old"), RestackLook::Waiting);
+        // The branch moved, or the pull request is no longer open.
+        assert_eq!(restack_look(&open("new", Value::Null, "unknown"), "old"), RestackLook::Moved);
+        assert_eq!(
+            restack_look(&json!({ "state": "closed", "head": { "sha": "old" } }), "old"),
+            RestackLook::Moved
+        );
+        assert_eq!(
+            restack_look(&open("old", json!(false), "dirty"), "old"),
+            RestackLook::Conflicting
+        );
+    }
+
+    #[test]
+    fn a_conflicting_answer_counts_as_a_refusal_only_once_it_has_stood() {
+        let start = Instant::now();
+        let at = |seconds: f32| start + Duration::from_secs_f32(seconds);
+        // Seen on the sandbox (O1b), where the pull request above edits a
+        // line the merged one added: unknown, dirty for about a second,
+        // unknown again, and then GitHub's own rebase arrives.
+        let mut watch = RestackWatch::default();
+        assert_eq!(watch.see(RestackLook::Waiting, at(5.5)), None);
+        assert_eq!(watch.see(RestackLook::Conflicting, at(6.0)), None);
+        assert_eq!(watch.see(RestackLook::Waiting, at(6.7)), None);
+        assert_eq!(watch.see(RestackLook::Moved, at(7.2)), Some(Restack::Rebased));
+
+        // Seen on the sandbox (R4b), where trunk itself conflicts with the
+        // pull request: dirty, and it stays dirty.
+        let mut watch = RestackWatch::default();
+        assert_eq!(watch.see(RestackLook::Conflicting, at(3.0)), None);
+        assert_eq!(watch.see(RestackLook::Conflicting, at(8.0)), None);
+        assert_eq!(
+            watch.see(RestackLook::Conflicting, at(13.0)),
+            Some(Restack::Conflicting)
+        );
+
+        // An answer in between starts the count again.
+        let mut watch = RestackWatch::default();
+        assert_eq!(watch.see(RestackLook::Conflicting, at(1.0)), None);
+        assert_eq!(watch.see(RestackLook::Waiting, at(9.0)), None);
+        assert_eq!(watch.see(RestackLook::Conflicting, at(12.0)), None);
+        assert_eq!(watch.see(RestackLook::Conflicting, at(21.0)), None);
+        assert_eq!(
+            watch.see(RestackLook::Conflicting, at(22.0)),
+            Some(Restack::Conflicting)
+        );
+    }
+
+    #[test]
+    fn an_unstack_answer_names_the_open_pull_requests_left_in_the_stack() {
+        // 204: dissolved, no body.
+        assert_eq!(still_stacked(&Value::Null), Vec::<u64>::new());
+        // 200 with only merged ones left, as seen on the sandbox.
+        let merged_left = json!({ "number": 20, "open": false, "pull_requests": [
+            { "number": 17, "state": "closed", "merged_at": "2026-11-26T00:00:00Z" }
+        ]});
+        assert_eq!(still_stacked(&merged_left), Vec::<u64>::new());
+        // 200 with an open one GitHub would not let go (documented for a
+        // pull request queued to merge; not seen on the sandbox).
+        let queued_left = json!({ "number": 20, "open": true, "pull_requests": [
+            { "number": 17, "state": "closed", "merged_at": "2026-11-26T00:00:00Z" },
+            { "number": 18, "state": "open", "merged_at": null }
+        ]});
+        assert_eq!(still_stacked(&queued_left), vec![18]);
     }
 
     #[test]

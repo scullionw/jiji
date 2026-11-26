@@ -57,15 +57,23 @@ pub fn stacks(repo: &str, stacks: &[PublishStack], hidden: usize, warnings: &[St
     );
     for stack in stacks {
         text.push_str(&format!(
-            "{} {}\n    {} PRs · {} changes · {} → {}\n    {}\n\n",
+            "{} {}\n    {} PRs · {} changes · {} → {}{}\n    {}\n\n",
             if stack.is_active { "●" } else { " " },
             clean(&stack.key),
             stack.pr_count,
             stack.change_count,
             stack.status.label(),
             clean(&stack.base),
+            github_stack(stack)
+                .map(|linked| format!(" · {linked}"))
+                .unwrap_or_default(),
             clean(&stack.title)
         ));
+        if !stack.others.is_empty() {
+            // Before the blank line that ends the entry.
+            text.pop();
+            text.push_str(&format!("    + {}\n\n", others_line(&stack.others)));
+        }
     }
     if stacks.is_empty() {
         text.push_str("No matching stacks.\n");
@@ -79,6 +87,20 @@ pub fn stacks(repo: &str, stacks: &[PublishStack], hidden: usize, warnings: &[St
         text.push_str(&format!("Note: {}\n", clean(warning)));
     }
     text
+}
+
+/// "GitHub stack 15", with how much of the chain is linked when not all
+/// of it is.
+fn github_stack(stack: &PublishStack) -> Option<String> {
+    let linked = stack.github_stack?;
+    Some(if linked.linked == stack.pr_count {
+        format!("GitHub stack {}", linked.number)
+    } else {
+        format!(
+            "GitHub stack {} ({} of {} PRs linked)",
+            linked.number, linked.linked, stack.pr_count
+        )
+    })
 }
 
 pub fn pr_row(pr: &PrSummary) -> String {
@@ -112,12 +134,15 @@ pub fn pr_row(pr: &PrSummary) -> String {
 
 pub fn stack_detail(stack: &PublishStack) -> String {
     let mut text = format!(
-        "{} → {}\n{} PRs · {} changes · {}\n\nLanding order\n  {}\n",
+        "{} → {}\n{} PRs · {} changes · {}{}\n\nLanding order\n  {}\n",
         clean(&stack.key),
         clean(&stack.base),
         stack.pr_count,
         stack.change_count,
         stack.status.label(),
+        github_stack(stack)
+            .map(|linked| format!(" · {linked}"))
+            .unwrap_or_default(),
         clean(&stack.base)
     );
     for (index, segment) in stack.segments.iter().enumerate() {
@@ -139,7 +164,49 @@ pub fn stack_detail(stack: &PublishStack) -> String {
         }
     }
     text.push('\n');
+    if !stack.others.is_empty() {
+        text.push_str("On this stack, by someone else (not a bookmark here)\n");
+        for other in &stack.others {
+            text.push_str(&format!(
+                "  {}  {} → {}\n     {}\n",
+                other_pr(other.number, other.author.as_deref()),
+                clean(&other.head_branch),
+                clean(&other.base_branch),
+                clean(&other.url)
+            ));
+        }
+        text.push_str(
+            "  Publish and Land never merge these and never push to their branches. Land\n  \
+             points one at trunk when its base lands; after a squash or a rebase it then\n  \
+             shows the landed commits as its own until its author rebases it.\n",
+        );
+        if stack.held() {
+            text.push_str(
+                "  jj calls the changes under them immutable while their branches build on\n  \
+                 them. Publish and Land work as usual. To edit one by hand, use jj's\n  \
+                 --ignore-immutable, or track the branch (jj bookmark track): it is then a\n  \
+                 bookmark of yours, and its pull request a part of this stack to publish\n  \
+                 and land.\n",
+            );
+        }
+        text.push('\n');
+    }
     text
+}
+
+/// "#9 by @kim on profile, #8 by @sam on auth (someone else's)".
+fn others_line(others: &[PrSummary]) -> String {
+    let listed: Vec<String> = others
+        .iter()
+        .map(|other| {
+            format!(
+                "{} on {}",
+                other_pr(other.number, other.author.as_deref()),
+                clean(&other.base_branch)
+            )
+        })
+        .collect();
+    format!("{} (someone else's)", listed.join(", "))
 }
 
 fn plan_text(
@@ -285,14 +352,64 @@ fn submit_action(action: &SubmitAction) -> String {
         SubmitAction::SyncStackComment { bookmark, .. } => {
             format!("Update the stack comment on {bookmark}")
         }
+        SubmitAction::Unstack { stack, members } if members.is_empty() => {
+            format!("Dissolve GitHub stack {stack}")
+        }
+        SubmitAction::Unstack { stack, members } => {
+            format!("Dissolve GitHub stack {stack} ({})", numbers(members))
+        }
+        SubmitAction::LinkStack {
+            bookmarks,
+            onto: None,
+            above,
+        } => format!(
+            "Link as a GitHub stack: {}{}",
+            bookmarks.join(", "),
+            above
+                .iter()
+                .map(|number| format!(", #{number}"))
+                .collect::<String>()
+        ),
+        SubmitAction::LinkStack {
+            bookmarks,
+            onto: Some(stack),
+            ..
+        } => format!("Add to GitHub stack {stack}: {}", bookmarks.join(", ")),
     }
 }
+/// A pull request that is someone else's, by number and author.
+fn other_pr(number: u64, author: Option<&str>) -> String {
+    match author {
+        Some(login) => format!("#{number} by @{}", clean(login)),
+        None => format!("#{number}"),
+    }
+}
+
 fn land_action(action: &LandAction) -> String {
     match action {
         LandAction::MarkReadyPr { number, .. } => format!("Mark #{number} ready for review"),
+        LandAction::MergePr {
+            number,
+            method,
+            with,
+            ..
+        } if !with.is_empty() => format!(
+            "Merge {} and #{number} together using {} (GitHub stack)",
+            with.iter()
+                .map(|lower| format!("#{}", lower.number))
+                .collect::<Vec<_>>()
+                .join(", "),
+            method.label()
+        ),
         LandAction::MergePr { number, method, .. } => {
             format!("Merge #{number} using {}", method.label())
         }
+        LandAction::AwaitRestack { number, .. } => {
+            format!("Wait for GitHub to rebase the rest of the stack (#{number})")
+        }
+        LandAction::CheckLanded {
+            number, bookmark, ..
+        } => format!("Check that trunk holds {bookmark} (#{number})"),
         LandAction::EnableAutoMerge { number, method, .. } => format!(
             "Enable GitHub auto-merge on #{number} using {}",
             method.label()
@@ -301,7 +418,9 @@ fn land_action(action: &LandAction) -> String {
             format!("Enqueue #{number} using {}", method.label())
         }
         LandAction::FetchRemote { remote } => format!("Fetch {remote}"),
-        LandAction::RebaseOntoTrunk { root_change, moves } => {
+        LandAction::RebaseOntoTrunk {
+            root_change, moves, ..
+        } => {
             format!("Rebase {root_change} onto trunk ({moves} changes)")
         }
         LandAction::PushStack { bookmarks } => {
@@ -310,10 +429,23 @@ fn land_action(action: &LandAction) -> String {
         LandAction::RetargetPr {
             number, to_base, ..
         } => format!("Retarget #{number} to {to_base}"),
-        LandAction::CleanupBookmark { bookmark } => format!("Clean up landed bookmark {bookmark}"),
+        LandAction::RetargetOther {
+            number,
+            author,
+            branch,
+            from_base,
+            to_base,
+        } => format!(
+            "Retarget {} ({branch}) to {to_base}: its base {from_base} lands and is deleted",
+            other_pr(*number, author.as_deref())
+        ),
+        LandAction::CleanupBookmark { bookmark, .. } => {
+            format!("Clean up landed bookmark {bookmark}")
+        }
         LandAction::AbandonLanded {
             bookmark,
             change_ids,
+            ..
         } => format!(
             "Clean up {} landed changes under {bookmark}",
             change_ids.len()
@@ -325,9 +457,51 @@ fn ship_action(action: &ShipAction) -> String {
         ShipAction::RebaseOntoTrunk { root_change, .. } => {
             format!("Rebase {root_change} onto trunk")
         }
+        ShipAction::PushBranches { bookmarks, remote } => format!(
+            "Push {} to {remote}, so each pull request has the commit that ships",
+            bookmarks.join(", ")
+        ),
+        ShipAction::Unstack { stack, members } => format!(
+            "Dissolve GitHub stack {stack} ({}): its pull requests cannot be retargeted inside it",
+            numbers(members)
+        ),
+        ShipAction::RetargetPr {
+            number,
+            bookmark,
+            to_base,
+            ..
+        } => format!("Retarget #{number} ({bookmark}) to {to_base}, so the push merges it"),
         ShipAction::MoveTrunk { bookmark, to } => format!("Move {bookmark} to {to}"),
         ShipAction::PushTrunk { bookmark, remote } => format!("Push {bookmark} to {remote}"),
+        ShipAction::ConfirmMerged { numbers: merged } => {
+            format!("Check that GitHub marked {} merged", numbers(merged))
+        }
+        ShipAction::RetargetAbove {
+            number,
+            author,
+            theirs,
+            branch,
+            to_base,
+            ..
+        } => format!(
+            "Retarget {} ({branch}) to {to_base}; it stays open",
+            if *theirs {
+                other_pr(*number, author.as_deref())
+            } else {
+                format!("#{number}")
+            }
+        ),
         ShipAction::NewWorkingCopy { on } => format!("Start a new working copy on {on}"),
+    }
+}
+
+/// "#12, #13 and #14".
+fn numbers(numbers: &[u64]) -> String {
+    let listed: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+    match listed.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 fn step(status: SubmitStepStatus, action: String, detail: Option<&str>) -> String {

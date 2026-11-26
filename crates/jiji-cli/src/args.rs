@@ -118,6 +118,12 @@ pub struct PublishArgs {
     /// Open new PRs as drafts; existing PRs keep their state (see `jiji draft`)
     #[arg(long)]
     pub draft: bool,
+    /// Link the stack's PRs as a GitHub stack; later publishes keep it in step
+    #[arg(long, conflicts_with = "no_stack")]
+    pub stack: bool,
+    /// Dissolve the GitHub stack; the PRs stay as a plain chain
+    #[arg(long, conflicts_with = "stack")]
+    pub no_stack: bool,
 }
 
 #[derive(Debug, Args)]

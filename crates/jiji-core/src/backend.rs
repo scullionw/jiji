@@ -6,8 +6,9 @@
 use std::path::Path;
 
 use crate::snapshot::{
-    ChangeDetail, ChangeDiff, ChangeEvolog, ConflictSide, FileAnnotation, HistorySearch,
-    MutationOutcome, RepoSnapshot, SnapshotView, SplitHunk, SplitSelection,
+    ChangeDetail, ChangeDiff, ChangeEvolog, ConflictSide, FileAnnotation,
+    HistorySearch, LandedCheck, MutationOutcome, RepoSnapshot, SnapshotView, SplitHunk,
+    SplitSelection, TipCheck,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +95,11 @@ pub fn git_root_for(path: &Path) -> Option<std::path::PathBuf> {
         .filter(|dir| dir.join(".git").is_dir())
         .map(Path::to_path_buf)
 }
+
+/// How [`RepoBackend::abandon_landed`] starts its answer when it left the
+/// landed commits where they are because someone else's branch still
+/// builds on them.
+pub const LANDED_LEFT_IN_PLACE: &str = "Left ";
 
 pub trait RepoBackend: Send + Sync {
     /// Open the repository at `path` and produce an immutable UI snapshot.
@@ -227,6 +233,31 @@ pub trait RepoBackend: Send + Sync {
         change_ids: &[String],
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Abandon exactly these commits, as [`RepoBackend::abandon_changes`]
+    /// does, unless something that is not one of them sits on them. Then
+    /// nothing is abandoned and the answer names what sits there.
+    ///
+    /// This is the sweep after a landing. Abandoning a commit rebases its
+    /// children onto what was below it, which for a landed commit is
+    /// trunk as it was before the landing: a child's diff survives, and
+    /// its tree loses what just landed. The caller moves the children it
+    /// knows of onto trunk first. One started after it looked is caught
+    /// here, under the write lock and after the working copy is
+    /// snapshotted, so there is no moment in between.
+    ///
+    /// Someone else's commits can sit on the landed ones too: a pull
+    /// request that was based on the landed branch and whose branch has
+    /// not been rebased yet. Those are not this repository's to move.
+    /// The landed commits then stay, nothing is recorded, and the answer
+    /// says so, starting with [`LANDED_LEFT_IN_PLACE`] and naming the
+    /// branch. A landed commit that is immutable only because such a
+    /// branch has it in its history is swept like any other.
+    fn abandon_landed(
+        &self,
+        path: &Path,
+        commits: &[String],
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Squash a change into its single parent (`jj squash -r <rev>`): the
     /// parent takes the change's content and combined description, the
     /// change itself is abandoned, and bookmarks on it move to the parent.
@@ -310,6 +341,31 @@ pub trait RepoBackend: Send + Sync {
         destination_id: &str,
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Move a change and all its descendants off landed history and onto
+    /// trunk as `remote` has it: the commit of the branch `trunk` on that
+    /// remote after the last fetch. The caller names the branch, the one
+    /// its plan was made for. `trunk()` is not asked again: a fetch can
+    /// change what it answers, and it can sit ahead of the remote with
+    /// commits nobody pushed, as the local bookmark of that name can; a
+    /// stack rebased onto those would carry them into its pull requests.
+    /// This is the commit [`RepoBackend::landed_check`] judges a landing
+    /// against, so what was checked and what is built on are one commit.
+    /// Refused when the remote has no such branch here.
+    ///
+    /// Only the parents that landed are replaced: those named in `landed`
+    /// (commit ids), and any that are part of that trunk already. A change
+    /// that merges a side branch in keeps that branch as its other parent,
+    /// and with it everything the branch brings. A change none of whose
+    /// parents landed is left where it is.
+    fn rebase_onto_trunk(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        change_id: &str,
+        landed: &[String],
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Move only this change onto a new parent (`jj rebase -r <rev> -d
     /// <dest>`): its descendants stay behind, reparented onto the change's
     /// current parents. The destination may be a descendant of the change —
@@ -356,6 +412,19 @@ pub trait RepoBackend: Send + Sync {
     /// Delete a local bookmark (`jj bookmark delete <name>`). A tracked
     /// remote counterpart is deleted on the next push, like the CLI.
     fn delete_bookmark(&self, path: &Path, name: &str) -> Result<MutationOutcome, BackendError>;
+
+    /// Delete a local bookmark only while it still points at `commit` (a
+    /// commit id, or a unique prefix of one). A bookmark that moved since
+    /// the caller looked is refused and left where it is: what it points
+    /// at now is not what the caller decided about. The comparison runs
+    /// inside the mutation, after the working copy is snapshotted, so an
+    /// edit made in the meantime counts.
+    fn delete_bookmark_at(
+        &self,
+        path: &Path,
+        name: &str,
+        commit: &str,
+    ) -> Result<MutationOutcome, BackendError>;
 
     /// Start tracking a remote bookmark (`jj bookmark track name@remote`):
     /// the local bookmark takes (or merges in) the remote position and
@@ -549,6 +618,107 @@ pub trait RepoBackend: Send + Sync {
         path: &Path,
         candidates: &[String],
     ) -> Result<Option<(String, String)>, BackendError>;
+
+    /// Whether trunk holds the run of changes from `bottom` up to `top`,
+    /// on the strength of a pull request a forge reports merged. Trunk is
+    /// the trunk branch as `remote` has it after the last fetch (see
+    /// [`RepoBackend::rebase_onto_trunk`]). `landing` is the commit the
+    /// forge names as that merge and `head` the commit it recorded as the
+    /// pull request's head; `bottom` and `top` are commit or node ids,
+    /// `top` reached from `bottom` along first parents. Read-only.
+    ///
+    /// "Holds" is the question a rebase would answer: applying the run's
+    /// whole diff (from the commit below `bottom` in the stack, its first
+    /// parent, up to `top`) on top of a commit must alter nothing. That
+    /// is true of a squash, a rebase or a merge commit of exactly these
+    /// changes, whatever else trunk gained underneath, and false as soon
+    /// as one line of them is absent. The first parent and not all
+    /// parents: when `bottom` merges a side branch in, that branch's
+    /// content is part of what the pull request carries.
+    ///
+    /// Which commit is asked depends on how the changes relate to trunk.
+    /// When the run's own commits are part of trunk's history (a merge
+    /// commit, or trunk moved onto the branch), the commit asked is the
+    /// one where they entered trunk's first-parent line. Being in the
+    /// history is not enough: a merge can take a branch in and keep none
+    /// of its content. And what is asked of that commit is everything it
+    /// brought in, from where the branch left trunk's line up to `top`,
+    /// whatever `bottom` the caller knows: a caller that has only the
+    /// pull request's head still gets an answer about the whole pull
+    /// request. (Where trunk and the branch merged each other before,
+    /// there are several such places, and the commit has to hold what
+    /// came in from each.) Otherwise, when the pull request was merged from
+    /// exactly `top`, `landing` is asked first and not trunk's tip, so a
+    /// later commit by someone else that edits the same lines, or a
+    /// revert, does not turn a good landing into a missing one; trunk's
+    /// tip is asked when `landing` is not the answer (it is off trunk, or
+    /// lacks something), because changes can reach trunk by another road
+    /// than their own pull request's merge. When the pull request was
+    /// merged from some other commit, its merge says nothing about these
+    /// changes (the branch name was used before, or the changes were
+    /// edited since), and only trunk's tip can vouch for them.
+    #[allow(clippy::too_many_arguments)]
+    fn landed_check(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        landing: &str,
+        head: &str,
+        bottom: &str,
+        top: &str,
+    ) -> Result<LandedCheck, BackendError>;
+
+    /// Whether landing a stack one pull request at a time, starting now,
+    /// would leave trunk as one merge of the stack's tip would. Trunk is
+    /// the branch `trunk` as `remote` has it after the last fetch.
+    /// `bottom` and `first_top` are the ends of the pull request that
+    /// lands first, and `tip` is the top of the stack; all three are
+    /// commit or node ids on one first-parent line. Read-only.
+    ///
+    /// The two can differ when trunk has moved under the stack. One merge
+    /// of the tip applies the stack's net change. One pull request at a
+    /// time applies each commit's own change in turn: the first pull
+    /// request as the forge merges it, in one piece, and then every
+    /// commit above it rebased onto the result, which is what follows a
+    /// landing. Where trunk made a change that a lower commit makes too,
+    /// and a higher commit changes the same thing again, the net change
+    /// leaves trunk's version alone and the commits in turn replace it
+    /// (seen on GitHub: a flag trunk had turned on ended up off).
+    ///
+    /// Both results are computed here, with jj's merge and not the
+    /// forge's, and compared. Trunk is as the last fetch left it, so a
+    /// change that reached the remote since is not seen.
+    ///
+    /// The same question is asked after a landing, before what is left
+    /// of the stack is rebased onto trunk, with `first_top` equal to
+    /// `bottom`: every commit replayed in turn, as that rebase does it.
+    /// The stack then sits on the landed commits, which are not part of
+    /// trunk's history when the landing was a squash. That base counts as
+    /// long as trunk holds everything it holds.
+    fn lands_as_tip(
+        &self,
+        path: &Path,
+        remote: &str,
+        trunk: &str,
+        bottom: &str,
+        first_top: &str,
+        tip: &str,
+    ) -> Result<TipCheck, BackendError>;
+
+    /// The remote branches that are no bookmarks here and still have any
+    /// of `commits` in their history, as `name@remote`: whose pull
+    /// requests keep those commits around. A commit that is part of
+    /// trunk's history rests under none: every branch made since has it.
+    /// Read-only. Landing asks it about landed commits it finds it has
+    /// nothing to sweep of, to say which of two things happened: they
+    /// became part of trunk's history, or someone else's branch still
+    /// builds on them.
+    fn branches_resting_on(
+        &self,
+        path: &Path,
+        commits: &[String],
+    ) -> Result<Vec<String>, BackendError>;
 
     /// Revert one earlier operation by applying its inverse on top of the
     /// current state (`jj op revert <op>`); everything recorded after it
@@ -878,12 +1048,49 @@ impl RepoBackend for MockBackend {
                 "there are no changes to abandon".to_owned(),
             ));
         }
-        self.mutate(
-            path,
-            crate::mock::MockMutation::AbandonMany {
-                ids: change_ids.to_vec(),
-            },
-        )
+        // Like the real backend, an id may name a commit instead of a
+        // change: landing's cleanup abandons by commit id.
+        let snapshot = self.overlaid_snapshot(path)?;
+        let ids = change_ids
+            .iter()
+            .map(|id| {
+                snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.id != *id && node.commit_id == *id)
+                    .map_or_else(|| id.clone(), |node| node.id.clone())
+            })
+            .collect();
+        self.mutate(path, crate::mock::MockMutation::AbandonMany { ids })
+    }
+
+    fn abandon_landed(
+        &self,
+        path: &Path,
+        commits: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        let snapshot = self.overlaid_snapshot(path)?;
+        let named = |node: &crate::snapshot::GraphNode| {
+            commits.iter().any(|id| node.id == *id || node.commit_id == *id)
+        };
+        let sitting: Vec<&str> = snapshot
+            .nodes
+            .iter()
+            .filter(|node| !named(node))
+            .filter(|node| {
+                node.parents
+                    .iter()
+                    .any(|p| snapshot.nodes.iter().any(|parent| parent.id == *p && named(parent)))
+            })
+            .map(|node| node.id.as_str())
+            .collect();
+        if !sitting.is_empty() {
+            return Err(BackendError::MutationFailed(format!(
+                "{} sits on the landed commits and is not one of them",
+                sitting.join(", ")
+            )));
+        }
+        self.abandon_changes(path, commits)
     }
 
     fn squash_change(&self, path: &Path, change_id: &str) -> Result<MutationOutcome, BackendError> {
@@ -993,6 +1200,31 @@ impl RepoBackend for MockBackend {
         )
     }
 
+    fn rebase_onto_trunk(
+        &self,
+        path: &Path,
+        _remote: &str,
+        _trunk: &str,
+        change_id: &str,
+        _landed: &[String],
+    ) -> Result<MutationOutcome, BackendError> {
+        // The fabricated repository has one trunk bookmark and no remote
+        // that moves, so its target is trunk. Its changes have one parent
+        // each, so there is no other parent to keep.
+        let destination = self
+            .overlaid_snapshot(path)?
+            .bookmarks
+            .into_iter()
+            .find(|b| b.is_trunk)
+            .map(|b| b.target)
+            .ok_or_else(|| {
+                BackendError::MutationFailed(
+                    "the repository has no trunk bookmark to rebase onto".to_owned(),
+                )
+            })?;
+        self.rebase_change(path, change_id, &destination)
+    }
+
     fn move_change(
         &self,
         path: &Path,
@@ -1061,6 +1293,29 @@ impl RepoBackend for MockBackend {
                 name: name.trim().to_owned(),
             },
         )
+    }
+
+    fn delete_bookmark_at(
+        &self,
+        path: &Path,
+        name: &str,
+        commit: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        let snapshot = self.overlaid_snapshot(path)?;
+        let name = name.trim();
+        let at = snapshot
+            .bookmarks
+            .iter()
+            .find(|b| b.name == name && b.is_local)
+            .and_then(|b| snapshot.nodes.iter().find(|n| n.id == b.target))
+            .map(|n| n.commit_id.clone())
+            .ok_or_else(|| BackendError::BookmarkMissing(name.to_owned()))?;
+        if commit.is_empty() || !(at.starts_with(commit) || commit.starts_with(&at)) {
+            return Err(BackendError::MutationFailed(format!(
+                "bookmark \u{201c}{name}\u{201d} no longer points at {commit}; it was left in place"
+            )));
+        }
+        self.delete_bookmark(path, name)
     }
 
     fn track_bookmark(
@@ -1190,6 +1445,64 @@ impl RepoBackend for MockBackend {
         // approximation: mock submit plans never see a PR template.
         validate_repo_path(path)?;
         Ok(None)
+    }
+
+    fn lands_as_tip(
+        &self,
+        path: &Path,
+        _remote: &str,
+        _trunk: &str,
+        _bottom: &str,
+        _first_top: &str,
+        _tip: &str,
+    ) -> Result<TipCheck, BackendError> {
+        // Documented approximation: the mock has no trees to merge, and
+        // its trunk never moves under a stack.
+        validate_repo_path(path)?;
+        Ok(TipCheck::Same)
+    }
+
+    fn branches_resting_on(
+        &self,
+        path: &Path,
+        _commits: &[String],
+    ) -> Result<Vec<String>, BackendError> {
+        // Documented approximation: the mock repository holds no remote
+        // branch that is not also a bookmark in it.
+        validate_repo_path(path)?;
+        Ok(Vec::new())
+    }
+
+    fn landed_check(
+        &self,
+        path: &Path,
+        _remote: &str,
+        _trunk: &str,
+        landing: &str,
+        _head: &str,
+        _bottom: &str,
+        _top: &str,
+    ) -> Result<LandedCheck, BackendError> {
+        // Documented approximation: the fabricated remote never moves and
+        // the mock has no trees, so it cannot receive a landing commit or
+        // compare content. It takes the forge's word for a commit it has
+        // never seen (the trunk commit a merge made), and knows better only
+        // about its own: a pull request "merged" at one of the mock's
+        // mutable commits did not reach trunk, which is what GitHub reports
+        // when a branch's commits turn up inside its base branch.
+        let snapshot = self.overlaid_snapshot(path)?;
+        let mutable_here = !landing.is_empty()
+            && snapshot.nodes.iter().any(|node| {
+                node.kind != crate::snapshot::NodeKind::Immutable
+                    && !node.commit_id.is_empty()
+                    && (landing.starts_with(&node.commit_id)
+                        || node.commit_id.starts_with(landing))
+            });
+        Ok(if mutable_here {
+            LandedCheck::Elsewhere
+        } else {
+            LandedCheck::Landed
+        })
     }
 
     fn search_history(&self, path: &Path, query: &str) -> Result<HistorySearch, BackendError> {

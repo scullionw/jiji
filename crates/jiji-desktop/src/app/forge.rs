@@ -344,6 +344,20 @@ impl AppModel {
         })
     }
 
+    // ── GitHub stacks ──
+
+    /// Whether a publish links a new stack as a GitHub stack without
+    /// being asked. The `jiji` command reads the same preference from the
+    /// same file (`jiji_forge::prefs`), so the two publish alike.
+    pub fn link_new_stacks(&self) -> bool {
+        self.store.flag(jiji_forge::prefs::LINK_NEW_STACKS)
+    }
+
+    pub fn set_link_new_stacks(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.store.set_pref(jiji_forge::prefs::LINK_NEW_STACKS, &on);
+        cx.notify();
+    }
+
     // ── Upstream checks ──
 
     pub fn set_upstream_interval(&mut self, minutes: u32, cx: &mut Context<Self>) {

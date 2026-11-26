@@ -20,13 +20,28 @@
 //! ([`SubmitPlan::open_new_prs_as_drafts`]); an existing PR's draft flag
 //! is never changed here — [`crate::readiness`] owns that.
 //!
+//! Two things about GitHub shape the order a plan runs in. GitHub closes
+//! a pull request as merged the moment its head is reachable from its
+//! base branch, and a reorder pushed with the old bases in place does
+//! exactly that to the pull request that moved down: the branch above it
+//! is still its base and now contains it. So every pull request whose
+//! base changes points at trunk before the push, and at its new base
+//! after. And a pull request in a GitHub stack cannot be retargeted at
+//! all, nor a stack reordered: the stack is dissolved first and linked
+//! again at the end.
+//!
+//! A chain becomes a GitHub stack only when asked ([`StackLink::Link`]);
+//! once it is one, by Jiji or by anyone on github.com, every later plan
+//! reads that from GitHub and keeps the stack in step with the local
+//! chain without being asked.
+//!
 //! Deliberately left out: foreign bases
 //! (a coworker's branch in the stack's ancestry — the snapshot does not
 //! carry remote-only bookmarks on nodes yet), and
 //! recognizing already-merged PRs (needs a per-bookmark merged-PR query;
 //! the land flow owns it).
 
-use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, SyncState};
+use jiji_core::snapshot::{GraphNode, RepoSnapshot, SyncState};
 use jiji_core::BackendError;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +70,49 @@ pub enum SubmitHead {
     /// otherwise the top segment gets a derived name.
     #[serde(rename_all = "camelCase")]
     Change { change: String },
+}
+
+/// What to do about GitHub's own stacked pull requests when publishing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StackLink {
+    /// Leave it as GitHub has it: a chain that is a GitHub stack stays
+    /// one and follows the local order; a plain chain stays plain.
+    #[default]
+    Follow,
+    /// Link the stack's pull requests as a GitHub stack.
+    Link,
+    /// Dissolve the GitHub stack; the pull requests stay, as a plain chain.
+    Unlink,
+    /// What [`StackLink::Follow`] becomes under the setting that links new
+    /// stacks without being asked: a chain that is not a GitHub stack is
+    /// linked by the publish that opens a pull request for it, and is
+    /// otherwise left as it is. Where the repository has no GitHub
+    /// stacks, the pull requests stay a plain chain and the publish does
+    /// not fail for it.
+    LinkNew,
+}
+
+/// How the user asked this publish to run. The options ride on the plan,
+/// so the re-derivation before execution judges by the same ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitOptions {
+    #[serde(default)]
+    pub stack: StackLink,
+}
+
+impl SubmitOptions {
+    /// These options under the setting that links new stacks as GitHub
+    /// stacks. A choice made for this publish (to link, or to dissolve)
+    /// stands either way; only a publish that was not told anything
+    /// follows the setting.
+    pub fn under_setting(mut self, link_new_stacks: bool) -> Self {
+        if link_new_stacks && self.stack == StackLink::Follow {
+            self.stack = StackLink::LinkNew;
+        }
+        self
+    }
 }
 
 /// One publishable run of changes under a bookmark, listed bottom-up in
@@ -126,6 +184,37 @@ pub enum SubmitAction {
         /// Jiji's fingerprints on a PR it recognizes as its own.
         seed: bool,
     },
+    /// Take the unmerged pull requests out of GitHub stack `stack`. They
+    /// keep their bases and go back to being a plain chain. GitHub has no
+    /// way to reorder a stack, insert into one, or retarget a pull request
+    /// inside one, so a chain that changed shape leaves its stack first
+    /// and is linked again by a `LinkStack` at the end of the same plan.
+    /// `members` are the open pull requests in the stack when the plan was
+    /// made, bottom first: everyone the dissolve takes out, whoever opened
+    /// them. A plan confirmed in the app is refused when they have changed
+    /// by the time it runs.
+    #[serde(rename_all = "camelCase")]
+    Unstack {
+        stack: u64,
+        #[serde(default)]
+        members: Vec<u64>,
+    },
+    /// Link pull requests as a GitHub stack: all of them as a new stack,
+    /// or with `onto` the listed ones on top of that existing stack.
+    /// Bottom first, by bookmark; the numbers of pull requests this plan
+    /// creates are only known once it runs. `above` are pull requests
+    /// that sat above the published head in a stack this plan dissolves
+    /// and still chain on top of it: they go back into the new stack, on
+    /// top, so a publish of part of a chain does not drop the rest of it
+    /// from GitHub's stack.
+    #[serde(rename_all = "camelCase")]
+    LinkStack {
+        bookmarks: Vec<String>,
+        #[serde(default)]
+        onto: Option<u64>,
+        #[serde(default)]
+        above: Vec<u64>,
+    },
     /// Post or refresh the stack-info comment that explains the stack to
     /// GitHub readers.
     #[serde(rename_all = "camelCase")]
@@ -151,6 +240,9 @@ pub struct SubmitPlan {
     pub remote: String,
     /// The trunk branch the bottom segment's PR targets.
     pub base_branch: String,
+    /// The options the plan was derived under.
+    #[serde(default)]
+    pub options: SubmitOptions,
     /// The stack's publishable segments, bottom-up.
     pub segments: Vec<SubmitSegment>,
     /// Everything that will run, in order. Empty means up to date.
@@ -243,6 +335,16 @@ pub struct ExistingComment {
 /// keeps plan tests network-free.
 pub trait StackCommentSource {
     fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError>;
+
+    /// Every open pull request whose base is `base`. The planner asks
+    /// this only when the batched open-PR list was cut short, for each
+    /// branch of the stack it publishes: a pull request based on a
+    /// pushed branch can be closed by the push, so none of them may be
+    /// missing from what the plan is made of. A source that knows no
+    /// more than the list answers nothing.
+    fn open_prs_based_on(&self, _base: &str) -> Result<Vec<PrSummary>, ForgeError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The forge side of executing a plan; implemented by [`RepoForge`] over
@@ -265,6 +367,15 @@ pub trait SubmitForge: StackCommentSource {
     ) -> Result<(), ForgeError>;
     fn create_comment(&self, number: u64, body: &str) -> Result<(), ForgeError>;
     fn update_comment(&self, comment_id: u64, body: &str) -> Result<(), ForgeError>;
+    /// Link pull requests, bottom first, as a new GitHub stack; answers
+    /// the stack's number.
+    fn create_stack(&self, pull_requests: &[u64]) -> Result<u64, ForgeError>;
+    /// Put pull requests, bottom first, on top of an existing GitHub stack.
+    fn add_to_stack(&self, stack: u64, pull_requests: &[u64]) -> Result<(), ForgeError>;
+    /// Take the unmerged pull requests out of a GitHub stack.
+    /// Answers the open pull requests GitHub left in the stack (it
+    /// documents keeping one that is queued to merge).
+    fn unstack(&self, stack: u64) -> Result<Vec<u64>, ForgeError>;
 }
 
 /// [`SubmitForge`] over the real GitHub client, bound to a detected repo.
@@ -274,6 +385,11 @@ pub struct RepoForge<'a> {
 }
 
 impl StackCommentSource for RepoForge<'_> {
+    fn open_prs_based_on(&self, base: &str) -> Result<Vec<PrSummary>, ForgeError> {
+        self.client
+            .open_prs_based_on(&self.repo.owner, &self.repo.name, base)
+    }
+
     fn stack_comment(&self, number: u64) -> Result<Option<ExistingComment>, ForgeError> {
         let comments = self
             .client
@@ -329,6 +445,36 @@ impl SubmitForge for RepoForge<'_> {
         self.client
             .update_comment(&self.repo.owner, &self.repo.name, comment_id, body)
     }
+
+    fn create_stack(&self, pull_requests: &[u64]) -> Result<u64, ForgeError> {
+        self.client
+            .create_stack(&self.repo.owner, &self.repo.name, pull_requests)
+            .map_err(|err| no_stacks_here(err, self.repo))
+    }
+
+    fn add_to_stack(&self, stack: u64, pull_requests: &[u64]) -> Result<(), ForgeError> {
+        self.client
+            .add_to_stack(&self.repo.owner, &self.repo.name, stack, pull_requests)
+            .map_err(|err| no_stacks_here(err, self.repo))
+    }
+
+    fn unstack(&self, stack: u64) -> Result<Vec<u64>, ForgeError> {
+        self.client
+            .unstack(&self.repo.owner, &self.repo.name, stack)
+            .map_err(|err| no_stacks_here(err, self.repo))
+    }
+}
+
+/// The stacks endpoints answer a bare 404 on a host or repository that
+/// does not have GitHub's stacked pull requests; say that instead.
+fn no_stacks_here(err: ForgeError, repo: &ForgeRepo) -> ForgeError {
+    match err {
+        ForgeError::NotFound(_) => ForgeError::NoStacks(format!(
+            "{}/{} on {} does not offer GitHub's stacked pull requests",
+            repo.owner, repo.name, repo.host
+        )),
+        other => other,
+    }
 }
 
 /// One bookmark-bounded run of the stack, bottom-up — the shape submit and
@@ -338,8 +484,11 @@ pub(crate) struct RawSegment<'a> {
     pub nodes: Vec<&'a GraphNode>,
 }
 
-/// Walk down first parents from `top` to the immutable base, answered
-/// bottom-up ending at `top`. Empty when `top` itself is immutable.
+/// Walk down first parents from `top` to the settled base, answered
+/// bottom-up ending at `top`. Empty when `top` itself is settled history.
+/// A change someone else's branch holds is immutable to jj and still part
+/// of the chain: it is the user's, published or to be published, and a
+/// walk that stopped at it would take it for trunk.
 fn mutable_chain<'a>(
     node_by_id: &std::collections::HashMap<&str, &'a GraphNode>,
     top: &'a GraphNode,
@@ -347,7 +496,7 @@ fn mutable_chain<'a>(
     let mut chain: Vec<&GraphNode> = Vec::new();
     let mut cursor = Some(top);
     while let Some(node) = cursor {
-        if node.kind == NodeKind::Immutable {
+        if node.is_settled() {
             break;
         }
         chain.push(node);
@@ -501,7 +650,7 @@ fn planned_segments<'a>(
                     "no change {change} in this snapshot — refresh and pick again"
                 ))
             })?;
-            if top.kind == NodeKind::Immutable {
+            if top.is_settled() {
                 return Err(ForgeError::Plan(format!(
                     "{change} is immutable history — it is already part of trunk"
                 )));
@@ -551,7 +700,32 @@ pub fn plan_submit(
     head: &SubmitHead,
     comments: &dyn StackCommentSource,
     pr_template: Option<&PrTemplate>,
+    options: &SubmitOptions,
 ) -> Result<SubmitPlan, ForgeError> {
+    // GitHub's batched list holds at most the hundred most recently
+    // updated open pull requests. One it left out can still be closed by
+    // this publish, and that takes its base being a branch the publish
+    // pushes: a branch of this stack. So when the list was cut short,
+    // GitHub is asked for the pull requests based on each of them, and
+    // the plan is made of the list with those added. Added before
+    // anything is planned: a pull request of the stack itself that the
+    // list left out has to be known as that segment's, or the plan would
+    // push around it and try to open it a second time.
+    let completed = if prs.report.truncated {
+        let (first_look, _) = planned_segments(snapshot, prs, head)?;
+        let mut report = prs.report.clone();
+        for seg in first_look.iter().filter(|seg| seg.create_at.is_none()) {
+            for pr in comments.open_prs_based_on(&seg.name)? {
+                if !report.prs.iter().any(|known| known.number == pr.number) {
+                    report.prs.push(pr);
+                }
+            }
+        }
+        Some(RepoPrState::new(report, &repo.owner))
+    } else {
+        None
+    };
+    let prs = completed.as_ref().unwrap_or(prs);
     let (planned, mut warnings) = planned_segments(snapshot, prs, head)?;
     let head_bookmark = planned
         .last()
@@ -564,8 +738,11 @@ pub fn plan_submit(
     // bookmark.
     let mut segments: Vec<SubmitSegment> = Vec::new();
     let mut bookmark_creates: Vec<SubmitAction> = Vec::new();
-    let mut actions: Vec<SubmitAction> = Vec::new();
-    let mut pr_actions: Vec<SubmitAction> = Vec::new();
+    let mut pushes: Vec<SubmitAction> = Vec::new();
+    let mut creates: Vec<SubmitAction> = Vec::new();
+    // Each existing PR whose base must change: (number, bookmark, the
+    // base GitHub has, the base the stack shape expects).
+    let mut rebases: Vec<(u64, String, String, String)> = Vec::new();
     let mut text_actions: Vec<SubmitAction> = Vec::new();
     // Segments that will have a PR once the plan runs (existing or being
     // created) — the stack the comment describes. Bottom-up.
@@ -648,7 +825,12 @@ pub fn plan_submit(
                 if node.has_conflict {
                     blockers.push(format!("{change} has conflicts; resolve them first"));
                 }
-                if node.is_divergent {
+                // Not when the other copies are only what someone else's
+                // branch still has of an earlier version: nothing here
+                // can abandon those, and pushing this one is how the
+                // change moves on. The warning about their pull request
+                // says the rest.
+                if node.diverged_here() {
                     blockers.push(format!(
                         "{change} is divergent; resolve the divergence first"
                     ));
@@ -671,7 +853,7 @@ pub fn plan_submit(
                     change: change.clone(),
                 });
             }
-            actions.push(SubmitAction::Push {
+            pushes.push(SubmitAction::Push {
                 bookmark: name.to_owned(),
                 create: state.is_none_or(|s| s.sync == SyncState::LocalOnly),
             });
@@ -680,12 +862,12 @@ pub fn plan_submit(
         match &pr {
             Some(pr) => {
                 if pr.base_branch != effective_base {
-                    pr_actions.push(SubmitAction::RetargetPr {
-                        number: pr.number,
-                        bookmark: name.to_owned(),
-                        from_base: pr.base_branch.clone(),
-                        to_base: effective_base.clone(),
-                    });
+                    rebases.push((
+                        pr.number,
+                        name.to_owned(),
+                        pr.base_branch.clone(),
+                        effective_base.clone(),
+                    ));
                 }
 
                 // Reconcile the PR's title and description against the
@@ -745,7 +927,7 @@ pub fn plan_submit(
                 }
             }
             None => {
-                pr_actions.push(SubmitAction::CreatePr {
+                creates.push(SubmitAction::CreatePr {
                     bookmark: name.to_owned(),
                     base: effective_base.clone(),
                     title: title.clone(),
@@ -763,15 +945,351 @@ pub fn plan_submit(
         effective_base = name.to_owned();
         segments.push(segment);
     }
+    // Retargets, around the push. GitHub closes a pull request as merged
+    // the moment its head is reachable from its base branch, whatever
+    // that branch is. A reorder pushed with the old bases in place does
+    // that to the pull request that moved down: the branch above it is
+    // still its base, and after the push contains it. So a pull request
+    // whose base changes points at trunk while branches move, where
+    // nothing this plan pushes can ever be reachable, and at its new base
+    // once they have moved.
+    let trunk = snapshot.trunk_bookmark.as_str();
+    let pushing = !pushes.is_empty();
+
+    // The same rule catches a pull request whose base stays the same.
+    // Slide a chain's bookmarks up by one commit and the lower branch is
+    // pushed onto the commit the upper pull request still has as its head
+    // on GitHub. Whether that pull request survives then hangs on its own
+    // branch arriving in the same push, and jj's push is not atomic. So:
+    // which pushed branch will contain which pull request's head?
+    let pushed: std::collections::HashSet<&str> = pushes
+        .iter()
+        .filter_map(|action| match action {
+            SubmitAction::Push { bookmark, .. } => Some(bookmark.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Where each pushed branch will stand, and what it will then contain:
+    // everything reachable from that commit, along every parent. (A merge
+    // can bring a pull request's head in as its second parent.)
+    let by_id: std::collections::HashMap<&str, &GraphNode> =
+        snapshot.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let pushed_to = |branch: &str| -> Option<&GraphNode> {
+        pushed.contains(branch).then(|| {
+            planned
+                .iter()
+                .find(|seg| seg.name == branch)
+                .and_then(|seg| seg.nodes.last().copied())
+        })?
+    };
+    // Whether `commit`, as GitHub names it, is `from` or below it here,
+    // as far as the snapshot draws. Immutable commits count like any
+    // other: a pull request's head can be one (a tagged commit is).
+    let contains = |from: &GraphNode, commit: &str| -> bool {
+        let mut queue = vec![from];
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(node) = queue.pop() {
+            if !seen.insert(node.id.as_str()) {
+                continue;
+            }
+            if crate::land::same_commit(commit, &node.commit_id) {
+                return true;
+            }
+            queue.extend(node.parents.iter().filter_map(|p| by_id.get(p.as_str()).copied()));
+        }
+        false
+    };
+    // Every open pull request a pushed branch can affect: the list, made
+    // whole above when GitHub cut it short.
+    let open: &[PrSummary] = &prs.report.prs;
+    // Only a pull request of this repository's own branch is ever matched
+    // to a segment or to a branch this publish pushes: a fork's branch
+    // may have the name of a bookmark here, and names nothing here.
+    let of_this_repository = |pr: &PrSummary| prs.of_this_repository(pr);
+    // A push of several branches can go through for some and not for
+    // others, so a pull request is at risk when any outcome puts its head
+    // inside its base: its base pushed onto the head GitHub has for it
+    // (bookmarks that slid up; its own branch may not follow), or its own
+    // branch pushed to a commit its base already has on GitHub (bookmarks
+    // that slid down; its base may not follow).
+    let at_risk = |pr: &PrSummary| -> bool {
+        let under_new_base = pushed_to(&pr.base_branch)
+            .is_some_and(|base| contains(base, &pr.head_commit));
+        // (Its own branch is pushed from here only when it is this
+        // repository's: a fork's branch of the same name is not.)
+        let own_head = of_this_repository(pr)
+            .then(|| pushed_to(&pr.head_branch))
+            .flatten();
+        let in_old_base = own_head.is_some_and(|head| {
+            match prs.by_branch.get(&pr.base_branch) {
+                Some(below) => snapshot
+                    .nodes
+                    .iter()
+                    .find(|n| crate::land::same_commit(&below.head_commit, &n.commit_id))
+                    .is_some_and(|base| contains(base, &head.commit_id)),
+                // Where a branch stands on GitHub is known here through
+                // its own pull request. A base that has none, and that
+                // this publish moves, could be anywhere: at risk.
+                None => pushed.contains(pr.base_branch.as_str()),
+            }
+        });
+        under_new_base || in_old_base
+    };
+    // A base that reads in sync stands, here, where the last fetch left
+    // it; where it stands on GitHub is its own pull request's head. When
+    // the two differ, the branch moved on GitHub since, to commits that
+    // are not here, and nothing above can tell whether a branch pushed
+    // against it ends up inside it. That is not parked around: it is
+    // fetched and looked at first. (In sync, and not merely "not pushed":
+    // a base whose changes all came out empty is not pushed either, and
+    // has moved here.)
+    for (name, pr) in live
+        .iter()
+        .filter_map(|(name, pr)| pr.as_ref().map(|pr| (name, pr)))
+    {
+        if !pushed.contains(name.as_str()) || pushed.contains(pr.base_branch.as_str()) {
+            continue;
+        }
+        let here = snapshot
+            .bookmarks
+            .iter()
+            .find(|b| b.name == pr.base_branch && b.is_local && b.sync == SyncState::Synced)
+            .and_then(|b| by_id.get(b.target.as_str()));
+        let (Some(below), Some(here)) = (prs.by_branch.get(&pr.base_branch), here) else {
+            continue;
+        };
+        if !crate::land::same_commit(&below.head_commit, &here.commit_id) {
+            blockers.push(format!(
+                "\u{201c}{}\u{201d} is at {} on GitHub and at {} here: something pushed to it \
+                 since the last fetch. Pushing \u{201c}{name}\u{201d} against a base that moved \
+                 could put #{} inside it, and GitHub would close #{} as merged \u{2014} fetch, \
+                 look at what arrived, and publish again",
+                pr.base_branch,
+                &below.head_commit[..below.head_commit.len().min(here.commit_id.len().max(8))],
+                here.commit_id,
+                pr.number,
+                pr.number,
+            ));
+        }
+    }
+    // In the chain being published it is parked like a base change, and
+    // put back on the same base afterwards.
+    let slid: Vec<(u64, String, String)> = live
+        .iter()
+        .filter_map(|(name, pr)| pr.as_ref().map(|pr| (name, pr)))
+        .filter(|(_, pr)| !rebases.iter().any(|r| r.0 == pr.number) && at_risk(pr))
+        .map(|(name, pr)| (pr.number, name.clone(), pr.base_branch.clone()))
+        .collect();
+    // Outside it, nothing this plan does can move the pull request's own
+    // branch, so the push would close it. Refuse, and say which publish
+    // would not.
+    // Someone else's pull requests on this stack: based on one of its
+    // branches, with a branch that is no bookmark here. A publish never
+    // pushes or retargets them. What it does under them is said, by
+    // number and author, before it runs.
+    let own_branches: Vec<&str> = planned.iter().map(|seg| seg.name.as_str()).collect();
+    let others = crate::pr::others_on(snapshot, prs, &own_branches);
+    let is_other = |pr: &PrSummary| others.iter().any(|other| other.number == pr.number);
+    for pr in open {
+        if of_this_repository(pr) && planned.iter().any(|seg| seg.name == pr.head_branch) {
+            continue;
+        }
+        if at_risk(pr) && is_other(pr) {
+            // Their branch is not here to be moved along, so there is no
+            // publish that keeps the pull request open: the only way out
+            // is not to put its commits under its base.
+            blockers.push(format!(
+                "publishing through \u{201c}{head_bookmark}\u{201d} would push \
+                 \u{201c}{}\u{201d} onto the commits of {} (\u{201c}{}\u{201d}), which is \
+                 based on it, and GitHub would close {} as merged into \u{201c}{}\u{201d}. That \
+                 pull request is someone else's: its branch is not a bookmark here, and no \
+                 publish from here can move it out of the way. Move \u{201c}{}\u{201d} back off \
+                 those commits, or make the branch yours first (track \u{201c}{}\u{201d}) and \
+                 publish through it",
+                pr.base_branch,
+                pr.by_author(),
+                pr.head_branch,
+                pr.by_author(),
+                pr.base_branch,
+                pr.base_branch,
+                pr.head_branch
+            ));
+        } else if at_risk(pr) {
+            blockers.push(format!(
+                "publishing through \u{201c}{head_bookmark}\u{201d} would push \
+                 \u{201c}{}\u{201d} onto the commits of #{} (\u{201c}{}\u{201d}), which is \
+                 based on it, and GitHub would close #{} as merged — publish through \
+                 \u{201c}{}\u{201d} instead, so its own branch moves too",
+                pr.base_branch, pr.number, pr.head_branch, pr.number, pr.head_branch
+            ));
+        }
+    }
+    // A push that replaces commits of a branch (a rewrite, a reorder, a
+    // bookmark moved back) leaves a pull request based on that branch
+    // with the replaced commits in its own branch and nowhere else: it
+    // shows them as its own until its branch is rebased. A push that
+    // only adds commits on top does not.
+    let replaces = |branch: &str| {
+        pushed.contains(branch)
+            && snapshot.bookmarks.iter().any(|b| {
+                b.name == branch
+                    && b.is_local
+                    && matches!(b.sync, SyncState::Diverged | SyncState::Behind)
+            })
+    };
+    for other in &others {
+        // The branch of the stack it rests on, through any of the others
+        // it is based on.
+        // (Through this repository's branches only, and never twice
+        // through the same one: a pull request from a fork can have the
+        // branch name of its own base.)
+        let mut base = other.base_branch.as_str();
+        let mut through: Vec<&str> = Vec::new();
+        while let Some(below) = others
+            .iter()
+            .find(|o| of_this_repository(o) && o.head_branch == base)
+        {
+            if through.contains(&base) {
+                break;
+            }
+            through.push(base);
+            base = below.base_branch.as_str();
+        }
+        if replaces(base) {
+            warnings.push(format!(
+                "{} (\u{201c}{}\u{201d}) is someone else's pull request on \u{201c}{base}\u{201d}, \
+                 and this push replaces commits under it: it shows the replaced commits as \
+                 its own until its branch is rebased. Nothing here pushes to \
+                 \u{201c}{}\u{201d}: rebasing it is its author's to do",
+                other.by_author(),
+                other.head_branch,
+                other.head_branch
+            ));
+        }
+    }
+
+    // GitHub's own stack, when this chain is (or is to become) one. It
+    // refuses a retarget inside a stack, so every pull request that is
+    // retargeted at all counts as moving.
+    let moving: Vec<u64> = rebases
+        .iter()
+        .map(|r| r.0)
+        .chain(slid.iter().map(|s| s.0))
+        .collect();
+    let (unstacks, link) = plan_stack_link(
+        &live,
+        &moving,
+        &prs.report.prs,
+        options.stack,
+        !creates.is_empty(),
+        &mut warnings,
+    );
+    // Dissolving a stack to link it again takes knowing all of it. With
+    // the list cut short, a member can be missing even after the lookups
+    // above (the bottom one is based on trunk, and one past the published
+    // head is based on a branch this publish does not touch). The plan
+    // would then dissolve the stack over a pull request it believes it
+    // has to open, or link it again without one it never saw. Asked for
+    // outright (`--no-stack`), a dissolve takes the same knowledge for
+    // another reason: every member leaves the stack with it, and one the
+    // list does not show may be someone else's pull request, which the
+    // plan could not name.
+    if prs.report.truncated {
+        for action in &unstacks {
+            let SubmitAction::Unstack { stack, .. } = action else {
+                continue;
+            };
+            if !sees_whole_stack(&prs.report.prs, *stack) {
+                let seen: Vec<u64> = prs
+                    .report
+                    .prs
+                    .iter()
+                    .filter(|pr| pr.stack.as_ref().is_some_and(|s| s.number == *stack))
+                    .map(|pr| pr.number)
+                    .collect();
+                blockers.push(format!(
+                    "GitHub answered only the 100 most recently updated open pull requests, \
+                     and they are not all of GitHub stack {stack}: Jiji sees only {}. It does \
+                     not dissolve a stack it cannot see whole, because it could not {}. A \
+                     comment on the pull requests it does not see brings them into the list \
+                     \u{2014} then publish again",
+                    crate::land::number_list(seen.into_iter()),
+                    if options.stack == StackLink::Unlink {
+                        "say whose pull requests leave it"
+                    } else {
+                        "put it back together"
+                    }
+                ));
+            }
+        }
+    }
+
+    let mut parked: Vec<SubmitAction> = Vec::new();
+    let mut retargets: Vec<SubmitAction> = Vec::new();
+    for (number, bookmark, base) in slid {
+        parked.push(SubmitAction::RetargetPr {
+            number,
+            bookmark: bookmark.clone(),
+            from_base: base.clone(),
+            to_base: trunk.to_owned(),
+        });
+        retargets.push(SubmitAction::RetargetPr {
+            number,
+            bookmark,
+            from_base: trunk.to_owned(),
+            to_base: base,
+        });
+    }
+    for (number, bookmark, from_base, to_base) in rebases {
+        if !pushing || from_base == trunk {
+            retargets.push(SubmitAction::RetargetPr {
+                number,
+                bookmark,
+                from_base,
+                to_base,
+            });
+            continue;
+        }
+        parked.push(SubmitAction::RetargetPr {
+            number,
+            bookmark: bookmark.clone(),
+            from_base,
+            to_base: trunk.to_owned(),
+        });
+        if to_base != trunk {
+            retargets.push(SubmitAction::RetargetPr {
+                number,
+                bookmark,
+                from_base: trunk.to_owned(),
+                to_base,
+            });
+        }
+    }
+    if parked
+        .iter()
+        .any(|a| retargets.iter().any(|b| retarget_number(a) == retarget_number(b)))
+    {
+        warnings.push(format!(
+            "pull requests that this push would put inside their own base branch point \
+             at \u{201c}{trunk}\u{201d} while the branches are pushed, and at their bases \
+             again afterwards — GitHub closes a pull request as merged the moment its \
+             branch turns up inside its base"
+        ));
+    }
+
     // Bookmark creations first (a derived branch must exist locally to
-    // push), then pushes (a new PR's head and base branches must exist),
-    // then PR creations bottom-up, then retargets, then text updates, then
-    // the stack comments (they mention the PRs everything above sets up).
-    actions.splice(0..0, bookmark_creates);
-    let (creates, retargets): (Vec<_>, Vec<_>) = pr_actions
-        .into_iter()
-        .partition(|a| matches!(a, SubmitAction::CreatePr { .. }));
+    // push); then the stack is dissolved if it has to change shape (GitHub
+    // refuses to retarget inside one); then the parking retargets, the
+    // pushes (a new PR's head and base branches must exist), PR creations
+    // bottom-up, the final retargets, text updates, the stack comments
+    // (they mention the PRs everything above sets up), and last the
+    // linking as a GitHub stack, which needs every PR to exist with its
+    // final base.
     let creating = !creates.is_empty();
+    let mut actions: Vec<SubmitAction> = bookmark_creates;
+    actions.extend(unstacks);
+    actions.extend(parked);
+    actions.extend(pushes);
     actions.extend(creates);
     actions.extend(retargets);
     actions.extend(text_actions);
@@ -838,6 +1356,7 @@ pub fn plan_submit(
     let stack_comment_preview = (!comment_actions.is_empty())
         .then(|| render_stack_comment(&entries, &[], None));
     actions.extend(comment_actions);
+    actions.extend(link);
     let pr_template_path = pr_template
         .filter(|_| {
             actions
@@ -850,6 +1369,7 @@ pub fn plan_submit(
         head_bookmark,
         remote: repo.remote.clone(),
         base_branch: snapshot.trunk_bookmark.clone(),
+        options: *options,
         segments,
         actions,
         blockers,
@@ -857,6 +1377,238 @@ pub fn plan_submit(
         stack_comment_preview,
         pr_template_path,
     })
+}
+
+fn retarget_number(action: &SubmitAction) -> Option<u64> {
+    match action {
+        SubmitAction::RetargetPr { number, .. } => Some(*number),
+        _ => None,
+    }
+}
+
+/// Whether the open pull requests in `open` are every open member of
+/// GitHub stack `stack`: the lowest of them is based on the stack's own
+/// base (members below it have merged; a stack lands from the bottom),
+/// the highest sits in the stack's last seat, and none is missing in
+/// between.
+pub(crate) fn sees_whole_stack(open: &[PrSummary], stack: u64) -> bool {
+    let mut seats: Vec<(&PrSummary, &crate::pr::StackSeat)> = open
+        .iter()
+        .filter_map(|pr| pr.stack.as_ref().filter(|s| s.number == stack).map(|s| (pr, s)))
+        .collect();
+    seats.sort_by_key(|(_, seat)| seat.position);
+    let (Some((bottom, low)), Some((_, high))) = (seats.first(), seats.last()) else {
+        return false;
+    };
+    bottom.base_branch == low.base
+        && high.position == high.size
+        && seats
+            .windows(2)
+            .all(|pair| pair[1].1.position == pair[0].1.position + 1)
+}
+
+/// What a plan does about GitHub's own stack: the stacks to dissolve
+/// before anything is retargeted, and the link to make at the end.
+///
+/// `live` is the chain as it will stand, bottom-up, each segment with its
+/// existing pull request; `moving` the pull requests this plan retargets
+/// at any point; `open` every open pull request GitHub answered, which is
+/// how the stack's members outside this chain are known. An existing
+/// stack is left alone when it already is the chain, extended when the
+/// chain only grew on top of it (the one change the stacks API has), and
+/// otherwise dissolved and linked again. Linking again takes back the
+/// pull requests above the published head that still chain on top of it;
+/// any other member the new stack cannot hold is named in a warning.
+fn plan_stack_link(
+    live: &[(String, Option<PrSummary>)],
+    moving: &[u64],
+    open: &[PrSummary],
+    wanted: StackLink,
+    opens_a_pr: bool,
+    warnings: &mut Vec<String>,
+) -> (Vec<SubmitAction>, Option<SubmitAction>) {
+    let seat = |entry: &(String, Option<PrSummary>)| {
+        entry.1.as_ref().and_then(|pr| pr.stack.clone())
+    };
+    let mut stacks: Vec<u64> = live.iter().filter_map(|e| seat(e).map(|s| s.number)).collect();
+    stacks.sort_unstable();
+    stacks.dedup();
+    let dissolve = |stacks: &[u64]| -> Vec<SubmitAction> {
+        stacks
+            .iter()
+            .map(|stack| {
+                let mut members: Vec<(u32, u64)> = open
+                    .iter()
+                    .filter_map(|pr| {
+                        let seat = pr.stack.as_ref().filter(|s| s.number == *stack)?;
+                        Some((seat.position, pr.number))
+                    })
+                    .collect();
+                members.sort_unstable();
+                SubmitAction::Unstack {
+                    stack: *stack,
+                    members: members.into_iter().map(|(_, number)| number).collect(),
+                }
+            })
+            .collect()
+    };
+    // Members of the stacks being dissolved that this chain does not
+    // reach, lowest seat first. (By pull request, not by branch name: a
+    // member is the chain's own when it is the pull request of one of
+    // its segments.)
+    let outside = || -> Vec<&PrSummary> {
+        let mut outside: Vec<&PrSummary> = open
+            .iter()
+            .filter(|pr| {
+                pr.stack.as_ref().is_some_and(|s| stacks.contains(&s.number))
+                    && !live
+                        .iter()
+                        .any(|(_, own)| own.as_ref().is_some_and(|own| own.number == pr.number))
+            })
+            .collect();
+        outside.sort_by_key(|pr| pr.stack.as_ref().map(|s| (s.number, s.position)));
+        outside
+    };
+    // By number and author: a member this chain does not reach may be
+    // someone else's pull request, added to the stack above this one.
+    let named = |prs: &[&PrSummary]| -> String {
+        let listed: Vec<String> = prs.iter().map(|pr| pr.by_author()).collect();
+        match listed.as_slice() {
+            [] => String::new(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    };
+    let stack_names = || crate::land::number_list(stacks.iter().copied()).replace('#', "");
+    let leaving = |left: &[&PrSummary], warnings: &mut Vec<String>| {
+        if left.is_empty() {
+            return;
+        }
+        warnings.push(format!(
+            "{} {} in GitHub stack {} but not in this chain as it now stands, and \
+             {} the stack when it is dissolved",
+            named(left),
+            if left.len() == 1 { "is" } else { "are" },
+            stack_names(),
+            if left.len() == 1 { "leaves" } else { "leave" },
+        ));
+    };
+
+    match wanted {
+        StackLink::Unlink => {
+            // Asked for outright. The members this chain does not reach
+            // go out with the rest; each stays open on the base it has.
+            let also = outside();
+            if !also.is_empty() {
+                warnings.push(format!(
+                    "dissolving GitHub stack {} takes {} out of it too: {} open, as a \
+                     plain pull request on the base {} now",
+                    stack_names(),
+                    named(&also),
+                    if also.len() == 1 { "it stays" } else { "they stay" },
+                    if also.len() == 1 { "it has" } else { "they have" },
+                ));
+            }
+            return (dissolve(&stacks), None);
+        }
+        StackLink::Follow if stacks.is_empty() => return (Vec::new(), None),
+        // The setting is about new stacks: a plain chain that only
+        // changes stays plain, however often it is published. One that
+        // gains a pull request is linked then.
+        StackLink::LinkNew if stacks.is_empty() && !opens_a_pr => return (Vec::new(), None),
+        StackLink::Follow | StackLink::Link | StackLink::LinkNew => {}
+    }
+    if live.len() < 2 {
+        if wanted == StackLink::Link {
+            warnings.push(
+                "a GitHub stack needs at least two pull requests; this one stays a \
+                 single pull request"
+                    .to_owned(),
+            );
+        }
+        // A lone pull request left in a stack that changes shape still
+        // has to leave it to be retargeted.
+        let moved = live.iter().any(|(_, pr)| {
+            pr.as_ref()
+                .is_some_and(|pr| pr.stack.is_some() && moving.contains(&pr.number))
+        });
+        if moved {
+            leaving(&outside(), warnings);
+        }
+        return (if moved { dissolve(&stacks) } else { Vec::new() }, None);
+    }
+    if stacks.is_empty() {
+        return (
+            Vec::new(),
+            Some(SubmitAction::LinkStack {
+                bookmarks: live.iter().map(|(name, _)| name.clone()).collect(),
+                onto: None,
+                above: Vec::new(),
+            }),
+        );
+    }
+
+    // The existing stack is still this chain when its pull requests are
+    // the chain's bottom, in order, in consecutive seats, none of them
+    // retargeted. Anything above them in the chain is then new and can be
+    // added on top, provided the stack ends where they do.
+    let seated = live.iter().take_while(|e| seat(e).is_some()).count();
+    let rest_unseated = live[seated..].iter().all(|e| seat(e).is_none());
+    let seats: Vec<_> = live[..seated].iter().filter_map(seat).collect();
+    let in_order = stacks.len() == 1
+        && rest_unseated
+        && seats.windows(2).all(|pair| pair[1].position == pair[0].position + 1)
+        && !live[..seated]
+            .iter()
+            .any(|(_, pr)| pr.as_ref().is_some_and(|pr| moving.contains(&pr.number)));
+    let top = seats.last();
+    if in_order && seated == live.len() {
+        return (Vec::new(), None);
+    }
+    if in_order && top.is_some_and(|top| top.position == top.size) {
+        return (
+            Vec::new(),
+            Some(SubmitAction::LinkStack {
+                bookmarks: live[seated..].iter().map(|(name, _)| name.clone()).collect(),
+                onto: Some(stacks[0]),
+                above: Vec::new(),
+            }),
+        );
+    }
+
+    // Dissolve and link again. The stack may go on above the published
+    // head, in pull requests this chain does not reach. Those that still
+    // chain on top of the head (each based on the branch of the one
+    // below, starting from the head's) go back in, in that order.
+    let mut left = outside();
+    let mut above: Vec<u64> = Vec::new();
+    let mut base = live.last().map(|(name, _)| name.as_str()).unwrap_or_default();
+    let mut back_on_top: Vec<&PrSummary> = Vec::new();
+    while let Some(at) = left.iter().position(|pr| pr.base_branch == base) {
+        let pr = left.remove(at);
+        above.push(pr.number);
+        back_on_top.push(pr);
+        base = pr.head_branch.as_str();
+    }
+    if !back_on_top.is_empty() {
+        warnings.push(format!(
+            "{} {} above this chain in GitHub stack {}: the stack is dissolved to \
+             change shape and linked again with {} back on top",
+            named(&back_on_top),
+            if back_on_top.len() == 1 { "sits" } else { "sit" },
+            stack_names(),
+            if back_on_top.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    leaving(&left, warnings);
+    (
+        dissolve(&stacks),
+        Some(SubmitAction::LinkStack {
+            bookmarks: live.iter().map(|(name, _)| name.clone()).collect(),
+            onto: None,
+            above,
+        }),
+    )
 }
 
 /// PR title and body from a change description: first line titles, the
@@ -910,11 +1662,13 @@ fn strip_trailers(body: &str) -> String {
     lines[..end].join("\n").trim_end().to_owned()
 }
 
-/// Run a plan: derived bookmark creations, then one batched push, then PR
-/// creations bottom-up, then base retargets, text updates, and stack
-/// comments. The first failure stops execution — later steps report as
-/// skipped rather than running against a half-updated remote. A plan with
-/// blockers refuses to run at all.
+/// Run a plan, step by step in the order it lists them (see
+/// [`plan_submit`] for why that order): derived bookmark creations, the
+/// stack dissolved if it changes shape, parking retargets, one batched
+/// push, PR creations bottom-up, the final retargets, text updates, stack
+/// comments, and the link as a GitHub stack. The first failure stops
+/// execution — later steps report as skipped rather than running against
+/// a half-updated remote. A plan with blockers refuses to run at all.
 ///
 /// Stack-comment steps re-read and re-render at execution time (the
 /// read-merge-write jjpr does): PRs created moments earlier now have real
@@ -942,128 +1696,275 @@ pub fn execute_submit(
         })
         .collect();
     let mut failed = false;
+    // PRs opened by this run, for the steps that follow them.
+    let mut created: std::collections::HashMap<String, PrSummary> =
+        std::collections::HashMap::new();
 
-    // Derived bookmarks first: the pushes below expect them to exist.
-    for step in &mut steps {
-        let SubmitAction::CreateBookmark { bookmark, change } = &step.action else {
+    let mut index = 0;
+    while index < steps.len() && !failed {
+        // The batched push: every push action succeeds or fails as one
+        // operation, exactly like `jj git push -b a -b b`. The plan lists
+        // its pushes together.
+        if matches!(steps[index].action, SubmitAction::Push { .. }) {
+            let run = steps[index..]
+                .iter()
+                .take_while(|step| matches!(step.action, SubmitAction::Push { .. }))
+                .count();
+            let names: Vec<String> = steps[index..index + run]
+                .iter()
+                .map(|step| match &step.action {
+                    SubmitAction::Push { bookmark, .. } => bookmark.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let (status, detail) = match vcs.push_bookmarks(&names, &plan.remote) {
+                Ok(summary) => (SubmitStepStatus::Done, summary),
+                Err(err) => {
+                    failed = true;
+                    (SubmitStepStatus::Failed, err.to_string())
+                }
+            };
+            for step in &mut steps[index..index + run] {
+                step.status = status;
+                step.detail = Some(detail.clone());
+            }
+            index += run;
             continue;
+        }
+
+        let step = &mut steps[index];
+        let result: Result<(String, Option<PrSummary>), ForgeError> = match &step.action {
+            SubmitAction::Push { .. } => unreachable!("pushes run as one batch above"),
+            SubmitAction::CreateBookmark { bookmark, change } => vcs
+                .create_bookmark(bookmark, change)
+                .map(|summary| (summary, None))
+                .map_err(|err| ForgeError::Plan(err.to_string())),
+            SubmitAction::CreatePr {
+                bookmark,
+                base,
+                title,
+                body,
+                draft,
+            } => forge.create_pr(title, body, bookmark, base, *draft).map(|pr| {
+                created.insert(bookmark.clone(), pr.clone());
+                let kind = if *draft { "draft " } else { "" };
+                (format!("Opened {kind}#{} for {bookmark}", pr.number), Some(pr))
+            }),
+            SubmitAction::RetargetPr {
+                number,
+                bookmark,
+                from_base,
+                to_base,
+            } => forge.update_pr_base(*number, to_base).map(|()| {
+                (
+                    format!("Retargeted #{number} ({bookmark}) from {from_base} to {to_base}"),
+                    None,
+                )
+            }),
+            SubmitAction::UpdatePrText {
+                number,
+                bookmark,
+                title,
+                body,
+                seed,
+            } => forge.update_pr_text(*number, title.as_deref(), body).map(|()| {
+                let story = if *seed {
+                    format!("Recorded Jiji's description fingerprints on #{number}")
+                } else if title.is_some() {
+                    format!("Updated #{number}'s title and description from {bookmark}")
+                } else {
+                    format!("Updated #{number}'s description from {bookmark}")
+                };
+                (story, None)
+            }),
+            SubmitAction::SyncStackComment { bookmark, number, .. } => {
+                sync_stack_comment(plan, forge, &created, bookmark, *number)
+                    .map(|story| (story, None))
+            }
+            SubmitAction::Unstack { stack, .. } => forge.unstack(*stack).and_then(|kept| {
+                if kept.is_empty() {
+                    return Ok((
+                        format!(
+                            "Dissolved GitHub stack {stack}; its pull requests are a plain chain"
+                        ),
+                        None,
+                    ));
+                }
+                // The steps after this one need every pull request out
+                // of the stack. One GitHub would not let go (it documents
+                // a pull request queued to merge) stops them.
+                Err(ForgeError::Api(format!(
+                    "GitHub kept {} in stack {stack} and took the rest out — a pull \
+                     request queued to merge cannot leave its stack; publish again once \
+                     it has merged or left the queue",
+                    crate::land::number_list(kept.into_iter())
+                )))
+            }),
+            SubmitAction::LinkStack {
+                bookmarks,
+                onto,
+                above,
+            } => match link_stack(plan, forge, &created, bookmarks, *onto, above) {
+                // Linked because a setting says to, not because this
+                // publish was asked: a repository without GitHub stacks
+                // keeps its plain chain, and that is not a failure.
+                Err(ForgeError::NoStacks(why)) if plan.options.stack == StackLink::LinkNew => {
+                    Ok((format!("{why}; the pull requests stay a plain chain"), None))
+                }
+                other => other.map(|story| (story, None)),
+            },
         };
-        match vcs.create_bookmark(bookmark, change) {
-            Ok(summary) => {
+        match result {
+            Ok((detail, pr)) => {
                 step.status = SubmitStepStatus::Done;
-                step.detail = Some(summary);
+                step.detail = Some(detail);
+                step.pr = pr;
             }
             Err(err) => {
                 step.status = SubmitStepStatus::Failed;
-                step.detail = Some(err.to_string());
+                step.detail = Some(match err {
+                    // A bookmark step's error is the backend's own story.
+                    ForgeError::Plan(message)
+                        if matches!(step.action, SubmitAction::CreateBookmark { .. }) =>
+                    {
+                        message
+                    }
+                    other => other.to_string(),
+                });
                 failed = true;
-                break;
             }
         }
+        index += 1;
     }
 
-    // The batched push: every push action succeeds or fails as one
-    // operation, exactly like `jj git push -b a -b b`.
-    let push_indices: Vec<usize> = steps
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| matches!(s.action, SubmitAction::Push { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    if !push_indices.is_empty() && !failed {
-        let names: Vec<String> = push_indices
-            .iter()
-            .map(|&i| match &steps[i].action {
-                SubmitAction::Push { bookmark, .. } => bookmark.clone(),
-                _ => unreachable!(),
-            })
-            .collect();
-        match vcs.push_bookmarks(&names, &plan.remote) {
-            Ok(summary) => {
-                for &i in &push_indices {
-                    steps[i].status = SubmitStepStatus::Done;
-                    steps[i].detail = Some(summary.clone());
-                }
-            }
-            Err(err) => {
-                failed = true;
-                for &i in &push_indices {
-                    steps[i].status = SubmitStepStatus::Failed;
-                    steps[i].detail = Some(err.to_string());
-                }
-            }
-        }
-    }
-
-    // PRs opened by this run, for the comment steps that follow them.
-    let mut created: std::collections::HashMap<String, PrSummary> =
-        std::collections::HashMap::new();
-    if !failed {
-        for step in &mut steps {
-            let result: Result<(String, Option<PrSummary>), ForgeError> = match &step.action {
-                SubmitAction::Push { .. } | SubmitAction::CreateBookmark { .. } => continue,
-                SubmitAction::CreatePr {
-                    bookmark,
-                    base,
-                    title,
-                    body,
-                    draft,
-                } => forge.create_pr(title, body, bookmark, base, *draft).map(|pr| {
-                    created.insert(bookmark.clone(), pr.clone());
-                    let kind = if *draft { "draft " } else { "" };
-                    (format!("Opened {kind}#{} for {bookmark}", pr.number), Some(pr))
-                }),
-                SubmitAction::RetargetPr {
-                    number,
-                    bookmark,
-                    from_base,
-                    to_base,
-                } => forge.update_pr_base(*number, to_base).map(|()| {
-                    (
-                        format!(
-                            "Retargeted #{number} ({bookmark}) from {from_base} to {to_base}"
-                        ),
-                        None,
-                    )
-                }),
-                SubmitAction::UpdatePrText {
-                    number,
-                    bookmark,
-                    title,
-                    body,
-                    seed,
-                } => forge.update_pr_text(*number, title.as_deref(), body).map(|()| {
-                    let story = if *seed {
-                        format!("Recorded Jiji's description fingerprints on #{number}")
-                    } else if title.is_some() {
-                        format!("Updated #{number}'s title and description from {bookmark}")
-                    } else {
-                        format!("Updated #{number}'s description from {bookmark}")
-                    };
-                    (story, None)
-                }),
-                SubmitAction::SyncStackComment { bookmark, number, .. } => {
-                    sync_stack_comment(plan, forge, &created, bookmark, *number)
-                        .map(|story| (story, None))
-                }
-            };
-            match result {
-                Ok((detail, pr)) => {
-                    step.status = SubmitStepStatus::Done;
-                    step.detail = Some(detail);
-                    step.pr = pr;
-                }
-                Err(err) => {
-                    step.status = SubmitStepStatus::Failed;
-                    step.detail = Some(err.to_string());
-                    failed = true;
-                    break;
-                }
+    if failed {
+        // What a stop in the middle left behind on GitHub, told where the
+        // failure is told.
+        let notes = unfinished(plan, &steps);
+        if let Some(step) = steps
+            .iter_mut()
+            .find(|step| step.status == SubmitStepStatus::Failed)
+        {
+            for note in notes {
+                let detail = step.detail.get_or_insert_with(String::new);
+                detail.push_str(" — ");
+                detail.push_str(&note);
             }
         }
     }
 
     Ok(SubmitOutcome { steps, failed })
+}
+
+/// What a publish that stopped part-way left for the next one: pull
+/// requests parked on trunk and not pointed back, and a GitHub stack
+/// dissolved and not linked again. Both are finished by publishing again,
+/// and each has something the user should know meanwhile.
+fn unfinished(plan: &SubmitPlan, steps: &[SubmitStep]) -> Vec<String> {
+    let trunk = plan.base_branch.as_str();
+    let done = |step: &SubmitStep| step.status == SubmitStepStatus::Done;
+    let mut notes: Vec<String> = Vec::new();
+
+    let parked: Vec<u64> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(at, step)| match &step.action {
+            SubmitAction::RetargetPr {
+                number,
+                from_base,
+                to_base,
+                ..
+            } if done(step) && to_base == trunk && from_base != trunk => {
+                // Parked, with the retarget that points it back still to
+                // run. One whose new base is trunk is where it belongs.
+                steps[at + 1..]
+                    .iter()
+                    .any(|later| {
+                        !done(later)
+                            && matches!(
+                                &later.action,
+                                SubmitAction::RetargetPr { number: n, .. } if n == number
+                            )
+                    })
+                    .then_some(*number)
+            }
+            _ => None,
+        })
+        .collect();
+    if !parked.is_empty() {
+        notes.push(format!(
+            "{} {} left pointing at \u{201c}{trunk}\u{201d}, where {} everything below \
+             as well: publish again to finish, and do not merge {} until then",
+            crate::land::number_list(parked.iter().copied()),
+            if parked.len() == 1 { "is" } else { "are" },
+            if parked.len() == 1 { "it shows" } else { "they show" },
+            if parked.len() == 1 { "it" } else { "them" },
+        ));
+    }
+
+    let relinks = steps
+        .iter()
+        .any(|step| matches!(step.action, SubmitAction::LinkStack { .. }));
+    let relinked = steps
+        .iter()
+        .any(|step| matches!(step.action, SubmitAction::LinkStack { .. }) && done(step));
+    let dissolved: Vec<u64> = steps
+        .iter()
+        .filter_map(|step| match step.action {
+            SubmitAction::Unstack { stack, .. } if done(step) => Some(stack),
+            _ => None,
+        })
+        .collect();
+    if relinks && !relinked && !dissolved.is_empty() {
+        notes.push(format!(
+            "GitHub stack {} was dissolved for this publish and is not linked again: \
+             its pull requests are a plain chain until a publish that asks for the \
+             GitHub stack (--stack) goes through",
+            crate::land::number_list(dissolved.into_iter()).replace('#', "")
+        ));
+    }
+    notes
+}
+
+/// One link step: the pull requests behind `bookmarks` (existing, or
+/// opened earlier in this run), bottom first, then the ones `above` them,
+/// as a new GitHub stack or on top of stack `onto`.
+fn link_stack(
+    plan: &SubmitPlan,
+    forge: &dyn SubmitForge,
+    created: &std::collections::HashMap<String, PrSummary>,
+    bookmarks: &[String],
+    onto: Option<u64>,
+    above: &[u64],
+) -> Result<String, ForgeError> {
+    let mut numbers: Vec<u64> = bookmarks
+        .iter()
+        .map(|bookmark| {
+            plan.segments
+                .iter()
+                .find(|segment| segment.bookmark == *bookmark)
+                .and_then(|segment| segment.pr.as_ref())
+                .or_else(|| created.get(bookmark))
+                .map(|pr| pr.number)
+                .ok_or_else(|| {
+                    ForgeError::Plan(format!(
+                        "no pull request exists for \u{201c}{bookmark}\u{201d} to link"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    numbers.extend_from_slice(above);
+    let list = crate::land::number_list(numbers.iter().copied());
+    match onto {
+        Some(stack) => {
+            forge.add_to_stack(stack, &numbers)?;
+            Ok(format!("Added {list} to GitHub stack {stack}"))
+        }
+        None => {
+            let stack = forge.create_stack(&numbers)?;
+            Ok(format!("Linked {list} as GitHub stack {stack}"))
+        }
+    }
 }
 
 /// One comment step: resolve the PR (planned number or just created),
@@ -1122,10 +2023,10 @@ fn sync_stack_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pr::{ChecksRollup, PrState, PrStateReport, ReviewDecision};
+    use crate::pr::{ChecksRollup, PrState, PrStateReport, ReviewDecision, StackSeat};
     use crate::reconcile::{extract_managed_body, fingerprint, stored_body_fp, wrap_managed_body};
     use crate::remote::ForgeProvider;
-    use jiji_core::snapshot::{BookmarkState, ConflictItem, ConflictKind};
+    use jiji_core::snapshot::{BookmarkState, ConflictItem, ConflictKind, NodeKind};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -1169,6 +2070,8 @@ mod tests {
             is_empty: false,
             has_conflict: false,
             is_divergent: false,
+            held: false,
+            old_copies_held: false,
         }
     }
 
@@ -1222,6 +2125,9 @@ mod tests {
             body: None,
             review: ReviewDecision::None,
             checks: ChecksRollup::None,
+            merge_commit: None,
+            stack: None,
+            author: None,
         }
     }
 
@@ -1294,7 +2200,7 @@ mod tests {
         // Jiji never wrote and an empty body.
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(plan.base_branch, "main");
         assert_eq!(plan.remote, "origin");
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
@@ -1386,6 +2292,7 @@ mod tests {
             &by_bookmark("profile"),
             &NoComments,
             Some(&template),
+            &SubmitOptions::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1432,6 +2339,7 @@ mod tests {
             &by_bookmark("profile"),
             &NoComments,
             Some(&template),
+            &SubmitOptions::default(),
         )
         .unwrap();
         assert!(
@@ -1495,7 +2403,7 @@ mod tests {
     #[test]
     fn consistent_stacks_plan_nothing() {
         let (snap, prs, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.blockers.is_empty());
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
@@ -1509,7 +2417,7 @@ mod tests {
         let (mut snap, prs, comments) = consistent_stack();
         snap.nodes[2].description =
             "auth: login flow\n\nThe form, now with validation.".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         let updates: Vec<_> = plan
             .actions
             .iter()
@@ -1538,7 +2446,7 @@ mod tests {
         prs.report.prs[0].body = Some(hand_edited.clone());
         prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
         let (_, _, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 
@@ -1550,7 +2458,7 @@ mod tests {
         prs.report.prs[0].body = Some(hand_edited.clone());
         prs.by_branch.get_mut("auth").unwrap().body = Some(hand_edited);
         let (_, _, comments) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         assert!(
             !plan.actions.iter().any(|a| matches!(a, SubmitAction::UpdatePrText { .. })),
             "{:?}",
@@ -1568,7 +2476,7 @@ mod tests {
         // Jiji wrote #6's title; the commit's first line moved.
         let (mut snap, prs, comments) = consistent_stack();
         snap.nodes[2].description = "auth: login and signup flow\n\nThe form.".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         let update = plan
             .actions
             .iter()
@@ -1591,7 +2499,7 @@ mod tests {
         let (snap, mut prs, comments) = consistent_stack();
         prs.report.prs[0].body = Some("The form.".into());
         prs.by_branch.get_mut("auth").unwrap().body = Some("The form.".into());
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         let seed = plan
             .actions
             .iter()
@@ -1610,7 +2518,7 @@ mod tests {
         prs.report.prs[0].body = Some("A description someone wrote by hand.".into());
         prs.by_branch.get_mut("auth").unwrap().body =
             Some("A description someone wrote by hand.".into());
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
@@ -1621,7 +2529,7 @@ mod tests {
         // update plans, aimed at that comment.
         let (snap, prs, mut comments) = consistent_stack();
         comments.0.get_mut(&7).unwrap().body = "someone touched this".into();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(
             plan.actions,
             vec![SubmitAction::SyncStackComment {
@@ -1634,7 +2542,7 @@ mod tests {
 
         // No comments exist yet on a two-PR stack: both get one.
         let (snap, prs, _) = consistent_stack();
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         let syncs: Vec<_> = plan
             .actions
             .iter()
@@ -1652,7 +2560,7 @@ mod tests {
         snap.nodes[2].bookmarks = vec![];
         prs.report.prs.remove(0);
         prs.by_branch.remove("auth");
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert!(
             !plan.actions.iter().any(|a| matches!(a, SubmitAction::SyncStackComment { .. })),
             "{:?}",
@@ -1682,7 +2590,7 @@ mod tests {
             7,
             ExistingComment { id: 70, body: previous },
         )]));
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
         let syncs: Vec<_> = plan
             .actions
             .iter()
@@ -1704,7 +2612,7 @@ mod tests {
         snap.nodes[1].description = String::new(); // a2, in auth's segment
         snap.nodes[0].has_conflict = true; // b1, profile's segment
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(plan.blockers.len(), 2, "{:?}", plan.blockers);
         assert!(plan.blockers[0].contains("no description"), "{:?}", plan.blockers);
         assert!(plan.blockers[1].contains("has conflicts"), "{:?}", plan.blockers);
@@ -1716,8 +2624,373 @@ mod tests {
         synced.bookmarks[1].sync = SyncState::Synced;
         synced.bookmarks[1].remote = Some("origin".into());
         synced.bookmarks[2].sync = SyncState::Synced;
-        let plan = plan_submit(&synced, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&synced, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    }
+
+    /// Someone else's open pull request: `head` into `base`, by
+    /// `author`, with `commit` as its head on GitHub.
+    fn their_pr(number: u64, head: &str, base: &str, author: &str, commit: &str) -> PrSummary {
+        PrSummary {
+            author: Some(author.into()),
+            head_commit: commit.into(),
+            ..open_pr(number, head, base)
+        }
+    }
+
+    fn plan_through(snap: &RepoSnapshot, prs: &RepoPrState, head: &str, stack: StackLink) -> SubmitPlan {
+        plan_submit(
+            snap,
+            prs,
+            &forge_repo(),
+            &by_bookmark(head),
+            &NoComments,
+            None,
+            &SubmitOptions { stack },
+        )
+        .unwrap()
+    }
+
+    /// main(m) ── a1 (auth) ── b1 (profile, @), with #9 by someone else
+    /// on profile and #10, theirs too, on top of #9. `profile` reads
+    /// `sync` against its remote.
+    fn pair_with_others(sync: SyncState) -> (RepoSnapshot, RepoPrState) {
+        let snap = snapshot(
+            vec![
+                node("b1", "profile: avatars", NodeKind::WorkingCopy, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", sync, false),
+            ],
+        );
+        // Each of the stack's own pull requests has, on GitHub, the
+        // commit its bookmark was last pushed at.
+        let pushed_at = |pr: PrSummary, commit: &str| PrSummary {
+            head_commit: commit.into(),
+            ..pr
+        };
+        let prs = pr_state(
+            vec![
+                pushed_at(text_pr(1, "auth", "main", "auth: login", ""), "ca1"),
+                pushed_at(
+                    text_pr(7, "profile", "auth", "profile: avatars", ""),
+                    if sync == SyncState::Synced { "cb1" } else { "0ldb1" },
+                ),
+                their_pr(9, "their-top", "profile", "kim", "c0ffee09"),
+                their_pr(10, "their-next", "their-top", "kim", "c0ffee10"),
+            ],
+            false,
+        );
+        (snap, prs)
+    }
+
+    /// A publish never pushes someone else's branch. When its push
+    /// replaces commits under their pull request, the plan says so by
+    /// number and author before anything runs; a push that only adds
+    /// commits on top of the branch disturbs nothing and says nothing.
+    #[test]
+    fn replacing_commits_under_someone_elses_pull_request_is_said_before_it_runs() {
+        let about = |plan: &SubmitPlan| -> Vec<String> {
+            plan.warnings.iter().filter(|w| w.contains("someone else's")).cloned().collect()
+        };
+        let (snap, prs) = pair_with_others(SyncState::Diverged);
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            about(&plan),
+            [
+                "#9 by @kim (\u{201c}their-top\u{201d}) is someone else's pull request on \
+                 \u{201c}profile\u{201d}, and this push replaces commits under it: it shows the \
+                 replaced commits as its own until its branch is rebased. Nothing here \
+                 pushes to \u{201c}their-top\u{201d}: rebasing it is its author's to do",
+                // The one on top of theirs rests on the same branch.
+                "#10 by @kim (\u{201c}their-next\u{201d}) is someone else's pull request on \
+                 \u{201c}profile\u{201d}, and this push replaces commits under it: it shows the \
+                 replaced commits as its own until its branch is rebased. Nothing here \
+                 pushes to \u{201c}their-next\u{201d}: rebasing it is its author's to do",
+            ]
+        );
+        // Theirs are never pushed, retargeted, described or commented on.
+        for action in &plan.actions {
+            let touched = match action {
+                SubmitAction::Push { bookmark, .. } | SubmitAction::CreateBookmark { bookmark, .. } => {
+                    bookmark.starts_with("their")
+                }
+                SubmitAction::RetargetPr { number, .. } | SubmitAction::UpdatePrText { number, .. } => {
+                    *number >= 9
+                }
+                SubmitAction::SyncStackComment { number, .. } => number.is_some_and(|n| n >= 9),
+                _ => false,
+            };
+            assert!(!touched, "{action:?}");
+        }
+
+        // Commits added on top of `profile`: their pull request still
+        // shows what it showed.
+        let (snap, prs) = pair_with_others(SyncState::Ahead);
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert!(plan.actions.iter().any(|a| matches!(a, SubmitAction::Push { .. })));
+        assert!(about(&plan).is_empty(), "{:?}", plan.warnings);
+
+        // The branch under them is not pushed at all: nothing to say.
+        let (snap, prs) = pair_with_others(SyncState::Synced);
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert!(about(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    /// Once a fetch has brought their branch, jj calls the stack under it
+    /// immutable. It is still the stack: a new segment on top of it is
+    /// published against the branch below it, not against trunk with the
+    /// whole stack inside its pull request.
+    #[test]
+    fn a_new_segment_on_a_held_stack_is_based_on_the_stack_not_on_trunk() {
+        let (mut snap, prs) = pair_with_others(SyncState::Synced);
+        for node in snap.nodes.iter_mut().take(2) {
+            node.kind = NodeKind::Immutable;
+            node.held = true;
+        }
+        snap.nodes.insert(
+            0,
+            node("c1", "search: index", NodeKind::WorkingCopy, &["b1"], &["search"]),
+        );
+        snap.bookmarks.push(bookmark("search", "c1", SyncState::LocalOnly, false));
+        let plan = plan_through(&snap, &prs, "search", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            plan.segments.iter().map(|s| (s.bookmark.as_str(), s.base.as_str())).collect::<Vec<_>>(),
+            [("auth", "main"), ("profile", "auth"), ("search", "profile")]
+        );
+        assert_eq!(retargets_and_pushes(&plan), ["push search", "open search->profile"]);
+
+        // Without the mark the two lower segments would read as landed
+        // history, and the new pull request would target trunk.
+        for node in snap.nodes.iter_mut() {
+            node.held = false;
+        }
+        let plan = plan_through(&snap, &prs, "search", StackLink::Follow);
+        assert_eq!(retargets_and_pushes(&plan), ["push search", "open search->main"]);
+    }
+
+    /// A bookmark of the stack moved onto their commits: pushed, their
+    /// pull request's head would be inside its own base, and GitHub
+    /// would close it as merged. Refused, with a way out that exists:
+    /// their branch is no bookmark here, so "publish through it" is not
+    /// one.
+    #[test]
+    fn a_bookmark_moved_onto_someone_elses_commits_is_refused_and_says_whose() {
+        let (mut snap, prs) = pair_with_others(SyncState::Ahead);
+        // Their commit, fetched, with `profile` moved up onto it. It is
+        // under a local bookmark now, so it draws as part of the chain.
+        let mut theirs = node("t1", "theirs: on top", NodeKind::Immutable, &["b1"], &["profile"]);
+        theirs.held = true;
+        theirs.commit_id = "c0ffee09".into();
+        snap.nodes.insert(0, theirs);
+        snap.nodes[1].bookmarks.clear();
+        snap.bookmarks[2].target = "t1".into();
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert_eq!(
+            plan.blockers,
+            ["publishing through \u{201c}profile\u{201d} would push \u{201c}profile\u{201d} onto \
+              the commits of #9 by @kim (\u{201c}their-top\u{201d}), which is based on it, and \
+              GitHub would close #9 by @kim as merged into \u{201c}profile\u{201d}. That pull \
+              request is someone else's: its branch is not a bookmark here, and no publish \
+              from here can move it out of the way. Move \u{201c}profile\u{201d} back off those \
+              commits, or make the branch yours first (track \u{201c}their-top\u{201d}) and \
+              publish through it"]
+        );
+    }
+
+    /// The same pull request from a fork whose branch has the name of a
+    /// bookmark here. A fork's branch names nothing in this repository:
+    /// the pull request is not the segment's own, and the push that
+    /// would close it is refused all the same. (Found in review: it was
+    /// skipped as the segment "auth"'s pull request.)
+    #[test]
+    fn a_pull_request_from_a_fork_is_never_taken_for_a_segments_by_its_branch_name() {
+        let (mut snap, prs) = pair_with_others(SyncState::Ahead);
+        let mut theirs = node("t1", "theirs: on top", NodeKind::Immutable, &["b1"], &["profile"]);
+        theirs.held = true;
+        theirs.commit_id = "c0ffee19".into();
+        snap.nodes.insert(0, theirs);
+        snap.nodes[1].bookmarks.clear();
+        snap.bookmarks[2].target = "t1".into();
+        let mut all = prs.report.prs.clone();
+        all.retain(|pr| pr.number != 9 && pr.number != 10);
+        all.push(PrSummary {
+            head_owner: Some("a-fork".into()),
+            ..their_pr(19, "auth", "profile", "kim", "c0ffee19")
+        });
+        let prs = pr_state(all, false);
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert_eq!(plan.blockers.len(), 1, "{:?}", plan.blockers);
+        assert!(
+            plan.blockers[0].starts_with(
+                "publishing through \u{201c}profile\u{201d} would push \u{201c}profile\u{201d} \
+                 onto the commits of #19 by @kim (\u{201c}auth\u{201d}), which is based on it, \
+                 and GitHub would close #19 by @kim as merged into \u{201c}profile\u{201d}."
+            ),
+            "{:?}",
+            plan.blockers
+        );
+
+        // A fork can also call its branch what its base is called here.
+        // Following bases through pull requests must not go round on
+        // that (it did, and a publish that had nothing to do hung).
+        let (snap, prs) = pair_with_others(SyncState::Diverged);
+        let mut all = prs.report.prs.clone();
+        all.push(PrSummary {
+            head_owner: Some("a-fork".into()),
+            ..their_pr(20, "profile", "profile", "sam", "c0ffee20")
+        });
+        let plan = plan_through(&snap, &pr_state(all, false), "profile", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(
+            plan.warnings.iter().any(|w| w.starts_with("#20 by @sam (\u{201c}profile\u{201d}) is someone else's")),
+            "{:?}",
+            plan.warnings
+        );
+
+        // Nor is a base followed through a fork's branch. #11 rests on
+        // "auth", which this publish leaves alone. A fork's branch called
+        // "auth", based on "profile", does not put #11 on "profile".
+        let (snap, prs) = pair_with_others(SyncState::Diverged);
+        let mut all = prs.report.prs.clone();
+        all.retain(|pr| pr.number != 9 && pr.number != 10);
+        all.push(their_pr(11, "their-mid", "auth", "lee", "c0ffee11"));
+        all.push(PrSummary {
+            head_owner: Some("a-fork".into()),
+            ..their_pr(21, "auth", "profile", "sam", "c0ffee21")
+        });
+        let plan = plan_through(&snap, &pr_state(all, false), "profile", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        let about: Vec<&String> =
+            plan.warnings.iter().filter(|w| w.contains("someone else's")).collect();
+        assert_eq!(about.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            about[0].starts_with(
+                "#21 by @sam (\u{201c}auth\u{201d}) is someone else's pull request on \
+                 \u{201c}profile\u{201d}"
+            ),
+            "{:?}",
+            plan.warnings
+        );
+
+        // And a fork's branch is not pushed from here, whatever it is
+        // called. "auth" has no pull request and is pushed; a pull
+        // request from a fork's "profile", based on it, is not at risk
+        // because the "profile" of this repository is pushed too.
+        let (mut snap, prs) = pair_with_others(SyncState::Diverged);
+        snap.bookmarks[1].sync = SyncState::Ahead;
+        let mut all = prs.report.prs.clone();
+        all.retain(|pr| pr.number == 7);
+        all.push(PrSummary {
+            head_owner: Some("a-fork".into()),
+            ..their_pr(22, "profile", "auth", "sam", "c0ffee22")
+        });
+        let plan = plan_through(&snap, &pr_state(all, false), "profile", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    }
+
+    /// The user rewrote a change someone else had built on, and a fetch
+    /// brought the old commit back with their branch: the change has two
+    /// commits, and the other one is theirs to keep. That must not stop
+    /// the publish of the new one. A divergence between two commits of
+    /// the user's own still does.
+    #[test]
+    fn an_old_copy_on_someone_elses_branch_does_not_block_the_publish() {
+        let (mut snap, prs) = pair_with_others(SyncState::Diverged);
+        snap.nodes[0].is_divergent = true;
+        snap.nodes[0].old_copies_held = true;
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(plan.actions.iter().any(
+            |a| matches!(a, SubmitAction::Push { bookmark, .. } if bookmark == "profile")
+        ));
+
+        snap.nodes[0].old_copies_held = false;
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert_eq!(plan.blockers, ["b1 is divergent; resolve the divergence first"]);
+    }
+
+    /// Their pull request was added to the GitHub stack above this chain.
+    /// Dissolving the stack takes it out too, and the plan says so by
+    /// number and author before it runs.
+    #[test]
+    fn dissolving_a_github_stack_names_someone_elses_pull_request_in_it() {
+        let (snap, mut prs) = pair_with_others(SyncState::Synced);
+        let seat = |position: u32| {
+            Some(StackSeat {
+                number: 90,
+                position,
+                size: 3,
+                base: "main".into(),
+            })
+        };
+        let mut report = prs.report.clone();
+        report.prs.truncate(3);
+        for (pr, position) in report.prs.iter_mut().zip(1..) {
+            pr.stack = seat(position);
+        }
+        prs = RepoPrState::new(report, "o");
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Unlink);
+        assert_eq!(retargets_and_pushes(&plan), ["unstack 90"]);
+        assert!(
+            plan.warnings.contains(
+                &"dissolving GitHub stack 90 takes #9 by @kim out of it too: it stays open, \
+                  as a plain pull request on the base it has now"
+                    .to_owned()
+            ),
+            "{:?}",
+            plan.warnings
+        );
+        // The step itself carries everyone it takes out, bottom first.
+        let members = |plan: &SubmitPlan| -> Vec<u64> {
+            plan.actions
+                .iter()
+                .find_map(|action| match action {
+                    SubmitAction::Unstack { members, .. } => Some(members.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(members(&plan), [1, 7, 9]);
+        // So a plan confirmed while the stack had two members is not the
+        // plan for the stack once someone has joined it: a host that
+        // compares the two (the app does, before it runs one) refuses.
+        // (Found in review: the two plans had the same steps, and only a
+        // note told them apart.)
+        let mut before = prs.report.clone();
+        before.prs.truncate(2);
+        for pr in &mut before.prs {
+            pr.stack.as_mut().unwrap().size = 2;
+        }
+        let earlier = plan_through(&snap, &RepoPrState::new(before, "o"), "profile", StackLink::Unlink);
+        assert_eq!(members(&earlier), [1, 7]);
+        assert_ne!(earlier.actions, plan.actions);
+        // A member from a fork is someone else's whatever its branch is
+        // called. Called "auth", like the segment here, it is still said
+        // to leave the stack: members are told apart by pull request.
+        let mut forked = prs.report.clone();
+        forked.prs[2].head_branch = "auth".into();
+        forked.prs[2].head_owner = Some("a-fork".into());
+        let from_a_fork =
+            plan_through(&snap, &RepoPrState::new(forked, "o"), "profile", StackLink::Unlink);
+        assert!(
+            from_a_fork
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("dissolving GitHub stack 90 takes #9 by @kim out of it too")),
+            "{:?}",
+            from_a_fork.warnings
+        );
+        // Left as GitHub has it, nothing is planned and nothing said.
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Follow);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(!plan.warnings.iter().any(|w| w.contains("#9")), "{:?}", plan.warnings);
     }
 
     #[test]
@@ -1726,7 +2999,7 @@ mod tests {
         snap.nodes[1].is_empty = true; // a2
         snap.nodes[2].is_empty = true; // a1 — auth's whole segment empty
         let prs = pr_state(vec![], true);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
 
         // auth neither pushes nor gets a PR, but profile still bases on it.
         assert!(plan
@@ -1766,7 +3039,7 @@ mod tests {
             workspace: None,
         });
         let prs = pr_state(vec![], false);
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert!(
             plan.blockers.iter().any(|b| b.contains("is conflicted")),
             "{:?}",
@@ -1774,15 +3047,15 @@ mod tests {
         );
 
         let snap = stack_snapshot();
-        let err = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("nope"), &NoComments, None).unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("nope"), &NoComments, None, &SubmitOptions::default()).unwrap_err();
         assert_eq!(err.code(), "plan_failed");
-        let err = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("main"), &NoComments, None).unwrap_err();
+        let err = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("main"), &NoComments, None, &SubmitOptions::default()).unwrap_err();
         assert!(err.to_string().contains("trunk"), "{err}");
         // A bookmark parked on immutable history has nothing to publish.
         let mut on_trunk = stack_snapshot();
         on_trunk.bookmarks.push(bookmark("old", "m", SyncState::LocalOnly, false));
         on_trunk.nodes[3].bookmarks.push("old".into());
-        let err = plan_submit(&on_trunk, &prs, &forge_repo(), &by_bookmark("old"), &NoComments, None).unwrap_err();
+        let err = plan_submit(&on_trunk, &prs, &forge_repo(), &by_bookmark("old"), &NoComments, None, &SubmitOptions::default()).unwrap_err();
         assert!(err.to_string().contains("immutable"), "{err}");
     }
 
@@ -1796,7 +3069,7 @@ mod tests {
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(9, "auth-alias", "main")], false);
 
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].bookmark, "auth-alias");
         assert!(
@@ -1826,7 +3099,7 @@ mod tests {
         let snap = unbookmarked_snapshot();
         let prs = pr_state(vec![], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None, &SubmitOptions::default()).unwrap();
 
         assert_eq!(plan.head_bookmark, "add-config-parser");
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
@@ -1869,7 +3142,7 @@ mod tests {
             .push(bookmark("add-config-parser", "m", SyncState::Synced, false));
         let prs = pr_state(vec![open_pr(9, "add-config-parser-2", "main")], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(plan.head_bookmark, "add-config-parser-3");
     }
 
@@ -1878,10 +3151,10 @@ mod tests {
         let snap = stack_snapshot();
         let prs = pr_state(vec![open_pr(7, "profile", "auth")], false);
         let by_name =
-            plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None)
+            plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default())
                 .unwrap();
         let by_head =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("b1"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("b1"), &NoComments, None, &SubmitOptions::default()).unwrap();
         assert_eq!(by_name, by_head);
         assert!(
             by_head
@@ -1904,7 +3177,7 @@ mod tests {
         );
         let prs = pr_state(vec![], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("t1"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("t1"), &NoComments, None, &SubmitOptions::default()).unwrap();
         let segs: Vec<(&str, &str)> = plan
             .segments
             .iter()
@@ -1932,10 +3205,10 @@ mod tests {
     fn unknown_and_immutable_change_heads_refuse() {
         let snap = unbookmarked_snapshot();
         let prs = pr_state(vec![], false);
-        let err = plan_submit(&snap, &prs, &forge_repo(), &by_change("zz"), &NoComments, None)
+        let err = plan_submit(&snap, &prs, &forge_repo(), &by_change("zz"), &NoComments, None, &SubmitOptions::default())
             .unwrap_err();
         assert!(err.to_string().contains("no change zz"), "{err}");
-        let err = plan_submit(&snap, &prs, &forge_repo(), &by_change("m"), &NoComments, None)
+        let err = plan_submit(&snap, &prs, &forge_repo(), &by_change("m"), &NoComments, None, &SubmitOptions::default())
             .unwrap_err();
         assert!(err.to_string().contains("immutable"), "{err}");
     }
@@ -1946,7 +3219,7 @@ mod tests {
         snap.nodes[1].description = String::new();
         let prs = pr_state(vec![], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None, &SubmitOptions::default()).unwrap();
         // Nothing slugs from an empty description: jj's own push-<change
         // id> convention names the branch, and the undescribed change is
         // already a blocker so nothing runs until it is described.
@@ -2056,6 +3329,23 @@ mod tests {
                 .push(format!("comment-update id:{comment_id}"));
             Ok(())
         }
+
+        fn create_stack(&self, pull_requests: &[u64]) -> Result<u64, ForgeError> {
+            self.log.borrow_mut().push(format!("stack {pull_requests:?}"));
+            Ok(90)
+        }
+
+        fn add_to_stack(&self, stack: u64, pull_requests: &[u64]) -> Result<(), ForgeError> {
+            self.log
+                .borrow_mut()
+                .push(format!("stack {stack} += {pull_requests:?}"));
+            Ok(())
+        }
+
+        fn unstack(&self, stack: u64) -> Result<Vec<u64>, ForgeError> {
+            self.log.borrow_mut().push(format!("unstack {stack}"));
+            Ok(Vec::new())
+        }
     }
 
     fn plan_with_all_action_kinds() -> SubmitPlan {
@@ -2064,7 +3354,7 @@ mod tests {
         snap.nodes[1].bookmarks = vec!["auth".into()];
         snap.nodes[2].bookmarks = vec![];
         let prs = pr_state(vec![open_pr(7, "profile", "main")], false);
-        plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None).unwrap()
+        plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &NoComments, None, &SubmitOptions::default()).unwrap()
     }
 
     #[test]
@@ -2155,7 +3445,7 @@ mod tests {
             6,
             ExistingComment { id: 60, body: previous_with_fossil.clone() },
         )]));
-        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None).unwrap();
+        let plan = plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &comments, None, &SubmitOptions::default()).unwrap();
 
         let forge = StubForge::default();
         forge.comments.borrow_mut().insert(
@@ -2212,7 +3502,7 @@ mod tests {
             StubComments(map)
         };
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &replan_comments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_bookmark("profile"), &replan_comments, None, &SubmitOptions::default()).unwrap();
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
     }
 
@@ -2268,7 +3558,7 @@ mod tests {
         let snap = unbookmarked_snapshot();
         let prs = pr_state(vec![], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None, &SubmitOptions::default()).unwrap();
         let vcs = StubVcs::default();
         let forge = StubForge::default();
         let outcome = execute_submit(&plan, &vcs, &forge).unwrap();
@@ -2290,7 +3580,7 @@ mod tests {
         let snap = unbookmarked_snapshot();
         let prs = pr_state(vec![], false);
         let plan =
-            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None).unwrap();
+            plan_submit(&snap, &prs, &forge_repo(), &by_change("c2"), &NoComments, None, &SubmitOptions::default()).unwrap();
         let vcs = StubVcs { fail_create_bookmark: true, ..Default::default() };
         let forge = StubForge::default();
         let outcome = execute_submit(&plan, &vcs, &forge).unwrap();
@@ -2321,5 +3611,1551 @@ mod tests {
         let (title, body) = derive_title_body("", "fallback");
         assert_eq!(title, "fallback");
         assert_eq!(body, "");
+    }
+    // ---- The order of a publish, against GitHub's own rules ----
+
+    #[derive(Clone)]
+    struct ModelPr {
+        number: u64,
+        head: String,
+        base: String,
+        open: bool,
+        merged: bool,
+        stack: Option<u64>,
+    }
+
+    /// GitHub and the branches on it, as far as a publish can tell, with
+    /// the rules seen on the real thing: a pull request whose head is
+    /// reachable from its base branch is closed as merged the moment a
+    /// push makes it so; a pull request in a stack cannot be retargeted; a
+    /// stack takes two or more open pull requests whose bases chain, and
+    /// grows at the top only. It is the remote of `local` too: a push
+    /// moves branches to where the local bookmarks are.
+    struct ModelGitHub<'a> {
+        local: &'a RepoSnapshot,
+        branches: RefCell<HashMap<String, String>>,
+        prs: RefCell<Vec<ModelPr>>,
+        stacks: RefCell<u64>,
+        log: RefCell<Vec<String>>,
+        /// Pull requests GitHub will not take out of a stack (its
+        /// documentation names one queued to merge). Not seen on the
+        /// sandbox, which has no merge queue.
+        queued: RefCell<Vec<u64>>,
+        /// Branches the remote refuses to update. A push of several
+        /// branches is not atomic: the others still move.
+        refused: RefCell<Vec<String>>,
+        /// A repository, or a host, without GitHub's stacked pull
+        /// requests: the stacks endpoints answer a bare 404 there.
+        no_stacks: std::cell::Cell<bool>,
+    }
+
+    impl<'a> ModelGitHub<'a> {
+        /// `branches` are where the remote's branches stand before the
+        /// publish (ids outside the local graph are commits that have
+        /// since been rewritten); `prs` are `(number, head, base)`.
+        fn new(local: &'a RepoSnapshot, branches: &[(&str, &str)], prs: &[(u64, &str, &str)]) -> Self {
+            Self {
+                local,
+                branches: RefCell::new(
+                    branches.iter().map(|(b, at)| (b.to_string(), at.to_string())).collect(),
+                ),
+                prs: RefCell::new(
+                    prs.iter()
+                        .map(|(number, head, base)| ModelPr {
+                            number: *number,
+                            head: head.to_string(),
+                            base: base.to_string(),
+                            open: true,
+                            merged: false,
+                            stack: None,
+                        })
+                        .collect(),
+                ),
+                stacks: RefCell::new(89),
+                log: RefCell::new(vec![]),
+                queued: RefCell::new(vec![]),
+                refused: RefCell::new(vec![]),
+                no_stacks: std::cell::Cell::new(false),
+            }
+        }
+
+        /// What the real client makes of the stacks endpoints' 404.
+        fn stacks_offered(&self) -> Result<(), ForgeError> {
+            if self.no_stacks.get() {
+                return Err(ForgeError::NoStacks(
+                    "acme/widgets on github.example does not offer GitHub's stacked pull requests"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn stacked(self, numbers: &[u64]) -> Self {
+            *self.stacks.borrow_mut() += 1;
+            let stack = *self.stacks.borrow();
+            for pr in self.prs.borrow_mut().iter_mut() {
+                if numbers.contains(&pr.number) {
+                    pr.stack = Some(stack);
+                }
+            }
+            self
+        }
+
+        /// Whether commit `ancestor` is `descendant` or one of its
+        /// ancestors, in the local graph.
+        fn reachable(&self, ancestor: &str, descendant: &str) -> bool {
+            let mut queue = vec![descendant.to_owned()];
+            while let Some(id) = queue.pop() {
+                if id == ancestor {
+                    return true;
+                }
+                if let Some(node) = self.local.nodes.iter().find(|n| n.id == id) {
+                    queue.extend(node.parents.iter().cloned());
+                }
+            }
+            false
+        }
+
+        /// GitHub's rule, applied after every push.
+        fn close_what_is_inside_its_base(&self) {
+            let branches = self.branches.borrow();
+            for pr in self.prs.borrow_mut().iter_mut().filter(|pr| pr.open) {
+                let (Some(head), Some(base)) = (branches.get(&pr.head), branches.get(&pr.base))
+                else {
+                    continue;
+                };
+                if self.reachable(head, base) {
+                    pr.open = false;
+                    pr.merged = true;
+                    self.log
+                        .borrow_mut()
+                        .push(format!("#{} closed as merged into {}", pr.number, pr.base));
+                }
+            }
+        }
+
+        fn pr(&self, number: u64) -> ModelPr {
+            self.prs
+                .borrow()
+                .iter()
+                .find(|pr| pr.number == number)
+                .cloned()
+                .expect("the model has this pull request")
+        }
+
+        fn stack_of(&self, stack: u64) -> Vec<u64> {
+            self.prs
+                .borrow()
+                .iter()
+                .filter(|pr| pr.stack == Some(stack))
+                .map(|pr| pr.number)
+                .collect()
+        }
+
+        fn refuse(message: &str) -> ForgeError {
+            ForgeError::Api(format!("HTTP 422: {message}"))
+        }
+    }
+
+    impl SubmitVcs for ModelGitHub<'_> {
+        fn push_bookmarks(&self, bookmarks: &[String], _remote: &str) -> Result<String, BackendError> {
+            let refused = self.refused.borrow();
+            let moved: Vec<&str> = bookmarks
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !refused.iter().any(|r| r == name))
+                .collect();
+            for name in &moved {
+                let target = self
+                    .local
+                    .bookmarks
+                    .iter()
+                    .find(|b| b.name == *name)
+                    .map(|b| b.target.clone())
+                    .expect("pushed bookmarks exist locally");
+                self.branches.borrow_mut().insert((*name).to_owned(), target);
+            }
+            self.log.borrow_mut().push(format!("push {}", moved.join(",")));
+            self.close_what_is_inside_its_base();
+            if moved.len() < bookmarks.len() {
+                return Err(BackendError::MutationFailed(format!(
+                    "the remote refused {}",
+                    refused.join(", ")
+                )));
+            }
+            Ok("Pushed".into())
+        }
+
+        fn create_bookmark(&self, name: &str, _change: &str) -> Result<String, BackendError> {
+            Ok(format!("Created bookmark {name}"))
+        }
+    }
+
+    impl StackCommentSource for ModelGitHub<'_> {
+        fn stack_comment(&self, _number: u64) -> Result<Option<ExistingComment>, ForgeError> {
+            Ok(None)
+        }
+
+        fn open_prs_based_on(&self, base: &str) -> Result<Vec<PrSummary>, ForgeError> {
+            self.log.borrow_mut().push(format!("list open on {base}"));
+            Ok(model_prs(self)
+                .report
+                .prs
+                .into_iter()
+                .filter(|pr| pr.base_branch == base)
+                .collect())
+        }
+    }
+
+    impl SubmitForge for ModelGitHub<'_> {
+        fn create_pr(
+            &self,
+            _title: &str,
+            _body: &str,
+            head: &str,
+            base: &str,
+            _draft: bool,
+        ) -> Result<PrSummary, ForgeError> {
+            let mut prs = self.prs.borrow_mut();
+            let number = prs.iter().map(|pr| pr.number).max().unwrap_or(0) + 1;
+            prs.push(ModelPr {
+                number,
+                head: head.into(),
+                base: base.into(),
+                open: true,
+                merged: false,
+                stack: None,
+            });
+            self.log.borrow_mut().push(format!("open #{number} {head}->{base}"));
+            Ok(open_pr(number, head, base))
+        }
+
+        fn update_pr_base(&self, number: u64, base: &str) -> Result<(), ForgeError> {
+            let mut prs = self.prs.borrow_mut();
+            let pr = prs.iter_mut().find(|pr| pr.number == number).expect("a known PR");
+            if !pr.open {
+                return Err(Self::refuse("Cannot change the base branch of a closed pull request."));
+            }
+            if pr.stack.is_some() {
+                return Err(Self::refuse(
+                    "Cannot change the base branch because the pull request is part of a stack.",
+                ));
+            }
+            pr.base = base.into();
+            self.log.borrow_mut().push(format!("retarget #{number}->{base}"));
+            Ok(())
+        }
+
+        fn update_pr_text(&self, _: u64, _: Option<&str>, _: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+
+        fn create_comment(&self, _: u64, _: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+
+        fn update_comment(&self, _: u64, _: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+
+        fn create_stack(&self, pull_requests: &[u64]) -> Result<u64, ForgeError> {
+            self.stacks_offered()?;
+            if pull_requests.len() < 2 {
+                return Err(Self::refuse("2 items required"));
+            }
+            let members: Vec<ModelPr> = pull_requests.iter().map(|n| self.pr(*n)).collect();
+            if members.iter().any(|pr| pr.stack.is_some()) {
+                return Err(Self::refuse("Pull requests are already part of a stack"));
+            }
+            if members.iter().any(|pr| !pr.open)
+                || members.windows(2).any(|pair| pair[1].base != pair[0].head)
+            {
+                return Err(Self::refuse(
+                    "Pull requests must form a stack, where each PR's base ref is the previous PR's head ref",
+                ));
+            }
+            *self.stacks.borrow_mut() += 1;
+            let stack = *self.stacks.borrow();
+            for pr in self.prs.borrow_mut().iter_mut() {
+                if pull_requests.contains(&pr.number) {
+                    pr.stack = Some(stack);
+                }
+            }
+            self.log.borrow_mut().push(format!("stack {stack} = {pull_requests:?}"));
+            Ok(stack)
+        }
+
+        fn add_to_stack(&self, stack: u64, pull_requests: &[u64]) -> Result<(), ForgeError> {
+            let top = self
+                .prs
+                .borrow()
+                .iter()
+                .rfind(|pr| pr.stack == Some(stack))
+                .cloned()
+                .ok_or_else(|| ForgeError::NotFound("Not Found".into()))?;
+            let mut below = top.head;
+            for number in pull_requests {
+                let pr = self.pr(*number);
+                if pr.stack.is_some() || !pr.open || pr.base != below {
+                    return Err(Self::refuse("the pull requests can't be appended to the stack"));
+                }
+                below = pr.head;
+            }
+            for pr in self.prs.borrow_mut().iter_mut() {
+                if pull_requests.contains(&pr.number) {
+                    pr.stack = Some(stack);
+                }
+            }
+            self.log.borrow_mut().push(format!("stack {stack} += {pull_requests:?}"));
+            Ok(())
+        }
+
+        fn unstack(&self, stack: u64) -> Result<Vec<u64>, ForgeError> {
+            let queued = self.queued.borrow();
+            let mut kept = Vec::new();
+            for pr in self.prs.borrow_mut().iter_mut() {
+                if pr.stack == Some(stack) && pr.open {
+                    if queued.contains(&pr.number) {
+                        kept.push(pr.number);
+                    } else {
+                        pr.stack = None;
+                    }
+                }
+            }
+            self.log.borrow_mut().push(format!("unstack {stack}"));
+            Ok(kept)
+        }
+    }
+
+    /// The model's pull requests as the open-PR query would answer them.
+    fn model_prs(model: &ModelGitHub<'_>) -> RepoPrState {
+        let prs = model.prs.borrow();
+        let seats: Vec<Option<StackSeat>> = prs
+            .iter()
+            .map(|pr| {
+                let stack = pr.stack?;
+                let members: Vec<&ModelPr> =
+                    prs.iter().filter(|other| other.stack == Some(stack)).collect();
+                Some(StackSeat {
+                    number: stack,
+                    position: members.iter().position(|m| m.number == pr.number)? as u32 + 1,
+                    size: members.len() as u32,
+                    base: "main".into(),
+                })
+            })
+            .collect();
+        // Each pull request's head is the commit its branch stands on.
+        let branches = model.branches.borrow();
+        pr_state(
+            prs.iter()
+                .zip(seats)
+                .filter(|(pr, _)| pr.open)
+                .map(|(pr, stack)| PrSummary {
+                    stack,
+                    head_commit: branches
+                        .get(&pr.head)
+                        .map_or_else(|| "feedface".to_owned(), |at| format!("c{at}")),
+                    ..open_pr(pr.number, &pr.head, &pr.base)
+                })
+                .collect(),
+            false,
+        )
+    }
+
+    /// main(m) ── b1 (profile) ── a1 (auth, @): the two-PR stack after
+    /// its changes swapped places. Both branches have to be pushed.
+    fn swapped_snapshot() -> RepoSnapshot {
+        snapshot(
+            vec![
+                node("a1", "auth: login", NodeKind::WorkingCopy, &["b1"], &["auth"]),
+                node("b1", "profile: avatars", NodeKind::Mutable, &["m"], &["profile"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Diverged, false),
+                bookmark("profile", "b1", SyncState::Diverged, false),
+            ],
+        )
+    }
+
+    fn retargets_and_pushes(plan: &SubmitPlan) -> Vec<String> {
+        plan.actions
+            .iter()
+            .filter_map(|action| match action {
+                SubmitAction::RetargetPr { number, to_base, .. } => {
+                    Some(format!("retarget #{number}->{to_base}"))
+                }
+                SubmitAction::Push { bookmark, .. } => Some(format!("push {bookmark}")),
+                SubmitAction::Unstack { stack, .. } => Some(format!("unstack {stack}")),
+                SubmitAction::LinkStack {
+                    bookmarks,
+                    onto,
+                    above,
+                } if above.is_empty() => Some(format!("link {bookmarks:?} onto {onto:?}")),
+                SubmitAction::LinkStack {
+                    bookmarks,
+                    onto,
+                    above,
+                } => Some(format!("link {bookmarks:?} onto {onto:?} with {above:?} above")),
+                SubmitAction::CreatePr { bookmark, base, .. } => {
+                    Some(format!("open {bookmark}->{base}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reorder_never_leaves_a_pull_request_inside_its_base() {
+        // Reproduced on GitHub: #1 auth -> main and #7 profile -> auth,
+        // then profile moved below auth. Pushed with #7 still based on
+        // auth, GitHub closed #7 as merged within two seconds: auth's new
+        // commit contains profile's.
+        let local = swapped_snapshot();
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "old-a"), ("profile", "old-b")],
+            &[(1, "auth", "main"), (7, "profile", "auth")],
+        );
+        let plan = plan_submit(
+            &local,
+            &model_prs(&github),
+            &forge_repo(),
+            &by_bookmark("auth"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        // #7 moves to trunk before anything is pushed (and stays there:
+        // trunk is its new base); #1 moves onto profile afterwards.
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            ["retarget #7->main", "push profile", "push auth", "retarget #1->profile"]
+        );
+
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!(github.pr(7).open && github.pr(1).open, "{:?}", github.log);
+        assert_eq!(github.pr(7).base, "main");
+        assert_eq!(github.pr(1).base, "profile");
+
+        // The order this replaced, on the same GitHub: push, then retarget.
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "old-a"), ("profile", "old-b")],
+            &[(1, "auth", "main"), (7, "profile", "auth")],
+        );
+        github
+            .push_bookmarks(&["profile".to_owned(), "auth".to_owned()], "origin")
+            .unwrap();
+        assert!(github.pr(7).merged, "the model closes it, as GitHub did");
+        assert!(github.update_pr_base(7, "main").is_err());
+    }
+
+    #[test]
+    fn a_base_that_moves_between_branches_parks_on_trunk_in_between() {
+        // main ── a (#1) ── b (#2) ── c (#3) became main ── a ── c ── b.
+        let local = snapshot(
+            vec![
+                node("b1", "b", NodeKind::WorkingCopy, &["c1"], &["b"]),
+                node("c1", "c", NodeKind::Mutable, &["a1"], &["c"]),
+                node("a1", "a", NodeKind::Mutable, &["m"], &["a"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("a", "a1", SyncState::Synced, false),
+                bookmark("b", "b1", SyncState::Diverged, false),
+                bookmark("c", "c1", SyncState::Diverged, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("a", "a1"), ("b", "old-b"), ("c", "old-c")],
+            &[(1, "a", "main"), (2, "b", "a"), (3, "c", "b")],
+        );
+        let plan = plan_submit(
+            &local,
+            &model_prs(&github),
+            &forge_repo(),
+            &by_bookmark("b"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            [
+                "retarget #3->main",
+                "retarget #2->main",
+                "push c",
+                "push b",
+                "retarget #3->a",
+                "retarget #2->c",
+            ]
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("while the branches are pushed")),
+            "{:?}",
+            plan.warnings
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!((1..=3).all(|n| github.pr(n).open), "{:?}", github.log);
+        assert_eq!(
+            (github.pr(2).base, github.pr(3).base),
+            ("c".to_owned(), "a".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_retarget_with_nothing_to_push_goes_straight_to_its_base() {
+        // Same shape on both sides, one base wrong on GitHub: no branch
+        // moves, so nothing can end up inside anything.
+        let local = synced_pair();
+        let prs = pr_state(
+            vec![open_pr(1, "auth", "main"), open_pr(7, "profile", "stale")],
+            false,
+        );
+        let plan = plan_submit(
+            &local,
+            &prs,
+            &forge_repo(),
+            &by_bookmark("profile"),
+            &NoComments,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(retargets_and_pushes(&plan), ["retarget #7->auth"]);
+    }
+
+    // ---- GitHub's own stacks ----
+
+    /// main(m) ── a1 (auth) ── b1 (profile, @), both pushed and in sync.
+    fn synced_pair() -> RepoSnapshot {
+        snapshot(
+            vec![
+                node("b1", "profile: avatars", NodeKind::WorkingCopy, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", SyncState::Synced, false),
+            ],
+        )
+    }
+
+    fn plan_on(
+        local: &RepoSnapshot,
+        github: &ModelGitHub<'_>,
+        head: &str,
+        stack: StackLink,
+    ) -> SubmitPlan {
+        plan_submit(
+            local,
+            &model_prs(github),
+            &forge_repo(),
+            &by_bookmark(head),
+            github,
+            None,
+            &SubmitOptions { stack },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_chain_becomes_a_github_stack_only_when_asked() {
+        let local = synced_pair();
+        let branches = [("main", "m"), ("auth", "a1"), ("profile", "b1")];
+        let chain = [(1, "auth", "main"), (7, "profile", "auth")];
+
+        // Left alone, a plain chain stays one.
+        let github = ModelGitHub::new(&local, &branches, &chain);
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+
+        // Asked: linked, as the last step, bottom first.
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        assert_eq!(
+            plan.actions.last(),
+            Some(&SubmitAction::LinkStack {
+                bookmarks: vec!["auth".into(), "profile".into()],
+                onto: None,
+                above: vec![],
+            })
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 7]);
+        assert_eq!(
+            outcome.steps.last().unwrap().detail.as_deref(),
+            Some("Linked #1 and #7 as GitHub stack 90")
+        );
+
+        // From then on nothing needs asking, and nothing needs doing.
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+
+        // Asked to let go: the stack is dissolved, the chain stays.
+        let plan = plan_on(&local, &github, "profile", StackLink::Unlink);
+        assert_eq!(retargets_and_pushes(&plan), ["unstack 90"]);
+        execute_submit(&plan, &github, &github).unwrap();
+        assert!(github.stack_of(90).is_empty());
+        assert_eq!(github.pr(7).base, "auth");
+    }
+
+    /// main(m) ── a1 (auth) ── b1 (profile, @), neither pushed yet.
+    fn unpublished_pair() -> RepoSnapshot {
+        snapshot(
+            vec![
+                node("b1", "profile: avatars", NodeKind::WorkingCopy, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::LocalOnly, false),
+                bookmark("profile", "b1", SyncState::LocalOnly, false),
+            ],
+        )
+    }
+
+    fn link_steps(plan: &SubmitPlan) -> Vec<String> {
+        retargets_and_pushes(plan)
+            .into_iter()
+            .filter(|step| step.starts_with("link") || step.starts_with("unstack"))
+            .collect()
+    }
+
+    #[test]
+    fn the_setting_stands_in_only_for_a_publish_that_was_not_told() {
+        let told = |stack| SubmitOptions { stack };
+        // Off, nothing changes.
+        assert_eq!(told(StackLink::Follow).under_setting(false).stack, StackLink::Follow);
+        // On, a publish that was told nothing links new stacks.
+        assert_eq!(told(StackLink::Follow).under_setting(true).stack, StackLink::LinkNew);
+        // What this publish was told wins, both ways.
+        for (stack, on) in [
+            (StackLink::Link, false),
+            (StackLink::Link, true),
+            (StackLink::Unlink, false),
+            (StackLink::Unlink, true),
+        ] {
+            assert_eq!(told(stack).under_setting(on).stack, stack);
+        }
+    }
+
+    #[test]
+    fn under_the_setting_the_publish_that_opens_a_pull_request_links_the_chain() {
+        // Nothing published yet. Not told and with no setting, the two
+        // pull requests are opened as a plain chain.
+        let local = unpublished_pair();
+        let github = ModelGitHub::new(&local, &[("main", "m")], &[]);
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+
+        // Under the setting the same publish links them, as its last step.
+        let plan = plan_on(&local, &github, "profile", StackLink::LinkNew);
+        assert_eq!(
+            plan.actions.last(),
+            Some(&SubmitAction::LinkStack {
+                bookmarks: vec!["auth".into(), "profile".into()],
+                onto: None,
+                above: vec![],
+            })
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 2]);
+
+        // It is a GitHub stack from then on, and follows the chain as one
+        // does: a third segment joins from the top.
+        let local = snapshot(
+            vec![
+                node("c1", "search: index", NodeKind::WorkingCopy, &["b1"], &["search"]),
+                node("b1", "profile: avatars", NodeKind::Mutable, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", SyncState::Synced, false),
+                bookmark("search", "c1", SyncState::LocalOnly, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "a1"), ("profile", "b1")],
+            &[(1, "auth", "main"), (2, "profile", "auth")],
+        )
+        .stacked(&[1, 2]);
+        let plan = plan_on(&local, &github, "search", StackLink::LinkNew);
+        assert_eq!(link_steps(&plan), ["link [\"search\"] onto Some(90)"]);
+    }
+
+    #[test]
+    fn under_the_setting_a_plain_chain_that_only_changes_stays_plain() {
+        // Both pull requests exist and were never linked: a chain from
+        // before the setting, or one that was dissolved on purpose.
+        let local = synced_pair();
+        let branches = [("main", "m"), ("auth", "a1"), ("profile", "b1")];
+        let github =
+            ModelGitHub::new(&local, &branches, &[(1, "auth", "main"), (7, "profile", "auth")]);
+        let plan = plan_on(&local, &github, "profile", StackLink::LinkNew);
+        assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+
+        // The same chain gains a segment: the publish that opens its pull
+        // request links all three.
+        let local = snapshot(
+            vec![
+                node("c1", "search: index", NodeKind::WorkingCopy, &["b1"], &["search"]),
+                node("b1", "profile: avatars", NodeKind::Mutable, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", SyncState::Synced, false),
+                bookmark("search", "c1", SyncState::LocalOnly, false),
+            ],
+        );
+        let github =
+            ModelGitHub::new(&local, &branches, &[(1, "auth", "main"), (7, "profile", "auth")]);
+        let plan = plan_on(&local, &github, "search", StackLink::LinkNew);
+        assert_eq!(
+            link_steps(&plan),
+            ["link [\"auth\", \"profile\", \"search\"] onto None"]
+        );
+        // A publish told not to still wins over the setting.
+        let plan = plan_on(&local, &github, "search", StackLink::Unlink);
+        assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+
+        // One pull request is not a stack, and the setting does not say
+        // so each time one is opened.
+        let local = snapshot(
+            vec![
+                node("a1", "auth: login", NodeKind::WorkingCopy, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::LocalOnly, false),
+            ],
+        );
+        let github = ModelGitHub::new(&local, &[("main", "m")], &[]);
+        let plan = plan_on(&local, &github, "auth", StackLink::LinkNew);
+        assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_repository_without_github_stacks_keeps_a_plain_chain_under_the_setting() {
+        let local = unpublished_pair();
+
+        // The setting is on, and this repository has no stacks. The
+        // publish goes through; its last step says what was left out.
+        let github = ModelGitHub::new(&local, &[("main", "m")], &[]);
+        github.no_stacks.set(true);
+        let plan = plan_on(&local, &github, "profile", StackLink::LinkNew);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        let last = outcome.steps.last().unwrap();
+        assert_eq!(last.status, SubmitStepStatus::Done);
+        assert_eq!(
+            last.detail.as_deref(),
+            Some(
+                "acme/widgets on github.example does not offer GitHub's stacked pull \
+                 requests; the pull requests stay a plain chain"
+            )
+        );
+        assert!(github.pr(1).open && github.pr(2).open);
+        assert_eq!(github.pr(2).base, "auth");
+
+        // Asked for on this publish, the same answer is a failure to do
+        // what was asked.
+        let github = ModelGitHub::new(&local, &[("main", "m")], &[]);
+        github.no_stacks.set(true);
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert_eq!(outcome.steps.last().unwrap().status, SubmitStepStatus::Failed);
+    }
+
+    #[test]
+    fn new_pull_requests_join_the_stack_from_the_top() {
+        // auth and profile are stack 90; a third segment is new.
+        let local = snapshot(
+            vec![
+                node("c1", "search: index", NodeKind::WorkingCopy, &["b1"], &["search"]),
+                node("b1", "profile: avatars", NodeKind::Mutable, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", SyncState::Synced, false),
+                bookmark("search", "c1", SyncState::LocalOnly, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "a1"), ("profile", "b1")],
+            &[(1, "auth", "main"), (7, "profile", "auth")],
+        )
+        .stacked(&[1, 7]);
+
+        let plan = plan_on(&local, &github, "search", StackLink::Follow);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            ["push search", "open search->profile", "link [\"search\"] onto Some(90)"]
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 7, 8]);
+    }
+
+    #[test]
+    fn a_stack_that_changes_shape_is_dissolved_and_linked_again() {
+        // Stack 90 is #1 auth, #7 profile; the two swapped places here.
+        let local = swapped_snapshot();
+        let before = || {
+            ModelGitHub::new(
+                &local,
+                &[("main", "m"), ("auth", "old-a"), ("profile", "old-b")],
+                &[(1, "auth", "main"), (7, "profile", "auth")],
+            )
+            .stacked(&[1, 7])
+        };
+        let github = before();
+        let plan = plan_on(&local, &github, "auth", StackLink::Follow);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            [
+                // GitHub refuses a retarget inside a stack, and has no
+                // reorder: out of the stack first.
+                "unstack 90",
+                "retarget #7->main",
+                "push profile",
+                "push auth",
+                "retarget #1->profile",
+                // And back in, in the new order, as the last step.
+                "link [\"profile\", \"auth\"] onto None",
+            ]
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!(github.pr(1).open && github.pr(7).open, "{:?}", github.log);
+        assert_eq!(github.stack_of(91), [1, 7]);
+        assert_eq!((github.pr(7).base, github.pr(1).base), ("main".into(), "profile".into()));
+
+        // Without leaving the stack first, GitHub refuses the first
+        // retarget and nothing is pushed.
+        let github = before();
+        let mut stuck = plan.clone();
+        stuck.actions.retain(|a| !matches!(a, SubmitAction::Unstack { .. }));
+        let outcome = execute_submit(&stuck, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert!(outcome.steps[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("part of a stack"));
+        assert!(!github.log.borrow().iter().any(|l| l.starts_with("push")));
+    }
+
+    #[test]
+    fn linking_needs_two_pull_requests_and_says_so() {
+        let local = snapshot(
+            vec![
+                node("a1", "auth: login", NodeKind::WorkingCopy, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+            ],
+        );
+        let github = ModelGitHub::new(&local, &[("main", "m"), ("auth", "a1")], &[(1, "auth", "main")]);
+        let plan = plan_on(&local, &github, "auth", StackLink::Link);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("at least two pull requests")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// main(m) ── a1 (auth) ── x1 (extra, new) ── b1 (profile, @): a
+    /// segment wedged in below profile.
+    fn wedged_snapshot() -> RepoSnapshot {
+        snapshot(
+            vec![
+                node("b1", "profile: avatars", NodeKind::WorkingCopy, &["x1"], &["profile"]),
+                node("x1", "extra: wedge", NodeKind::Mutable, &["a1"], &["extra"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("extra", "x1", SyncState::LocalOnly, false),
+                bookmark("profile", "b1", SyncState::Diverged, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_stack_that_goes_on_above_the_published_head_keeps_what_is_above() {
+        // Stack 90 is auth, profile, search on GitHub. Publishing through
+        // "profile" with a new base for it has to rebuild the stack, and
+        // search, which this publish does not reach, still sits on
+        // profile: it goes back in on top.
+        let local = wedged_snapshot();
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "a1"), ("profile", "old-b"), ("search", "old-c")],
+            &[(1, "auth", "main"), (7, "profile", "auth"), (9, "search", "profile")],
+        )
+        .stacked(&[1, 7, 9]);
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            [
+                "unstack 90",
+                "retarget #7->main",
+                "push extra",
+                "push profile",
+                "open extra->auth",
+                "retarget #7->extra",
+                "link [\"auth\", \"extra\", \"profile\"] onto None with [9] above",
+            ]
+        );
+        // "search" is no bookmark here: #9 is someone else's, and the plan
+        // says, by number, what this publish does around it. (The model's
+        // pull requests have no author; with one the plan names it too.)
+        let about_9: Vec<&String> = plan.warnings.iter().filter(|w| w.contains("#9")).collect();
+        assert_eq!(
+            about_9,
+            [
+                "#9 (\u{201c}search\u{201d}) is someone else's pull request on \u{201c}profile\u{201d}, \
+                 and this push replaces commits under it: it shows the replaced commits as \
+                 its own until its branch is rebased. Nothing here pushes to \
+                 \u{201c}search\u{201d}: rebasing it is its author's to do",
+                "#9 sits above this chain in GitHub stack 90: the stack is dissolved to \
+                 change shape and linked again with it back on top",
+            ]
+        );
+        assert!(!plan.warnings.iter().any(|w| w.contains("leaves the stack")));
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(91), [1, 7, 9, 10]);
+        assert_eq!(
+            outcome.steps.last().unwrap().detail.as_deref(),
+            Some("Linked #1, #10, #7 and #9 as GitHub stack 91")
+        );
+    }
+
+    #[test]
+    fn a_stack_member_the_new_stack_cannot_hold_is_named_before_it_leaves() {
+        // Stack 90 is auth, profile, search, and search sits on a branch
+        // this chain no longer has under that name: GitHub's stack cannot
+        // take it back, and the plan says so before anything runs.
+        let local = wedged_snapshot();
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "a1"), ("profile", "old-b"), ("search", "old-c")],
+            &[(1, "auth", "main"), (7, "profile", "auth"), (9, "search", "elsewhere")],
+        )
+        .stacked(&[1, 7, 9]);
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert_eq!(
+            retargets_and_pushes(&plan).last().map(String::as_str),
+            Some("link [\"auth\", \"extra\", \"profile\"] onto None")
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("#9 is in GitHub stack 90")
+                && w.contains("leaves the stack")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn an_unstack_that_leaves_a_pull_request_behind_stops_the_publish() {
+        // GitHub documents that a pull request queued to merge cannot
+        // leave its stack: the answer then still lists it, open.
+        let local = swapped_snapshot();
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "old-a"), ("profile", "old-b")],
+            &[(1, "auth", "main"), (7, "profile", "auth")],
+        )
+        .stacked(&[1, 7]);
+        github.queued.borrow_mut().push(1);
+        let plan = plan_on(&local, &github, "auth", StackLink::Follow);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        let story = outcome.steps[0].detail.as_deref().unwrap();
+        assert!(story.contains("GitHub kept #1 in stack 90"), "{story}");
+        // Nothing was retargeted or pushed on the strength of a stack
+        // that is only half dissolved.
+        assert_eq!(github.log.borrow().as_slice(), ["unstack 90"]);
+    }
+
+    /// main(m) ── p1 ── q1 (lower) ── r1 (upper, @): a published chain
+    /// whose two bookmarks each moved up one commit. On the remote,
+    /// lower is still p1 and upper still q1.
+    fn slid_snapshot() -> RepoSnapshot {
+        snapshot(
+            vec![
+                node("r1", "r", NodeKind::WorkingCopy, &["q1"], &["upper"]),
+                node("q1", "q", NodeKind::Mutable, &["p1"], &["lower"]),
+                node("p1", "p", NodeKind::Mutable, &["m"], &[]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("lower", "q1", SyncState::Ahead, false),
+                bookmark("upper", "r1", SyncState::Ahead, false),
+            ],
+        )
+    }
+
+    fn slid_github(local: &RepoSnapshot) -> ModelGitHub<'_> {
+        ModelGitHub::new(
+            local,
+            &[("main", "m"), ("lower", "p1"), ("upper", "q1")],
+            &[(1, "lower", "main"), (7, "upper", "lower")],
+        )
+    }
+
+    #[test]
+    fn publishing_part_of_a_chain_never_swallows_the_pull_request_above() {
+        // Reproduced on GitHub (R7a): with only "lower" pushed, its branch
+        // lands on the commit #7 still has as its head, and GitHub closes
+        // #7 as merged into "lower".
+        let local = slid_snapshot();
+        let github = slid_github(&local);
+        let plan = plan_on(&local, &github, "lower", StackLink::Follow);
+        assert_eq!(plan.blockers.len(), 1, "{:?}", plan.blockers);
+        assert!(
+            plan.blockers[0].contains("GitHub would close #7 as merged")
+                && plan.blockers[0].contains("publish through \u{201c}upper\u{201d}"),
+            "{:?}",
+            plan.blockers
+        );
+        assert!(execute_submit(&plan, &github, &github).is_err());
+        assert!(github.log.borrow().is_empty());
+
+        // What the refused push would have done, on the same GitHub.
+        github.push_bookmarks(&["lower".to_owned()], "origin").unwrap();
+        assert!(github.pr(7).merged, "{:?}", github.log);
+    }
+
+    #[test]
+    fn a_slide_parks_the_pull_request_its_push_would_swallow() {
+        // The whole chain is published, so #7's own branch moves too. On
+        // GitHub that was enough when both branches arrived (R7b). It is
+        // not when only one does, and a push of several branches is not
+        // atomic. So #7 points at trunk while the branches move.
+        let local = slid_snapshot();
+        let github = slid_github(&local);
+        let plan = plan_on(&local, &github, "upper", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            ["retarget #7->main", "push lower", "push upper", "retarget #7->lower"]
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!(github.pr(1).open && github.pr(7).open, "{:?}", github.log);
+        assert_eq!(github.pr(7).base, "lower");
+
+        // A push that goes through for "lower" and is refused for
+        // "upper": #7 survives, and the failure says where it was left.
+        let github = slid_github(&local);
+        github.refused.borrow_mut().push("upper".to_owned());
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert!(github.pr(7).open, "{:?}", github.log);
+        assert_eq!(github.pr(7).base, "main");
+        let story = outcome
+            .steps
+            .iter()
+            .find(|step| step.status == SubmitStepStatus::Failed)
+            .and_then(|step| step.detail.as_deref())
+            .unwrap();
+        assert!(
+            story.contains("#7 is left pointing at \u{201c}main\u{201d}")
+                && story.contains("publish again to finish"),
+            "{story}"
+        );
+        // Without the parking, the same partial push closes it.
+        let github = slid_github(&local);
+        github.refused.borrow_mut().push("upper".to_owned());
+        let _ = github.push_bookmarks(&["lower".to_owned(), "upper".to_owned()], "origin");
+        assert!(github.pr(7).merged, "{:?}", github.log);
+
+        // Publishing again after the failure finishes the job: #7 goes
+        // back onto "lower" once its branch has moved.
+        let github = slid_github(&local);
+        github.update_pr_base(7, "main").unwrap();
+        github.branches.borrow_mut().insert("lower".into(), "q1".into());
+        github.log.borrow_mut().clear();
+        let mut after = local.clone();
+        after.bookmarks[1].sync = SyncState::Synced;
+        let plan = plan_on(&after, &github, "upper", StackLink::Follow);
+        assert_eq!(retargets_and_pushes(&plan), ["push upper", "retarget #7->lower"]);
+    }
+
+    #[test]
+    fn a_slide_inside_a_github_stack_leaves_the_stack_to_be_parked() {
+        // GitHub refuses a retarget inside a stack, so the parking needs
+        // the stack dissolved first and linked again afterwards.
+        let local = slid_snapshot();
+        let github = slid_github(&local).stacked(&[1, 7]);
+        let plan = plan_on(&local, &github, "upper", StackLink::Follow);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            [
+                "unstack 90",
+                "retarget #7->main",
+                "push lower",
+                "push upper",
+                "retarget #7->lower",
+                "link [\"lower\", \"upper\"] onto None",
+            ]
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(91), [1, 7]);
+    }
+
+    #[test]
+    fn a_publish_that_stops_after_dissolving_a_stack_says_it_is_not_linked_again() {
+        let local = swapped_snapshot();
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("auth", "old-a"), ("profile", "old-b")],
+            &[(1, "auth", "main"), (7, "profile", "auth")],
+        )
+        .stacked(&[1, 7]);
+        github.refused.borrow_mut().push("auth".to_owned());
+        let plan = plan_on(&local, &github, "auth", StackLink::Follow);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        let story = outcome
+            .steps
+            .iter()
+            .find(|step| step.status == SubmitStepStatus::Failed)
+            .and_then(|step| step.detail.as_deref())
+            .unwrap();
+        assert!(
+            story.contains("GitHub stack 90 was dissolved for this publish and is not linked again")
+                && story.contains("--stack"),
+            "{story}"
+        );
+        // #7's new base is trunk, where the parking left it: nothing to
+        // point back, and nothing said about it.
+        assert!(!story.contains("left pointing at"), "{story}");
+        assert!(github.stack_of(90).is_empty());
+    }
+
+    #[test]
+    fn a_stack_is_seen_whole_only_with_its_bottom_its_top_and_all_between() {
+        let member = |number: u64, base: &str, position: u32, size: u32| PrSummary {
+            stack: Some(StackSeat { number: 90, position, size, base: "main".into() }),
+            ..open_pr(number, "x", base)
+        };
+        // Both of two.
+        assert!(sees_whole_stack(&[member(1, "main", 1, 2), member(7, "lower", 2, 2)], 90));
+        // The upper one alone: its base is the branch of one not seen.
+        assert!(!sees_whole_stack(&[member(7, "lower", 2, 2)], 90));
+        // The bottom one merged: the next is based on trunk, and nothing
+        // open is below it.
+        assert!(sees_whole_stack(&[member(7, "main", 2, 3), member(9, "upper", 3, 3)], 90));
+        // The top one not seen.
+        assert!(!sees_whole_stack(
+            &[member(1, "main", 1, 4), member(7, "lower", 2, 4), member(9, "upper", 3, 4)],
+            90
+        ));
+        // One in the middle not seen.
+        assert!(!sees_whole_stack(&[member(1, "main", 1, 3), member(9, "upper", 3, 3)], 90));
+        // None of it.
+        assert!(!sees_whole_stack(&[], 90));
+    }
+
+    /// A base this publish does not push is, here, where the last fetch
+    /// left it. GitHub can have it somewhere else by now, at commits that
+    /// are not here: whether the branch pushed against it ends up inside
+    /// it cannot be told from this repository. (Seen with the real
+    /// backend: "lower" had gained a commit holding the very commit
+    /// "upper" was moved back to, and the push closed #7 as merged.)
+    #[test]
+    fn a_base_that_moved_on_github_since_the_fetch_stops_the_push_against_it() {
+        // main(m) ── p1 (lower, in sync here) ── q1 (upper, moved back) ── r1.
+        let local = snapshot(
+            vec![
+                node("r1", "r", NodeKind::WorkingCopy, &["q1"], &[]),
+                node("q1", "q", NodeKind::Mutable, &["p1"], &["upper"]),
+                node("p1", "p", NodeKind::Mutable, &["m"], &["lower"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("lower", "p1", SyncState::Synced, false),
+                bookmark("upper", "q1", SyncState::Behind, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("lower", "p1"), ("upper", "r1")],
+            &[(1, "lower", "main"), (7, "upper", "lower")],
+        );
+        // As far as the last fetch knows: fine, and "upper" is pushed.
+        let plan = plan_on(&local, &github, "upper", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(retargets_and_pushes(&plan).contains(&"push upper".to_owned()));
+
+        // GitHub has "lower" at a commit that is not here.
+        let mut prs = model_prs(&github);
+        for pr in prs.report.prs.iter_mut().filter(|pr| pr.number == 1) {
+            pr.head_commit = "0ddba11feedface".into();
+        }
+        let moved = RepoPrState::new(prs.report, "o");
+        let plan = plan_submit(
+            &local,
+            &moved,
+            &forge_repo(),
+            &by_bookmark("upper"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().any(|b| b.contains("\u{201c}lower\u{201d} is at 0ddba11f on GitHub and at cp1 here")
+                && b.contains("GitHub would close #7 as merged")
+                && b.contains("fetch")),
+            "{:?}",
+            plan.blockers
+        );
+
+        // "Not pushed" alone does not mean "where the fetch left it". A
+        // base whose change came out empty (a rebase made it a no-op) is
+        // not pushed either, and it has moved here: GitHub having it at
+        // another commit says nothing then. (Seen on the sandbox, where
+        // this stopped the publish that the rebase had been made for.)
+        let mut emptied = local.clone();
+        emptied.nodes[2].is_empty = true;
+        emptied.bookmarks[1].sync = SyncState::Ahead;
+        let plan = plan_submit(
+            &emptied,
+            &moved,
+            &forge_repo(),
+            &by_bookmark("upper"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !plan.blockers.iter().any(|b| b.contains("since the last fetch")),
+            "{:?}",
+            plan.blockers
+        );
+    }
+
+    #[test]
+    fn a_pull_request_head_brought_in_by_a_merge_is_seen_too() {
+        // main(m) ── p1 ── l1 (lower, @), and l1 merges q1 in: the commit
+        // #7 (upper, based on lower) has as its head. The stack walk goes
+        // p1, l1 along first parents and never visits q1.
+        let local = snapshot(
+            vec![
+                node("l1", "lower: merge q in", NodeKind::WorkingCopy, &["p1", "q1"], &["lower"]),
+                node("q1", "q", NodeKind::Mutable, &["p1"], &["upper"]),
+                node("p1", "p", NodeKind::Mutable, &["m"], &[]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("lower", "l1", SyncState::Ahead, false),
+                bookmark("upper", "q1", SyncState::Synced, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &local,
+            &[("main", "m"), ("lower", "p1"), ("upper", "q1")],
+            &[(1, "lower", "main"), (7, "upper", "lower")],
+        );
+        let plan = plan_on(&local, &github, "lower", StackLink::Follow);
+        assert_eq!(plan.blockers.len(), 1, "{:?}", plan.blockers);
+        assert!(plan.blockers[0].contains("GitHub would close #7 as merged"));
+        // What the refused push would have done.
+        github.push_bookmarks(&["lower".to_owned()], "origin").unwrap();
+        assert!(github.pr(7).merged, "{:?}", github.log);
+
+        // The same when that head is immutable here, as a tagged commit
+        // is: it is still the commit GitHub would find inside "lower".
+        let mut tagged = local.clone();
+        tagged.nodes[1].kind = NodeKind::Immutable;
+        tagged.nodes[1].tags = vec!["v1".to_owned()];
+        let github = ModelGitHub::new(
+            &tagged,
+            &[("main", "m"), ("lower", "p1"), ("upper", "q1")],
+            &[(1, "lower", "main"), (7, "upper", "lower")],
+        );
+        let plan = plan_on(&tagged, &github, "lower", StackLink::Follow);
+        assert!(
+            plan.blockers.iter().any(|b| b.contains("GitHub would close #7 as merged")),
+            "{:?}",
+            plan.blockers
+        );
+    }
+
+    #[test]
+    fn bookmarks_that_slid_down_are_parked_against_a_push_that_goes_half_through() {
+        // main(m) ── p1 ── q1 ── r1. On GitHub lower is q1 and upper is
+        // r1; here both moved down one commit. Pushed whole, nothing ends
+        // up inside anything. But if the remote takes "upper" and refuses
+        // "lower", upper's branch is the very commit lower's still is.
+        let local = snapshot(
+            vec![
+                node("r1", "r", NodeKind::WorkingCopy, &["q1"], &[]),
+                node("q1", "q", NodeKind::Mutable, &["p1"], &["upper"]),
+                node("p1", "p", NodeKind::Mutable, &["m"], &["lower"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("lower", "p1", SyncState::Behind, false),
+                bookmark("upper", "q1", SyncState::Behind, false),
+            ],
+        );
+        let on_github = || {
+            ModelGitHub::new(
+                &local,
+                &[("main", "m"), ("lower", "q1"), ("upper", "r1")],
+                &[(1, "lower", "main"), (7, "upper", "lower")],
+            )
+        };
+        let github = on_github();
+        let plan = plan_on(&local, &github, "upper", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            ["retarget #7->main", "push lower", "push upper", "retarget #7->lower"]
+        );
+        github.refused.borrow_mut().push("lower".to_owned());
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert!(github.pr(7).open, "{:?}", github.log);
+        assert_eq!(github.pr(7).base, "main");
+
+        // Unparked, that push closes it.
+        let github = on_github();
+        github.refused.borrow_mut().push("lower".to_owned());
+        let _ = github.push_bookmarks(&["lower".to_owned(), "upper".to_owned()], "origin");
+        assert!(github.pr(7).merged, "{:?}", github.log);
+        // And pushed whole it is fine either way.
+        let github = on_github();
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!(github.pr(1).open && github.pr(7).open);
+        assert_eq!(github.pr(7).base, "lower");
+
+        // Where "lower" stands on GitHub is known here through its pull
+        // request. Without one there is nothing to compare with, and #7 is
+        // parked because its base moves at all.
+        let bare_base = || {
+            ModelGitHub::new(
+                &local,
+                &[("main", "m"), ("lower", "q1"), ("upper", "r1")],
+                &[(7, "upper", "lower")],
+            )
+        };
+        let github = bare_base();
+        let plan = plan_on(&local, &github, "upper", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        let steps = retargets_and_pushes(&plan);
+        let at = |step: &str| steps.iter().position(|s| s == step).unwrap_or_else(|| panic!("{steps:?}"));
+        assert!(at("retarget #7->main") < at("push lower"), "{steps:?}");
+        assert!(at("push upper") < at("retarget #7->lower"), "{steps:?}");
+        github.refused.borrow_mut().push("lower".to_owned());
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert!(github.pr(7).open, "{:?}", github.log);
+        // Unparked, the same half-done push closes it.
+        let github = bare_base();
+        github.refused.borrow_mut().push("lower".to_owned());
+        let _ = github.push_bookmarks(&["lower".to_owned(), "upper".to_owned()], "origin");
+        assert!(github.pr(7).merged, "{:?}", github.log);
+    }
+
+    #[test]
+    fn a_list_cut_short_is_completed_for_the_branches_a_publish_moves() {
+        // GitHub's batched answer holds a hundred pull requests at most.
+        // Here it was cut short and lacks #7, which is based on the
+        // branch this publish moves.
+        let local = slid_snapshot();
+        let github = slid_github(&local);
+        let cut_short = pr_state(
+            model_prs(&github)
+                .report
+                .prs
+                .into_iter()
+                .filter(|pr| pr.number != 7)
+                .collect(),
+            true,
+        );
+        let plan = plan_submit(
+            &local,
+            &cut_short,
+            &forge_repo(),
+            &by_bookmark("lower"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(github.log.borrow().as_slice(), ["list open on lower"]);
+        assert!(
+            plan.blockers.iter().any(|b| b.contains("GitHub would close #7 as merged")),
+            "{:?}",
+            plan.blockers
+        );
+        // A complete list is not asked about again.
+        github.log.borrow_mut().clear();
+        plan_on(&local, &github, "lower", StackLink::Follow);
+        assert!(github.log.borrow().is_empty());
+
+        // The lookups go by base, so they cannot find a pull request that
+        // is based on trunk. When that one is the bottom of a GitHub stack
+        // the list also left out, the plan sees the stack's upper half
+        // only, takes "lower" for unpublished, and would dissolve the
+        // stack to rebuild it around a pull request it cannot open. It
+        // stops there: nothing here needed a new shape.
+        let synced = snapshot(
+            vec![
+                node("r1", "r", NodeKind::WorkingCopy, &["q1"], &["upper"]),
+                node("q1", "q", NodeKind::Mutable, &["p1"], &["lower"]),
+                node("p1", "p", NodeKind::Mutable, &["m"], &[]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("lower", "q1", SyncState::Synced, false),
+                bookmark("upper", "r1", SyncState::Synced, false),
+            ],
+        );
+        let stacked = ModelGitHub::new(
+            &synced,
+            &[("main", "m"), ("lower", "q1"), ("upper", "r1")],
+            &[(1, "lower", "main"), (7, "upper", "lower")],
+        )
+        .stacked(&[1, 7]);
+        // With the whole list, an unchanged stack is left as it is.
+        let reshapes = |plan: &SubmitPlan| {
+            plan.actions.iter().any(|a| {
+                matches!(
+                    a,
+                    SubmitAction::Unstack { .. }
+                        | SubmitAction::LinkStack { .. }
+                        | SubmitAction::CreatePr { .. }
+                )
+            })
+        };
+        let plan = plan_on(&synced, &stacked, "upper", StackLink::Follow);
+        assert!(plan.blockers.is_empty() && !reshapes(&plan), "{:?}", plan.actions);
+        // Cut short, without either pull request.
+        let neither = pr_state(Vec::new(), true);
+        let plan = plan_submit(
+            &synced,
+            &neither,
+            &forge_repo(),
+            &by_bookmark("upper"),
+            &stacked,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().any(|b| b.contains("are not all of GitHub stack 90")
+                && b.contains("Jiji sees only #7")
+                && b.contains("does not dissolve a stack it cannot see whole")),
+            "{:?} {:?}",
+            plan.blockers,
+            plan.actions
+        );
+        // Asked for outright, a dissolve needs the whole stack in view
+        // as well: every member leaves it, and one the list does not
+        // show may be someone else's, which the plan could not name.
+        let plan = plan_submit(
+            &synced,
+            &neither,
+            &forge_repo(),
+            &by_bookmark("upper"),
+            &stacked,
+            None,
+            &SubmitOptions { stack: StackLink::Unlink },
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().any(|b| b.contains("Jiji sees only #7")
+                && b.contains(
+                    "does not dissolve a stack it cannot see whole, because it could not say \
+                     whose pull requests leave it"
+                )),
+            "{:?}",
+            plan.blockers
+        );
+
+        // Published whole, #7 is one of the stack's own pull requests, and
+        // the list still lacks it. The plan has to know it all the same:
+        // park it for the push, and not open "upper" a second time.
+        let github = slid_github(&local);
+        let plan = plan_submit(
+            &local,
+            &cut_short,
+            &forge_repo(),
+            &by_bookmark("upper"),
+            &github,
+            None,
+            &SubmitOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            github.log.borrow().as_slice(),
+            ["list open on lower", "list open on upper"]
+        );
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(
+            !plan.actions.iter().any(|a| matches!(a, SubmitAction::CreatePr { .. })),
+            "{:?}",
+            plan.actions
+        );
+        assert_eq!(
+            retargets_and_pushes(&plan),
+            ["retarget #7->main", "push lower", "push upper", "retarget #7->lower"]
+        );
+        // With "upper" refused, the push that would have closed #7 leaves
+        // it open.
+        github.log.borrow_mut().clear();
+        github.refused.borrow_mut().push("upper".to_owned());
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(outcome.failed);
+        assert!(github.pr(7).open, "{:?}", github.log);
     }
 }

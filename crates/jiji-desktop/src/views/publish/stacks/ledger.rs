@@ -34,12 +34,14 @@ impl PublishView {
             .child(text)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_segment(
         &self,
         segment: &StackSegment,
         index: usize,
         last: bool,
         landing: &[LandSegment],
+        others: &[&PrSummary],
         hue: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -269,6 +271,53 @@ impl PublishView {
             .py(px(9.))
             .child(line)
             .child(meta);
+        // Someone else's pull requests that rest on this branch: shown
+        // where they sit, and plainly not a station of this stack's line.
+        for other in others {
+            let url = other.url.clone();
+            let number = other.number;
+            body = body.child(
+                h_flex()
+                    .id(SharedString::from(format!("seg-other-{}", other.number)))
+                    .debug_selector(move || format!("seg-other-{number}"))
+                    .role(gpui::Role::Link)
+                    .aria_label(format!(
+                        "Pull request {}, someone else's, based on {}",
+                        other.by_author(),
+                        other.base_branch
+                    ))
+                    .aria_description("Open on GitHub")
+                    .tabbable(cx)
+                    .gap(px(6.))
+                    .min_w_0()
+                    .text_size(px(TEXT_XS))
+                    .text_color(t.text3)
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(t.text1))
+                    .tooltip(tooltip(
+                        "Someone else's pull request on this stack: its branch is not a \
+                         bookmark here. Publish and Land never merge it and never push to \
+                         its branch; Land points it at trunk when its base lands",
+                    ))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(icon(IconName::Branch, 11., t.text3))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(t.mono.clone())
+                            .child(format!("#{}", other.number)),
+                    )
+                    .child(div().min_w_0().child(truncated(format!(
+                        "{} · {} on {}",
+                        other
+                            .author
+                            .as_ref()
+                            .map_or_else(|| "someone else".to_owned(), |login| format!("@{login}")),
+                        other.head_branch,
+                        other.base_branch
+                    )))),
+            );
+        }
         if open {
             let mut changes = v_flex().mt(px(4.));
             for (cx_index, change) in segment.changes.iter().enumerate() {
@@ -406,11 +455,22 @@ impl PublishView {
                     ),
             );
         for (index, segment) in stack.segments.iter().enumerate() {
+            // Each of someone else's pull requests goes under the branch
+            // of the stack it rests on, directly or through another one.
+            let mut bases: Vec<&str> = segment.bookmark.as_deref().into_iter().collect();
+            let mut here: Vec<&PrSummary> = Vec::new();
+            for other in &stack.others {
+                if bases.contains(&other.base_branch.as_str()) {
+                    bases.push(&other.head_branch);
+                    here.push(other);
+                }
+            }
             ledger = ledger.child(self.render_segment(
                 segment,
                 index,
                 index + 1 == total,
                 landing,
+                &here,
                 hue,
                 cx,
             ));

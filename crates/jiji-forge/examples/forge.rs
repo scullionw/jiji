@@ -213,7 +213,15 @@ fn plan(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     } else {
         jiji_forge::SubmitHead::Change { change: head.to_string() }
     };
-    let plan = plan_submit(&snapshot, &prs, &repo, &head, &forge_side, template.as_ref())?;
+    let plan = plan_submit(
+        &snapshot,
+        &prs,
+        &repo,
+        &head,
+        &forge_side,
+        template.as_ref(),
+        &jiji_forge::SubmitOptions::default(),
+    )?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
     Ok(())
 }
@@ -271,12 +279,19 @@ fn land(repo_path: Option<&str>, head: Option<&str>) -> Result<(), ForgeError> {
     let client = GitHubClient::for_repo(&repo, &resolved.token)?;
     let prs = RepoPrState::new(client.open_prs(&repo.owner, &repo.name)?, &repo.owner);
     let forge_side = LandRepoForge { client: &client, repo: &repo };
+    // Planning asks the repository whether merges GitHub reports are on
+    // trunk here; it reads, nothing more.
+    let vcs = CliVcs {
+        backend: jiji_core::JjBackend::default(),
+        path: std::path::PathBuf::from(repo_path),
+    };
     let plan = plan_land(
         &snapshot,
         &prs,
         &repo,
         head,
         &forge_side,
+        &vcs,
         &jiji_forge::LandOptions::default(),
     )?;
     println!("{}", serde_json::to_string_pretty(&plan).expect("plan serializes"));
@@ -306,22 +321,16 @@ impl jiji_forge::LandVcs for CliVcs {
         self.backend.open(&self.path)
     }
 
-    fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, jiji_core::BackendError> {
+    fn rebase_onto_trunk(
+        &self,
+        remote: &str,
+        trunk: &str,
+        root_change: &str,
+        landed: &[String],
+    ) -> Result<String, jiji_core::BackendError> {
         use jiji_core::RepoBackend as _;
-        let trunk_target = self
-            .backend
-            .open(&self.path)?
-            .bookmarks
-            .iter()
-            .find(|b| b.is_trunk)
-            .map(|b| b.target.clone())
-            .ok_or_else(|| {
-                jiji_core::BackendError::MutationFailed(
-                    "the repository has no trunk bookmark to rebase onto".into(),
-                )
-            })?;
         self.backend
-            .rebase_change(&self.path, root_change, &trunk_target)
+            .rebase_onto_trunk(&self.path, remote, trunk, root_change, landed)
             .map(|outcome| outcome.summary)
     }
 
@@ -336,18 +345,54 @@ impl jiji_forge::LandVcs for CliVcs {
             .map(|outcome| outcome.summary)
     }
 
-    fn delete_bookmark(&self, name: &str) -> Result<String, jiji_core::BackendError> {
+    fn delete_bookmark_at(
+        &self,
+        name: &str,
+        commit: &str,
+    ) -> Result<String, jiji_core::BackendError> {
         use jiji_core::RepoBackend as _;
         self.backend
-            .delete_bookmark(&self.path, name)
+            .delete_bookmark_at(&self.path, name, commit)
             .map(|outcome| outcome.summary)
     }
 
-    fn abandon_changes(&self, change_ids: &[String]) -> Result<String, jiji_core::BackendError> {
+    fn landed(
+        &self,
+        remote: &str,
+        trunk: &str,
+        landing: &str,
+        head: &str,
+        bottom: &str,
+        top: &str,
+    ) -> Result<jiji_core::snapshot::LandedCheck, jiji_core::BackendError> {
         use jiji_core::RepoBackend as _;
         self.backend
-            .abandon_changes(&self.path, change_ids)
+            .landed_check(&self.path, remote, trunk, landing, head, bottom, top)
+    }
+
+    fn lands_as_tip(
+        &self,
+        remote: &str,
+        trunk: &str,
+        bottom: &str,
+        first_top: &str,
+        tip: &str,
+    ) -> Result<jiji_core::snapshot::TipCheck, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend
+            .lands_as_tip(&self.path, remote, trunk, bottom, first_top, tip)
+    }
+
+    fn abandon_changes(&self, commits: &[String]) -> Result<String, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend
+            .abandon_landed(&self.path, commits)
             .map(|outcome| outcome.summary)
+    }
+
+    fn resting_on(&self, commits: &[String]) -> Result<Vec<String>, jiji_core::BackendError> {
+        use jiji_core::RepoBackend as _;
+        self.backend.branches_resting_on(&self.path, commits)
     }
 }
 

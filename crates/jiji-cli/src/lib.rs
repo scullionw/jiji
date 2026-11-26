@@ -217,7 +217,7 @@ fn execute(cli: Cli, out: &mut Output) -> Result<i32> {
             let stack = select_stack(&stacks, head.as_deref())?;
             let plan = match (&forge, &stack.head_bookmark) {
                 (Some(f), Some(head)) if stack.submit_head.is_some() && stack.pr_count > 0 => {
-                    Some(f.land_plan(&snapshot, head, &LandOptions::default())?)
+                    Some(f.land_plan(&snapshot, head, &vcs, &LandOptions::default())?)
                 }
                 _ => None,
             };
@@ -248,8 +248,12 @@ fn execute(cli: Cli, out: &mut Output) -> Result<i32> {
             let forge = ForgeContext::connect(&snapshot)?;
             let head = resolve_head(&snapshot, &forge.prs, args.write.head.as_deref())?;
             let head = require_bookmark(head)?;
-            let plan =
-                forge.land_plan(&snapshot, &head, &args.rules.apply(LandOptions::default()))?;
+            let plan = forge.land_plan(
+                &snapshot,
+                &head,
+                &vcs,
+                &args.rules.apply(LandOptions::default()),
+            )?;
             out.preflight(&output::land_plan(&plan))?;
             let side = forge.land_side();
             let outcome = execute_if_ready(args.write.dry_run, !plan.blockers.is_empty(), || {
@@ -350,6 +354,7 @@ impl ForgeContext {
         &self,
         snapshot: &RepoSnapshot,
         head: &str,
+        vcs: &LocalVcs,
         options: &LandOptions,
     ) -> Result<LandPlan> {
         Ok(plan_land(
@@ -358,6 +363,7 @@ impl ForgeContext {
             &self.repo,
             head,
             &self.land_side(),
+            vcs,
             options,
         )?)
     }
@@ -502,7 +508,17 @@ fn execute_if_ready<T>(
 }
 
 fn publish(vcs: &LocalVcs, args: PublishArgs, out: &mut Output) -> Result<i32> {
-    let PublishArgs { write: args, draft } = args;
+    let PublishArgs {
+        write: args,
+        draft,
+        stack,
+        no_stack,
+    } = args;
+    let options = publish_options(
+        stack,
+        no_stack,
+        prefs::link_new_stacks(&prefs::data_dir()),
+    );
     let _lock = if args.dry_run {
         None
     } else {
@@ -526,6 +542,7 @@ fn publish(vcs: &LocalVcs, args: PublishArgs, out: &mut Output) -> Result<i32> {
         &head,
         &side,
         template.as_ref(),
+        &options,
     )?;
     if draft {
         plan.open_new_prs_as_drafts();
@@ -544,6 +561,22 @@ fn publish(vcs: &LocalVcs, args: PublishArgs, out: &mut Output) -> Result<i32> {
         .unwrap_or(if plan.blockers.is_empty() { 0 } else { 3 });
     out.emit(&json!({"plan": plan, "outcome": outcome}), text)?;
     Ok(exit)
+}
+
+/// What `--stack` and `--no-stack` ask of a publish, under the setting
+/// that links new stacks as GitHub stacks (the app's Settings keep it, and
+/// the command reads it from the app's preferences). Either flag is this
+/// publish's own choice and wins over the setting; without one, the
+/// setting decides.
+fn publish_options(stack: bool, no_stack: bool, link_new_stacks: bool) -> SubmitOptions {
+    SubmitOptions {
+        stack: match (stack, no_stack) {
+            (true, _) => StackLink::Link,
+            (_, true) => StackLink::Unlink,
+            _ => StackLink::Follow,
+        },
+    }
+    .under_setting(link_new_stacks)
 }
 
 /// Flip the draft flag on a stack's PRs. Only GitHub changes: no snapshot
@@ -631,12 +664,17 @@ fn ship(vcs: &LocalVcs, args: WriteArgs, out: &mut Output) -> Result<i32> {
         );
     }
     if forge.is_none() {
-        plan.warnings
-            .push("GitHub PR status was not checked.".into());
+        plan.warnings.push(jiji_forge::SHIPPED_WITHOUT_GITHUB.into());
     }
     out.preflight(&output::ship_plan(&plan))?;
+    // GitHub, for a plan that finishes pull requests. A plan made without
+    // it has none to finish.
+    let side = forge.as_ref().map(|f| RepoForge {
+        client: &f.client,
+        repo: &f.repo,
+    });
     let outcome = execute_if_ready(args.dry_run, !plan.blockers.is_empty(), || {
-        execute_ship(&plan, vcs)
+        execute_ship(&plan, vcs, side.as_ref().map(|side| side as &dyn ShipForge))
     })?;
     let mut text = String::new();
     if let Some(outcome) = &outcome {

@@ -138,6 +138,40 @@ pub struct GraphNode {
     /// the change id no longer names one commit. Rendered first-class; the
     /// usual resolution is abandoning or rewriting the copies not wanted.
     pub is_divergent: bool,
+    /// The user's own change, immutable only because a remote branch that
+    /// is no bookmark here builds on it: someone else pushed a branch on
+    /// top of this stack (or the same person did, from another clone),
+    /// and jj treats everything an untracked remote bookmark contains as
+    /// immutable. The change sits under a local bookmark and is not part
+    /// of trunk. Its `kind` stays `Immutable`, since nothing here may
+    /// rewrite it by hand; stacks still count it as theirs to publish and
+    /// land, which is what tells it from landed history.
+    #[serde(default)]
+    pub held: bool,
+    /// Divergent only on account of someone else's branch: every other
+    /// visible commit of this change is immutable here and not part of
+    /// trunk, kept in view by a branch that is no bookmark here and was
+    /// built on an earlier version of the change. Nothing here can
+    /// abandon those copies, so this is not a divergence to resolve
+    /// before publishing: it ends when that branch is rebased onto this
+    /// commit (Land does that with the stack) or is deleted.
+    #[serde(default)]
+    pub old_copies_held: bool,
+}
+
+impl GraphNode {
+    /// Divergent in a way that is the user's to resolve: another visible
+    /// commit of this change is theirs to abandon or rewrite.
+    pub fn diverged_here(&self) -> bool {
+        self.is_divergent && !self.old_copies_held
+    }
+
+    /// History nothing here works on any more: immutable, and not a
+    /// change of the user's own that someone else's branch holds (`held`).
+    /// Where a stack ends when it is walked down from its head.
+    pub fn is_settled(&self) -> bool {
+        self.kind == NodeKind::Immutable && !self.held
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +667,59 @@ pub struct AnnotateLine {
     pub origin: u32,
     /// The line's text, without its trailing newline.
     pub text: String,
+}
+
+/// Whether trunk holds a run of local changes on the strength of a pull
+/// request the forge reports merged, as this repository sees it right
+/// now. Answered by `RepoBackend::landed_check`; landing reads it before
+/// it rebases, pushes, or abandons anything on the strength of a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LandedCheck {
+    /// The changes are part of trunk's history here: the commit the forge
+    /// names as the merge is, the pull request was merged from exactly
+    /// these commits, and applying them on top of that commit would alter
+    /// nothing. Or the commits themselves are in trunk's history.
+    Landed,
+    /// The merge the forge names does not vouch for the changes (it is
+    /// not part of trunk's history, it lacks something, or the pull
+    /// request was merged from other commits), but trunk's tip holds all
+    /// of them all the same: they arrived another way (a pull request
+    /// merged into the branch below it, which then landed whole).
+    Held,
+    /// The landing commit is not in this repository. Nothing has fetched
+    /// it yet.
+    Unfetched,
+    /// The landing commit is here, but trunk's history does not include
+    /// it, and trunk's tip does not hold the changes: the pull request
+    /// merged somewhere other than trunk.
+    Elsewhere,
+    /// The landing commit is part of trunk's history, yet applying the
+    /// changes on top of the commit that was asked (the landing commit,
+    /// or trunk's tip when the pull request was merged from other
+    /// commits) would still alter `paths` (capped; `more` counts the
+    /// rest). Trunk does not hold everything the changes hold.
+    #[serde(rename_all = "camelCase")]
+    Missing { paths: Vec<String>, more: u32 },
+}
+
+/// Whether landing a stack one pull request at a time would leave trunk
+/// as one merge of the stack's tip would. Answered by
+/// `RepoBackend::lands_as_tip`; landing reads it before the first merge
+/// of a stack that has more than one pull request left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TipCheck {
+    /// Both ways end with the same tree.
+    Same,
+    /// They end with different content at `paths` (capped; `more` counts
+    /// the rest).
+    #[serde(rename_all = "camelCase")]
+    Differs { paths: Vec<String>, more: u32 },
+    /// The stack has a shape this does not judge: a merge inside it, more
+    /// commits than it walks, or a base that is neither part of trunk's
+    /// history nor content trunk already holds.
+    Unknown,
 }
 
 /// What a mutation did, surfaced as the operation breadcrumb after the

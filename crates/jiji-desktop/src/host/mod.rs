@@ -115,7 +115,10 @@ impl Host {
             } else {
                 Box::new(JjBackend::default())
             };
-        let forge: Box<dyn Forge> = if std::env::var("JIJI_OFFLINE").as_deref() == Ok("1") {
+        let forge: Box<dyn Forge> = if let Some(double) = mock_forge() {
+            log::info!("JIJI_MOCK_FORGE set; Publish is answered by the test double");
+            double
+        } else if std::env::var("JIJI_OFFLINE").as_deref() == Ok("1") {
             log::info!("JIJI_OFFLINE=1 set; no forge token is looked up or used");
             Box::new(forge::Offline)
         } else {
@@ -423,6 +426,68 @@ impl Host {
             backend.push_bookmarks(path, names, Some(remote))
         })
     }
+}
+
+/// `JIJI_MOCK_FORGE`, in a `headless` build over the mock backend: GitHub
+/// as the tests capture it stands behind the mock repository, so a
+/// scripted run can draw Publish with pull requests on it. Nothing is
+/// looked up and nothing is reached, as with `JIJI_OFFLINE`. `1` is the
+/// mock stack's two pull requests as a plain chain, `stack` the same two
+/// linked as a GitHub stack, `stray` the lower one closed as merged
+/// without having landed, `others` the plain chain with two pull requests
+/// by other people on it (one on each of its branches).
+#[cfg(all(feature = "headless", not(test)))]
+fn mock_forge() -> Option<Box<dyn Forge>> {
+    use crate::testing::forge::Fixture;
+    if std::env::var("JIJI_MOCK_BACKEND").as_deref() != Ok("1") {
+        return None;
+    }
+    let fixture = Fixture::mock_stack();
+    match std::env::var("JIJI_MOCK_FORGE").ok()?.as_str() {
+        "1" => {}
+        "stack" => {
+            fixture.link_stack(&[41, 42]);
+        }
+        "stray" => {
+            fixture.pull(41, |pull| {
+                pull.summary.base_branch = "diff-virtualization".into();
+                pull.merged_as("8b19f3c2");
+            });
+            fixture.pull(42, |pull| pull.summary.base_branch = "main".into());
+        }
+        "others" => {
+            use crate::testing::forge::open_pr;
+            for (number, head, base, commit, title, author) in [
+                (
+                    50,
+                    "sticky-header-shadow",
+                    "diff-model",
+                    "0ddba11c",
+                    "Shadow under the sticky header",
+                    "kim",
+                ),
+                (
+                    51,
+                    "virtual-scroll-bench",
+                    "diff-virtualization",
+                    "5ca1ab1e",
+                    "Benchmark for the virtualized diff",
+                    "sam",
+                ),
+            ] {
+                let mut theirs = open_pr(number, head, base, commit, title);
+                theirs.summary.author = Some(author.into());
+                fixture.github().prs.push(theirs);
+            }
+        }
+        _ => return None,
+    }
+    Some(fixture.boxed())
+}
+
+#[cfg(not(all(feature = "headless", not(test))))]
+fn mock_forge() -> Option<Box<dyn Forge>> {
+    None
 }
 
 /// The nearest ancestor that is a jj workspace root. The backend wants the
