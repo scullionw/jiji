@@ -266,6 +266,44 @@ another clone: its branch is not a bookmark here):
   header's "immutable" tag say why changes of yours read as immutable
   while their branch builds on them.
 
+Taking over someone else's pull request, for when someone opens one to
+help and wants you to push it over the line:
+
+- "Take over", on their pull request's row in Publish, on the card of
+  their stack and in the command palette, and `jiji take-over NUMBER` (or
+  a branch name) in the command. Their branch becomes a bookmark here, at
+  what GitHub has for it, and their pull request a segment of your stack
+  like any other: listed in the landing order with whose it was, rebased
+  with the stack, pushed by Publish and merged by Land. The changes of
+  yours under it are yours to rewrite again. The plan is shown first and
+  says what it means; nothing is pushed until your next Publish. On
+  GitHub the pull request stays its author's, with their title and
+  description, and their commits keep their author.
+- "Give back", on the segment and in the palette, and `jiji give-back
+  NUMBER`, is the reverse: no bookmark here any more, the branch left as
+  it is. It is refused while changes to the branch were not published or
+  work of your own sits on it.
+- From the take-over on, Jiji pushes to a branch someone else made. Each
+  push goes through only if the branch is where the last fetch saw it, so
+  a commit its author pushes afterwards is never overwritten. A plan that
+  pushes the branch names the pull request and its author as taken over; a
+  push that is refused because they pushed again says so, and what to do.
+- A branch that was built on an earlier copy of your changes (you amended
+  them since, or landed what was under them) is brought onto the copy you
+  have now when it is taken over, here only; the result says so and the
+  next Publish pushes it.
+- A pull request from a fork cannot be taken over, and the plan says why:
+  its branch is in another repository, and pushing there takes the fork as
+  a remote of its own, which Jiji does not set up. Nor can one that rests
+  on another pull request of someone else's, until that one is taken over.
+- `jiji publish --stack`, and "Link as a GitHub stack" in Publish, now take
+  someone else's pull requests that sit on top of the chain into the stack,
+  naming each by number and author. In a stack GitHub rebases their branch
+  itself after each merge below it, so their pull request goes on showing
+  only its own changes. Where Land's plan says that their pull request
+  will show your landed commits, it now names the ways to avoid that:
+  take it over, or, for one on top of the chain, link the stack first.
+
 Known limits:
 
 - From the moment commits under someone else's pull request are replaced

@@ -3,7 +3,7 @@
 
 use jiji_core::snapshot::{LandedCheck, TipCheck};
 use jiji_core::{BackendError, JjBackend, RepoBackend, RepoSnapshot};
-use jiji_forge::{LandVcs, ShipVcs, SubmitVcs};
+use jiji_forge::{LandVcs, ShipVcs, SubmitVcs, TakeOverVcs};
 use std::path::PathBuf;
 
 pub struct LocalVcs {
@@ -26,6 +26,30 @@ impl SubmitVcs for LocalVcs {
     fn create_bookmark(&self, name: &str, change: &str) -> Result<String, BackendError> {
         self.backend
             .create_bookmark(&self.path, name, change)
+            .map(|o| o.summary)
+    }
+}
+
+impl TakeOverVcs for LocalVcs {
+    fn git_fetch(&self, remote: &str) -> Result<String, BackendError> {
+        self.backend
+            .git_fetch(&self.path, Some(&[remote.to_owned()]))
+            .map(|o| o.summary)
+    }
+    fn take_over(
+        &self,
+        bookmark: &str,
+        remote: &str,
+        number: u64,
+        author: Option<&str>,
+    ) -> Result<String, BackendError> {
+        self.backend
+            .take_over_branch(&self.path, bookmark, remote, number, author)
+            .map(|o| o.summary)
+    }
+    fn give_back(&self, bookmark: &str, remote: &str) -> Result<String, BackendError> {
+        self.backend
+            .give_back_branch(&self.path, bookmark, remote)
             .map(|o| o.summary)
     }
 }

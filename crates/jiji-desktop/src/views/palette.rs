@@ -107,6 +107,7 @@ impl Palette {
             })
             .collect();
         let (landable, shippable) = (model.landable_stacks(), model.shippable_stacks());
+        let (takeable, taken_over) = (model.takeable_prs(), model.taken_over_prs());
         let repo_path = model.repo_path();
         let jobs = visible_jobs(&model.autoland.jobs, repo_path.as_deref());
         let entries: Vec<_> = model
@@ -138,6 +139,8 @@ impl Palette {
                 lenses: &VIEW_PRESETS,
                 landable: &landable,
                 shippable: &shippable,
+                takeable: &takeable,
+                taken_over: &taken_over,
                 autoland_jobs: &jobs,
                 cli: model.cli.status.as_ref().map(|status| CliState {
                     installed: status.installed,

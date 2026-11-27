@@ -139,6 +139,14 @@ pub enum UiIntent {
     Ship {
         head: String,
     },
+    /// Open Publish on the plan to take over someone else's pull request.
+    TakeOver {
+        number: u64,
+    },
+    /// Open Publish on the plan to give back one that was taken over.
+    GiveBack {
+        number: u64,
+    },
 }
 
 /// The breadcrumb after a mutation: what happened and which operation

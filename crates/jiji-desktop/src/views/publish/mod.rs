@@ -18,7 +18,7 @@ use jiji_core::snapshot::RepoSnapshot;
 use jiji_forge::{
     AutoLandStatus, LandOptions, LandOutcome, LandPlan, MergeMethod, PrSummary, PublishStack,
     RepoPrState, ShipOutcome, ShipPlan, StackLink, SubmitHead, SubmitOutcome, SubmitPlan,
-    SubmitStepStatus, TokenSource,
+    SubmitStepStatus, TakeOverOutcome, TakeOverPlan, TokenSource,
 };
 
 use crate::app::{app, AppEvent, AppModel, ForgePhase, UiIntent};
@@ -112,6 +112,20 @@ pub struct PublishView {
     queue_error: Option<String>,
     resuming: bool,
     resume_error: Option<String>,
+
+    /// The pull request the user asked to take over, or to give back, and
+    /// the plan for it once it is in. The plan is shown in the action
+    /// column and runs only when confirmed there.
+    takeover_for: Option<u64>,
+    takeover: Option<TakeOverPlan>,
+    takeover_loading: bool,
+    takeover_error: Option<String>,
+    taking_over: bool,
+    takeover_outcome: Option<TakeOverOutcome>,
+    takeover_seq: u64,
+    /// The stack to show once the stacks have been read again: the one a
+    /// take-over just put their pull request in.
+    follow: Option<String>,
 
     review_for: Option<PrSummary>,
     review_name: Entity<TextInput>,
@@ -268,6 +282,14 @@ impl PublishView {
             queue_error: None,
             resuming: false,
             resume_error: None,
+            takeover_for: None,
+            takeover: None,
+            takeover_loading: false,
+            takeover_error: None,
+            taking_over: false,
+            takeover_outcome: None,
+            takeover_seq: 0,
+            follow: None,
             review_for: None,
             review_name,
             review_busy: false,
@@ -305,7 +327,7 @@ impl PublishView {
     }
 
     fn executing(&self) -> bool {
-        self.publishing || self.landing || self.shipping || self.queueing
+        self.publishing || self.landing || self.shipping || self.queueing || self.taking_over
     }
 
     fn selected_stack(&self) -> Option<&PublishStack> {
@@ -378,6 +400,14 @@ impl PublishView {
                             .and_then(|stack| stack.head_change.clone());
                         this.snapshot = Some(snapshot);
                         this.stacks = stacks;
+                        // A take-over put their pull request in a stack
+                        // of its own key: that is the one to show.
+                        if let Some(key) = this
+                            .follow
+                            .take_if(|key| this.stacks.iter().any(|stack| stack.key == *key))
+                        {
+                            this.select_stack(&key, cx);
+                        }
                         if this.selected_stack().is_none() {
                             if let Some(stack) = this
                                 .stacks
@@ -436,7 +466,8 @@ impl PublishView {
                     && self.ship_error.is_none()
                     && self.outcome.is_none()
                     && self.land_outcome.is_none()
-                    && self.ship_outcome.is_none();
+                    && self.ship_outcome.is_none()
+                    && self.takeover_for.is_none();
                 if connected && idle && stack.submit_head.is_some() {
                     self.select_stack(&stack.key, cx);
                 }
@@ -452,10 +483,49 @@ impl PublishView {
         }
         let intent = self.app.update(cx, |model, _| {
             model.take_intent(|intent| {
-                matches!(intent, UiIntent::Land { .. } | UiIntent::Ship { .. })
+                matches!(
+                    intent,
+                    UiIntent::Land { .. }
+                        | UiIntent::Ship { .. }
+                        | UiIntent::TakeOver { .. }
+                        | UiIntent::GiveBack { .. }
+                )
             })
         });
         match intent {
+            // The palette's "Take over #9…" and "Give back #9…": the
+            // stack the pull request is on, with the plan to confirm.
+            Some(UiIntent::TakeOver { number }) => {
+                let on = self
+                    .stacks
+                    .iter()
+                    .find(|stack| stack.others.iter().any(|other| other.number == number))
+                    .map(|stack| stack.key.clone());
+                if let Some(key) = on {
+                    self.select_stack(&key, cx);
+                }
+                self.page = Page::Stacks;
+                self.ask_take_over(number, cx);
+            }
+            Some(UiIntent::GiveBack { number }) => {
+                let on = self
+                    .stacks
+                    .iter()
+                    .find(|stack| {
+                        stack.segments.iter().any(|segment| {
+                            segment
+                                .taken_over
+                                .as_ref()
+                                .is_some_and(|taken| taken.number == number)
+                        })
+                    })
+                    .map(|stack| stack.key.clone());
+                if let Some(key) = on {
+                    self.select_stack(&key, cx);
+                }
+                self.page = Page::Stacks;
+                self.ask_give_back(number, cx);
+            }
             Some(UiIntent::Land { bookmark }) => {
                 self.selected = self
                     .stacks
@@ -2231,6 +2301,260 @@ mod tests {
         assert_eq!(theirs.summary.state, PrState::Open);
         assert_eq!(theirs.summary.base_branch, "main");
         drop(github);
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// A teammate's branch of the mock repository, as a pull request on
+    /// top of the mock stack: `alice/palette-icons` is on the remote and
+    /// is no bookmark here.
+    fn alice_on_top(fixture: &Fixture) {
+        let mut theirs = crate::testing::forge::open_pr(
+            52,
+            "alice/palette-icons",
+            "diff-virtualization",
+            "19b753c4",
+            "Icon set for the palette rows",
+        );
+        theirs.summary.author = Some("alice".into());
+        fixture.github().prs.push(theirs);
+    }
+
+    /// Their pull request is taken over from its own row. The click asks:
+    /// the card says what will happen and nothing runs. Confirmed, their
+    /// branch is a bookmark here and their pull request the stack's next
+    /// station, marked as taken over, and the plans that follow name it.
+    /// Giving back is the same two steps the other way.
+    #[gpui::test]
+    fn their_pull_request_is_taken_over_from_its_row_and_given_back(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        alice_on_top(&fixture);
+        let bench = bench("publish-take-over", &fixture, true, cx);
+        bench.model.read_with(cx, |model, _| {
+            assert_eq!(
+                model.takeable_prs(),
+                [(
+                    52,
+                    "#52 by @alice".to_owned(),
+                    "Icon set for the palette rows".to_owned()
+                )]
+            );
+            assert!(model.taken_over_prs().is_empty());
+        });
+        // The action is on their row, and a click on it asks.
+        {
+            let mut visual = gpui::VisualTestContext::from_window(bench._window.into(), cx);
+            let action = visual
+                .debug_bounds("take-over-52")
+                .expect("their row offers to take it over");
+            assert!(visual.debug_bounds("give-back-52").is_none());
+            visual.simulate_click(action.center(), gpui::Modifiers::none());
+        }
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.takeover_for, Some(52));
+            let plan = view.takeover.as_ref().expect("the plan is on the card");
+            assert!(!plan.giving_back);
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            assert_eq!(plan.who(), "#52 by @alice");
+            // What it means is on the card, in full.
+            assert_eq!(plan.warnings.len(), 4, "{:?}", plan.warnings);
+            assert!(plan.warnings[0].starts_with("Nothing is pushed now."));
+            // And nothing ran.
+            assert!(view.takeover_outcome.is_none());
+            assert!(view.snapshot.as_ref().unwrap().taken_over.is_empty());
+        });
+        assert!(fixture
+            .take_asked()
+            .iter()
+            .all(|what| !what.contains("#52")));
+
+        bench
+            .publish
+            .update(cx, |view, cx| view.confirm_take_over(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.takeover_error, None);
+            let outcome = view.takeover_outcome.as_ref().expect("the take-over ran");
+            assert!(!outcome.failed, "{:?}", outcome.steps);
+            assert_eq!(
+                outcome.steps.last().unwrap().detail.as_deref(),
+                Some(
+                    "Took over \u{201c}alice/palette-icons\u{201d}: it is a bookmark here now, at \
+                     19b753c4, and nothing was pushed"
+                )
+            );
+            // The stack on screen is the one with theirs in it: a third
+            // station, marked, and no longer someone else's.
+            let stack = view.selected_stack().expect("a stack is selected");
+            assert_eq!(stack.key, "alice/palette-icons");
+            assert_eq!(
+                stack
+                    .segments
+                    .iter()
+                    .map(|s| (
+                        s.pr.as_ref().map(|pr| pr.number),
+                        s.taken_over.as_ref().map(|t| t.by_author())
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (Some(41), None),
+                    (Some(42), None),
+                    (Some(52), Some("#52 by @alice".to_owned())),
+                ]
+            );
+            assert!(stack.others.is_empty());
+        });
+        bench.model.read_with(cx, |model, _| {
+            assert!(model.takeable_prs().is_empty());
+            assert_eq!(
+                model.taken_over_prs(),
+                [(
+                    52,
+                    "#52 by @alice".to_owned(),
+                    "alice/palette-icons".to_owned()
+                )]
+            );
+        });
+        {
+            let mut visual = gpui::VisualTestContext::from_window(bench._window.into(), cx);
+            assert!(
+                visual.debug_bounds("seg-taken-52").is_some(),
+                "the mark is drawn"
+            );
+            assert!(visual.debug_bounds("give-back-52").is_some());
+            assert!(visual.debug_bounds("seg-other-52").is_none());
+        }
+        // Read, the card gives way to the stack's own plan, which names
+        // the pull request that was taken over.
+        bench
+            .publish
+            .update(cx, |view, cx| view.dismiss_take_over(cx));
+        cx.run_until_parked();
+        let plan = bench.land(cx);
+        assert!(
+            plan.warnings.iter().any(|note| note.starts_with(
+                "#52 by @alice was taken over, and lands with this stack like a pull request of \
+                 your own"
+            )),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!plan
+            .warnings
+            .iter()
+            .any(|note| note.contains("someone else's")));
+
+        // The way back, from the segment.
+        {
+            let mut visual = gpui::VisualTestContext::from_window(bench._window.into(), cx);
+            let back = visual.debug_bounds("give-back-52").unwrap();
+            visual.simulate_click(back.center(), gpui::Modifiers::none());
+        }
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            let plan = view.takeover.as_ref().expect("the plan is on the card");
+            assert!(plan.giving_back);
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            assert_eq!(plan.title, "Icon set for the palette rows");
+            assert_eq!(view.snapshot.as_ref().unwrap().taken_over.len(), 1);
+        });
+        bench
+            .publish
+            .update(cx, |view, cx| view.confirm_take_over(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.takeover_error, None);
+            assert!(!view.takeover_outcome.as_ref().unwrap().failed);
+            assert!(view.snapshot.as_ref().unwrap().taken_over.is_empty());
+            // Theirs again: on the stack's top, and no station of it.
+            let stack = view.selected_stack().expect("a stack is selected");
+            assert_eq!(stack.segments.len(), 2);
+            assert_eq!(
+                stack.others.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                [52]
+            );
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// Their pull request is also a stack of its own in the browser, one
+    /// that is on GitHub only. Asked from there, the take-over ends on
+    /// the stack it has become a part of.
+    #[gpui::test]
+    fn a_stack_that_is_on_github_only_is_taken_over_from_its_own_card(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        alice_on_top(&fixture);
+        let bench = bench("publish-take-over-remote", &fixture, true, cx);
+        bench.select("remote:alice/palette-icons", cx);
+        bench.publish.read_with(cx, |view, _| {
+            let stack = view.selected_stack().unwrap();
+            assert!(stack.submit_head.is_none(), "on GitHub only");
+            assert_eq!(stack.segments[0].pr.as_ref().unwrap().number, 52);
+        });
+        // What the card's "Take over #52…" does.
+        bench
+            .publish
+            .update(cx, |view, cx| view.ask_take_over(52, cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.selected.as_deref(), Some("remote:alice/palette-icons"));
+            assert!(view
+                .takeover
+                .as_ref()
+                .is_some_and(|plan| plan.blockers.is_empty()));
+        });
+        bench
+            .publish
+            .update(cx, |view, cx| view.confirm_take_over(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.takeover_error, None);
+            let stack = view.selected_stack().expect("a stack is selected");
+            assert_eq!(stack.key, "alice/palette-icons");
+            assert!(stack.submit_head.is_some(), "a stack of the user's now");
+            assert_eq!(stack.segments.len(), 3);
+            assert!(!view
+                .stacks
+                .iter()
+                .any(|s| s.key == "remote:alice/palette-icons"));
+        });
+        let _ = std::fs::remove_dir_all(bench.dir);
+    }
+
+    /// A pull request from a fork has the same action, and the card says
+    /// why it cannot be taken over. There is nothing to confirm.
+    #[gpui::test]
+    fn a_fork_s_pull_request_is_refused_on_the_card_with_the_reason(cx: &mut TestAppContext) {
+        let fixture = Fixture::mock_stack();
+        alice_on_top(&fixture);
+        fixture.pull(52, |pull| pull.summary.head_owner = Some("alice".into()));
+        let bench = bench("publish-take-over-fork", &fixture, true, cx);
+        // Asked from the palette's row, which opens the same card.
+        bench.model.update(cx, |model, cx| {
+            model.send_intent(crate::app::UiIntent::TakeOver { number: 52 }, cx)
+        });
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert_eq!(view.takeover_for, Some(52));
+            let plan = view.takeover.as_ref().expect("the plan is on the card");
+            assert_eq!(plan.blockers.len(), 1, "{:?}", plan.blockers);
+            assert!(
+                plan.blockers[0].starts_with(
+                    "#52 by @alice is from a fork (alice/workbench): its branch \
+                     \u{201c}alice/palette-icons\u{201d} is not on origin"
+                ),
+                "{:?}",
+                plan.blockers
+            );
+        });
+        bench
+            .publish
+            .update(cx, |view, cx| view.confirm_take_over(cx));
+        cx.run_until_parked();
+        bench.publish.read_with(cx, |view, _| {
+            assert!(view.takeover_outcome.is_none());
+            assert!(view.snapshot.as_ref().unwrap().taken_over.is_empty());
+        });
         let _ = std::fs::remove_dir_all(bench.dir);
     }
 

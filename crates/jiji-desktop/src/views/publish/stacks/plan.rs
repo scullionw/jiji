@@ -10,7 +10,7 @@ use super::ACTIONS_W;
 use crate::logic::autoland::can_queue;
 use crate::logic::publish::{
     comment_preview, land_action_text, manual_land_label, method_word, ship_action_text,
-    stack_link_after_click, stack_link_wanted, submit_action_text,
+    stack_link_after_click, stack_link_wanted, submit_action_text, submit_step_text,
 };
 use crate::logic::text::plural_s;
 use crate::theme::{theme, Theme, RADIUS_M, RADIUS_S, TEXT_L, TEXT_S, TEXT_XS, TOOLBAR_H};
@@ -491,7 +491,10 @@ impl PublishView {
                 .map(|step| {
                     (
                         step.status,
-                        submit_action_text(&step.action, &remote),
+                        match &self.plan {
+                            Some(plan) => submit_step_text(plan, &step.action),
+                            None => submit_action_text(&step.action, &remote),
+                        },
                         step.detail.clone(),
                     )
                 })
@@ -543,7 +546,7 @@ impl PublishView {
                 let steps = plan
                     .actions
                     .iter()
-                    .map(|action| submit_action_text(action, &plan.remote))
+                    .map(|action| submit_step_text(plan, action))
                     .collect();
                 card = card.child(self.action_list(steps, cx)).child(
                     self.stacked().child(
@@ -872,7 +875,9 @@ impl PublishView {
             );
         }
 
-        let plan = if !connected {
+        let plan = if self.takeover_for.is_some() {
+            self.render_take_over(cx)
+        } else if !connected {
             v_flex()
                 .child(self.plan_heading("Connect to publish", cx))
                 .child(self.plan_text("Sign in to see checks, reviews, and landing options.", cx))
@@ -889,25 +894,42 @@ impl PublishView {
                 )
         } else if stack.submit_head.is_none() {
             let pr = stack.segments.last().and_then(|segment| segment.pr.clone());
+            // Its bottom pull request rests on trunk or on a stack that
+            // is here, so that is the one that can be taken over; one
+            // above it follows once the one below is a bookmark here.
+            let bottom = stack
+                .segments
+                .first()
+                .and_then(|segment| segment.pr.as_ref())
+                .map(|pr| pr.number);
+            let mut ways = self.stacked().child(
+                btn("plan-fetch", "Fetch for review")
+                    .primary()
+                    .large()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(pr) = pr.clone() {
+                            this.page = Page::Review;
+                            this.open_review_panel(pr, window, cx);
+                        }
+                    })),
+            );
+            if let Some(number) = bottom {
+                ways = ways.child(
+                    btn("plan-take-over", format!("Take over #{number}\u{2026}"))
+                        .large()
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.ask_take_over(number, cx)),
+                        ),
+                );
+            }
             v_flex()
                 .child(self.plan_heading("Bring this stack home", cx))
                 .child(self.plan_text(
-                    "This stack is on GitHub. Fetch its head to review it locally.",
+                    "This stack is on GitHub. Fetch its head to review it locally, or take \
+                     it over to make it yours to publish and land.",
                     cx,
                 ))
-                .child(
-                    self.stacked().child(
-                        btn("plan-fetch", "Fetch for review")
-                            .primary()
-                            .large()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(pr) = pr.clone() {
-                                    this.page = Page::Review;
-                                    this.open_review_panel(pr, window, cx);
-                                }
-                            })),
-                    ),
-                )
+                .child(ways)
         } else {
             match self.mode {
                 Mode::Land => self.render_land_plan(stack, watching, cx),

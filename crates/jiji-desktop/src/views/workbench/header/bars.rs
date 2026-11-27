@@ -557,9 +557,10 @@ impl WorkbenchView {
                     .tooltip(tooltip(
                         "Immutable to jj while a branch that is not a bookmark here builds on \
                          it. It is still part of your stack: Publish and Land work as usual. \
-                         Tracking that branch makes this change editable again; the branch is \
-                         then a bookmark of yours, and its pull request a part of this stack \
-                         to publish and land",
+                         Taking that branch's pull request over (Take over, on its row in \
+                         Publish) makes this change editable again: the branch is then a \
+                         bookmark of yours, and its pull request a part of this stack to \
+                         publish and land",
                     ))
                     .into_any_element(),
             ),

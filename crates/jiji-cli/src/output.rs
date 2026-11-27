@@ -69,6 +69,17 @@ pub fn stacks(repo: &str, stacks: &[PublishStack], hidden: usize, warnings: &[St
                 .unwrap_or_default(),
             clean(&stack.title)
         ));
+        let taken: Vec<String> = stack
+            .segments
+            .iter()
+            .filter_map(|segment| segment.taken_over.as_ref())
+            .map(|taken| other_pr(taken.number, taken.author.as_deref()))
+            .collect();
+        if !taken.is_empty() {
+            // Before the blank line that ends the entry.
+            text.pop();
+            text.push_str(&format!("    with {} (taken over)\n\n", taken.join(", ")));
+        }
         if !stack.others.is_empty() {
             // Before the blank line that ends the entry.
             text.pop();
@@ -162,6 +173,16 @@ pub fn stack_detail(stack: &PublishStack) -> String {
         if let Some(pr) = &segment.pr {
             text.push_str(&format!("     {}\n", clean(&pr.url)));
         }
+        if let Some(taken) = &segment.taken_over {
+            text.push_str(&format!(
+                "     taken over from {}: pushed and landed with this stack; give-back {} hands it back\n",
+                taken
+                    .author
+                    .as_deref()
+                    .map_or_else(|| "its author".to_owned(), |login| format!("@{}", clean(login))),
+                taken.number
+            ));
+        }
     }
     text.push('\n');
     if !stack.others.is_empty() {
@@ -178,15 +199,16 @@ pub fn stack_detail(stack: &PublishStack) -> String {
         text.push_str(
             "  Publish and Land never merge these and never push to their branches. Land\n  \
              points one at trunk when its base lands; after a squash or a rebase it then\n  \
-             shows the landed commits as its own until its author rebases it.\n",
+             shows the landed commits as its own until its author rebases it.\n  \
+             To push one over the line yourself, take it over: jiji take-over NUMBER\n  \
+             makes its branch a bookmark here and its pull request a part of this stack,\n  \
+             to publish and to land. Nothing is pushed until you publish.\n",
         );
         if stack.held() {
             text.push_str(
                 "  jj calls the changes under them immutable while their branches build on\n  \
-                 them. Publish and Land work as usual. To edit one by hand, use jj's\n  \
-                 --ignore-immutable, or track the branch (jj bookmark track): it is then a\n  \
-                 bookmark of yours, and its pull request a part of this stack to publish\n  \
-                 and land.\n",
+                 them. Publish and Land work as usual. Taking the pull request over makes\n  \
+                 them yours to edit again.\n",
             );
         }
         text.push('\n');
@@ -268,11 +290,85 @@ pub fn submit_plan(plan: &SubmitPlan) -> String {
             clean(&plan.base_branch),
             plan.segments.len()
         ),
-        plan.actions.iter().map(submit_action),
+        plan.actions.iter().map(|action| submit_step(plan, action)),
         plan.blockers.iter().cloned(),
         &plan.warnings,
     )
 }
+
+/// A publish step, with whose branch a push moves when the branch was
+/// taken over.
+fn submit_step(plan: &SubmitPlan, action: &SubmitAction) -> String {
+    let text = submit_action(action);
+    let SubmitAction::Push { bookmark, .. } = action else {
+        return text;
+    };
+    match plan
+        .segments
+        .iter()
+        .find(|segment| segment.bookmark == *bookmark)
+        .and_then(|segment| segment.taken_over.as_ref())
+    {
+        Some(taken) => format!(
+            "{text} ({}, taken over)",
+            other_pr(taken.number, taken.author.as_deref())
+        ),
+        None => text,
+    }
+}
+
+/// Taking a pull request over, or giving it back: what it will do, and
+/// in its notes what that means.
+pub fn take_over_plan(plan: &TakeOverPlan) -> String {
+    let who = other_pr(plan.number, plan.author.as_deref());
+    let title = match (&plan.base_branch, plan.giving_back) {
+        (_, true) => format!("Give back {who} · {}", clean(&plan.branch)),
+        (Some(base), false) => format!(
+            "Take over {who} · {} → {}",
+            clean(&plan.branch),
+            clean(base)
+        ),
+        (None, false) => format!("Take over {who} · {}", clean(&plan.branch)),
+    };
+    plan_text(
+        title,
+        plan.actions.iter().map(take_over_action),
+        plan.blockers.iter().cloned(),
+        &plan.warnings,
+    )
+}
+
+fn take_over_action(action: &TakeOverAction) -> String {
+    match action {
+        TakeOverAction::Fetch { remote } => format!("Fetch {remote}"),
+        TakeOverAction::TakeOver {
+            bookmark,
+            remote,
+            number,
+            ..
+        } => format!(
+            "Make {bookmark} a bookmark here, at what {remote} has for #{number} now"
+        ),
+        TakeOverAction::GiveBack {
+            bookmark, remote, ..
+        } => format!(
+            "Remove the bookmark {bookmark} here and stop following {bookmark}@{remote}; the branch stays as it is"
+        ),
+    }
+}
+
+pub fn take_over_outcome(outcome: &TakeOverOutcome) -> String {
+    let mut text = String::from("\nResults\n");
+    for s in &outcome.steps {
+        text.push_str(&step(
+            s.status,
+            take_over_action(&s.action),
+            s.detail.as_deref(),
+        ));
+    }
+    text
+}
+
 pub fn ship_plan(plan: &ShipPlan) -> String {
     plan_text(
         format!(
@@ -373,8 +469,16 @@ fn submit_action(action: &SubmitAction) -> String {
         SubmitAction::LinkStack {
             bookmarks,
             onto: Some(stack),
-            ..
-        } => format!("Add to GitHub stack {stack}: {}", bookmarks.join(", ")),
+            above,
+        } => format!(
+            "Add to GitHub stack {stack}: {}",
+            bookmarks
+                .iter()
+                .cloned()
+                .chain(above.iter().map(|number| format!("#{number}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 /// A pull request that is someone else's, by number and author.
@@ -518,12 +622,12 @@ fn step(status: SubmitStepStatus, action: String, detail: Option<&str>) -> Strin
             .unwrap_or_default()
     )
 }
-pub fn submit_outcome(outcome: &SubmitOutcome) -> String {
+pub fn submit_outcome(plan: &SubmitPlan, outcome: &SubmitOutcome) -> String {
     let mut text = String::from("\nResults\n");
     for s in &outcome.steps {
         text.push_str(&step(
             s.status,
-            submit_action(&s.action),
+            submit_step(plan, &s.action),
             s.detail.as_deref(),
         ));
         if let Some(pr) = &s.pr {

@@ -41,6 +41,7 @@ pub mod remote;
 pub mod ship;
 pub mod stacks;
 pub mod submit;
+pub mod takeover;
 pub mod template;
 
 pub use auth::{
@@ -79,5 +80,9 @@ pub use submit::{
     execute_submit, plan_submit, ExistingComment, RepoForge, StackCommentSource, StackLink,
     SubmitAction, SubmitForge, SubmitHead, SubmitOptions, SubmitOutcome, SubmitPlan,
     SubmitSegment, SubmitStep, SubmitStepStatus, SubmitVcs,
+};
+pub use takeover::{
+    execute_take_over, plan_give_back, plan_take_over, TakeOverAction, TakeOverOutcome,
+    TakeOverPlan, TakeOverStep, TakeOverTarget, TakeOverVcs,
 };
 pub use template::{new_pr_body, pr_template_candidates, PrTemplate};

@@ -56,7 +56,11 @@ stack's entry ("+ #31 by @sam on auth (someone else's)"), and `status` lists
 each one under "On this stack, by someone else", after the landing order,
 with the branch it is based on. Such a pull request is also a stack of its
 own, on GitHub only, which starts at the branch of yours it is based on.
-See [Someone else's pull request on your stack](#someone-elses-pull-request-on-your-stack).
+`jiji take-over NUMBER` makes it a part of your stack; one that was taken
+over is a segment like any other, and `stacks` and `status` say whose it
+was ("with #31 by @sam (taken over)").
+See [Someone else's pull request on your stack](#someone-elses-pull-request-on-your-stack)
+and [Take over a pull request](#take-over-a-pull-request).
 
 Without a head argument, commands select the current workstream's publishable
 stack, or the sole stack if there is no current one. An ambiguous selection
@@ -495,15 +499,16 @@ machine or from github.com. What makes a pull request theirs is that its
 branch is not a bookmark here. It is based on one of your stack's branches
 (the top one, or one in the middle), or on another such PR, or was added to
 your GitHub stack above your own. A PR from a fork is theirs whatever its
-branch is called: it is never matched to a bookmark here by name. Track
-their branch here (`jj bookmark track NAME@REMOTE`) and it is a bookmark of
-yours like any other, and its PR a segment of the stack, to publish and to
-land.
+branch is called: it is never matched to a bookmark here by name. To make
+one yours to finish, [take it over](#take-over-a-pull-request): its branch
+is then a bookmark of yours like any other, and its PR a segment of the
+stack, to publish and to land. What follows is about a PR that was not
+taken over.
 
 jj calls everything an untracked remote bookmark contains immutable. So
 once a fetch has brought their branch, the changes of yours under it are
 immutable too: `jj` and the app refuse to rewrite them by hand, until that
-branch is tracked here or has moved off them. They are still your stack.
+PR is taken over or its branch has moved off them. They are still your stack.
 `stacks`, `status`, `publish`, `land`, `watch` and `ship` go on treating
 them as such, and `status` and the app's change header say why they read as
 immutable.
@@ -524,7 +529,8 @@ anything runs.
   branch.
 - A bookmark of yours moved onto their commits would, pushed, put their
   PR's head inside its own base, and GitHub would close it as merged. The
-  plan is blocked (exit 3) and says whose PR that is.
+  plan is blocked (exit 3) and says whose PR that is, and that taking it
+  over is the other way out.
 - After you rewrote a change they had built on, a fetch brings the old
   commit back with their branch, and jj shows the change as divergent. That
   copy is theirs to keep and does not block the publish of yours. A
@@ -559,6 +565,15 @@ thing for it:
   stack above a landed branch is rebased onto trunk and pushed, and a PR of
   theirs on one of those branches shows the replaced commits in the same
   way.
+- Where the plan says that, it also names the ways to spare their author
+  the rebase, and only those that are open. `take-over N` first: their PR
+  is then rebased and landed from here with the rest. Or, for a PR that
+  sits on top of the chain, `publish --stack` first: it links the chain as
+  a GitHub stack with their PR in it, and GitHub then rebases their branch
+  itself after each merge below it (seen on GitHub: a PR opened from
+  another clone showed one commit and one file again after the two under
+  it had landed by squash). A stack is one line, so a PR on a branch in
+  the middle can only be taken over. Neither is open for a PR from a fork.
 - A PR in the GitHub stack your landing is part of gets no step: GitHub
   moves and rebases what is left of a stack itself. A GitHub stack of
   someone else's that starts on a branch this run lands is another matter.
@@ -620,9 +635,108 @@ Limits.
   `immutable_heads()` that names remote branches some other way
   (`remote_bookmarks()`), for one that calls `untracked_remote_bookmarks`
   with an argument (a remote, a name pattern), and for a configuration
-  that defines a helper named `untracked_remote_bookmarks()` itself. Track
-  their branch, or wait until it has moved off your changes, and the stack
-  is yours to land again.
+  that defines a helper named `untracked_remote_bookmarks()` itself. Take
+  their PR over, or wait until its branch has moved off your changes, and
+  the stack is yours to land again.
+
+### Take over a pull request
+
+Sometimes someone opens a PR to help, on your stack or on trunk, and wants
+you to push it over the line. Taking it over makes that yours to do:
+
+```sh
+jiji take-over 31              # by number
+jiji take-over sam/fix-login   # or by its branch
+jiji take-over 31 --dry-run    # only say what it would do
+jiji give-back 31              # hand it back
+```
+
+`take-over` prints its plan first, with what it means, and then runs it:
+
+1. "Fetch REMOTE", so that the branch here is what GitHub has now.
+2. "Make BRANCH a bookmark here, at what REMOTE has for #N now". That is a
+   `jj bookmark track`, and a record of whose branch it was and for which
+   PR (`.jj/repo/jiji/taken-over.json`, shared by the repository's
+   workspaces).
+
+Nothing is pushed. From then on their PR is a segment of your stack:
+`stacks` and `status` list it in the landing order and say whose it was,
+jj rebases it with the stack, `publish` pushes it, and `land` merges it and
+removes its branch once it has landed, as for a PR of your own. The changes
+of yours under it are yours to rewrite again, and none of the notes and
+refusals for someone else's PR applies to it any more. On GitHub the PR
+stays its author's, with the title and the description they wrote, and
+their commits keep their author; you become the committer of the ones you
+rewrite.
+
+Every push from here goes through only if the branch is where the last
+fetch saw it (the lease `jj git push` always takes), so a commit its author
+pushes afterwards is never overwritten:
+
+- Each plan that pushes the branch says whose it is: the step reads "Push
+  BRANCH (#N by @LOGIN, taken over)", with a note that it is a branch
+  someone else made. `land` and `ship` say the same of a PR they merge.
+- A push the remote refuses because the branch moved says that its author
+  pushed to it again, that nothing there was overwritten, and what to do:
+  fetch, bring the two together, publish again.
+- After that fetch the bookmark reads as conflicted (it was changed here
+  and there), and `publish` is blocked with the same story. The new commits
+  are on `BRANCH@REMOTE`: rebase them onto yours, or take theirs, point the
+  bookmark at the result, and publish.
+
+A branch that was built on an earlier copy of your changes (you amended
+them after the PR was opened, or landed what was under them) would, as it
+is, sit beside your stack with a second copy of those changes. So
+`take-over` rebases its own changes onto the copy you have now, here only,
+and its result says so; the next `publish` pushes that, and names the
+branch as above. It is refused, with nothing changed, where there is no one
+place to bring the changes to: the branch carries a version of your change
+that someone rewrote elsewhere, or its own changes do not sit on yours in
+one line.
+
+`give-back` is the reverse: the bookmark here is removed and the branch is
+no longer followed, in one operation. The branch on GitHub is not touched.
+The PR is someone else's again, nothing here pushes to it, and the changes
+under it read as immutable while its branch builds on them. It is refused
+while that would leave something behind: changes to the branch that were
+not published (publish first, or point the bookmark back at
+`BRANCH@REMOTE`), or work of your own on top of it.
+
+A PR that is in a GitHub stack keeps or changes it in the open. Added to
+your own stack above your PRs, it is a member like the others once it is
+taken over, and nothing changes. As the bottom of a stack of its author's
+that is built on your chain, it is now a part of that chain: the next
+`publish` dissolves their stack and links the whole chain as one, with
+what is still theirs back on top, and says so first (`--no-stack` only
+dissolves it). The plan of the take-over names the stack.
+
+What cannot be taken over, and why (exit 3, with the reason):
+
+- A PR from a fork. Its branch is in another repository, and Jiji pushes
+  only to the repository's own remote. GitHub does let a maintainer push to
+  a fork's branch when its author allows edits, but that takes the fork as
+  a git remote of its own, which Jiji does not set up. `jiji pr fetch N`
+  brings its commits for review.
+- A PR that is merged or closed.
+- A PR based on a branch that is neither trunk nor a bookmark here, such
+  as the upper one of two PRs by someone else: take over the one under it
+  first.
+- A branch that is a bookmark here already.
+
+Limits.
+
+- After the branch under their PR landed by squash, a PR that was based on
+  that very branch still carries the landed commits when it is taken over:
+  nothing of yours has a current copy under it, so there is nowhere to
+  bring it to. It shows them as its own, as it does on GitHub, until you
+  rebase its changes onto trunk.
+- Taking over is a matter of this clone. On GitHub nothing says that the PR
+  was taken over, and nothing stops its author from pushing; the lease is
+  what keeps their pushes safe.
+- The record names the branch and the PR. It is forgotten when the branch
+  is deleted from here (a landing does that) or a fetch finds it gone. A
+  bookmark deleted and made again with `jj` alone, under the same name and
+  for the same PR, still reads as taken over.
 - The branch of a PR from a fork is never here. `ship` refuses for such a
   PR while a branch under it is rewritten here and not yet published. Once
   the rewrite is published (`publish` says then that it replaces commits
@@ -656,7 +770,19 @@ does not fail. The setting is kept in the app's preferences file
 (`prefs.json` in the app's data directory, key `publish.linkNewStacks`),
 which the command reads and never writes.
 
-`--stack` needs at least two PRs. Once a chain is a GitHub stack, whether
+`--stack` needs at least two PRs. A PR by someone else that sits on top of
+the chain counts, and goes into the stack with it: `publish --stack` takes
+in the PR based on the chain's top branch, the one based on that one, and
+so on, as far as they form one line in this repository, and names each by
+number and author before anything runs ("#31 by @sam sits on top of this
+chain and is someone else's: it goes into the GitHub stack with it"). That
+is how their PR is spared showing your landed commits: in a stack GitHub
+rebases their branch itself after each merge below it. Their base cannot
+be changed while they are in the stack. Only an explicit `--stack` reaches
+for them; a stack that is merely kept in step, or linked because of the
+setting, does not.
+
+Once a chain is a GitHub stack, whether
 Jiji linked it or someone accepted GitHub's banner on github.com, every
 later `publish` reads that from GitHub and maintains it with no flag: PRs
 for new segments on top are added to the stack, and a change of shape (a
@@ -850,7 +976,8 @@ stack is `retargetOther` (`number`, `author`, `branch`, `fromBase`,
 last fetch). A publish plan carries its `options` and may include `unstack`
 and `linkStack` actions; `unstack` lists in `members` the open PRs that
 leave the stack with it, bottom first, and `linkStack` lists in `above` the
-PRs above the published head that go back into the stack. Under the setting that links
+PRs above the published head that go into the stack on top: the ones that
+were in it, or someone else's that `--stack` takes in. Under the setting that links
 new stacks, `options.stack` reads `linkNew` for a publish that was given
 neither flag. A ship plan's actions for PRs are `pushBranches`, `unstack`,
 `retargetPr`, `confirmMerged` (`numbers`) and `retargetAbove` (`theirs` says
@@ -858,7 +985,12 @@ whether the PR is someone else's). A PR has `author` when GitHub names one,
 and in a GitHub stack a `stack` object (`number`, `position`, `size`,
 `base`). A stack has `githubStack` (`number`, `linked`) and `others`, the
 PRs on it that are someone else's; a change someone else's branch holds has
-`held`. Stack listing returns the repository
+`held`. A segment that was taken over has `takenOver` (`bookmark`,
+`remote`, `number`, `author`), in a stack and in a publish plan.
+`take-over` and `give-back` return the same `{ "plan": ..., "outcome": ... }`:
+the plan has `givingBack`, `number`, `author`, `title`, `branch`,
+`baseBranch`, `remote`, and its actions are `fetch`, `takeOver` and
+`giveBack`. Stack listing returns the repository
 path, trunk, stacks, hidden local count, and any truncation warnings. `watch --json` emits newline-delimited
 `{ "event": "autoLand", "state": ... }` records as its state changes.
 

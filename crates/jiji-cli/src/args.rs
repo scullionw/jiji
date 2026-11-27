@@ -83,6 +83,18 @@ pub enum Command {
     Watch(WatchArgs),
     /// Ship local changes directly to trunk without opening pull requests
     Ship(WriteArgs),
+    /// Take over someone else's pull request: its branch becomes a bookmark here, in your stack
+    #[command(
+        name = "take-over",
+        after_help = "Nothing is pushed. From then on Publish pushes the branch with your stack and Land merges\nits pull request. Each push goes through only if the branch is where the last fetch saw it,\nso a commit its author pushes afterwards is never overwritten. The pull request stays its\nauthor's on GitHub. jiji give-back hands it back."
+    )]
+    TakeOver(TakeOverArgs),
+    /// Give back a pull request you took over: its branch stops being a bookmark here
+    #[command(
+        name = "give-back",
+        after_help = "The branch on the remote is not touched and nothing is pushed. Refused while the bookmark\nhas changes that were not published, or while work of your own sits on it."
+    )]
+    GiveBack(TakeOverArgs),
     /// Inspect saved CLI auto-land jobs
     Jobs {
         #[arg(long)]
@@ -107,6 +119,15 @@ pub struct WriteArgs {
     /// Stack head; defaults to the current stack
     pub head: Option<String>,
     /// Print the plan without changing local or remote state
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TakeOverArgs {
+    /// Pull request number (9 or #9), or its branch name
+    pub target: String,
+    /// Print the plan without changing anything
     #[arg(long)]
     pub dry_run: bool,
 }

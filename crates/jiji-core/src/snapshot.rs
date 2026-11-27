@@ -68,6 +68,39 @@ pub struct RepoSnapshot {
     /// or Sublime Merge when nothing is configured and it is installed.
     /// `None` hides Resolve affordances — no usable tool is configured.
     pub resolve_tool: Option<String>,
+    /// The bookmarks here that were someone else's branches and were taken
+    /// over with Jiji: each is a local bookmark that tracks the branch on
+    /// its remote. Empty for most repositories.
+    #[serde(default)]
+    pub taken_over: Vec<TakenOver>,
+}
+
+/// A branch someone else made that was taken over here: it is a bookmark
+/// of this repository now, pushed and landed with the stack it is in, and
+/// its pull request stays its author's on GitHub. Recorded when it is taken
+/// over and until it is given back, so that every plan that pushes it can
+/// say whose branch it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakenOver {
+    pub bookmark: String,
+    pub remote: String,
+    /// The pull request it was taken over for.
+    pub number: u64,
+    /// Its author's login, as GitHub named it then. `None` when GitHub
+    /// named none (a deleted account).
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
+impl TakenOver {
+    /// "#9 by @kim", or "#9" when the author is not known.
+    pub fn by_author(&self) -> String {
+        match &self.author {
+            Some(login) => format!("#{} by @{login}", self.number),
+            None => format!("#{}", self.number),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

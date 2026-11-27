@@ -5,7 +5,7 @@
 use jiji_forge::{
     AutoLandPhase, AutoLandStatus, ChecksRollup, CiRerunReport, LandAction, LandOptions, LandPlan,
     MergeMethod, PrState, PrSummary, RepoPrState, ShipAction, StackLink, StackStatus, SubmitAction,
-    SubmitPlan,
+    SubmitPlan, TakeOverAction,
 };
 
 use super::autoland::is_interrupted;
@@ -196,6 +196,43 @@ pub fn land_action_text(action: &LandAction, remote: &str) -> String {
     }
 }
 
+/// One step of taking a pull request over, or of giving it back, as its
+/// card states it.
+pub fn take_over_action_text(action: &TakeOverAction) -> String {
+    match action {
+        TakeOverAction::Fetch { remote } => {
+            format!("Fetch from {remote}, so the branch here is what GitHub has now")
+        }
+        TakeOverAction::TakeOver {
+            bookmark, number, ..
+        } => format!("Make {bookmark} a bookmark here, where #{number} is now"),
+        TakeOverAction::GiveBack {
+            bookmark, remote, ..
+        } => format!("Remove the bookmark {bookmark} here; the branch on {remote} stays as it is"),
+    }
+}
+
+/// A submit step as the plan card states it: the action, and for a push
+/// of a branch that was taken over, whose branch it is.
+pub fn submit_step_text(plan: &SubmitPlan, action: &SubmitAction) -> String {
+    let text = submit_action_text(action, &plan.remote);
+    let SubmitAction::Push { bookmark, .. } = action else {
+        return text;
+    };
+    match plan
+        .segments
+        .iter()
+        .find(|segment| segment.bookmark == *bookmark)
+        .and_then(|segment| segment.taken_over.as_ref())
+    {
+        Some(taken) => format!(
+            "{text} ({}, taken over)",
+            other_pr(taken.number, taken.author.as_deref())
+        ),
+        None => text,
+    }
+}
+
 /// One submit action as the plan card states it.
 pub fn submit_action_text(action: &SubmitAction, remote: &str) -> String {
     match action {
@@ -274,26 +311,31 @@ pub fn submit_action_text(action: &SubmitAction, remote: &str) -> String {
             onto: None,
             above,
         } if above.is_empty() => format!("Link as a GitHub stack: {}", bookmarks.join(", ")),
-        // Pull requests above the published head that were in the stack
-        // and still sit on it go back in, on top.
+        // Pull requests above the published head go in on top: the ones
+        // that were in the stack and still sit on it, or someone else's
+        // that the link was asked to take in. The plan's note says which.
         SubmitAction::LinkStack {
             bookmarks,
             onto: None,
             above,
         } => format!(
-            "Link as a GitHub stack: {}, with {} back on top",
+            "Link as a GitHub stack: {}, with {} on top",
             bookmarks.join(", "),
-            above
-                .iter()
-                .map(|number| format!("#{number}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            pr_numbers(above)
         ),
         SubmitAction::LinkStack {
             bookmarks,
             onto: Some(stack),
-            ..
-        } => format!("Add {} to GitHub stack {stack}", bookmarks.join(", ")),
+            above,
+        } => format!(
+            "Add {} to GitHub stack {stack}",
+            bookmarks
+                .iter()
+                .cloned()
+                .chain(above.iter().map(|number| format!("#{number}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

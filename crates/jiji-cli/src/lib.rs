@@ -14,7 +14,7 @@ use jiji_core::{JjBackend, RepoBackend, RepoSnapshot};
 use jiji_forge::*;
 use serde_json::json;
 
-use args::{AuthCommand, Cli, Command, PrCommand, PublishArgs, WriteArgs};
+use args::{AuthCommand, Cli, Command, PrCommand, PublishArgs, TakeOverArgs, WriteArgs};
 use output::Output;
 use vcs::LocalVcs;
 
@@ -272,6 +272,8 @@ fn execute(cli: Cli, out: &mut Output) -> Result<i32> {
         }
         Command::Watch(args) => watch::run(&vcs, args, out),
         Command::Ship(args) => ship(&vcs, args, out),
+        Command::TakeOver(args) => take_over(&vcs, args, out),
+        Command::GiveBack(args) => give_back(&vcs, args, out),
         Command::Jobs { state_file } => {
             let state_file = state_file.unwrap_or_else(|| watch::default_state_file(&vcs.path));
             let records: Vec<_> = watch::read_records(&state_file)?
@@ -553,7 +555,95 @@ fn publish(vcs: &LocalVcs, args: PublishArgs, out: &mut Output) -> Result<i32> {
     })?;
     let mut text = String::new();
     if let Some(outcome) = &outcome {
-        text.push_str(&output::submit_outcome(outcome));
+        text.push_str(&output::submit_outcome(&plan, outcome));
+    }
+    let exit = outcome
+        .as_ref()
+        .map(|o| if o.failed { 1 } else { 0 })
+        .unwrap_or(if plan.blockers.is_empty() { 0 } else { 3 });
+    out.emit(&json!({"plan": plan, "outcome": outcome}), text)?;
+    Ok(exit)
+}
+
+/// Take over someone else's pull request, named by its number or by its
+/// branch. The plan is printed first and says what it means; nothing is
+/// pushed.
+fn take_over(vcs: &LocalVcs, args: TakeOverArgs, out: &mut Output) -> Result<i32> {
+    let target = TakeOverTarget::parse(&args.target);
+    let _lock = if args.dry_run {
+        None
+    } else {
+        Some(MutationLock::acquire(&vcs.path)?)
+    };
+    let snapshot = planning_snapshot(vcs, args.dry_run)?;
+    let forge = ForgeContext::connect(&snapshot)?;
+    let pr = match &target {
+        // Asked for by number, so that one that is closed or merged is
+        // told as that.
+        TakeOverTarget::Number(number) => {
+            forge
+                .client
+                .pr_by_number(&forge.repo.owner, &forge.repo.name, *number)?
+        }
+        // By branch: this repository's own pull request for it first, and
+        // then a fork's of that name, to say why that one cannot be taken.
+        TakeOverTarget::Branch(branch) => forge
+            .prs
+            .by_branch
+            .get(branch)
+            .or_else(|| {
+                forge
+                    .prs
+                    .report
+                    .prs
+                    .iter()
+                    .find(|pr| pr.head_branch == *branch)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::usage(format!(
+                    "No open pull request has the branch {branch}; name it by its number"
+                ))
+            })?,
+    };
+    let plan = plan_take_over(&snapshot, &forge.repo, &pr);
+    out.preflight(&output::take_over_plan(&plan))?;
+    let outcome = execute_if_ready(args.dry_run, !plan.blockers.is_empty(), || {
+        execute_take_over(&plan, vcs)
+    })?;
+    finish_take_over(&plan, outcome, out)
+}
+
+/// Give back a pull request that was taken over. GitHub is asked only for
+/// the pull request's title: a branch can be given back without it.
+fn give_back(vcs: &LocalVcs, args: TakeOverArgs, out: &mut Output) -> Result<i32> {
+    let target = TakeOverTarget::parse(&args.target);
+    let _lock = if args.dry_run {
+        None
+    } else {
+        Some(MutationLock::acquire(&vcs.path)?)
+    };
+    let snapshot = planning_snapshot(vcs, args.dry_run)?;
+    let open = match read_forge(&snapshot, false) {
+        Ok(Some(forge)) => forge.prs.report.prs,
+        _ => Vec::new(),
+    };
+    let plan = plan_give_back(&snapshot, &open, &target)?;
+    out.preflight(&output::take_over_plan(&plan))?;
+    let outcome = execute_if_ready(args.dry_run, !plan.blockers.is_empty(), || {
+        execute_take_over(&plan, vcs)
+    })?;
+    finish_take_over(&plan, outcome, out)
+}
+
+fn finish_take_over(
+    plan: &TakeOverPlan,
+    outcome: Option<TakeOverOutcome>,
+    out: &mut Output,
+) -> Result<i32> {
+    let mut text = String::new();
+    if let Some(outcome) = &outcome {
+        text.push_str(&output::take_over_outcome(outcome));
     }
     let exit = outcome
         .as_ref()

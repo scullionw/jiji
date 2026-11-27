@@ -75,6 +75,7 @@ use crate::settings::{load_settings, load_user_settings, revset_aliases, UserCon
 use crate::snapshot::*;
 
 pub mod hidden;
+mod taken;
 
 /// Synchronous iteration over a jj-lib stream. Revsets, operation walks and
 /// evolog walks are streams since jj-lib 0.40; every backend call already
@@ -1962,6 +1963,26 @@ impl RepoBackend for JjBackend {
         })
     }
 
+    fn take_over_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+        number: u64,
+        author: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.take_over_branch_impl(path, name, remote, number, author)
+    }
+
+    fn give_back_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.give_back_branch_impl(path, name, remote)
+    }
+
     fn delete_remote_bookmark(
         &self,
         path: &Path,
@@ -2149,6 +2170,8 @@ impl RepoBackend for JjBackend {
             return Err(remote_moved_error(&rejected, &remote_name, None));
         }
         let new_repo = finish_mutation(&mut workspace, &repo, tx, op_description)?;
+        // A branch this push deleted is no longer one that was taken over.
+        taken::forget_gone(&workspace, new_repo.view());
         if !rejected.is_empty() {
             let pushed: Vec<String> = stats
                 .pushed
@@ -2344,6 +2367,8 @@ impl RepoBackend for JjBackend {
         }
         let moved = stats.changed_remote_bookmarks.len();
         let new_repo = finish_mutation(&mut workspace, &repo, tx, op_description)?;
+        // Nor is one this fetch found deleted.
+        taken::forget_gone(&workspace, new_repo.view());
         let summary = match moved {
             0 => format!("Fetched from {remotes_label}"),
             1 => format!("Fetched 1 bookmark update from {remotes_label}"),
@@ -3519,6 +3544,7 @@ fn build_snapshot(
         conflicts,
         operations,
         resolve_tool: crate::merge_tool::available_tool_name(workspace.settings()),
+        taken_over: taken::taken_over_in_view(workspace, view),
     })
 }
 
@@ -12612,6 +12638,586 @@ mod tests {
             backend.abandon_landed(root, std::slice::from_ref(&upper_commit)).unwrap_err(),
             BackendError::ImmutableChange(_)
         ));
+    }
+
+    /// Someone opened a pull request on the stack, and it is taken over.
+    /// Their branch becomes a bookmark here at what the remote has, the
+    /// repository records for which pull request and whose, and nothing
+    /// is pushed. The changes under their branch, held until then, are
+    /// the user's to rewrite again: no branch of someone else's rests on
+    /// them any more.
+    #[test]
+    fn taking_over_a_branch_makes_it_a_bookmark_here_and_records_whose_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: a helping change");
+        backend.git_fetch(root, None).unwrap();
+        let before = backend.open(root).unwrap();
+        assert!(before.taken_over.is_empty());
+        assert!(before.nodes.iter().find(|n| n.id == upper).unwrap().held);
+        assert!(before.bookmarks.iter().any(|b| b.name == "theirs" && !b.is_local && !b.tracked));
+
+        let outcome = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!(
+                "Took over \u{201c}theirs\u{201d}: it is a bookmark here now, at {}, and nothing \
+                 was pushed",
+                &theirs[..8]
+            )
+        );
+        let after = backend.open(root).unwrap();
+        assert_eq!(
+            after.operations[0].description,
+            "take over theirs@origin (pull request #9)"
+        );
+        assert_eq!(
+            after.taken_over,
+            [TakenOver {
+                bookmark: "theirs".into(),
+                remote: "origin".into(),
+                number: 9,
+                author: Some("kim".into()),
+            }]
+        );
+        let bookmark = after.bookmarks.iter().find(|b| b.name == "theirs").unwrap();
+        assert!(bookmark.is_local && bookmark.tracked);
+        assert_eq!(bookmark.sync, SyncState::Synced);
+        // Theirs is a change like any other here, and what was held under
+        // it is not held any more.
+        let their_node = after.nodes.iter().find(|n| n.id == bookmark.target).unwrap();
+        assert_eq!(their_node.kind, NodeKind::Mutable);
+        assert!(theirs.starts_with(&their_node.commit_id));
+        let upper_node = after.nodes.iter().find(|n| n.id == upper).unwrap();
+        assert_eq!(upper_node.kind, NodeKind::Mutable);
+        assert!(!upper_node.held);
+        // Nothing was pushed: the branch is where they left it.
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), theirs);
+
+        // Taken already.
+        let err = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap_err();
+        assert!(err.to_string().contains("is a bookmark here already"), "{err}");
+        // A name that another bookmark here has is not their branch.
+        bare_commit(bare.path(), "clash", &upper_commit, "theirs: another one");
+        backend.create_bookmark(root, "clash", &upper).unwrap();
+        backend.git_fetch(root, None).unwrap();
+        let err = backend
+            .take_over_branch(root, "clash", "origin", 10, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exists here and is not that branch"),
+            "{err}"
+        );
+        // And one that is not on the remote at all.
+        let err = backend
+            .take_over_branch(root, "nowhere", "origin", 11, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("there is no remote bookmark nowhere@origin"), "{err}");
+    }
+
+    /// From the take-over on, Jiji pushes to a branch someone else made.
+    /// Every such push carries what the last fetch saw as its lease: a
+    /// commit they pushed since is never overwritten, and the push says
+    /// that the branch moved.
+    #[test]
+    fn a_push_of_a_taken_over_branch_never_overwrites_what_they_pushed_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: a helping change");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        // Their change is amended here...
+        let snapshot = backend.open(root).unwrap();
+        let change = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.description == "theirs: a helping change")
+            .unwrap()
+            .id
+            .clone();
+        backend.describe(root, &change, "theirs: a helping change, finished").unwrap();
+        // ...and they push once more, which this repository has not seen.
+        let again = bare_commit(bare.path(), "theirs", &theirs, "theirs: one more");
+
+        let err = backend
+            .push_bookmarks(root, &["theirs".into()], None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("theirs moved on the remote since the last fetch"),
+            "{err}"
+        );
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), again);
+
+        // With nothing of theirs in between, the same push goes through,
+        // and the commit keeps its author.
+        git(bare.path(), &["update-ref", "refs/heads/theirs", &theirs]);
+        backend.push_bookmarks(root, &["theirs".into()], None).unwrap();
+        let pushed = bare_branch(bare.path(), "theirs").unwrap();
+        assert_ne!(pushed, theirs);
+        assert_eq!(
+            git(bare.path(), &["log", "-1", "--format=%an", &pushed]),
+            git(bare.path(), &["log", "-1", "--format=%an", &theirs])
+        );
+    }
+
+    /// Giving a branch back is the reverse of taking it over: it is no
+    /// bookmark here any more, the remote branch is not touched, and the
+    /// changes under it are held again. It is refused where it would
+    /// leave something behind: changes here that were never published, or
+    /// work of the user's own that sits on the branch.
+    #[test]
+    fn giving_a_branch_back_is_the_reverse_and_strands_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: a helping change");
+        backend.git_fetch(root, None).unwrap();
+
+        // Only what was taken over can be given back.
+        let err = backend.give_back_branch(root, "upper", "origin").unwrap_err();
+        assert!(err.to_string().contains("was not taken over here"), "{err}");
+
+        backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        let outcome = backend.give_back_branch(root, "theirs", "origin").unwrap();
+        assert_eq!(
+            outcome.summary,
+            "Gave back \u{201c}theirs\u{201d}: it is no bookmark here any more, and \
+             theirs@origin is as it was"
+        );
+        let after = backend.open(root).unwrap();
+        assert_eq!(
+            after.operations[0].description,
+            "give back theirs@origin (pull request #9)"
+        );
+        assert!(after.taken_over.is_empty());
+        assert!(after.bookmarks.iter().any(|b| b.name == "theirs" && !b.is_local && !b.tracked));
+        assert!(!after.bookmarks.iter().any(|b| b.name == "theirs" && b.is_local));
+        assert!(after.nodes.iter().find(|n| n.id == upper).unwrap().held);
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), theirs);
+        // And a push of it from here is no longer possible at all.
+        assert!(backend.push_bookmarks(root, &["theirs".into()], None).is_err());
+
+        // Taken over again, and changed here without publishing.
+        backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        let snapshot = backend.open(root).unwrap();
+        let change = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.description == "theirs: a helping change")
+            .unwrap()
+            .id
+            .clone();
+        backend.describe(root, &change, "theirs: a helping change, finished").unwrap();
+        let err = backend.give_back_branch(root, "theirs", "origin").unwrap_err();
+        assert!(
+            err.to_string().contains("is not what origin has for it") && err.to_string().contains("Publish it"),
+            "{err}"
+        );
+        // Published, it can go back. Unless work of the user's sits on it.
+        backend.push_bookmarks(root, &["theirs".into()], None).unwrap();
+        let (mine, _) = record_change(root, &backend, &change, "mine: on theirs", &[("m.txt", "m\n")]);
+        backend.create_bookmark(root, "mine", &mine).unwrap();
+        let err = backend.give_back_branch(root, "theirs", "origin").unwrap_err();
+        assert!(
+            err.to_string().contains("\u{201c}mine\u{201d} of yours sits on \u{201c}theirs\u{201d}"),
+            "{err}"
+        );
+        assert_eq!(backend.open(root).unwrap().taken_over.len(), 1, "refused: still taken over");
+        backend.delete_bookmark(root, "mine").unwrap();
+        backend.give_back_branch(root, "theirs", "origin").unwrap();
+        assert!(backend.open(root).unwrap().taken_over.is_empty());
+    }
+
+    /// The record is not what a snapshot stands on. A record that cannot
+    /// be read shows nothing and the repository still opens; an entry
+    /// whose bookmark no longer tracks its branch is left over and is not
+    /// shown. The command that would change the record says what is wrong.
+    #[test]
+    fn the_record_of_taken_over_branches_never_stops_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: a helping change");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        assert_eq!(backend.open(root).unwrap().taken_over.len(), 1);
+
+        // Untracked by hand: the entry is left over.
+        backend.untrack_bookmark(root, "theirs", "origin").unwrap();
+        assert!(backend.open(root).unwrap().taken_over.is_empty());
+
+        // Not a record at all.
+        let record = root.join(".jj/repo/jiji/taken-over.json");
+        assert!(record.exists());
+        std::fs::write(&record, "not json").unwrap();
+        assert!(backend.open(root).unwrap().taken_over.is_empty());
+        bare_commit(bare.path(), "more", &upper_commit, "theirs: another");
+        backend.git_fetch(root, None).unwrap();
+        let err = backend
+            .take_over_branch(root, "more", "origin", 10, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("taken-over.json"), "{err}");
+        assert!(!backend.open(root).unwrap().bookmarks.iter().any(|b| b.name == "more" && b.is_local));
+    }
+
+    /// Their branch was built on `upper` as it was then, and the user has
+    /// rewritten `upper` since: the branch carries the earlier copy. Taken
+    /// over as it is, that copy would sit under a bookmark here beside
+    /// the current one, the same change twice. So the take-over brings
+    /// their change onto the copy the user has now, here only, and says
+    /// so; the push that follows is an ordinary one, under the lease.
+    #[test]
+    fn taking_over_a_branch_built_on_an_earlier_copy_brings_it_onto_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let earlier = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &earlier, "theirs: a helping change");
+        backend.describe(root, &upper, "upper, reworded since").unwrap();
+        backend.push_bookmarks(root, &["upper".into()], None).unwrap();
+        backend.git_fetch(root, None).unwrap();
+
+        let outcome = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            format!(
+                "Took over \u{201c}theirs\u{201d}: it is a bookmark here now, and nothing was \
+                 pushed. It was built on an earlier copy of {upper}, so its one change was \
+                 rebased onto the copy you have now, here only; the next Publish pushes that"
+            )
+        );
+        let after = backend.open(root).unwrap();
+        // One copy of every change: nothing is divergent, and theirs sits
+        // on `upper` as it is now.
+        assert!(
+            after.nodes.iter().all(|n| !n.is_divergent),
+            "{:?}",
+            after.nodes.iter().map(|n| (&n.id, n.is_divergent)).collect::<Vec<_>>()
+        );
+        let bookmark = after.bookmarks.iter().find(|b| b.name == "theirs" && b.is_local).unwrap();
+        assert!(bookmark.tracked);
+        assert_ne!(bookmark.sync, SyncState::Synced);
+        assert_eq!(outcome.target_change.as_deref(), Some(bookmark.target.as_str()));
+        let their_node = after.nodes.iter().find(|n| n.id == bookmark.target).unwrap();
+        assert_eq!(their_node.parents, std::slice::from_ref(&upper));
+        assert_eq!(their_node.kind, NodeKind::Mutable);
+        assert_eq!(their_node.description, "theirs: a helping change");
+        assert_eq!(after.taken_over.len(), 1);
+        // Nothing was pushed: the branch is where they left it.
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), theirs);
+        // Unpublished, the rebase is a change here that giving back would
+        // strand.
+        let err = backend.give_back_branch(root, "theirs", "origin").unwrap_err();
+        assert!(err.to_string().contains("is not what origin has for it"), "{err}");
+
+        // The publish that follows: their commit, on the user's current
+        // one, with its author kept.
+        backend.push_bookmarks(root, &["theirs".into()], None).unwrap();
+        let pushed = bare_branch(bare.path(), "theirs").unwrap();
+        assert_ne!(pushed, theirs);
+        assert_eq!(
+            git(bare.path(), &["rev-parse", &format!("{pushed}^")]),
+            bare_branch(bare.path(), "upper").unwrap()
+        );
+        assert_eq!(git(bare.path(), &["log", "-1", "--format=%an", &pushed]), "Upstream");
+
+        // A branch that is at the earlier copy and has nothing of its own
+        // is not taken over, and nothing is left behind.
+        git(bare.path(), &["update-ref", "refs/heads/copycat", &earlier]);
+        backend.git_fetch(root, None).unwrap();
+        let err = backend
+            .take_over_branch(root, "copycat", "origin", 10, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("with nothing of its own on top: there is nothing to take over"),
+            "{err}"
+        );
+        // Nor is one whose own change does not sit on the earlier copy in
+        // one line (here a merge of it with another commit): there is no
+        // one place to bring it to.
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let tree = git(bare.path(), &["rev-parse", &format!("{earlier}^{{tree}}")]);
+        let knot = git(
+            bare.path(),
+            &[
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "commit-tree",
+                &tree,
+                "-p",
+                &earlier,
+                "-p",
+                &lower_commit,
+                "-m",
+                "theirs: a merge",
+            ],
+        );
+        git(bare.path(), &["update-ref", "refs/heads/knot", &knot]);
+        backend.git_fetch(root, None).unwrap();
+        let err = backend
+            .take_over_branch(root, "knot", "origin", 11, None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("do not sit on them in one line"),
+            "{err}"
+        );
+        let after = backend.open(root).unwrap();
+        assert!(!after
+            .bookmarks
+            .iter()
+            .any(|b| ["copycat", "knot"].contains(&b.name.as_str()) && b.is_local));
+        assert_eq!(after.taken_over.len(), 1);
+    }
+
+    /// The same after a landing. The branch under theirs landed by squash,
+    /// and the landing rebased the rest of the stack onto trunk, leaving
+    /// their branch on the commits it replaced and out of view here. Taken
+    /// over then, their change comes onto `upper` as it is now, and the
+    /// landed commit and the earlier copy stay out of view.
+    #[test]
+    fn taking_over_after_the_branch_under_it_landed_brings_theirs_onto_the_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        // The landing of `lower`, as Land runs it.
+        let squash = bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        backend.push_bookmarks(root, &["upper".into()], None).unwrap();
+        backend.delete_bookmark(root, "lower").unwrap();
+        backend.abandon_landed(root, std::slice::from_ref(&lower_commit)).unwrap();
+        let before = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(!before.nodes.iter().any(|n| n.description == "theirs: on top"));
+
+        let outcome = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        assert!(
+            outcome.summary.contains(&format!(
+                "It was built on an earlier copy of {upper}, so its one change was rebased onto \
+                 the copy you have now, here only"
+            )),
+            "{}",
+            outcome.summary
+        );
+        let after = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(after.nodes.iter().all(|n| !n.is_divergent && !n.held));
+        let bookmark = after.bookmarks.iter().find(|b| b.name == "theirs" && b.is_local).unwrap();
+        let their_node = after.nodes.iter().find(|n| n.id == bookmark.target).unwrap();
+        assert_eq!(their_node.description, "theirs: on top");
+        assert_eq!(their_node.parents, std::slice::from_ref(&upper));
+        // `upper` sits on the squash, and the landed commit is not back.
+        let upper_node = after.nodes.iter().find(|n| n.id == upper).unwrap();
+        let on = after.nodes.iter().find(|n| n.id == upper_node.parents[0]).unwrap();
+        assert!(squash.starts_with(&on.commit_id));
+        assert!(!after.nodes.iter().any(|n| n.id == lower));
+        assert_eq!(bare_branch(bare.path(), "theirs").unwrap(), theirs);
+    }
+
+    /// Their branch carries a copy of the user's change that was not made
+    /// here: someone rewrote it elsewhere. That is a second version of the
+    /// change, not an earlier one, and a take-over does not choose between
+    /// the two: it is refused, and nothing changes.
+    #[test]
+    fn a_branch_with_another_version_of_the_users_change_is_not_taken_over() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        // The same commit with other words: jj keeps a change's id in the
+        // commit's header, so this is that change, rewritten elsewhere.
+        let object = std::process::Command::new("git")
+            .arg("-C")
+            .arg(bare.path())
+            .args(["cat-file", "commit", &upper_commit])
+            .output()
+            .unwrap();
+        let object = String::from_utf8(object.stdout).unwrap();
+        assert!(object.contains("\nchange-id "), "{object}");
+        let mut write = std::process::Command::new("git")
+            .arg("-C")
+            .arg(bare.path())
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        write
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(object.replace("upper", "upper, as someone else has it").as_bytes())
+            .unwrap();
+        let elsewhere = String::from_utf8(write.wait_with_output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_ne!(elsewhere, upper_commit);
+        bare_commit(bare.path(), "theirs", &elsewhere, "theirs: on their version");
+        backend.git_fetch(root, None).unwrap();
+
+        let err = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Could not apply the change: theirs@origin carries a copy of {upper} that is not \
+                 an earlier copy of the one here: there are two versions of that change, and \
+                 which one stands is yours to decide. Nothing was changed"
+            )
+        );
+        let after = backend.open(root).unwrap();
+        assert!(after.taken_over.is_empty());
+        assert!(!after.bookmarks.iter().any(|b| b.name == "theirs" && b.is_local));
+    }
+
+    /// A landing under their branch leaves their commits out of view
+    /// here. Where nothing of the user's has a current copy under them
+    /// (here the user dropped the change they were built on), there is
+    /// nowhere to bring them to. Taken over, they are in view again all
+    /// the same, on the commits they were pushed on: a bookmark brings
+    /// what it points at into view, and the take-over relies on that.
+    #[test]
+    fn a_take_over_brings_their_commits_back_into_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let lower_commit = bare_branch(bare.path(), "lower").unwrap();
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        let theirs = bare_commit(bare.path(), "theirs", &upper_commit, "theirs: on top");
+        bare_squash(bare.path(), &lower_commit, "lower (#1)");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .rebase_onto_trunk(root, "origin", "main", &upper, std::slice::from_ref(&lower_commit))
+            .unwrap();
+        backend.delete_bookmark(root, "upper").unwrap();
+        backend.abandon_change(root, &upper).unwrap();
+        let before = backend.open_with(root, &SnapshotView::All).unwrap();
+        assert!(!before.nodes.iter().any(|n| n.description == "theirs: on top"));
+
+        let outcome = backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        assert!(
+            outcome.summary.ends_with(&format!("at {}, and nothing was pushed", &theirs[..8])),
+            "{}",
+            outcome.summary
+        );
+        let after = backend.open(root).unwrap();
+        let bookmark = after.bookmarks.iter().find(|b| b.name == "theirs" && b.is_local).unwrap();
+        assert_eq!(bookmark.sync, SyncState::Synced);
+        let their_node = after
+            .nodes
+            .iter()
+            .find(|n| n.id == bookmark.target)
+            .expect("their change is drawn");
+        assert_eq!(their_node.kind, NodeKind::Mutable);
+        assert_eq!(their_node.description, "theirs: on top");
+    }
+
+    /// The record is about a branch on its remote. Untracking the bookmark
+    /// here leaves the branch theirs, and tracking it again takes it up
+    /// again. Once the branch is gone from the remote, deleted from here
+    /// or found deleted by a fetch, the record forgets it: a branch of
+    /// that name made later is the user's own.
+    #[test]
+    fn the_record_forgets_a_branch_once_it_is_gone_from_its_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let backend = test_backend();
+        let root = dir.path();
+        let (_lower, upper) = pushed_pair(root, bare.path(), &backend);
+        let upper_commit = bare_branch(bare.path(), "upper").unwrap();
+        bare_commit(bare.path(), "theirs", &upper_commit, "theirs: a helping change");
+        bare_commit(bare.path(), "more", &upper_commit, "theirs: another");
+        backend.git_fetch(root, None).unwrap();
+        backend
+            .take_over_branch(root, "theirs", "origin", 9, Some("kim"))
+            .unwrap();
+        backend
+            .take_over_branch(root, "more", "origin", 10, Some("sam"))
+            .unwrap();
+        let taken = |backend: &JjBackend| -> Vec<u64> {
+            backend.open(root).unwrap().taken_over.iter().map(|t| t.number).collect()
+        };
+        let recorded = || -> String {
+            std::fs::read_to_string(root.join(".jj/repo/jiji/taken-over.json")).unwrap()
+        };
+        assert_eq!(taken(&backend), [9, 10]);
+
+        // Untracked here: nothing to show, and the branch is still
+        // theirs. A fetch in between changes nothing of that. Tracked
+        // again, it is the taken-over branch it was.
+        backend.untrack_bookmark(root, "theirs", "origin").unwrap();
+        bare_commit(bare.path(), "unrelated", &upper_commit, "theirs: something else");
+        backend.git_fetch(root, None).unwrap();
+        assert_eq!(taken(&backend), [10]);
+        assert!(recorded().contains("\"theirs\""), "{}", recorded());
+        backend.track_bookmark(root, "theirs", "origin").unwrap();
+        assert_eq!(taken(&backend), [9, 10]);
+
+        // Deleted on the remote from here: its life is over.
+        backend.delete_remote_bookmark(root, "theirs", "origin").unwrap();
+        assert_eq!(bare_branch(bare.path(), "theirs"), None);
+        assert!(!recorded().contains("\"theirs\""), "{}", recorded());
+        // A branch of the user's own with that name, pushed and tracked,
+        // is the user's own.
+        backend.create_bookmark(root, "theirs", &upper).unwrap();
+        backend.push_bookmarks(root, &["theirs".into()], None).unwrap();
+        let again = backend.open(root).unwrap();
+        assert!(again.bookmarks.iter().any(|b| b.name == "theirs" && b.is_local && b.tracked));
+        assert_eq!(taken(&backend), [10]);
+
+        // Deleted on the remote by someone else, and found so by a fetch.
+        git(bare.path(), &["update-ref", "-d", "refs/heads/more"]);
+        backend.git_fetch(root, None).unwrap();
+        assert!(!recorded().contains("\"more\""), "{}", recorded());
+        assert!(taken(&backend).is_empty());
     }
 
     /// Where nothing is taken apart, settled is what jj calls immutable

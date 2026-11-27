@@ -97,6 +97,50 @@ impl AppModel {
             .collect()
     }
 
+    /// Someone else's pull requests that rest on a bookmark here, as
+    /// (number, "#9 by @kim", title): the ones "Take over" is offered
+    /// for. The plan the route opens asks GitHub, so this is empty until
+    /// the connection is verified.
+    pub fn takeable_prs(&self) -> Vec<(u64, String, String)> {
+        let (Some(snapshot), Some(prs)) = (self.snapshot(), self.forge.prs.as_ref()) else {
+            return Vec::new();
+        };
+        if !self.forge.connection_ready() {
+            return Vec::new();
+        }
+        let branches: Vec<&str> = snapshot
+            .bookmarks
+            .iter()
+            .filter(|b| b.is_local && !b.is_trunk)
+            .map(|b| b.name.as_str())
+            .collect();
+        jiji_forge::others_on(snapshot, prs, &branches)
+            .into_iter()
+            .map(|pr| (pr.number, pr.by_author(), pr.title.clone()))
+            .collect()
+    }
+
+    /// The pull requests that were taken over here, as (number, "#9 by
+    /// @kim", branch). Giving back asks GitHub nothing.
+    pub fn taken_over_prs(&self) -> Vec<(u64, String, String)> {
+        let Some(snapshot) = self.snapshot() else {
+            return Vec::new();
+        };
+        snapshot
+            .taken_over
+            .iter()
+            .filter_map(|entry| {
+                let pr = self
+                    .forge
+                    .prs
+                    .as_ref()
+                    .and_then(|prs| prs.by_branch.get(&entry.bookmark));
+                jiji_forge::takeover::taken_over(snapshot, &entry.bookmark, pr)
+            })
+            .map(|taken| (taken.number, taken.by_author(), taken.bookmark))
+            .collect()
+    }
+
     /// The stacks that can ship straight to trunk, as (head change, head
     /// title, change count). Shipping needs only a detected GitHub remote:
     /// the push authenticates like any git push.

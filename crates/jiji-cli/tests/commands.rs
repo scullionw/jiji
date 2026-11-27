@@ -10,7 +10,7 @@ fn standalone_help_exposes_the_public_workflow_commands() {
     let help = String::from_utf8(output.stdout).unwrap();
     for command in [
         "hide", "unhide", "hidden", "stacks", "status", "publish", "ready", "draft", "land",
-        "watch", "ship", "jobs", "pr", "auth", "open",
+        "watch", "ship", "take-over", "give-back", "jobs", "pr", "auth", "open",
     ] {
         assert!(help.contains(command), "missing {command}");
     }

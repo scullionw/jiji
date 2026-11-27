@@ -162,6 +162,12 @@ pub struct PaletteContext<'a> {
     /// Publish's shippable stack heads (head change, title, change count)
     /// — empty until a GitHub remote is detected.
     pub shippable: &'a [(String, String, usize)],
+    /// Someone else's pull requests on the stacks here, as (number, "#9 by
+    /// @kim", title): each can be asked to be taken over.
+    pub takeable: &'a [(u64, String, String)],
+    /// The pull requests that were taken over here, as (number, "#9 by
+    /// @kim", branch): each can be given back.
+    pub taken_over: &'a [(u64, String, String)],
     /// The open repo's auto-land job records, live job first.
     pub autoland_jobs: &'a [&'a AutoLandStatus],
     /// The `jiji` terminal launcher's install state; `None` while unknown,
@@ -613,6 +619,35 @@ fn build_items(ctx: &PaletteContext) -> Vec<PaletteItem> {
                 .keywords("ship now push trunk direct no pr main"),
             );
         }
+        // Someone else's pull request on a stack here, and the way back
+        // for one that was taken over. Both rows hand off to Publish's
+        // card, which says what will happen and waits to be confirmed.
+        for (number, who, title) in ctx.takeable {
+            items.push(
+                item(
+                    format!("publish.takeOver.{number}"),
+                    "Publish",
+                    format!("Take over {who}…"),
+                    IconName::Branch,
+                    intent(UiIntent::TakeOver { number: *number }),
+                )
+                .hint(title.clone())
+                .keywords("takeover adopt someone else's pull request branch track push finish"),
+            );
+        }
+        for (number, who, branch) in ctx.taken_over {
+            items.push(
+                item(
+                    format!("publish.giveBack.{number}"),
+                    "Publish",
+                    format!("Give back {who}…"),
+                    IconName::Branch,
+                    intent(UiIntent::GiveBack { number: *number }),
+                )
+                .hint(branch.clone())
+                .keywords("hand back return release taken over pull request branch untrack"),
+            );
+        }
         // Back to the working copy from anywhere in history — only while
         // the lens draws it.
         if let Some(working_copy) = snapshot
@@ -1018,6 +1053,8 @@ mod tests {
             lenses: &[],
             landable: &[],
             shippable: &[],
+            takeable: &[],
+            taken_over: &[],
             autoland_jobs: &[],
             cli: None,
             open_tabs: &[],
@@ -1447,6 +1484,50 @@ mod tests {
         // With nothing passed in (no connection, no GitHub remote), none.
         let bare = listed(&context(Some(&snapshot), Some(&snapshot.nodes[1])), "ship");
         assert!(!has(&bare, "publish.land.feature") && !has(&bare, "publish.ship.mnop"));
+    }
+
+    /// Someone else's pull request on a stack here is a row that opens
+    /// the plan to take it over, found by what the user would type; one
+    /// that was taken over has the row that gives it back.
+    #[test]
+    fn taking_over_and_giving_back_are_rows_that_open_their_plan() {
+        let snapshot = stack();
+        let takeable = [(9, "#9 by @kim".to_owned(), "A helping change".to_owned())];
+        let taken_over = [(7, "#7 by @sam".to_owned(), "sam/fix".to_owned())];
+        let ctx = PaletteContext {
+            takeable: &takeable,
+            taken_over: &taken_over,
+            ..context(Some(&snapshot), Some(&snapshot.nodes[1]))
+        };
+        let results = palette_results(&ctx, "take over");
+        let take = results
+            .iter()
+            .find(|item| item.id == "publish.takeOver.9")
+            .expect("found by the words the user would type");
+        assert_eq!(take.title, "Take over #9 by @kim\u{2026}");
+        assert_eq!(
+            take.action,
+            PaletteAction::Intent(UiIntent::TakeOver { number: 9 })
+        );
+        let results = palette_results(&ctx, "give back");
+        let give = results
+            .iter()
+            .find(|item| item.id == "publish.giveBack.7")
+            .expect("found by the words the user would type");
+        assert_eq!(give.title, "Give back #7 by @sam\u{2026}");
+        assert_eq!(
+            give.action,
+            PaletteAction::Intent(UiIntent::GiveBack { number: 7 })
+        );
+        // Nobody else on the stacks, nothing taken over: no such rows.
+        let bare = listed(
+            &context(Some(&snapshot), Some(&snapshot.nodes[1])),
+            "take over",
+        );
+        assert!(
+            !bare.iter().any(|id| id.starts_with("publish.takeOver")),
+            "{bare:?}"
+        );
     }
 
     fn job(head: &str, phase: AutoLandPhase, live: bool, bypass: bool) -> AutoLandStatus {

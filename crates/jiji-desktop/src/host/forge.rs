@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex};
 use jiji_core::snapshot::{LandedCheck, RepoSnapshot, TipCheck};
 use jiji_core::BackendError;
 use jiji_forge::{
-    detect_github_repo, execute_land, execute_ship, execute_submit, no_github_remote, plan_land,
-    plan_ship, plan_submit, pr_template_candidates, resolve_token, AutoLandPrs, CiRerunReport,
-    ForgeAuth, ForgeError, ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandForge,
-    LandOptions, LandOutcome, LandPlan, LandRepoForge, LandVcs, PrSummary, PrTemplate,
-    PublishStack, RepoForge, RepoPrState, ResolvedToken, ShipOutcome, ShipPlan, ShipVcs,
-    SubmitForge, SubmitHead, SubmitOptions, SubmitOutcome, SubmitPlan, SubmitVcs, TokenSource,
-    TokenStore as _,
+    detect_github_repo, execute_land, execute_ship, execute_submit, execute_take_over,
+    no_github_remote, plan_give_back, plan_land, plan_ship, plan_submit, plan_take_over,
+    pr_template_candidates, resolve_token, AutoLandPrs, CiRerunReport, ForgeAuth, ForgeError,
+    ForgeRepo, ForgeStatus, GitHubClient, KeychainTokenStore, LandForge, LandOptions, LandOutcome,
+    LandPlan, LandRepoForge, LandVcs, PrSummary, PrTemplate, PublishStack, RepoForge, RepoPrState,
+    ResolvedToken, ShipOutcome, ShipPlan, ShipVcs, SubmitForge, SubmitHead, SubmitOptions,
+    SubmitOutcome, SubmitPlan, SubmitVcs, TakeOverOutcome, TakeOverPlan, TakeOverTarget,
+    TakeOverVcs, TokenSource, TokenStore as _,
 };
 
 use super::{CommandError, Host, HostResult};
@@ -406,6 +407,60 @@ impl Host {
         client.pr(&repo, number).map_err(Into::into)
     }
 
+    /// Plan taking over the pull request `number`. Read-only: GitHub is
+    /// asked for that pull request as it is now, so that one that has
+    /// closed, merged or come from a fork is told as that.
+    pub fn take_over_plan(&self, repo_path: &str, number: u64) -> HostResult<TakeOverPlan> {
+        let snapshot = self.workflow_snapshot(repo_path)?;
+        let (repo, client, _) = self.forge_client(repo_path)?;
+        let pr = client.pr(&repo, number)?;
+        Ok(plan_take_over(&snapshot, &repo, &pr))
+    }
+
+    /// Plan giving back the pull request `number`, which was taken over.
+    /// Read-only, and GitHub is not asked: `pr` is the pull request as the
+    /// stack already shows it, and gives the plan its title.
+    pub fn give_back_plan(
+        &self,
+        repo_path: &str,
+        number: u64,
+        pr: Option<&PrSummary>,
+    ) -> HostResult<TakeOverPlan> {
+        let snapshot = self.workflow_snapshot(repo_path)?;
+        plan_give_back(
+            &snapshot,
+            pr.map(std::slice::from_ref).unwrap_or_default(),
+            &TakeOverTarget::Number(number),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Run a take-over or a give-back the user confirmed. The plan is
+    /// made again first, and refused when it is no longer the one the
+    /// user saw.
+    pub fn take_over(&self, repo_path: &str, plan: &TakeOverPlan) -> HostResult<TakeOverOutcome> {
+        let fresh = if plan.giving_back {
+            self.give_back_plan(repo_path, plan.number, None)?
+        } else {
+            self.take_over_plan(repo_path, plan.number)?
+        };
+        if fresh.actions != plan.actions || !fresh.blockers.is_empty() {
+            return Err(plan_stale(
+                "The pull request or its branch",
+                if plan.giving_back {
+                    "give it back"
+                } else {
+                    "take it over"
+                },
+            ));
+        }
+        let vcs = HostVcs {
+            host: self,
+            repo_path: repo_path.to_owned(),
+        };
+        execute_take_over(&fresh, &vcs).map_err(Into::into)
+    }
+
     /// Re-run the failed GitHub Actions runs on a PR's head. The PR is
     /// re-fetched first so the re-run targets the head GitHub currently
     /// has.
@@ -591,6 +646,26 @@ impl SubmitVcs for HostVcs<'_> {
 
     fn create_bookmark(&self, name: &str, change: &str) -> Result<String, BackendError> {
         self.run(|backend, path| backend.create_bookmark(path, name, change))
+    }
+}
+
+impl TakeOverVcs for HostVcs<'_> {
+    fn git_fetch(&self, remote: &str) -> Result<String, BackendError> {
+        LandVcs::git_fetch(self, remote)
+    }
+
+    fn take_over(
+        &self,
+        bookmark: &str,
+        remote: &str,
+        number: u64,
+        author: Option<&str>,
+    ) -> Result<String, BackendError> {
+        self.run(|backend, path| backend.take_over_branch(path, bookmark, remote, number, author))
+    }
+
+    fn give_back(&self, bookmark: &str, remote: &str) -> Result<String, BackendError> {
+        self.run(|backend, path| backend.give_back_branch(path, bookmark, remote))
     }
 }
 

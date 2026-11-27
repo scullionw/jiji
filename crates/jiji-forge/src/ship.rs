@@ -443,6 +443,34 @@ pub fn plan_ship(
                 shipped.push(pr);
             }
         }
+        // A pull request of the work that was someone else's and was
+        // taken over ships like the rest. Named, with what a push of its
+        // branch can and cannot do.
+        let taken: Vec<jiji_core::snapshot::TakenOver> = shipped
+            .iter()
+            .filter_map(|pr| crate::takeover::taken_over(snapshot, &pr.head_branch, Some(pr)))
+            .collect();
+        if !taken.is_empty() {
+            let listed: Vec<String> = taken.iter().map(|entry| entry.by_author()).collect();
+            let one = listed.len() == 1;
+            warnings.push(format!(
+                "{} {} taken over, and {} with this work like a pull request of your own",
+                match listed.as_slice() {
+                    [one] => one.clone(),
+                    [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                    [] => unreachable!("checked non-empty"),
+                },
+                if one { "was" } else { "were" },
+                if one { "ships" } else { "ship" },
+            ));
+            let pushed: Vec<&jiji_core::snapshot::TakenOver> = taken
+                .iter()
+                .filter(|entry| branch_pushes.contains(&entry.bookmark))
+                .collect();
+            if let Some(note) = crate::takeover::pushes_their_branch(&pushed) {
+                warnings.push(note);
+            }
+        }
         // GitHub's own stacks. A pull request in one cannot be
         // retargeted, so a stack whose pull requests need it is dissolved
         // first. That is done only when the whole stack ships: taking a
@@ -673,15 +701,23 @@ pub fn plan_ship(
             } else {
                 continue;
             };
+            // Taken over, the pull request ships with the work. A fork's
+            // cannot be taken over.
+            let or_take_over = if prs.of_this_repository(pr) {
+                format!(
+                    ", or take the pull request over (take-over {}) if it is yours to ship",
+                    pr.number
+                )
+            } else {
+                String::new()
+            };
             blockers.push(format!(
                 "{} (\u{201c}{}\u{201d}) has its head among the changes this ships: {how}. \
                  Shipping would put that head inside \u{201c}{}\u{201d}, and GitHub would mark \
-                 the pull request merged \u{2014} {way_out}, or track \u{201c}{}\u{201d} if the \
-                 pull request is yours to ship",
+                 the pull request merged \u{2014} {way_out}{or_take_over}",
                 named(pr.number, pr.author.as_deref(), true),
                 pr.head_branch,
                 pr.base_branch,
-                pr.head_branch,
             ));
         }
         // Someone else's pull request on the shipped work ends open, on
@@ -802,7 +838,8 @@ pub fn plan_ship(
         blockers.push(format!(
             "this work has to be rebased onto \u{201c}{}\u{201d} before it can ship, and a \
              branch that is not a bookmark here builds on it, which makes it immutable to \
-             jj \u{2014} land the stack instead, or track that branch and rebase both",
+             jj \u{2014} land the stack instead, or take over the pull request that branch \
+             belongs to (take-over BRANCH) and ship then",
             trunk.name
         ));
     }
@@ -1123,9 +1160,21 @@ fn run_ship_step(
         ShipAction::RebaseOntoTrunk { root_change, .. } => vcs
             .rebase_onto_trunk(root_change)
             .map_err(|err| err.to_string()),
-        ShipAction::PushBranches { bookmarks, remote } => vcs
-            .push_bookmarks(bookmarks, remote)
-            .map_err(|err| err.to_string()),
+        ShipAction::PushBranches { bookmarks, remote } => {
+            vcs.push_bookmarks(bookmarks, remote).map_err(|err| {
+                // The lease held: when the branch that had moved is one
+                // that was taken over, its author pushed to it again.
+                let refusal = err.to_string();
+                let taken = vcs
+                    .snapshot()
+                    .map(|snapshot| snapshot.taken_over)
+                    .unwrap_or_default();
+                match crate::takeover::pushed_to_again(&refusal, &taken, "ship again") {
+                    Some(story) => format!("{refusal}. {story}"),
+                    None => refusal,
+                }
+            })
+        }
         ShipAction::Unstack { stack, .. } => {
             let kept = github()?.unstack(*stack).map_err(|err| err.to_string())?;
             if kept.is_empty() {
@@ -1315,6 +1364,7 @@ mod tests {
             conflicts: vec![],
             operations: vec![],
             resolve_tool: None,
+            taken_over: Vec::new(),
         }
     }
 
@@ -2422,8 +2472,8 @@ mod tests {
                 &"#9 by @kim (\u{201c}their-fix\u{201d}) has its head among the changes this \
                   ships: a bookmark of this work was moved onto its commits. Shipping would put \
                   that head inside \u{201c}bottom\u{201d}, and GitHub would mark the pull request \
-                  merged \u{2014} move the bookmark back off those commits, or track \
-                  \u{201c}their-fix\u{201d} if the pull request is yours to ship"
+                  merged \u{2014} move the bookmark back off those commits, or take the pull \
+                  request over (take-over 9) if it is yours to ship"
                     .to_owned()
             ),
             "{:?}",
@@ -2457,8 +2507,8 @@ mod tests {
                 &"#9 by @kim (\u{201c}their-fix\u{201d}) has its head among the changes this \
                   ships: a merge in this work brings its commits in. Shipping would put that \
                   head inside \u{201c}bottom\u{201d}, and GitHub would mark the pull request \
-                  merged \u{2014} take that merge out of this work, or track \
-                  \u{201c}their-fix\u{201d} if the pull request is yours to ship"
+                  merged \u{2014} take that merge out of this work, or take the pull request \
+                  over (take-over 9) if it is yours to ship"
                     .to_owned()
             ),
             "{:?}",
@@ -2471,6 +2521,21 @@ mod tests {
         assert!(
             plan.blockers.iter().any(|b| b.starts_with("#9 by @kim")
                 && b.contains("a merge in this work brings its commits in")),
+            "{:?}",
+            plan.blockers
+        );
+        // From a fork, the pull request cannot be taken over, and the
+        // refusal does not offer that.
+        let from_a_fork = {
+            let mut report = theirs(&prs).report;
+            report.prs.last_mut().unwrap().head_owner = Some("kim".into());
+            prs_with(report.prs)
+        };
+        let plan = plan_ship(&snap, Some(&from_a_fork), "origin", "b2").unwrap();
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.starts_with("#9 by @kim") && b.ends_with("take that merge out of this work")),
             "{:?}",
             plan.blockers
         );
@@ -2823,5 +2888,108 @@ mod tests {
         };
         assert!(execute_ship(&plan, &vcs, None).is_err());
         assert!(vcs.calls.borrow().is_empty());
+    }
+
+    /// The published pair, with #8 on top by kim and taken over.
+    fn pair_with_taken_over() -> (RepoSnapshot, RepoPrState) {
+        let (mut snap, prs) = published_pair();
+        snap.taken_over = vec![jiji_core::snapshot::TakenOver {
+            bookmark: "top".into(),
+            remote: "origin".into(),
+            number: 8,
+            author: Some("kim".into()),
+        }];
+        let mut open = prs.report.prs;
+        open[1].author = Some("kim".into());
+        (snap, prs_with(open))
+    }
+
+    /// The remote refuses the first push it sees, in the backend's words
+    /// for a branch that moved since the last fetch.
+    struct Leased(RepoSnapshot);
+
+    impl ShipVcs for Leased {
+        fn snapshot(&self) -> Result<RepoSnapshot, BackendError> {
+            Ok(self.0.clone())
+        }
+        fn rebase_onto_trunk(&self, root_change: &str) -> Result<String, BackendError> {
+            Ok(format!("Rebased {root_change} onto trunk"))
+        }
+        fn move_bookmark(&self, name: &str, to_change: &str) -> Result<String, BackendError> {
+            Ok(format!("Moved {name} to {to_change}"))
+        }
+        fn push_bookmarks(&self, bookmarks: &[String], _: &str) -> Result<String, BackendError> {
+            Err(BackendError::MutationFailed(format!(
+                "{} moved on the remote since the last fetch; fetch, reconcile, and push again",
+                bookmarks.join(", ")
+            )))
+        }
+        fn new_change(&self, parent_change: &str) -> Result<String, BackendError> {
+            Ok(format!("Started a new change on {parent_change}"))
+        }
+    }
+
+    /// A pull request that was taken over ships with the work like one
+    /// of the user's own, and the plan says whose it is. When the ship
+    /// first has to push its branch, the plan names that push, and a
+    /// push the remote refuses because its author pushed again says so.
+    #[test]
+    fn a_taken_over_pull_request_ships_with_the_work_and_says_whose_it_is() {
+        let about = |plan: &ShipPlan| -> Vec<String> {
+            plan.warnings.iter().filter(|w| w.contains("taken over")).cloned().collect()
+        };
+        // In step with GitHub: it ships, and nothing of its branch moves.
+        let (snap, prs) = pair_with_taken_over();
+        let plan = plan_ship(&snap, Some(&prs), "origin", "b2").unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(told(&plan).last().map(String::as_str), Some("confirm [7, 8]"));
+        assert_eq!(
+            about(&plan),
+            ["#8 by @kim was taken over, and ships with this work like a pull request of your own"]
+        );
+
+        // Changed here since: its branch is pushed first, and the plan
+        // says whose branch that is.
+        let (mut snap, prs) = pair_with_taken_over();
+        snap.bookmarks[2].sync = SyncState::Ahead;
+        let plan = plan_ship(&snap, Some(&prs), "origin", "b2").unwrap();
+        assert_eq!(told(&plan)[0], "push branches top");
+        assert_eq!(
+            about(&plan),
+            [
+                "#8 by @kim was taken over, and ships with this work like a pull request of your own",
+                "This pushes \u{201c}top\u{201d} (#8 by @kim, taken over): a branch someone else \
+                 made. The push goes through only if the branch is where the last fetch saw it, \
+                 so nothing pushed there since is overwritten",
+            ]
+        );
+        // Refused, because its author pushed in the meantime.
+        let outcome = execute_ship(&plan, &Leased(snap.clone()), Some(&Hub::default())).unwrap();
+        assert!(outcome.failed);
+        assert_eq!(
+            outcome.steps[0].detail.as_deref(),
+            Some(
+                "Could not apply the change: top moved on the remote since the last fetch; \
+                 fetch, reconcile, and push again. \u{201c}top\u{201d} is #8 by @kim's branch, \
+                 taken over: it was pushed to again since the last fetch, and nothing there was \
+                 overwritten. Fetch: the new commits arrive beside yours, and \u{201c}top\u{201d} \
+                 reads as conflicted until you have brought the two together (rebase theirs onto \
+                 yours, or take theirs) and pointed it at the result. Then ship again"
+            )
+        );
+
+        // The user's own pair says none of it.
+        let (mut snap, prs) = published_pair();
+        snap.bookmarks[2].sync = SyncState::Ahead;
+        let plan = plan_ship(&snap, Some(&prs), "origin", "b2").unwrap();
+        assert!(about(&plan).is_empty(), "{:?}", plan.warnings);
+        let outcome = execute_ship(&plan, &Leased(snap), Some(&Hub::default())).unwrap();
+        assert_eq!(
+            outcome.steps[0].detail.as_deref(),
+            Some(
+                "Could not apply the change: top moved on the remote since the last fetch; \
+                 fetch, reconcile, and push again"
+            )
+        );
     }
 }

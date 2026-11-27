@@ -41,7 +41,7 @@
 //! recognizing already-merged PRs (needs a per-bookmark merged-PR query;
 //! the land flow owns it).
 
-use jiji_core::snapshot::{GraphNode, RepoSnapshot, SyncState};
+use jiji_core::snapshot::{GraphNode, RepoSnapshot, SyncState, TakenOver};
 use jiji_core::BackendError;
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +132,11 @@ pub struct SubmitSegment {
     pub title: String,
     /// The open PR GitHub already has for this bookmark, when one exists.
     pub pr: Option<PrSummary>,
+    /// Set when this segment's branch was someone else's and was taken
+    /// over here ([`crate::takeover`]): for which pull request, and whose.
+    /// A plan that pushes it says so.
+    #[serde(default)]
+    pub taken_over: Option<TakenOver>,
 }
 
 /// One remote action the plan will run, in execution order.
@@ -772,12 +777,14 @@ pub fn plan_submit(
         let bottom = seg.nodes.first().expect("segments are never empty");
         let (title, body) = derive_title_body(&bottom.description, name);
         let pr = prs.by_branch.get(name).cloned();
+        let taken_over = crate::takeover::taken_over(snapshot, name, pr.as_ref());
         let segment = SubmitSegment {
             bookmark: name.to_owned(),
             base: effective_base.clone(),
             change_ids: seg.nodes.iter().map(|n| n.id.clone()).collect(),
             title: title.clone(),
             pr: pr.clone(),
+            taken_over: taken_over.clone(),
         };
 
         // An all-empty segment pushes nothing: an empty diff would make
@@ -809,10 +816,15 @@ pub fn plan_submit(
                     .iter()
                     .any(|c| c.id == format!("bookmark-{name}"))
             {
-                blockers.push(format!(
-                    "bookmark \u{201c}{name}\u{201d} is conflicted; repoint it before \
-                     publishing"
-                ));
+                // For a branch that was taken over, a conflict is what a
+                // fetch leaves when its author pushed to it again.
+                blockers.push(match &taken_over {
+                    Some(entry) => crate::takeover::conflicted_story(entry),
+                    None => format!(
+                        "bookmark \u{201c}{name}\u{201d} is conflicted; repoint it before \
+                         publishing"
+                    ),
+                });
             }
             // Only commits that would land on the remote need to be
             // presentable — the same checks the push itself enforces,
@@ -969,6 +981,17 @@ pub fn plan_submit(
             _ => None,
         })
         .collect();
+    // A push of a branch that was taken over moves a branch someone else
+    // made. Said by pull request and author, so that the user sees whose
+    // branch is about to move.
+    let theirs: Vec<&TakenOver> = segments
+        .iter()
+        .filter(|segment| pushed.contains(segment.bookmark.as_str()))
+        .filter_map(|segment| segment.taken_over.as_ref())
+        .collect();
+    if let Some(note) = crate::takeover::pushes_their_branch(&theirs) {
+        warnings.push(note);
+    }
     // Where each pushed branch will stand, and what it will then contain:
     // everything reachable from that commit, along every parent. (A merge
     // can bring a pull request's head in as its second parent.)
@@ -1098,21 +1121,30 @@ pub fn plan_submit(
             // Their branch is not here to be moved along, so there is no
             // publish that keeps the pull request open: the only way out
             // is not to put its commits under its base.
+            // Taken over, its branch is a bookmark here and the publish
+            // goes through it. A fork's branch cannot be taken over.
+            let or_take_over = if prs.of_this_repository(pr) {
+                format!(
+                    ", or take that pull request over first (take-over {}) and publish \
+                     through it",
+                    pr.number
+                )
+            } else {
+                String::new()
+            };
             blockers.push(format!(
                 "publishing through \u{201c}{head_bookmark}\u{201d} would push \
                  \u{201c}{}\u{201d} onto the commits of {} (\u{201c}{}\u{201d}), which is \
                  based on it, and GitHub would close {} as merged into \u{201c}{}\u{201d}. That \
                  pull request is someone else's: its branch is not a bookmark here, and no \
                  publish from here can move it out of the way. Move \u{201c}{}\u{201d} back off \
-                 those commits, or make the branch yours first (track \u{201c}{}\u{201d}) and \
-                 publish through it",
+                 those commits{or_take_over}",
                 pr.base_branch,
                 pr.by_author(),
                 pr.head_branch,
                 pr.by_author(),
                 pr.base_branch,
                 pr.base_branch,
-                pr.head_branch
             ));
         } else if at_risk(pr) {
             blockers.push(format!(
@@ -1176,10 +1208,17 @@ pub fn plan_submit(
         .map(|r| r.0)
         .chain(slid.iter().map(|s| s.0))
         .collect();
+    // What sits on top of the chain as it will stand: on its top segment
+    // that has, or gets, a pull request.
+    let on_top = live
+        .last()
+        .map(|(top, _)| on_top_of(snapshot, prs, top))
+        .unwrap_or_default();
     let (unstacks, link) = plan_stack_link(
         &live,
         &moving,
         &prs.report.prs,
+        &on_top,
         options.stack,
         !creates.is_empty(),
         &mut warnings,
@@ -1407,6 +1446,67 @@ pub(crate) fn sees_whole_stack(open: &[PrSummary], stack: u64) -> bool {
             .all(|pair| pair[1].1.position == pair[0].1.position + 1)
 }
 
+/// Someone else's pull requests that sit on top of `head`, the top branch
+/// of a chain, as one line: the one based on `head`, the one based on
+/// that one's branch, and so on up. These are the ones a GitHub stack of
+/// the chain can take in, and in a stack GitHub rebases their branches
+/// itself after each merge below (seen on the sandbox), so they go on
+/// showing only their own changes.
+///
+/// Plain ones of this repository only: one that is in a stack already is
+/// where it is, and a fork's branch is in another repository. The line
+/// ends where two rest on the same branch, because a stack is one line.
+/// And nothing is on top of a chain that goes on above `head` here: a
+/// bookmark of the user's up there means theirs is beside the chain.
+pub(crate) fn on_top_of<'a>(
+    snapshot: &RepoSnapshot,
+    prs: &'a RepoPrState,
+    head: &str,
+) -> Vec<&'a PrSummary> {
+    let Some(at) = snapshot
+        .bookmarks
+        .iter()
+        .find(|b| b.is_local && b.name == head)
+        .map(|b| b.target.as_str())
+    else {
+        return Vec::new();
+    };
+    // Nodes come children before parents: one pass from the bottom up
+    // finds everything that has `at` below it.
+    let mut above: Vec<&str> = Vec::new();
+    for node in snapshot.nodes.iter().rev() {
+        if node
+            .parents
+            .iter()
+            .any(|p| p == at || above.contains(&p.as_str()))
+        {
+            above.push(node.id.as_str());
+        }
+    }
+    let goes_on = snapshot
+        .bookmarks
+        .iter()
+        .any(|b| b.is_local && !b.is_trunk && above.contains(&b.target.as_str()));
+    if goes_on {
+        return Vec::new();
+    }
+    let others = crate::pr::others_on(snapshot, prs, &[head]);
+    let mut line: Vec<&PrSummary> = Vec::new();
+    let mut base = head;
+    loop {
+        let mut on_it = others.iter().filter(|pr| pr.base_branch == base);
+        let (Some(next), None) = (on_it.next(), on_it.next()) else {
+            break;
+        };
+        if next.stack.is_some() || !prs.of_this_repository(next) {
+            break;
+        }
+        line.push(next);
+        base = next.head_branch.as_str();
+    }
+    line
+}
+
 /// What a plan does about GitHub's own stack: the stacks to dissolve
 /// before anything is retargeted, and the link to make at the end.
 ///
@@ -1419,14 +1519,47 @@ pub(crate) fn sees_whole_stack(open: &[PrSummary], stack: u64) -> bool {
 /// otherwise dissolved and linked again. Linking again takes back the
 /// pull requests above the published head that still chain on top of it;
 /// any other member the new stack cannot hold is named in a warning.
+///
+/// `on_top` are someone else's pull requests that sit on top of the chain
+/// ([`on_top_of`]). A link that is asked for outright takes them in, on
+/// top, and says so by number and author: that is how a pull request of
+/// theirs is spared showing landed commits. A stack that is only kept in
+/// step, or linked because of the setting, does not reach for them.
 fn plan_stack_link(
     live: &[(String, Option<PrSummary>)],
     moving: &[u64],
     open: &[PrSummary],
+    on_top: &[&PrSummary],
     wanted: StackLink,
     opens_a_pr: bool,
     warnings: &mut Vec<String>,
 ) -> (Vec<SubmitAction>, Option<SubmitAction>) {
+    let take_in: Vec<u64> = match wanted {
+        StackLink::Link => on_top.iter().map(|pr| pr.number).collect(),
+        _ => Vec::new(),
+    };
+    let taking_in = |warnings: &mut Vec<String>| {
+        let listed: Vec<String> = on_top.iter().map(|pr| pr.by_author()).collect();
+        let one = listed.len() == 1;
+        warnings.push(format!(
+            "{} {} on top of this chain and {} someone else's: {} into the GitHub stack with \
+             it. In a stack GitHub rebases {} itself after each merge below, so {} on \
+             showing only {} own changes; and {} cannot be changed while {} in the stack",
+            match listed.as_slice() {
+                [one] => one.clone(),
+                [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                [] => unreachable!("only called with some to take in"),
+            },
+            if one { "sits" } else { "sit" },
+            if one { "is" } else { "are" },
+            if one { "it goes" } else { "they go" },
+            if one { "its branch" } else { "their branches" },
+            if one { "it goes" } else { "they go" },
+            if one { "its" } else { "their" },
+            if one { "its base" } else { "their bases" },
+            if one { "it is" } else { "they are" },
+        ));
+    };
     let seat = |entry: &(String, Option<PrSummary>)| {
         entry.1.as_ref().and_then(|pr| pr.stack.clone())
     };
@@ -1518,7 +1651,9 @@ fn plan_stack_link(
         StackLink::LinkNew if stacks.is_empty() && !opens_a_pr => return (Vec::new(), None),
         StackLink::Follow | StackLink::Link | StackLink::LinkNew => {}
     }
-    if live.len() < 2 {
+    // One pull request of the chain's own is enough for a stack when
+    // someone else's sits on top of it and is taken in.
+    if live.is_empty() || live.len() + take_in.len() < 2 {
         if wanted == StackLink::Link {
             warnings.push(
                 "a GitHub stack needs at least two pull requests; this one stays a \
@@ -1538,12 +1673,15 @@ fn plan_stack_link(
         return (if moved { dissolve(&stacks) } else { Vec::new() }, None);
     }
     if stacks.is_empty() {
+        if !take_in.is_empty() {
+            taking_in(warnings);
+        }
         return (
             Vec::new(),
             Some(SubmitAction::LinkStack {
                 bookmarks: live.iter().map(|(name, _)| name.clone()).collect(),
                 onto: None,
-                above: Vec::new(),
+                above: take_in,
             }),
         );
     }
@@ -1562,16 +1700,20 @@ fn plan_stack_link(
             .iter()
             .any(|(_, pr)| pr.as_ref().is_some_and(|pr| moving.contains(&pr.number)));
     let top = seats.last();
-    if in_order && seated == live.len() {
+    let ends_here = top.is_some_and(|top| top.position == top.size);
+    if in_order && seated == live.len() && !(ends_here && !take_in.is_empty()) {
         return (Vec::new(), None);
     }
-    if in_order && top.is_some_and(|top| top.position == top.size) {
+    if in_order && ends_here {
+        if !take_in.is_empty() {
+            taking_in(warnings);
+        }
         return (
             Vec::new(),
             Some(SubmitAction::LinkStack {
                 bookmarks: live[seated..].iter().map(|(name, _)| name.clone()).collect(),
                 onto: Some(stacks[0]),
-                above: Vec::new(),
+                above: take_in,
             }),
         );
     }
@@ -1601,6 +1743,12 @@ fn plan_stack_link(
         ));
     }
     leaving(&left, warnings);
+    // Nothing of the old stack goes back on top: what sits there now and
+    // was asked in comes instead.
+    if above.is_empty() && !take_in.is_empty() {
+        taking_in(warnings);
+        above = take_in;
+    }
     (
         dissolve(&stacks),
         Some(SubmitAction::LinkStack {
@@ -1721,7 +1869,23 @@ pub fn execute_submit(
                 Ok(summary) => (SubmitStepStatus::Done, summary),
                 Err(err) => {
                     failed = true;
-                    (SubmitStepStatus::Failed, err.to_string())
+                    // The lease held: when the branch that had moved is one
+                    // that was taken over, its author pushed to it again.
+                    let taken: Vec<TakenOver> = plan
+                        .segments
+                        .iter()
+                        .filter_map(|segment| segment.taken_over.clone())
+                        .collect();
+                    let refusal = err.to_string();
+                    let detail = match crate::takeover::pushed_to_again(
+                        &refusal,
+                        &taken,
+                        "publish again",
+                    ) {
+                        Some(story) => format!("{refusal}. {story}"),
+                        None => refusal,
+                    };
+                    (SubmitStepStatus::Failed, detail)
                 }
             };
             for step in &mut steps[index..index + run] {
@@ -2108,6 +2272,7 @@ mod tests {
             conflicts: vec![],
             operations: vec![],
             resolve_tool: None,
+            taken_over: Vec::new(),
         }
     }
 
@@ -2799,8 +2964,8 @@ mod tests {
               GitHub would close #9 by @kim as merged into \u{201c}profile\u{201d}. That pull \
               request is someone else's: its branch is not a bookmark here, and no publish \
               from here can move it out of the way. Move \u{201c}profile\u{201d} back off those \
-              commits, or make the branch yours first (track \u{201c}their-top\u{201d}) and \
-              publish through it"]
+              commits, or take that pull request over first (take-over 9) and publish through \
+              it"]
         );
     }
 
@@ -2833,6 +2998,13 @@ mod tests {
                  onto the commits of #19 by @kim (\u{201c}auth\u{201d}), which is based on it, \
                  and GitHub would close #19 by @kim as merged into \u{201c}profile\u{201d}."
             ),
+            "{:?}",
+            plan.blockers
+        );
+        // A fork's pull request cannot be taken over, so that way out is
+        // not offered: the bookmark has to come back off its commits.
+        assert!(
+            plan.blockers[0].ends_with("Move \u{201c}profile\u{201d} back off those commits"),
             "{:?}",
             plan.blockers
         );
@@ -5157,5 +5329,446 @@ mod tests {
         let outcome = execute_submit(&plan, &github, &github).unwrap();
         assert!(outcome.failed);
         assert!(github.pr(7).open, "{:?}", github.log);
+    }
+
+    /// main(m) ── a1 (auth) ── b1 (profile) ── t1 (their-fix, @): the
+    /// pair with #9 by kim on top of it, taken over. `their-fix` reads
+    /// `sync` against its remote.
+    fn pair_with_taken_over(sync: SyncState) -> (RepoSnapshot, RepoPrState) {
+        let mut snap = snapshot(
+            vec![
+                node("t1", "their fix", NodeKind::WorkingCopy, &["b1"], &["their-fix"]),
+                node("b1", "profile: avatars", NodeKind::Mutable, &["a1"], &["profile"]),
+                node("a1", "auth: login", NodeKind::Mutable, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+                bookmark("profile", "b1", SyncState::Synced, false),
+                bookmark("their-fix", "t1", sync, false),
+            ],
+        );
+        snap.taken_over = vec![TakenOver {
+            bookmark: "their-fix".into(),
+            remote: "origin".into(),
+            number: 9,
+            author: Some("kim".into()),
+        }];
+        let pushed_at = |pr: PrSummary, commit: &str| PrSummary {
+            head_commit: commit.into(),
+            ..pr
+        };
+        let prs = pr_state(
+            vec![
+                pushed_at(text_pr(1, "auth", "main", "auth: login", ""), "ca1"),
+                pushed_at(text_pr(7, "profile", "auth", "profile: avatars", ""), "cb1"),
+                // Theirs, with a title and a body of their own.
+                PrSummary {
+                    title: "A fix, as its author called it".into(),
+                    body: Some("Their own words.".into()),
+                    ..their_pr(
+                        9,
+                        "their-fix",
+                        "profile",
+                        "kim",
+                        if sync == SyncState::Synced { "ct1" } else { "0ldt1" },
+                    )
+                },
+            ],
+            false,
+        );
+        (snap, prs)
+    }
+
+    fn about_taking_over(plan: &SubmitPlan) -> Vec<&str> {
+        plan.warnings
+            .iter()
+            .map(String::as_str)
+            .filter(|w| w.contains("taken over") || w.contains("someone else"))
+            .collect()
+    }
+
+    /// Taken over, their pull request is a segment like any other, and
+    /// the plan carries whose it is. A publish that pushes its branch
+    /// names the pull request and its author before anything runs; one
+    /// that does not push it has nothing to say.
+    #[test]
+    fn a_publish_that_pushes_a_taken_over_branch_says_whose_it_is() {
+        let kim = TakenOver {
+            bookmark: "their-fix".into(),
+            remote: "origin".into(),
+            number: 9,
+            author: Some("kim".into()),
+        };
+        // In step with its remote: a segment, marked, and nothing pushed.
+        let (snap, prs) = pair_with_taken_over(SyncState::Synced);
+        let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            plan.segments
+                .iter()
+                .map(|s| (s.bookmark.as_str(), s.pr.as_ref().map(|pr| pr.number), s.taken_over.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("auth", Some(1), None),
+                ("profile", Some(7), None),
+                ("their-fix", Some(9), Some(kim.clone())),
+            ]
+        );
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(about_taking_over(&plan).is_empty(), "{:?}", plan.warnings);
+        // The pull request stays its author's: the title and the body
+        // they wrote are not Jiji's to rewrite.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SubmitAction::UpdatePrText { number: 9, .. })),
+            "{:?}",
+            plan.actions
+        );
+
+        // Changed here: the push is named for what it is.
+        for sync in [SyncState::Ahead, SyncState::Diverged] {
+            let (snap, prs) = pair_with_taken_over(sync);
+            let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+            assert_eq!(retargets_and_pushes(&plan), ["push their-fix"]);
+            assert_eq!(
+                about_taking_over(&plan),
+                ["This pushes \u{201c}their-fix\u{201d} (#9 by @kim, taken over): a branch someone \
+                  else made. The push goes through only if the branch is where the last fetch \
+                  saw it, so nothing pushed there since is overwritten"]
+            );
+        }
+
+        // A push of the user's own branches says nothing about theirs.
+        let (mut snap, prs) = pair_with_taken_over(SyncState::Synced);
+        snap.bookmarks[2] = bookmark("profile", "b1", SyncState::Ahead, false);
+        let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+        assert_eq!(retargets_and_pushes(&plan), ["push profile"]);
+        assert!(about_taking_over(&plan).is_empty(), "{:?}", plan.warnings);
+
+        // A record for another pull request is a name used again: the
+        // branch this bookmark has now is the user's own.
+        let (mut snap, prs) = pair_with_taken_over(SyncState::Ahead);
+        snap.taken_over[0].number = 12;
+        let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+        assert_eq!(retargets_and_pushes(&plan), ["push their-fix"]);
+        assert_eq!(plan.segments[2].taken_over, None);
+        assert!(about_taking_over(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    /// A taken-over bookmark that reads as conflicted is what a fetch
+    /// leaves when its author pushed to it again after it was changed
+    /// here. The refusal says that, and what to do.
+    #[test]
+    fn a_conflicted_taken_over_bookmark_says_its_author_pushed_again() {
+        let (mut snap, prs) = pair_with_taken_over(SyncState::Diverged);
+        snap.conflicts.push(ConflictItem {
+            id: "bookmark-their-fix".into(),
+            kind: ConflictKind::Bookmark,
+            summary: "conflicted".into(),
+            node_id: None,
+            paths: vec![],
+            more_paths: 0,
+            targets: vec![],
+            workspace: None,
+        });
+        let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+        assert_eq!(
+            plan.blockers,
+            ["\u{201c}their-fix\u{201d} is conflicted: it is #9 by @kim's branch, taken over, and \
+              it was pushed to again after it was changed here. The new commits are on \
+              their-fix@origin. Bring the two together (rebase theirs onto yours, or take \
+              theirs), point \u{201c}their-fix\u{201d} at the result, and publish again"]
+        );
+    }
+
+    /// The remote refuses a push of a branch that moved since the last
+    /// fetch. `refusal` is the backend's sentence for it.
+    struct Refusing(&'static str);
+
+    impl SubmitVcs for Refusing {
+        fn push_bookmarks(&self, _: &[String], _: &str) -> Result<String, BackendError> {
+            Err(BackendError::MutationFailed(self.0.into()))
+        }
+        fn create_bookmark(&self, name: &str, _: &str) -> Result<String, BackendError> {
+            Ok(format!("Created bookmark {name}"))
+        }
+    }
+
+    /// Every push carries a lease, so a commit its author pushed after
+    /// the last fetch is never overwritten. When that is why the push
+    /// was refused, the step says so: who pushed, that nothing of theirs
+    /// was lost, and what to do. Any other failure reads as it did.
+    #[test]
+    fn a_refused_push_of_a_taken_over_branch_says_who_pushed_and_what_to_do() {
+        let (snap, prs) = pair_with_taken_over(SyncState::Diverged);
+        let plan = plan_through(&snap, &prs, "their-fix", StackLink::Follow);
+        let push_detail = |vcs: &Refusing| -> String {
+            let outcome = execute_submit(&plan, vcs, &StubForge::default()).unwrap();
+            assert!(outcome.failed);
+            let step = outcome
+                .steps
+                .iter()
+                .find(|step| matches!(step.action, SubmitAction::Push { .. }))
+                .expect("the plan pushes");
+            assert_eq!(step.status, SubmitStepStatus::Failed);
+            step.detail.clone().unwrap_or_default()
+        };
+        let moved = "their-fix moved on the remote since the last fetch; fetch, reconcile, and \
+                     push again";
+        assert_eq!(
+            push_detail(&Refusing(moved)),
+            format!(
+                "Could not apply the change: {moved}. \u{201c}their-fix\u{201d} is #9 by @kim's \
+                 branch, taken over: it was pushed to again since the last fetch, and nothing \
+                 there was overwritten. Fetch: the new commits arrive beside yours, and \
+                 \u{201c}their-fix\u{201d} reads as conflicted until you have brought the two \
+                 together (rebase theirs onto yours, or take theirs) and pointed it at the \
+                 result. Then publish again"
+            )
+        );
+        assert_eq!(
+            push_detail(&Refusing("the remote hung up")),
+            "Could not apply the change: the remote hung up"
+        );
+    }
+
+    /// Asked to link the chain as a GitHub stack, a publish takes someone
+    /// else's pull requests that sit on top of it into the stack, and
+    /// says so by number and author: in a stack GitHub rebases their
+    /// branches after each merge below. Unasked, it never reaches for
+    /// them.
+    #[test]
+    fn asked_for_a_github_stack_takes_in_someone_elses_pull_requests_on_top() {
+        let (snap, prs) = pair_with_others(SyncState::Synced);
+        let plan = plan_through(&snap, &prs, "profile", StackLink::Link);
+        assert_eq!(
+            link_steps(&plan),
+            ["link [\"auth\", \"profile\"] onto None with [9, 10] above"]
+        );
+        assert_eq!(
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("GitHub stack"))
+                .collect::<Vec<_>>(),
+            ["#9 by @kim and #10 by @kim sit on top of this chain and are someone else's: they \
+              go into the GitHub stack with it. In a stack GitHub rebases their branches itself \
+              after each merge below, so they go on showing only their own changes; and their \
+              bases cannot be changed while they are in the stack"]
+        );
+        // Left alone, or under the setting for new stacks: nothing of
+        // theirs is touched.
+        for unasked in [StackLink::Follow, StackLink::LinkNew] {
+            let plan = plan_through(&snap, &prs, "profile", unasked);
+            assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+            assert!(!plan.warnings.iter().any(|w| w.contains("GitHub stack")), "{:?}", plan.warnings);
+        }
+
+        // One on top, said in the singular.
+        let only_nine = pr_state(
+            prs.report.prs.iter().filter(|pr| pr.number != 10).cloned().collect(),
+            false,
+        );
+        let plan = plan_through(&snap, &only_nine, "profile", StackLink::Link);
+        assert_eq!(
+            link_steps(&plan),
+            ["link [\"auth\", \"profile\"] onto None with [9] above"]
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "#9 by @kim sits on top of this chain and is someone else's: it goes into the \
+                    GitHub stack with it. In a stack GitHub rebases its branch itself after each \
+                    merge below, so it goes on showing only its own changes; and its base cannot \
+                    be changed while it is in the stack"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// A stack is one line, in one repository. What cannot go into it is
+    /// left where it is, and the chain is linked without it.
+    #[test]
+    fn what_cannot_sit_in_a_stack_on_top_of_the_chain_is_not_taken_in() {
+        let (snap, prs) = pair_with_others(SyncState::Synced);
+        let with = |change: &dyn Fn(&mut Vec<PrSummary>)| {
+            let mut all = prs.report.prs.clone();
+            change(&mut all);
+            pr_state(all, false)
+        };
+        let just_the_pair = ["link [\"auth\", \"profile\"] onto None"];
+
+        // From a fork: its branch is in another repository.
+        let fork = with(&|all| all[2].head_owner = Some("kim".into()));
+        let plan = plan_through(&snap, &fork, "profile", StackLink::Link);
+        assert_eq!(link_steps(&plan), just_the_pair);
+        assert!(!plan.warnings.iter().any(|w| w.contains("on top of this chain")), "{:?}", plan.warnings);
+
+        // Two that rest on the same branch: neither is the one on top.
+        let two = with(&|all| all.push(their_pr(11, "their-other", "profile", "sam", "c0ffee11")));
+        let plan = plan_through(&snap, &two, "profile", StackLink::Link);
+        assert_eq!(link_steps(&plan), just_the_pair);
+
+        // The line is taken as far as it is one: #9, and not the two
+        // that rest on it.
+        let forked_above = with(&|all| all.push(their_pr(11, "their-other", "their-top", "sam", "c0ffee11")));
+        let plan = plan_through(&snap, &forked_above, "profile", StackLink::Link);
+        assert_eq!(
+            link_steps(&plan),
+            ["link [\"auth\", \"profile\"] onto None with [9] above"]
+        );
+
+        // A chain that goes on above the published head: theirs on the
+        // head is beside the chain, not on top of it.
+        let on_auth = with(&|all| {
+            all.truncate(2);
+            all.push(their_pr(8, "their-mid", "auth", "sam", "c0ffee08"));
+        });
+        let plan = plan_through(&snap, &on_auth, "auth", StackLink::Link);
+        assert!(link_steps(&plan).is_empty(), "{:?}", plan.actions);
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("at least two pull requests")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// The same against GitHub's rules: the link goes through with
+    /// theirs on top, one pull request of the user's own is enough for a
+    /// stack with theirs, and a stack that exists gets theirs added.
+    #[test]
+    fn taking_someone_elses_pull_request_into_a_stack_is_what_github_accepts() {
+        let local = synced_pair();
+        let branches = [
+            ("main", "m"),
+            ("auth", "a1"),
+            ("profile", "b1"),
+            ("their-top", "t9"),
+            ("their-next", "t10"),
+        ];
+        let chain = [
+            (1, "auth", "main"),
+            (7, "profile", "auth"),
+            (9, "their-top", "profile"),
+            (10, "their-next", "their-top"),
+        ];
+
+        // A plain chain: one stack of all four, bottom first.
+        let github = ModelGitHub::new(&local, &branches, &chain);
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 7, 9, 10]);
+        assert_eq!(
+            outcome.steps.last().unwrap().detail.as_deref(),
+            Some("Linked #1, #7, #9 and #10 as GitHub stack 90")
+        );
+        // Linked, there is nothing more to ask for.
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+
+        // The chain is a stack already, and theirs came afterwards: it is
+        // added on top. Unasked, the stack is left as it is.
+        let github = ModelGitHub::new(&local, &branches, &chain[..3]).stacked(&[1, 7]);
+        let plan = plan_on(&local, &github, "profile", StackLink::Follow);
+        assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        let plan = plan_on(&local, &github, "profile", StackLink::Link);
+        assert_eq!(link_steps(&plan), ["link [] onto Some(90) with [9] above"]);
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 7, 9]);
+        assert_eq!(
+            outcome.steps.last().unwrap().detail.as_deref(),
+            Some("Added #9 to GitHub stack 90")
+        );
+
+        // One pull request of the user's own, with theirs on top: two,
+        // which is a stack.
+        let lone = snapshot(
+            vec![
+                node("a1", "auth: login", NodeKind::WorkingCopy, &["m"], &["auth"]),
+                node("m", "release", NodeKind::Immutable, &[], &["main"]),
+            ],
+            vec![
+                bookmark("main", "m", SyncState::Synced, true),
+                bookmark("auth", "a1", SyncState::Synced, false),
+            ],
+        );
+        let github = ModelGitHub::new(
+            &lone,
+            &[("main", "m"), ("auth", "a1"), ("their-top", "t9")],
+            &[(1, "auth", "main"), (9, "their-top", "auth")],
+        );
+        let plan = plan_on(&lone, &github, "auth", StackLink::Link);
+        assert_eq!(link_steps(&plan), ["link [\"auth\"] onto None with [9] above"]);
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("at least two pull requests")),
+            "{:?}",
+            plan.warnings
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(90), [1, 9]);
+    }
+
+    /// A pull request that is in a GitHub stack when it is taken over.
+    /// Added to the user's own stack above their pull requests, it is a
+    /// member like the others once its branch is a bookmark here, and a
+    /// publish has nothing to do. As the bottom of a stack of its
+    /// author's, built on the user's chain, it is now a part of that
+    /// chain: the next publish dissolves their stack and links the whole
+    /// chain, with what is still theirs back on top, and says so first.
+    #[test]
+    fn a_taken_over_pull_request_keeps_or_changes_its_github_stack_in_the_open() {
+        let (local, _) = pair_with_taken_over(SyncState::Synced);
+        let branches = [
+            ("main", "m"),
+            ("auth", "a1"),
+            ("profile", "b1"),
+            ("their-fix", "t1"),
+            ("their-next", "t2"),
+        ];
+        let chain = [
+            (1, "auth", "main"),
+            (7, "profile", "auth"),
+            (9, "their-fix", "profile"),
+            (10, "their-next", "their-fix"),
+        ];
+
+        // In the user's own stack, above their pull requests.
+        let github = ModelGitHub::new(&local, &branches, &chain[..3]).stacked(&[1, 7, 9]);
+        for wanted in [StackLink::Follow, StackLink::Link] {
+            let plan = plan_on(&local, &github, "their-fix", wanted);
+            assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+            assert!(retargets_and_pushes(&plan).is_empty(), "{:?}", plan.actions);
+        }
+
+        // The bottom of a stack of its author's, on the user's plain chain.
+        let github = ModelGitHub::new(&local, &branches, &chain).stacked(&[9, 10]);
+        let plan = plan_on(&local, &github, "their-fix", StackLink::Follow);
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            link_steps(&plan),
+            [
+                "unstack 90",
+                "link [\"auth\", \"profile\", \"their-fix\"] onto None with [10] above",
+            ]
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "#10 sits above this chain in GitHub stack 90: the stack is dissolved to \
+                    change shape and linked again with it back on top"),
+            "{:?}",
+            plan.warnings
+        );
+        let outcome = execute_submit(&plan, &github, &github).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert_eq!(github.stack_of(91), [1, 7, 9, 10]);
+        // Told not to keep a GitHub stack, the publish only dissolves it.
+        let github = ModelGitHub::new(&local, &branches, &chain).stacked(&[9, 10]);
+        let plan = plan_on(&local, &github, "their-fix", StackLink::Unlink);
+        assert_eq!(link_steps(&plan), ["unstack 90"]);
     }
 }

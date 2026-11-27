@@ -196,7 +196,10 @@ impl AppModel {
             return;
         }
         let section = match intent {
-            UiIntent::Land { .. } | UiIntent::Ship { .. } => Section::Publish,
+            UiIntent::Land { .. }
+            | UiIntent::Ship { .. }
+            | UiIntent::TakeOver { .. }
+            | UiIntent::GiveBack { .. } => Section::Publish,
             _ => Section::Workbench,
         };
         let navigated = self.section() != section;

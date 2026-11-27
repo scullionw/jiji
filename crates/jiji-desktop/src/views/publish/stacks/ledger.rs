@@ -271,51 +271,115 @@ impl PublishView {
             .py(px(9.))
             .child(line)
             .child(meta);
+        // A pull request that was someone else's and was taken over says
+        // so on a line of its own, where their row was, with the way back
+        // beside it.
+        if let (Some(taken), false) = (&segment.taken_over, merged.is_some()) {
+            let number = taken.number;
+            let from = taken
+                .author
+                .as_ref()
+                .map_or_else(|| "its author".to_owned(), |login| format!("@{login}"));
+            body = body.child(
+                h_flex()
+                    .gap(px(10.))
+                    .min_w_0()
+                    .text_size(px(TEXT_XS))
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!("seg-taken-{key}")))
+                            .debug_selector(move || format!("seg-taken-{number}"))
+                            .min_w_0()
+                            .gap(px(6.))
+                            .text_color(t.text2)
+                            .tooltip(tooltip(format!(
+                                "Taken over from {from}: its branch is a bookmark here. Publish \
+                                 pushes it with the stack and Land merges it. A push goes \
+                                 through only if the branch is where the last fetch saw it"
+                            )))
+                            .child(icon(IconName::Branch, 11., t.text2))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .child(truncated(format!("Taken over from {from}"))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("give-back-{number}"))
+                            .flex_shrink_0()
+                            .child(self.text_button(
+                                SharedString::from(format!("give-back-{number}")),
+                                "Give back",
+                                move |this, _, cx| this.ask_give_back(number, cx),
+                                cx,
+                            )),
+                    ),
+            );
+        }
         // Someone else's pull requests that rest on this branch: shown
         // where they sit, and plainly not a station of this stack's line.
         for other in others {
             let url = other.url.clone();
             let number = other.number;
+            let link = h_flex()
+                .id(SharedString::from(format!("seg-other-{}", other.number)))
+                .debug_selector(move || format!("seg-other-{number}"))
+                .role(gpui::Role::Link)
+                .aria_label(format!(
+                    "Pull request {}, someone else's, based on {}",
+                    other.by_author(),
+                    other.base_branch
+                ))
+                .aria_description("Open on GitHub")
+                .tabbable(cx)
+                .gap(px(6.))
+                .min_w_0()
+                .text_color(t.text3)
+                .cursor_pointer()
+                .hover(|style| style.text_color(t.text1))
+                .tooltip(tooltip(
+                    "Someone else's pull request on this stack: its branch is not a \
+                     bookmark here. Publish and Land never merge it and never push to \
+                     its branch; Land points it at trunk when its base lands. Take over \
+                     makes it a part of this stack",
+                ))
+                .on_click(move |_, _, cx| cx.open_url(&url))
+                .child(icon(IconName::Branch, 11., t.text3))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_family(t.mono.clone())
+                        .child(format!("#{}", other.number)),
+                )
+                .child(div().min_w_0().child(truncated(format!(
+                    "{} · {} on {}",
+                    other
+                        .author
+                        .as_ref()
+                        .map_or_else(|| "someone else".to_owned(), |login| format!("@{login}")),
+                    other.head_branch,
+                    other.base_branch
+                ))));
+            // Beside the link, not inside it: the way to make their pull
+            // request a part of this stack. It opens the plan to confirm.
             body = body.child(
                 h_flex()
-                    .id(SharedString::from(format!("seg-other-{}", other.number)))
-                    .debug_selector(move || format!("seg-other-{number}"))
-                    .role(gpui::Role::Link)
-                    .aria_label(format!(
-                        "Pull request {}, someone else's, based on {}",
-                        other.by_author(),
-                        other.base_branch
-                    ))
-                    .aria_description("Open on GitHub")
-                    .tabbable(cx)
-                    .gap(px(6.))
+                    .gap(px(10.))
                     .min_w_0()
                     .text_size(px(TEXT_XS))
-                    .text_color(t.text3)
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(t.text1))
-                    .tooltip(tooltip(
-                        "Someone else's pull request on this stack: its branch is not a \
-                         bookmark here. Publish and Land never merge it and never push to \
-                         its branch; Land points it at trunk when its base lands",
-                    ))
-                    .on_click(move |_, _, cx| cx.open_url(&url))
-                    .child(icon(IconName::Branch, 11., t.text3))
+                    .child(link)
                     .child(
                         div()
+                            .debug_selector(move || format!("take-over-{number}"))
                             .flex_shrink_0()
-                            .font_family(t.mono.clone())
-                            .child(format!("#{}", other.number)),
-                    )
-                    .child(div().min_w_0().child(truncated(format!(
-                        "{} · {} on {}",
-                        other
-                            .author
-                            .as_ref()
-                            .map_or_else(|| "someone else".to_owned(), |login| format!("@{login}")),
-                        other.head_branch,
-                        other.base_branch
-                    )))),
+                            .child(self.text_button(
+                                SharedString::from(format!("take-over-{number}")),
+                                "Take over",
+                                move |this, _, cx| this.ask_take_over(number, cx),
+                                cx,
+                            )),
+                    ),
             );
         }
         if open {

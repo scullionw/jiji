@@ -312,6 +312,15 @@ fn status_and_stacks_name_someone_elses_pull_requests_on_the_stack() {
         theirs.contains("Publish and Land never merge these and never push to their branches"),
         "{theirs}"
     );
+    // And how to make one the user's to finish, by the name of the command.
+    assert!(
+        theirs.contains(
+            "  To push one over the line yourself, take it over: jiji take-over NUMBER\n  \
+             makes its branch a bookmark here and its pull request a part of this stack,\n  \
+             to publish and to land. Nothing is pushed until you publish.\n"
+        ),
+        "{theirs}"
+    );
     // The fixture's changes are mutable: nothing to say about jj.
     assert!(!theirs.contains("immutable"), "{theirs}");
     // Once a fetch has brought their branches, jj calls the changes under
@@ -322,10 +331,8 @@ fn status_and_stacks_name_someone_elses_pull_requests_on_the_stack() {
     assert!(
         detail.contains(
             "  jj calls the changes under them immutable while their branches build on\n  \
-             them. Publish and Land work as usual. To edit one by hand, use jj's\n  \
-             --ignore-immutable, or track the branch (jj bookmark track): it is then a\n  \
-             bookmark of yours, and its pull request a part of this stack to publish\n  \
-             and land.\n"
+             them. Publish and Land work as usual. Taking the pull request over makes\n  \
+             them yours to edit again.\n"
         ),
         "{detail}"
     );
@@ -447,6 +454,238 @@ fn plans_name_each_pull_request_they_touch() {
     assert_eq!(json["actions"][2]["number"], 8);
     assert_eq!(json["actions"][4]["numbers"], serde_json::json!([7, 8]));
     assert_eq!(json["actions"][5]["theirs"], true);
+}
+
+/// "Take over" is a command of its own, found in the help by those
+/// words, and it takes a pull request's number or its branch. So does
+/// the way back.
+#[test]
+fn take_over_and_give_back_are_commands_found_by_their_names() {
+    let help = Cli::command().render_help().to_string();
+    assert!(
+        help.contains("take-over  Take over someone else's pull request"),
+        "{help}"
+    );
+    assert!(
+        help.contains("give-back  Give back a pull request you took over"),
+        "{help}"
+    );
+    for (args, giving_back, target, dry_run) in [
+        (vec!["jiji", "take-over", "9"], false, "9", false),
+        (vec!["jiji", "take-over", "#9", "--dry-run"], false, "#9", true),
+        (vec!["jiji", "take-over", "kim/fix"], false, "kim/fix", false),
+        (vec!["jiji", "give-back", "9", "--dry-run"], true, "9", true),
+        (vec!["jiji", "give-back", "kim/fix"], true, "kim/fix", false),
+    ] {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let args = match parsed.command {
+            Some(Command::TakeOver(args)) if !giving_back => args,
+            Some(Command::GiveBack(args)) if giving_back => args,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((args.target.as_str(), args.dry_run), (target, dry_run));
+    }
+    // Which pull request is never guessed.
+    assert!(Cli::try_parse_from(["jiji", "take-over"]).is_err());
+    assert!(Cli::try_parse_from(["jiji", "give-back"]).is_err());
+    assert!(Cli::try_parse_from(["jiji", "take-over", "9", "--force"]).is_err());
+}
+
+/// What `take-over` and `give-back` print before anything runs, and
+/// after: the steps, what they mean, and what stands in the way.
+#[test]
+fn take_over_prints_what_it_will_do_and_what_it_means() {
+    let plan = TakeOverPlan {
+        giving_back: false,
+        number: 9,
+        author: Some("kim".into()),
+        title: "A helping change".into(),
+        branch: "kim/fix".into(),
+        base_branch: Some("profile".into()),
+        remote: "origin".into(),
+        actions: vec![
+            TakeOverAction::Fetch {
+                remote: "origin".into(),
+            },
+            TakeOverAction::TakeOver {
+                bookmark: "kim/fix".into(),
+                remote: "origin".into(),
+                number: 9,
+                author: Some("kim".into()),
+            },
+        ],
+        blockers: vec![],
+        warnings: vec!["Nothing is pushed now.".into()],
+    };
+    assert_eq!(
+        output::take_over_plan(&plan),
+        "Take over #9 by @kim · kim/fix → profile\n  \
+         1. Fetch origin\n  \
+         2. Make kim/fix a bookmark here, at what origin has for #9 now\n  \
+         Note: Nothing is pushed now.\n"
+    );
+    let refused = TakeOverPlan {
+        blockers: vec!["#9 by @kim is from a fork".into()],
+        ..plan.clone()
+    };
+    assert!(
+        output::take_over_plan(&refused).contains("  Blocked: #9 by @kim is from a fork\n"),
+        "{}",
+        output::take_over_plan(&refused)
+    );
+    let outcome = TakeOverOutcome {
+        steps: vec![
+            TakeOverStep {
+                action: plan.actions[0].clone(),
+                status: SubmitStepStatus::Done,
+                detail: Some("Fetched 1 bookmark update from origin".into()),
+            },
+            TakeOverStep {
+                action: plan.actions[1].clone(),
+                status: SubmitStepStatus::Failed,
+                detail: Some("there is no remote bookmark kim/fix@origin".into()),
+            },
+        ],
+        failed: true,
+    };
+    let text = output::take_over_outcome(&outcome);
+    assert!(text.starts_with("\nResults\n"), "{text}");
+    assert!(
+        text.contains("Fetch origin: Fetched 1 bookmark update from origin\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Make kim/fix a bookmark here, at what origin has for #9 now: there is no remote \
+             bookmark kim/fix@origin\n"
+        ),
+        "{text}"
+    );
+
+    let back = TakeOverPlan {
+        giving_back: true,
+        title: String::new(),
+        base_branch: None,
+        actions: vec![TakeOverAction::GiveBack {
+            bookmark: "kim/fix".into(),
+            remote: "origin".into(),
+            number: 9,
+            author: Some("kim".into()),
+        }],
+        warnings: vec![],
+        ..plan
+    };
+    assert_eq!(
+        output::take_over_plan(&back),
+        "Give back #9 by @kim · kim/fix\n  \
+         1. Remove the bookmark kim/fix here and stop following kim/fix@origin; the branch \
+         stays as it is\n"
+    );
+    // As JSON a plan carries the pull request and each step by kind.
+    let json = serde_json::to_value(&back).unwrap();
+    assert_eq!(json["givingBack"], true);
+    assert_eq!(json["number"], 9);
+    assert_eq!(json["actions"][0]["kind"], "giveBack");
+    assert_eq!(json["actions"][0]["bookmark"], "kim/fix");
+}
+
+/// A pull request that was taken over is a segment of the stack in
+/// `stacks` and `status`, marked with whose it was and how to hand it
+/// back; and a publish names it where it pushes its branch.
+#[test]
+fn a_taken_over_pull_request_is_marked_wherever_it_is_listed_or_pushed() {
+    let f = fixture();
+    let mut snapshot = f.snapshot.clone();
+    snapshot.taken_over = vec![jiji_core::snapshot::TakenOver {
+        bookmark: "ws/tu3-emission".into(),
+        remote: "origin".into(),
+        number: 757,
+        author: Some("kim".into()),
+    }];
+    let stacks = discover_stacks(&snapshot, Some(&f.prs));
+    let listing = output::stacks("repo", &stacks, 0, &[]);
+    assert!(listing.contains("    with #757 by @kim (taken over)\n\n"), "{listing}");
+    let detail = output::stack_detail(&select_stack(&stacks, Some("ws/tu3-emission")).unwrap());
+    assert!(
+        detail.contains(
+            "     taken over from @kim: pushed and landed with this stack; give-back 757 hands \
+             it back\n"
+        ),
+        "{detail}"
+    );
+    // A stack with nothing taken over says nothing of it.
+    let plain = output::stacks("repo", &f.stacks, 0, &[]);
+    assert!(!plain.contains("taken over"), "{plain}");
+
+    let taken = stacks[0].segments[4].taken_over.clone();
+    assert!(taken.is_some());
+    let segment = |bookmark: &str, taken_over| SubmitSegment {
+        bookmark: bookmark.into(),
+        base: "develop".into(),
+        change_ids: vec![],
+        title: String::new(),
+        pr: None,
+        taken_over,
+    };
+    let plan = SubmitPlan {
+        head_bookmark: "ws/tu3-emission".into(),
+        remote: "origin".into(),
+        base_branch: "develop".into(),
+        options: SubmitOptions::default(),
+        segments: vec![
+            segment("ws/tu3-identity", None),
+            segment("ws/tu3-emission", taken),
+        ],
+        actions: vec![
+            SubmitAction::Push {
+                bookmark: "ws/tu3-identity".into(),
+                create: false,
+            },
+            SubmitAction::Push {
+                bookmark: "ws/tu3-emission".into(),
+                create: false,
+            },
+            SubmitAction::LinkStack {
+                bookmarks: vec!["ws/tu3-identity".into(), "ws/tu3-emission".into()],
+                onto: None,
+                above: vec![900],
+            },
+            SubmitAction::LinkStack {
+                bookmarks: vec![],
+                onto: Some(90),
+                above: vec![900],
+            },
+        ],
+        blockers: vec![],
+        warnings: vec![],
+        stack_comment_preview: None,
+        pr_template_path: None,
+    };
+    let text = output::submit_plan(&plan);
+    for line in [
+        "  1. Push ws/tu3-identity\n",
+        "  2. Push ws/tu3-emission (#757 by @kim, taken over)\n",
+        // Someone else's pull request that a link takes into the stack.
+        "  3. Link as a GitHub stack: ws/tu3-identity, ws/tu3-emission, #900\n",
+        "  4. Add to GitHub stack 90: #900\n",
+    ] {
+        assert!(text.contains(line), "{line:?} in {text}");
+    }
+    let outcome = SubmitOutcome {
+        steps: vec![SubmitStep {
+            action: plan.actions[1].clone(),
+            status: SubmitStepStatus::Failed,
+            detail: Some("moved on the remote".into()),
+            pr: None,
+        }],
+        failed: true,
+    };
+    assert!(
+        output::submit_outcome(&plan, &outcome)
+            .contains("Push ws/tu3-emission (#757 by @kim, taken over): moved on the remote\n"),
+        "{}",
+        output::submit_outcome(&plan, &outcome)
+    );
 }
 
 #[test]

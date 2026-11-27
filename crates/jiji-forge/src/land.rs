@@ -1578,6 +1578,38 @@ pub fn plan_land(
     // each, by number and author, before anything runs.
     let own_branches: Vec<&str> = raw_segments.iter().map(|raw| raw.bookmark).collect();
     let others = crate::pr::others_on(snapshot, prs, &own_branches);
+    // A pull request of this stack that was someone else's and was taken
+    // over lands like any other of it. Named, so that the user sees whose
+    // pull request a merge from here is.
+    let taken: Vec<String> = raw_segments
+        .iter()
+        .filter_map(|raw| {
+            let pr = prs.by_branch.get(raw.bookmark)?;
+            crate::takeover::taken_over(snapshot, raw.bookmark, Some(pr))
+        })
+        .map(|entry| entry.by_author())
+        .collect();
+    if !taken.is_empty() {
+        let one = taken.len() == 1;
+        // The branch a landing below it rebases is pushed with the rest
+        // of the stack, like every push from here with a lease on where
+        // the last fetch saw it.
+        let branches = if one { "its branch" } else { "their branches" };
+        warnings.push(format!(
+            "{} {} taken over, and {} with this stack like a pull request of your own: Land \
+             rebases and pushes {branches} with the stack, merges {}, and removes {branches} \
+             once {} landed",
+            match taken.as_slice() {
+                [one] => one.clone(),
+                [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                [] => unreachable!("checked non-empty"),
+            },
+            if one { "was" } else { "were" },
+            if one { "lands" } else { "land" },
+            if one { "it" } else { "them" },
+            if one { "it has" } else { "they have" },
+        ));
+    }
 
     // Walk bottom-up: already-merged segments, then the landing candidate,
     // then the stacked rest.
@@ -2536,6 +2568,9 @@ fn reconcile_actions(
                 if one { "it" } else { "them" },
                 if one { "its branch" } else { "their branches" },
             );
+            // Those that will show more than their own changes after
+            // this run, until their authors rebase.
+            let mut stale: Vec<&PrSummary> = Vec::new();
             for other in &plain {
                 let (who, base, branch) = (other.by_author(), &other.base_branch, &other.head_branch);
                 if landed_branches.contains(&base.as_str()) {
@@ -2552,6 +2587,7 @@ fn reconcile_actions(
                              carries as its own until its author rebases \
                              \u{201c}{branch}\u{201d}"
                         ));
+                        stale.push(other);
                     }
                 } else if pushed.contains(&base.as_str()) {
                     note.push_str(&format!(
@@ -2559,7 +2595,84 @@ fn reconcile_actions(
                          run replaces there as its own until its author rebases \
                          \u{201c}{branch}\u{201d}"
                     ));
+                    stale.push(other);
                 }
+            }
+            // There are two ways to spare their authors that, and the note
+            // names the ones that are open. Taken over, a pull request is
+            // rebased and landed from here. In a GitHub stack with this
+            // chain, GitHub rebases its branch after each merge below it
+            // (seen on the sandbox); that takes it sitting on top of the
+            // chain, since a stack is one line. Neither is open for a pull
+            // request from a fork, whose branch is in another repository.
+            let takeable: Vec<&PrSummary> = stale
+                .iter()
+                .copied()
+                .filter(|other| prs.of_this_repository(other))
+                .collect();
+            if !takeable.is_empty() {
+                let one = takeable.len() == 1;
+                let commands = takeable
+                    .iter()
+                    .map(|other| format!("take-over {}", other.number))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // By name where it is not all of them: the rest are from
+                // forks.
+                let lead = if takeable.len() == stale.len() {
+                    format!(
+                        "To spare {} that, take {} over first ({commands})",
+                        if one { "its author" } else { "their authors" },
+                        if one { "it" } else { "them" },
+                    )
+                } else {
+                    format!(
+                        "{} can be spared that: take {} over first ({commands})",
+                        names(&takeable),
+                        if one { "it" } else { "them" },
+                    )
+                };
+                note.push_str(&format!(
+                    ". {lead}: {} then rebased and landed from here, like a pull request of \
+                     your own",
+                    if one { "it is" } else { "each is" },
+                ));
+                let on_top = crate::submit::on_top_of(
+                    snapshot,
+                    prs,
+                    raw_segments.last().map(|raw| raw.bookmark).unwrap_or_default(),
+                );
+                let stackable: Vec<&PrSummary> = takeable
+                    .iter()
+                    .copied()
+                    .filter(|other| on_top.iter().any(|top| top.number == other.number))
+                    .collect();
+                if !stackable.is_empty() {
+                    let one = stackable.len() == 1;
+                    note.push_str(&format!(
+                        ". Or link the chain as a GitHub stack before landing (publish \
+                         --stack takes {} in, on top): GitHub then rebases {} itself after \
+                         each merge below {}",
+                        names(&stackable),
+                        if one { "its branch" } else { "their branches" },
+                        if one { "it" } else { "them" },
+                    ));
+                }
+            }
+            let from_forks: Vec<&PrSummary> = stale
+                .iter()
+                .copied()
+                .filter(|other| !prs.of_this_repository(other))
+                .collect();
+            if !from_forks.is_empty() {
+                let one = from_forks.len() == 1;
+                note.push_str(&format!(
+                    ". {} {} from a fork, whose branch is in another repository: {} cannot be \
+                     taken over",
+                    names(&from_forks),
+                    if one { "is" } else { "are" },
+                    if one { "it" } else { "they" },
+                ));
             }
             warnings.push(note);
         }
@@ -3580,8 +3693,19 @@ fn run_land_step(
                         .join(", ")
                 ));
             }
-            vcs.push_bookmarks(&live, &plan.remote)
-                .map_err(|err| err.to_string())
+            vcs.push_bookmarks(&live, &plan.remote).map_err(|err| {
+                // The lease held: when the branch that had moved is one
+                // that was taken over, its author pushed to it again.
+                let refusal = err.to_string();
+                match crate::takeover::pushed_to_again(
+                    &refusal,
+                    &snapshot.taken_over,
+                    "publish, and land again",
+                ) {
+                    Some(story) => format!("{refusal}. {story}"),
+                    None => refusal,
+                }
+            })
         }
         LandAction::RetargetPr {
             number, to_base, ..
@@ -4048,6 +4172,7 @@ mod tests {
             conflicts: vec![],
             operations: vec![],
             resolve_tool: None,
+            taken_over: Vec::new(),
         }
     }
 
@@ -4848,7 +4973,11 @@ mod tests {
               branch still carries as its own until its author rebases \
               \u{201c}their-mid\u{201d}. #9 by @kim stays on \u{201c}profile\u{201d}, and shows \
               the commits this run replaces there as its own until its author rebases \
-              \u{201c}their-top\u{201d}"]
+              \u{201c}their-top\u{201d}. To spare their authors that, take them over first \
+              (take-over 8, take-over 9): each is then rebased and landed from here, like a \
+              pull request of your own. Or link the chain as a GitHub stack before landing \
+              (publish --stack takes #9 by @kim in, on top): GitHub then rebases its branch \
+              itself after each merge below it"]
         );
 
         forge.calls.borrow_mut().clear();
@@ -9175,5 +9304,261 @@ mod tests {
         // stack's base.
         assert_eq!(state.base_branch, "b1-two");
         assert_eq!(state.landing_branch(), "main");
+    }
+
+    /// main(m) ── a1 ── a2 (auth) ── t1 (their-top, @): #9 by kim sat on
+    /// the stack and was taken over, so its branch is a bookmark here.
+    /// `trunk` is where main stands: "m" before the landing, "s" after
+    /// the squash of auth was fetched.
+    fn taken_over_snapshot(trunk: &str) -> RepoSnapshot {
+        let mut nodes = vec![
+            node("t1", "their fix", NodeKind::WorkingCopy, &["a2"], &["their-top"]),
+            node("a2", "auth: sessions", NodeKind::Mutable, &["a1"], &["auth"]),
+            node("a1", "auth: login flow", NodeKind::Mutable, &["m"], &[]),
+        ];
+        if trunk == "s" {
+            nodes.push(node("s", "auth (squash)", NodeKind::Immutable, &["m"], &["main"]));
+            nodes.push(node("m", "release", NodeKind::Immutable, &[], &[]));
+        } else {
+            nodes.push(node("m", "release", NodeKind::Immutable, &[], &["main"]));
+        }
+        let mut snap = snapshot(
+            nodes,
+            vec![
+                bookmark("main", trunk, SyncState::Synced, true),
+                bookmark("auth", "a2", SyncState::Synced, false),
+                bookmark("their-top", "t1", SyncState::Synced, false),
+            ],
+        );
+        snap.taken_over = vec![jiji_core::snapshot::TakenOver {
+            bookmark: "their-top".into(),
+            remote: "origin".into(),
+            number: 9,
+            author: Some("kim".into()),
+        }];
+        snap
+    }
+
+    fn taken_over_github() -> (RepoPrState, StubLandForge) {
+        let prs = pr_state(
+            vec![open_pr(1, "auth", "main"), their_pr(9, "their-top", "auth", "kim", "ct1")],
+            false,
+        );
+        let mut forge = StubLandForge::default();
+        forge.states.insert(1, ready_state());
+        forge.states.insert(
+            9,
+            PrLandState {
+                base_branch: "auth".into(),
+                head_commit: "ct1".into(),
+                ..ready_state()
+            },
+        );
+        *forge.open_by_base.borrow_mut() = prs.report.prs.clone();
+        (prs, forge)
+    }
+
+    fn steps_of(plan: &LandPlan) -> Vec<String> {
+        plan.actions
+            .iter()
+            .map(|action| match action {
+                LandAction::MergePr { number, .. } => format!("merge #{number}"),
+                LandAction::FetchRemote { .. } => "fetch".into(),
+                LandAction::CheckLanded { number, .. } => format!("check #{number}"),
+                LandAction::RetargetPr { number, to_base, .. } => {
+                    format!("retarget #{number} -> {to_base}")
+                }
+                LandAction::RetargetOther { number, .. } => format!("retarget other #{number}"),
+                LandAction::RebaseOntoTrunk { root_change, .. } => format!("rebase {root_change}"),
+                LandAction::PushStack { bookmarks } => format!("push {}", bookmarks.join(",")),
+                LandAction::CleanupBookmark { bookmark, .. } => format!("clean up {bookmark}"),
+                LandAction::AbandonLanded { bookmark, .. } => format!("abandon {bookmark}"),
+                LandAction::EnableAutoMerge { number, .. } => format!("auto-merge #{number}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Taken over, their pull request is a segment of the landing like
+    /// any of the user's own: retargeted, rebased and pushed with the
+    /// stack when the one below it lands, and merged in its turn. The
+    /// plan says whose it is, and nothing treats it as someone else's.
+    #[test]
+    fn a_taken_over_pull_request_lands_with_the_stack() {
+        let snap = taken_over_snapshot("m");
+        let (prs, forge) = taken_over_github();
+        let at_plan = StubVcs::new(snap.clone());
+        let plan = plan_land(&snap, &prs, &forge_repo(), "their-top", &forge, &at_plan, &opts()).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(
+            plan.segments.iter().map(|s| s.bookmark.as_str()).collect::<Vec<_>>(),
+            ["auth", "their-top"]
+        );
+        assert_eq!(
+            steps_of(&plan),
+            [
+                "merge #1",
+                "fetch",
+                "check #1",
+                "retarget #9 -> main",
+                "rebase t1",
+                "push their-top",
+                "clean up auth",
+                "abandon auth",
+                "auto-merge #9",
+            ]
+        );
+        assert_eq!(
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("taken over") || w.contains("someone else"))
+                .collect::<Vec<_>>(),
+            ["#9 by @kim was taken over, and lands with this stack like a pull request of your \
+              own: Land rebases and pushes its branch with the stack, merges it, and removes its \
+              branch once it has landed"]
+        );
+
+        // Run: their branch is pushed with the stack, from here.
+        let vcs = StubVcs::new(taken_over_snapshot("s"));
+        let outcome = execute_land(&plan, &vcs, &forge).unwrap();
+        assert!(!outcome.failed, "{:?}", outcome.steps);
+        assert!(
+            vcs.calls.borrow().contains(&"push:their-top:origin".to_owned()),
+            "{:?}",
+            vcs.calls
+        );
+
+        // Without the record the same bookmark is the user's own, and the
+        // plan has nothing to say about it.
+        let mut own = taken_over_snapshot("m");
+        own.taken_over.clear();
+        let plan = plan_land(&own, &prs, &forge_repo(), "their-top", &forge, &StubVcs::new(own.clone()), &opts())
+            .unwrap();
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("taken over")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// The push of the rebased stack carries a lease like any push. When
+    /// the remote refuses it because the author of a taken-over branch
+    /// pushed in the meantime, the step says so and what to do.
+    #[test]
+    fn a_landing_whose_push_meets_a_new_commit_of_theirs_says_so() {
+        let snap = taken_over_snapshot("m");
+        let (prs, forge) = taken_over_github();
+        let plan = plan_land(&snap, &prs, &forge_repo(), "their-top", &forge, &StubVcs::new(snap.clone()), &opts())
+            .unwrap();
+        let mut vcs = StubVcs::new(taken_over_snapshot("s"));
+        vcs.refuses_deletion.push("their-top".into());
+        let outcome = execute_land(&plan, &vcs, &forge).unwrap();
+        assert!(outcome.failed);
+        let push = outcome
+            .steps
+            .iter()
+            .find(|step| matches!(step.action, LandAction::PushStack { .. }))
+            .unwrap();
+        assert_eq!(push.status, SubmitStepStatus::Failed);
+        assert_eq!(
+            push.detail.as_deref(),
+            Some(
+                "Could not apply the change: their-top moved on the remote since the last fetch; \
+                 fetch, reconcile, and push again. \u{201c}their-top\u{201d} is #9 by @kim's \
+                 branch, taken over: it was pushed to again since the last fetch, and nothing \
+                 there was overwritten. Fetch: the new commits arrive beside yours, and \
+                 \u{201c}their-top\u{201d} reads as conflicted until you have brought the two \
+                 together (rebase theirs onto yours, or take theirs) and pointed it at the \
+                 result. Then publish, and land again"
+            )
+        );
+        // The same refusal for a branch of the user's own reads as before.
+        let mut own = taken_over_snapshot("s");
+        own.taken_over.clear();
+        let mut vcs = StubVcs::new(own);
+        vcs.refuses_deletion.push("their-top".into());
+        let outcome = execute_land(&plan, &vcs, &forge).unwrap();
+        let push = outcome
+            .steps
+            .iter()
+            .find(|step| matches!(step.action, LandAction::PushStack { .. }))
+            .unwrap();
+        assert_eq!(
+            push.detail.as_deref(),
+            Some(
+                "Could not apply the change: their-top moved on the remote since the last fetch; \
+                 fetch, reconcile, and push again"
+            )
+        );
+    }
+
+    /// The two ways to spare someone else's pull request the landed
+    /// commits are named only where they are open: taking over for a
+    /// pull request of this repository, a GitHub stack for the one that
+    /// sits on top of the chain, and neither where nothing goes stale.
+    #[test]
+    fn the_ways_to_spare_their_pull_request_are_named_only_where_they_are_open() {
+        let snap = land_snapshot();
+        let note = |prs: &RepoPrState, options: &LandOptions| -> String {
+            let mut forge = StubLandForge::default();
+            their_states(&mut forge);
+            *forge.open_by_base.borrow_mut() = prs.report.prs.clone();
+            let plan =
+                plan_land(&snap, prs, &forge_repo(), "profile", &forge, &at_plan(), options).unwrap();
+            let mut notes = plan.warnings.into_iter().filter(|w| w.contains("someone else's"));
+            let note = notes.next().expect("a note about someone else's pull requests");
+            assert_eq!(notes.next(), None);
+            note
+        };
+        let with = |change: &dyn Fn(&mut Vec<PrSummary>)| {
+            let mut all = with_others().report.prs;
+            change(&mut all);
+            pr_state(all, false)
+        };
+
+        // Only the one on top: both ways are open for it.
+        let top_only = with(&|all| all.retain(|pr| pr.number != 8));
+        assert!(
+            note(&top_only, &opts()).ends_with(
+                "until its author rebases \u{201c}their-top\u{201d}. To spare its author that, \
+                 take it over first (take-over 9): it is then rebased and landed from here, like \
+                 a pull request of your own. Or link the chain as a GitHub stack before landing \
+                 (publish --stack takes #9 by @kim in, on top): GitHub then rebases its branch \
+                 itself after each merge below it"
+            ),
+            "{}",
+            note(&top_only, &opts())
+        );
+        // Only the one in the middle: a stack is one line, and it is
+        // beside it.
+        let mid_only = with(&|all| all.retain(|pr| pr.number != 9));
+        assert!(
+            note(&mid_only, &opts()).ends_with(
+                "until its author rebases \u{201c}their-mid\u{201d}. To spare its author that, \
+                 take it over first (take-over 8): it is then rebased and landed from here, like \
+                 a pull request of your own"
+            ),
+            "{}",
+            note(&mid_only, &opts())
+        );
+        // The one on top is from a fork: neither way is open for it, and
+        // the note says which one can be spared and why the other cannot.
+        let fork_on_top = with(&|all| all[2].head_owner = Some("kim".into()));
+        assert!(
+            note(&fork_on_top, &opts()).ends_with(
+                "until its author rebases \u{201c}their-top\u{201d}. #8 by @sam can be spared \
+                 that: take it over first (take-over 8): it is then rebased and landed from here, \
+                 like a pull request of your own. #9 by @kim is from a fork, whose branch is in \
+                 another repository: it cannot be taken over"
+            ),
+            "{}",
+            note(&fork_on_top, &opts())
+        );
+        // A merge commit lands the branch under #8 with its own commits:
+        // #8 goes on showing what it shows, and only #9, whose base this
+        // run still rewrites, is offered a way out.
+        let by_merge = LandOptions { method: Some(MergeMethod::Merge), ..opts() };
+        let told = note(&with_others(), &by_merge);
+        assert!(told.contains("take-over 9") && !told.contains("take-over 8"), "{told}");
     }
 }

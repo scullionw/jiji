@@ -448,6 +448,39 @@ pub trait RepoBackend: Send + Sync {
         remote: &str,
     ) -> Result<MutationOutcome, BackendError>;
 
+    /// Take over a branch someone else made: `name@remote`, a remote
+    /// bookmark that is no bookmark here. It becomes a local bookmark at
+    /// the remote position and follows the remote from then on, exactly
+    /// as `track_bookmark` would leave it, and the repository records for
+    /// which pull request it was taken over and whose that is
+    /// ([`crate::snapshot::TakenOver`]), so that every plan that pushes
+    /// the branch can say whose it is. Nothing is fetched and nothing is
+    /// pushed: the caller fetches first, and the first push is a later
+    /// one, under `push_bookmarks`' lease like any other. Refuses a branch
+    /// that is tracked already, and a name another local bookmark has.
+    fn take_over_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+        number: u64,
+        author: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError>;
+
+    /// Give a taken-over branch back: the reverse, as one operation. The
+    /// remote bookmark is untracked and the local bookmark removed; the
+    /// branch on the remote is not touched and nothing is pushed. Refuses
+    /// a branch that was not taken over, one that is not here what its
+    /// remote has (what differs would be left without a bookmark), and
+    /// one that another local bookmark sits on (that work would rest on
+    /// someone else's branch).
+    fn give_back_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+    ) -> Result<MutationOutcome, BackendError>;
+
     /// Delete a branch on the remote — and its local bookmark, when one
     /// exists. The composite of the CLI dance (track if untracked, delete
     /// the local bookmark, push): the local delete records one operation,
@@ -1348,6 +1381,40 @@ impl RepoBackend for MockBackend {
         )
     }
 
+    fn take_over_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+        number: u64,
+        author: Option<&str>,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::TakeOver {
+                name: name.trim().to_owned(),
+                remote: remote.trim().to_owned(),
+                number,
+                author: author.map(str::to_owned),
+            },
+        )
+    }
+
+    fn give_back_branch(
+        &self,
+        path: &Path,
+        name: &str,
+        remote: &str,
+    ) -> Result<MutationOutcome, BackendError> {
+        self.mutate(
+            path,
+            crate::mock::MockMutation::GiveBack {
+                name: name.trim().to_owned(),
+                remote: remote.trim().to_owned(),
+            },
+        )
+    }
+
     fn delete_remote_bookmark(
         &self,
         path: &Path,
@@ -1683,6 +1750,86 @@ mod tests {
         }
         let err = MockBackend::default().change_detail(dir.path(), "zzzzzzzz").unwrap_err();
         assert!(matches!(err, BackendError::ChangeMissing(_)));
+    }
+
+    /// The fabricated repository takes a teammate's branch over as the
+    /// real one does: a tracked bookmark here and a record of whose it
+    /// was, with the same refusals. Its one approximation is that the
+    /// branch, which the fabricated graph does not draw, arrives as one
+    /// change on top of the working copy's stack. Given back, it is as
+    /// it was.
+    #[test]
+    fn mock_takes_a_teammates_branch_over_and_gives_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let backend = MockBackend::default();
+        let before = backend.open(dir.path()).unwrap();
+        assert!(before.taken_over.is_empty());
+        assert!(!before.nodes.iter().any(|n| n.id == "yqosuwnv"));
+
+        let outcome = backend
+            .take_over_branch(dir.path(), "alice/palette-icons", "origin", 52, Some("alice"))
+            .unwrap();
+        assert_eq!(
+            outcome.summary,
+            "Took over \u{201c}alice/palette-icons\u{201d}: it is a bookmark here now, at \
+             19b753c4, and nothing was pushed"
+        );
+        let after = backend.open(dir.path()).unwrap();
+        assert_eq!(
+            after.taken_over,
+            [crate::snapshot::TakenOver {
+                bookmark: "alice/palette-icons".into(),
+                remote: "origin".into(),
+                number: 52,
+                author: Some("alice".into()),
+            }]
+        );
+        let bookmark = after
+            .bookmarks
+            .iter()
+            .find(|b| b.name == "alice/palette-icons")
+            .unwrap();
+        assert!(bookmark.is_local && bookmark.tracked);
+        assert_eq!(bookmark.sync, crate::snapshot::SyncState::Synced);
+        // Their change, on top of the working copy's stack, in a lane of
+        // its own that runs down that stack.
+        let theirs = after.nodes.iter().find(|n| n.id == "yqosuwnv").unwrap();
+        assert_eq!(theirs.commit_id, "19b753c4");
+        assert_eq!(theirs.author, "alice");
+        assert_eq!(theirs.parents, ["lwnouzpy"]);
+        assert_eq!(theirs.bookmarks, ["alice/palette-icons"]);
+        let lane = after.workstreams.iter().find(|w| w.id == "ws-yqosuwnv").unwrap();
+        assert_eq!(lane.node_ids, ["yqosuwnv", "lwnouzpy", "mvkortsq", "nzpwlxvr"]);
+        assert!(backend.change_detail(dir.path(), "yqosuwnv").is_ok());
+        assert_eq!(
+            after.operations[0].description,
+            "take over alice/palette-icons@origin (pull request #52)"
+        );
+
+        // Taken already; and a branch that is not on the remote.
+        let err = backend
+            .take_over_branch(dir.path(), "alice/palette-icons", "origin", 52, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("is a bookmark here already"), "{err}");
+        let err = backend
+            .take_over_branch(dir.path(), "nowhere", "origin", 53, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("there is no remote bookmark nowhere@origin"), "{err}");
+        // Only what was taken over is given back.
+        let err = backend
+            .give_back_branch(dir.path(), "diff-model", "origin")
+            .unwrap_err();
+        assert!(err.to_string().contains("was not taken over here"), "{err}");
+
+        backend
+            .give_back_branch(dir.path(), "alice/palette-icons", "origin")
+            .unwrap();
+        let back = backend.open(dir.path()).unwrap();
+        assert!(back.taken_over.is_empty());
+        assert_eq!(back.nodes, before.nodes);
+        assert_eq!(back.bookmarks, before.bookmarks);
+        assert_eq!(back.workstreams, before.workstreams);
     }
 
     #[test]

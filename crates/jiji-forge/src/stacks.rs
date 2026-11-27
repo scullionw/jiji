@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot};
+use jiji_core::snapshot::{GraphNode, NodeKind, RepoSnapshot, TakenOver};
 use serde::{Deserialize, Serialize};
 
 use crate::{ChecksRollup, PrSummary, RepoPrState, ReviewDecision, SubmitHead};
@@ -16,6 +16,10 @@ pub struct StackSegment {
     pub base: String,
     pub changes: Vec<GraphNode>,
     pub pr: Option<PrSummary>,
+    /// Set when this segment's branch was someone else's and was taken
+    /// over here ([`crate::takeover`]): for which pull request, and whose.
+    #[serde(default)]
+    pub taken_over: Option<TakenOver>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,12 +302,16 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
                     .unwrap_or("Untitled change")
                     .to_owned()
             });
+            let taken_over = bookmark
+                .as_deref()
+                .and_then(|name| crate::takeover::taken_over(snapshot, name, pr.as_ref()));
             segments.push(StackSegment {
                 bookmark: bookmark.clone(),
                 title,
                 base: base.clone(),
                 changes: std::mem::take(&mut pending),
                 pr,
+                taken_over,
             });
             if let Some(name) = bookmark {
                 base = name;
@@ -377,6 +385,7 @@ pub fn discover_stacks(snapshot: &RepoSnapshot, prs: Option<&RepoPrState>) -> Ve
                 base: pr.base_branch.clone(),
                 changes: vec![],
                 pr: Some(pr.clone()),
+                taken_over: None,
             });
             // Down to where a stack that is here begins, and no further:
             // a pull request someone else opened on top of a local stack
@@ -582,6 +591,64 @@ mod tests {
         }
         let stacks = discover_stacks(&snapshot, Some(&prs));
         assert!(stacks.iter().all(|stack| stack.submit_head.is_none() || stack.pr_count == 0));
+    }
+
+    /// Taken over, their pull request is a segment of the stack that says
+    /// whose it is, and nothing lists it as someone else's any more.
+    #[test]
+    fn a_taken_over_pull_request_is_a_segment_that_says_whose_it_is() {
+        let (mut snapshot, prs, _) = fixture();
+        let prs = with_others(&prs);
+        // Their branch "their-top" (#900 by kim) is a bookmark here now,
+        // on the working copy's change above the stack's top.
+        let mut theirs = snapshot.bookmarks[5].clone();
+        theirs.name = "their-top".into();
+        theirs.target = "wc".into();
+        snapshot.bookmarks.push(theirs);
+        let top = snapshot.nodes.iter_mut().find(|n| n.id == "wc").unwrap();
+        top.bookmarks = vec!["their-top".into()];
+        top.description = "their fix".into();
+        snapshot.workstreams[0].bookmark = Some("their-top".into());
+        snapshot.taken_over = vec![TakenOver {
+            bookmark: "their-top".into(),
+            remote: "origin".into(),
+            number: 900,
+            author: Some("kim".into()),
+        }];
+
+        let stacks = discover_stacks(&snapshot, Some(&prs));
+        let own = &stacks[0];
+        assert_eq!((own.segments.len(), own.pr_count), (6, 6));
+        let marks: Vec<Option<String>> = own
+            .segments
+            .iter()
+            .map(|s| s.taken_over.as_ref().map(|t| t.by_author()))
+            .collect();
+        assert_eq!(marks, [None, None, None, None, None, Some("#900 by @kim".into())]);
+        // #900 is the stack's own now. What rests on it, and what rests
+        // elsewhere on the stack, are still someone else's.
+        assert_eq!(
+            own.others.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [901, 902]
+        );
+        // And it is no stack of its own on GitHub any more.
+        assert!(
+            !stacks
+                .iter()
+                .any(|stack| stack.submit_head.is_none()
+                    && stack.segments.iter().any(|s| s.bookmark.as_deref() == Some("their-top"))),
+            "{:?}",
+            stacks.iter().map(|s| s.key.as_str()).collect::<Vec<_>>()
+        );
+
+        // A prefix that ends below it carries no mark.
+        let lower = own.through_bookmark("ws/tu3-emission").unwrap();
+        assert!(lower.segments.iter().all(|s| s.taken_over.is_none()));
+
+        // A record that names another pull request is a name used again.
+        snapshot.taken_over[0].number = 12;
+        let stacks = discover_stacks(&snapshot, Some(&prs));
+        assert!(stacks[0].segments.iter().all(|s| s.taken_over.is_none()));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 mod browser;
 mod ledger;
 mod plan;
+mod takeover;
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Window};
 use jiji_core::snapshot::RepoSnapshot;
@@ -50,6 +51,13 @@ impl PublishView {
         self.land_bypass = false;
         self.stack_link = StackLink::Follow;
         self.more.reset();
+        // A question about a pull request belongs to the stack it was
+        // asked on. What a take-over did stays on its card until it has
+        // been read: the stacks are read again right after it, and the
+        // selection moves with them.
+        if self.takeover_outcome.is_none() {
+            self.dismiss_take_over(cx);
+        }
         if self.connected(cx) {
             match (stack.pr_count > 0, stack.head_bookmark, stack.submit_head) {
                 (true, Some(bookmark), Some(_)) => self.load_land_plan(bookmark, cx),

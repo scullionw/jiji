@@ -435,7 +435,10 @@ impl Host {
 /// mock stack's two pull requests as a plain chain, `stack` the same two
 /// linked as a GitHub stack, `stray` the lower one closed as merged
 /// without having landed, `others` the plain chain with two pull requests
-/// by other people on it (one on each of its branches).
+/// by other people on it (one on each of its branches), `takeover` the
+/// plain chain with a teammate's pull request on its top whose branch the
+/// mock repository has on its remote, so that it can be taken over, and
+/// one from a fork, which cannot.
 #[cfg(all(feature = "headless", not(test)))]
 fn mock_forge() -> Option<Box<dyn Forge>> {
     use crate::testing::forge::Fixture;
@@ -479,6 +482,27 @@ fn mock_forge() -> Option<Box<dyn Forge>> {
                 theirs.summary.author = Some(author.into());
                 fixture.github().prs.push(theirs);
             }
+        }
+        "takeover" => {
+            use crate::testing::forge::open_pr;
+            let mut theirs = open_pr(
+                52,
+                "alice/palette-icons",
+                "diff-virtualization",
+                &jiji_core::mock::teammate_commit("yqosuwnv"),
+                "Icon set for the palette rows",
+            );
+            theirs.summary.author = Some("alice".into());
+            let mut from_a_fork = open_pr(
+                53,
+                "sticky-header-shadow",
+                "diff-model",
+                "0ddba11c",
+                "Shadow under the sticky header",
+            );
+            from_a_fork.summary.author = Some("kim".into());
+            from_a_fork.summary.head_owner = Some("kim".into());
+            fixture.github().prs.extend([theirs, from_a_fork]);
         }
         _ => return None,
     }

@@ -512,6 +512,7 @@ mod tests {
             conflicts: vec![],
             operations: vec![],
             resolve_tool: None,
+            taken_over: Vec::new(),
         }
     }
 

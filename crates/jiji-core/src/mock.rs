@@ -87,6 +87,8 @@ pub enum MockMutation {
     DeleteBookmark { name: String },
     TrackBookmark { name: String, remote: String },
     UntrackBookmark { name: String, remote: String },
+    TakeOver { name: String, remote: String, number: u64, author: Option<String> },
+    GiveBack { name: String, remote: String },
     DeleteRemoteBookmark { name: String, remote: String },
     Push { names: Vec<String>, remote: String },
     FetchPr { number: u64, bookmark: String },
@@ -531,6 +533,65 @@ pub fn mutation_outcome(
             Ok(MutationOutcome {
                 operation_id: Some(mock_operation_id(index)),
                 summary: format!("Stopped tracking {name}@{remote}"),
+                target_change: None,
+            })
+        }
+        MockMutation::TakeOver { name, remote, .. } => {
+            let entry = snapshot
+                .bookmarks
+                .iter()
+                .find(|b| b.name == *name && b.remote.as_deref() == Some(remote.as_str()))
+                .ok_or_else(|| {
+                    BackendError::MutationFailed(format!(
+                        "there is no remote bookmark {name}@{remote}"
+                    ))
+                })?;
+            if entry.is_local || entry.tracked {
+                return Err(BackendError::MutationFailed(format!(
+                    "\u{201c}{name}\u{201d} is a bookmark here already: it tracks {name}@{remote}"
+                )));
+            }
+            let target = entry.target.clone();
+            let at = match snapshot.nodes.iter().find(|n| n.id == target) {
+                Some(node) => node.commit_id.clone(),
+                None => teammate_commit(&target),
+            };
+            Ok(recorded(
+                format!(
+                    "Took over \u{201c}{name}\u{201d}: it is a bookmark here now, at {at}, and \
+                     nothing was pushed"
+                ),
+                &target,
+            ))
+        }
+        MockMutation::GiveBack { name, remote } => {
+            let taken = snapshot
+                .taken_over
+                .iter()
+                .any(|entry| entry.bookmark == *name && entry.remote == *remote);
+            if !taken {
+                return Err(BackendError::MutationFailed(format!(
+                    "\u{201c}{name}\u{201d} was not taken over here, so there is nothing to \
+                     give back; to stop following a branch of your own, untrack it"
+                )));
+            }
+            let synced = snapshot.bookmarks.iter().any(|b| {
+                b.name == *name && b.is_local && b.tracked && b.sync == SyncState::Synced
+            });
+            if !synced {
+                return Err(BackendError::MutationFailed(format!(
+                    "\u{201c}{name}\u{201d} is not what {remote} has for it: there are \
+                     changes here that were not published, or commits there that were not \
+                     brought in. Publish it, or point it back at {name}@{remote}, and give it \
+                     back then"
+                )));
+            }
+            Ok(MutationOutcome {
+                operation_id: Some(mock_operation_id(index)),
+                summary: format!(
+                    "Gave back \u{201c}{name}\u{201d}: it is no bookmark here any more, and \
+                     {name}@{remote} is as it was"
+                ),
                 target_change: None,
             })
         }
@@ -1406,6 +1467,152 @@ pub fn apply_mutation(
                 vec![],
             );
         }
+        MockMutation::TakeOver {
+            name,
+            remote,
+            number,
+            author,
+        } => {
+            // As a track: the remote-only entry becomes a tracked local
+            // bookmark at the remote position. And it is recorded.
+            let mut target = String::new();
+            let mut told = (String::new(), String::new(), String::new());
+            for bookmark in &mut snapshot.bookmarks {
+                if bookmark.name == *name
+                    && !bookmark.is_local
+                    && bookmark.remote.as_deref() == Some(remote.as_str())
+                {
+                    bookmark.is_local = true;
+                    bookmark.tracked = true;
+                    bookmark.sync = SyncState::Synced;
+                    target = bookmark.target.clone();
+                    told = (
+                        bookmark.target_description.clone(),
+                        bookmark.target_author.clone(),
+                        bookmark.target_timestamp.clone(),
+                    );
+                }
+            }
+            if let Some(node) = snapshot.nodes.iter_mut().find(|n| n.id == target) {
+                if !node.bookmarks.contains(name) {
+                    node.bookmarks.push(name.clone());
+                }
+            } else if !target.is_empty() {
+                // Documented approximation: the fabricated graph does not
+                // draw a teammate's branch. Taken over, it is the user's
+                // to see, and arrives as one change on top of the stack
+                // the working copy is on, the way a pull request opened
+                // on that stack sits. (The real backend shows whatever
+                // history the branch has.)
+                let (description, author, timestamp) = told;
+                let parent = snapshot
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == snapshot.working_copy)
+                    .and_then(|wc| wc.parents.first().cloned())
+                    .unwrap_or_default();
+                let mut lane = vec![target.clone()];
+                let mut below = parent.clone();
+                while let Some(node) = snapshot
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == below && n.kind == NodeKind::Mutable)
+                {
+                    lane.push(node.id.clone());
+                    below = node.parents.first().cloned().unwrap_or_default();
+                }
+                snapshot.nodes.insert(
+                    0,
+                    GraphNode {
+                        id: target.clone(),
+                        change_id: target.clone(),
+                        commit_id: teammate_commit(&target),
+                        description: description.clone(),
+                        author,
+                        timestamp,
+                        kind: NodeKind::Mutable,
+                        parents: vec![parent],
+                        elided_parents: Vec::new(),
+                        bookmarks: vec![name.clone()],
+                        tags: Vec::new(),
+                        is_empty: false,
+                        has_conflict: false,
+                        is_divergent: false,
+                        held: false,
+                        old_copies_held: false,
+                    },
+                );
+                snapshot.workstreams.push(WorkstreamSummary {
+                    id: format!("ws-{target}"),
+                    title: description,
+                    node_ids: lane,
+                    bookmark: Some(name.clone()),
+                    is_active: false,
+                    behind_trunk: 0,
+                });
+            }
+            snapshot
+                .taken_over
+                .retain(|entry| !(entry.bookmark == *name && entry.remote == *remote));
+            snapshot.taken_over.push(TakenOver {
+                bookmark: name.clone(),
+                remote: remote.clone(),
+                number: *number,
+                author: author.clone(),
+            });
+            push_op(
+                snapshot,
+                index,
+                format!("take over {name}@{remote} (pull request #{number})"),
+                vec![OpEffect {
+                    kind: OpEffectKind::Bookmark,
+                    label: format!("{name} created"),
+                }],
+            );
+        }
+        MockMutation::GiveBack { name, remote } => {
+            // The reverse: the entry is remote-only and untracked again,
+            // and a change the take-over drew is someone else's once
+            // more, which this graph does not draw.
+            let mut target = String::new();
+            for bookmark in &mut snapshot.bookmarks {
+                if bookmark.name == *name
+                    && bookmark.is_local
+                    && bookmark.remote.as_deref() == Some(remote.as_str())
+                {
+                    bookmark.is_local = false;
+                    bookmark.tracked = false;
+                    bookmark.sync = SyncState::RemoteOnly;
+                    target = bookmark.target.clone();
+                }
+            }
+            for node in &mut snapshot.nodes {
+                node.bookmarks.retain(|b| b != name);
+            }
+            let built_on = snapshot.nodes.iter().any(|n| n.parents.contains(&target));
+            let drawn_by_the_take_over = snapshot
+                .nodes
+                .iter()
+                .any(|n| n.id == target && n.commit_id == teammate_commit(&target));
+            if drawn_by_the_take_over && !built_on {
+                snapshot.nodes.retain(|n| n.id != target);
+                snapshot
+                    .workstreams
+                    .retain(|ws| ws.id != format!("ws-{target}"));
+            }
+            snapshot
+                .taken_over
+                .retain(|entry| !(entry.bookmark == *name && entry.remote == *remote));
+            push_op(
+                snapshot,
+                index,
+                format!("give back {name}@{remote}"),
+                vec![OpEffect {
+                    kind: OpEffectKind::Bookmark,
+                    label: format!("{name} deleted"),
+                }],
+            );
+        }
         MockMutation::DeleteRemoteBookmark { name, remote } => {
             // The real backend records the local delete and the push as
             // separate operations; the mock collapses them into the push —
@@ -1710,6 +1917,19 @@ pub fn apply_mutation(
 }
 
 /// The commit id a change id currently renders as, for op descriptions.
+/// The commit a teammate's fabricated branch stands on, for a change the
+/// graph does not draw: the change id read as the hex it spells (jj
+/// writes change ids in the letters z to k for the digits 0 to f).
+pub fn teammate_commit(change: &str) -> String {
+    change
+        .chars()
+        .map(|c| match c {
+            'k'..='z' => char::from_digit(u32::from(b'z' - c as u8), 16).unwrap_or(c),
+            other => other,
+        })
+        .collect()
+}
+
 fn commit_of_node(snapshot: &RepoSnapshot, id: &str) -> String {
     snapshot
         .nodes
@@ -1781,6 +2001,10 @@ fn inactive_op_description(snapshot: &RepoSnapshot, mutation: &MockMutation) -> 
         MockMutation::UntrackBookmark { name, remote } => {
             format!("untrack remote bookmark {name}@{remote}")
         }
+        MockMutation::TakeOver { name, remote, number, .. } => {
+            format!("take over {name}@{remote} (pull request #{number})")
+        }
+        MockMutation::GiveBack { name, remote } => format!("give back {name}@{remote}"),
         MockMutation::DeleteRemoteBookmark { name, remote } => {
             format!("push bookmark {name} to git remote {remote}")
         }
@@ -2438,6 +2662,7 @@ pub fn mock_snapshot(repo_path: &Path) -> RepoSnapshot {
         // The fabricated machine has Sublime Merge installed, so every
         // Resolve affordance renders.
         resolve_tool: Some("smerge".into()),
+        taken_over: Vec::new(),
     }
 }
 
